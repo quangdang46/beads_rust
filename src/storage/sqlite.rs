@@ -5784,21 +5784,48 @@ impl SqliteStorage {
     /// Returns an error if the database query fails.
     pub fn get_unique_labels_with_counts(&self) -> Result<Vec<(String, i64)>> {
         let rows = self.conn.query(
-            r"SELECT l.label, COUNT(*) as count
-              FROM labels l
-              JOIN issues i ON l.issue_id = i.id
-              WHERE i.status != 'tombstone'
-              GROUP BY l.label
-              ORDER BY l.label",
+            "SELECT label, COUNT(*) as count
+             FROM labels
+             GROUP BY label
+             ORDER BY label",
         )?;
-        Ok(rows
+        let mut counts: Vec<(String, i64)> = rows
             .iter()
             .filter_map(|r| {
                 let label = r.get(0).and_then(SqliteValue::as_text)?.to_string();
                 let count = r.get(1).and_then(SqliteValue::as_integer)?;
                 Some((label, count))
             })
-            .collect())
+            .collect();
+
+        if counts.is_empty() {
+            return Ok(counts);
+        }
+
+        let tombstone_rows = self.conn.query(
+            "SELECT l.label, COUNT(*) as count
+             FROM labels l
+             JOIN issues i ON l.issue_id = i.id
+             WHERE i.status = 'tombstone'
+             GROUP BY l.label
+             ORDER BY l.label",
+        )?;
+
+        for row in &tombstone_rows {
+            let Some(label) = row.get(0).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            let Some(tombstone_count) = row.get(1).and_then(SqliteValue::as_integer) else {
+                continue;
+            };
+            if let Ok(index) = counts.binary_search_by(|(existing, _)| existing.as_str().cmp(label))
+            {
+                counts[index].1 = counts[index].1.saturating_sub(tombstone_count).max(0);
+            }
+        }
+        counts.retain(|(_, count)| *count > 0);
+
+        Ok(counts)
     }
 
     /// Rename a label across all issues.
@@ -9999,6 +10026,53 @@ mod tests {
 
         let labels = storage.get_labels("bd-l-tomb").unwrap();
         assert_eq!(labels, vec!["existing".to_string()]);
+    }
+
+    #[test]
+    fn test_unique_label_counts_exclude_tombstone_issues() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
+
+        let active = make_issue(
+            "bd-l-active",
+            "Active label count target",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let tombstone = make_issue(
+            "bd-l-deleted",
+            "Deleted label count target",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&active, "tester").unwrap();
+        storage.create_issue(&tombstone, "tester").unwrap();
+        storage
+            .add_label("bd-l-active", "shared", "tester")
+            .unwrap();
+        storage
+            .add_label("bd-l-active", "active-only", "tester")
+            .unwrap();
+        storage
+            .add_label("bd-l-deleted", "shared", "tester")
+            .unwrap();
+        storage
+            .add_label("bd-l-deleted", "deleted-only", "tester")
+            .unwrap();
+        storage
+            .delete_issue("bd-l-deleted", "tester", "delete label count target", None)
+            .unwrap();
+
+        assert_eq!(
+            storage.get_unique_labels_with_counts().unwrap(),
+            vec![("active-only".to_string(), 1), ("shared".to_string(), 1),]
+        );
     }
 
     #[test]
