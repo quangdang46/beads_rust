@@ -124,6 +124,24 @@ fn setup_db_with_issues(count: usize) -> (TempDir, SqliteStorage) {
     (dir, storage)
 }
 
+fn setup_db_with_multi_label_issues(count: usize) -> (TempDir, SqliteStorage) {
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let db_path = dir.path().join("bench.db");
+    let mut storage = SqliteStorage::open(&db_path).expect("Failed to open db");
+
+    for i in 0..count {
+        let mut issue = create_test_issue(i);
+        if i.is_multiple_of(2) {
+            issue.labels.push("label-even".to_string());
+        }
+        storage
+            .create_issue(&issue, "benchmark")
+            .expect("Failed to create issue");
+    }
+
+    (dir, storage)
+}
+
 /// Set up a database with issues and dependencies.
 fn setup_db_with_deps(issue_count: usize, dep_count: usize) -> (TempDir, SqliteStorage) {
     let dir = TempDir::new().expect("Failed to create temp dir");
@@ -504,6 +522,24 @@ fn bench_list_issues_filtered(c: &mut Criterion) {
         let bench_start = log_bench_start(bench_name);
         b.iter(|| {
             let issues = storage.list_issues(black_box(&filters)).unwrap();
+            black_box(issues)
+        });
+        log_bench_end(bench_name, bench_start);
+    });
+
+    let (_multi_label_dir, multi_label_storage) = setup_db_with_multi_label_issues(1000);
+    let multi_label_filters = ListFilters {
+        labels: Some(vec!["label-2".to_string(), "label-even".to_string()]),
+        ..ListFilters::default()
+    };
+
+    group.bench_function("filtered_multi_label_and", |b| {
+        let bench_name = "storage/list_filtered/filtered_multi_label_and";
+        let bench_start = log_bench_start(bench_name);
+        b.iter(|| {
+            let issues = multi_label_storage
+                .list_issues(black_box(&multi_label_filters))
+                .unwrap();
             black_box(issues)
         });
         log_bench_end(bench_name, bench_start);
