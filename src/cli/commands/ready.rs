@@ -147,19 +147,8 @@ fn execute_inner(
 
     info!("Fetching ready issues");
 
-    // Optimization: if there are no external dependencies, we can apply the limit
-    // directly in the SQL query to avoid loading all candidate issues into memory.
-    let has_external = storage.has_external_dependencies(true)?;
-    let external_db_paths = if has_external {
-        Some(config::external_project_db_paths(
-            &load_config_layer()?,
-            beads_dir,
-        ))
-    } else {
-        None
-    };
     let mut filters = filters;
-    if !has_external && args.limit > 0 {
+    if args.limit > 0 {
         filters.limit = Some(args.limit);
     }
 
@@ -169,13 +158,16 @@ fn execute_inner(
     // heavyweight issue columns that never reach ready output.
     let mut ready_issues = storage.get_ready_issues_for_command_output(&filters, sort_policy)?;
 
-    if has_external {
-        let external_statuses = storage.resolve_external_dependency_statuses(
-            external_db_paths
-                .as_ref()
-                .expect("external dependency paths should be loaded"),
-            true,
-        )?;
+    if !ready_issues.is_empty() && storage.has_external_dependencies(true)? {
+        if args.limit > 0 {
+            // External filtering can remove early rows, so reload all local
+            // candidates before applying the final user-visible limit.
+            filters.limit = None;
+            ready_issues = storage.get_ready_issues_for_command_output(&filters, sort_policy)?;
+        }
+        let external_db_paths = config::external_project_db_paths(&load_config_layer()?, beads_dir);
+        let external_statuses =
+            storage.resolve_external_dependency_statuses(&external_db_paths, true)?;
         let external_blockers = storage.external_blockers(&external_statuses)?;
         if !external_blockers.is_empty() {
             ready_issues.retain(|issue| !external_blockers.contains_key(&issue.id));
