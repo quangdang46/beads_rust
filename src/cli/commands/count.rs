@@ -83,9 +83,6 @@ fn execute_inner(args: &CountArgs, ctx: &OutputContext, storage: &SqliteStorage)
     filters.include_templates = args.include_templates;
     filters.title_contains.clone_from(&args.title_contains);
 
-    let issues = storage.list_issues(&filters)?;
-    let total = issues.len();
-
     let by = args.by.or(if args.by_status {
         Some(CountBy::Status)
     } else if args.by_priority {
@@ -100,12 +97,13 @@ fn execute_inner(args: &CountArgs, ctx: &OutputContext, storage: &SqliteStorage)
         None
     });
 
-    if ctx.is_quiet() {
-        return Ok(());
-    }
-
     match by {
         None => {
+            let total = storage.count_issues_with_filters(&filters)?;
+            if ctx.is_quiet() {
+                return Ok(());
+            }
+
             if ctx.is_toon() {
                 ctx.toon(&CountOutput { count: total });
             } else if ctx.is_json() {
@@ -117,6 +115,12 @@ fn execute_inner(args: &CountArgs, ctx: &OutputContext, storage: &SqliteStorage)
             }
         }
         Some(by) => {
+            let issues = storage.list_issues(&filters)?;
+            let total = issues.len();
+            if ctx.is_quiet() {
+                return Ok(());
+            }
+
             let groups = group_counts(storage, &issues, by)?;
             if ctx.is_toon() {
                 ctx.toon(&CountGroupedOutput { total, groups });
