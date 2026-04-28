@@ -92,20 +92,14 @@ fn execute_inner(
             || beads_dir.join("issues.jsonl"),
             |ctx| ctx.paths.jsonl_path.clone(),
         );
-    let config_layer =
-        if let Some(storage_ctx) = preloaded_storage_ctx.or(owned_storage_ctx.as_ref()) {
-            storage_ctx.load_config(cli)?
-        } else {
-            config::load_config(beads_dir, Some(storage), cli)?
-        };
-    let use_color = config::should_use_color(&config_layer);
     let output_format = resolve_output_format_basic_with_outer_mode(
         args.format,
         outer_ctx.inherited_output_mode(),
         args.robot,
     );
     let quiet = cli.quiet.unwrap_or(false);
-    let ctx = OutputContext::from_output_format(output_format, quiet, !use_color);
+    let storage_ctx_for_config = preloaded_storage_ctx.or(owned_storage_ctx.as_ref());
+    let mut config_layer: Option<config::ConfigLayer> = None;
 
     info!("Computing project statistics");
 
@@ -118,9 +112,22 @@ fn execute_inner(
     let has_potential_ready_candidates = all_issues
         .iter()
         .any(|issue| is_potential_ready_candidate(issue, &now));
-    let external_db_paths = config::external_project_db_paths(&config_layer, beads_dir);
     let external_blockers =
         if has_potential_ready_candidates && storage.has_external_dependencies(true)? {
+            if config_layer.is_none() {
+                config_layer = Some(load_stats_config_layer(
+                    beads_dir,
+                    storage,
+                    storage_ctx_for_config,
+                    cli,
+                )?);
+            }
+            let external_db_paths = config::external_project_db_paths(
+                config_layer
+                    .as_ref()
+                    .expect("stats config layer loaded for external dependency resolution"),
+                beads_dir,
+            );
             let external_statuses =
                 storage.resolve_external_dependency_statuses(&external_db_paths, true)?;
             Some(storage.external_blockers(&external_statuses)?)
@@ -164,6 +171,25 @@ fn execute_inner(
         recent_activity,
     };
 
+    let use_color = if matches!(output_format, OutputFormat::Text | OutputFormat::Csv) {
+        if config_layer.is_none() {
+            config_layer = Some(load_stats_config_layer(
+                beads_dir,
+                storage,
+                storage_ctx_for_config,
+                cli,
+            )?);
+        }
+        config::should_use_color(
+            config_layer
+                .as_ref()
+                .expect("stats config layer loaded for human output color"),
+        )
+    } else {
+        false
+    };
+    let ctx = OutputContext::from_output_format(output_format, quiet, !use_color);
+
     // Output based on mode
     if matches!(ctx.mode(), OutputMode::Quiet) {
         return Ok(());
@@ -186,6 +212,19 @@ fn execute_inner(
     }
 
     Ok(())
+}
+
+fn load_stats_config_layer(
+    beads_dir: &Path,
+    storage: &SqliteStorage,
+    storage_ctx: Option<&config::OpenStorageResult>,
+    cli: &config::CliOverrides,
+) -> Result<config::ConfigLayer> {
+    if let Some(storage_ctx) = storage_ctx {
+        storage_ctx.load_config(cli)
+    } else {
+        config::load_config(beads_dir, Some(storage), cli)
+    }
 }
 
 const fn should_include_activity(args: &StatsArgs) -> bool {

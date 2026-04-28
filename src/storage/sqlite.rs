@@ -2381,13 +2381,6 @@ impl SqliteStorage {
 
         let mut params: Vec<SqliteValue> = Vec::new();
 
-        append_label_membership_filters(
-            &mut sql,
-            &mut params,
-            filters.labels.as_deref().unwrap_or(&[]),
-            filters.labels_or.as_deref().unwrap_or(&[]),
-        );
-
         if let Some(ref statuses) = filters.statuses
             && !statuses.is_empty()
         {
@@ -2458,6 +2451,13 @@ impl SqliteStorage {
             sql.push_str(" AND updated_at >= ?");
             params.push(SqliteValue::from(ts.to_rfc3339()));
         }
+
+        append_label_membership_filters(
+            &mut sql,
+            &mut params,
+            filters.labels.as_deref().unwrap_or(&[]),
+            filters.labels_or.as_deref().unwrap_or(&[]),
+        );
 
         // Apply custom sort if provided
         if let Some(ref sort_field) = filters.sort {
@@ -2551,13 +2551,6 @@ impl SqliteStorage {
 
         let mut params: Vec<SqliteValue> = Vec::new();
 
-        append_label_membership_filters(
-            &mut sql,
-            &mut params,
-            filters.labels.as_deref().unwrap_or(&[]),
-            filters.labels_or.as_deref().unwrap_or(&[]),
-        );
-
         if let Some(ref statuses) = filters.statuses
             && !statuses.is_empty()
         {
@@ -2626,6 +2619,13 @@ impl SqliteStorage {
             sql.push_str(" AND updated_at >= ?");
             params.push(SqliteValue::from(ts.to_rfc3339()));
         }
+
+        append_label_membership_filters(
+            &mut sql,
+            &mut params,
+            filters.labels.as_deref().unwrap_or(&[]),
+            filters.labels_or.as_deref().unwrap_or(&[]),
+        );
 
         let row = self.conn.query_row_with_params(&sql, &params)?;
         let count = row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0);
@@ -2905,13 +2905,6 @@ impl SqliteStorage {
         sql.push_str(" FROM issues WHERE 1=1");
         let mut params: Vec<SqliteValue> = Vec::new();
 
-        append_label_membership_filters(
-            &mut sql,
-            &mut params,
-            &filters.labels_and,
-            &filters.labels_or,
-        );
-
         // Ready condition 1: only `open` issues are "ready" (in_progress means
         // already claimed). Optionally include deferred issues when requested.
         if filters.include_deferred {
@@ -3004,6 +2997,13 @@ impl SqliteStorage {
                 params.push(SqliteValue::from(parent_id.as_str()));
             }
         }
+
+        append_label_membership_filters(
+            &mut sql,
+            &mut params,
+            &filters.labels_and,
+            &filters.labels_or,
+        );
 
         if apply_ordering {
             match sort {
@@ -13047,6 +13047,31 @@ mod tests {
             labels: Some(vec!["core".to_string()]),
             ..Default::default()
         };
+
+        eprintln!(
+            "type-only: {:?}",
+            storage
+                .list_issues(&ListFilters {
+                    types: Some(vec![IssueType::Task]),
+                    ..Default::default()
+                })
+                .unwrap()
+                .into_iter()
+                .map(|issue| (issue.id, issue.issue_type.as_str().to_string()))
+                .collect::<Vec<_>>()
+        );
+        eprintln!(
+            "label-only: {:?}",
+            storage
+                .list_issues(&ListFilters {
+                    labels: Some(vec!["core".to_string()]),
+                    ..Default::default()
+                })
+                .unwrap()
+                .into_iter()
+                .map(|issue| (issue.id, issue.issue_type.as_str().to_string()))
+                .collect::<Vec<_>>()
+        );
 
         let issues = storage.list_issues(&filters).unwrap();
         assert_eq!(issues.len(), 1);
