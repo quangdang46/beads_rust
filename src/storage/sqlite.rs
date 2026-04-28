@@ -52,17 +52,40 @@ fn append_label_membership_filters(
     labels_and: &[String],
     labels_or: &[String],
 ) {
-    match labels_and {
+    let mut unique_labels_and = Vec::with_capacity(labels_and.len());
+    let mut seen_labels_and = HashSet::with_capacity(labels_and.len());
+    for label in labels_and {
+        if seen_labels_and.insert(label.as_str()) {
+            unique_labels_and.push(label);
+        }
+    }
+
+    match unique_labels_and.as_slice() {
         [] => {}
         [label] => {
             sql.push_str(" AND issues.id IN (SELECT issue_id FROM labels WHERE label = ?)");
             params.push(SqliteValue::from(label.as_str()));
         }
         _ => {
-            for label in labels_and {
-                sql.push_str(" AND EXISTS (SELECT 1 FROM labels WHERE labels.issue_id = issues.id AND labels.label = ?)");
+            let placeholders: Vec<String> =
+                unique_labels_and.iter().map(|_| "?".to_string()).collect();
+            let _ = write!(
+                sql,
+                " AND issues.id IN (
+                    SELECT issue_id
+                    FROM labels
+                    WHERE label IN ({})
+                    GROUP BY issue_id
+                    HAVING COUNT(DISTINCT label) = ?
+                )",
+                placeholders.join(",")
+            );
+            for label in &unique_labels_and {
                 params.push(SqliteValue::from(label.as_str()));
             }
+            params.push(SqliteValue::from(
+                i64::try_from(unique_labels_and.len()).unwrap_or(i64::MAX),
+            ));
         }
     }
 
@@ -12982,6 +13005,25 @@ mod tests {
         let issues = storage.list_issues(&filters).unwrap();
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].id, "bd-l4");
+
+        let duplicate_filters = ListFilters {
+            labels: Some(vec![
+                "core".to_string(),
+                "frontend".to_string(),
+                "frontend".to_string(),
+            ]),
+            ..Default::default()
+        };
+
+        let duplicate_issues = storage.list_issues(&duplicate_filters).unwrap();
+        assert_eq!(duplicate_issues.len(), 1);
+        assert_eq!(duplicate_issues[0].id, "bd-l4");
+        assert_eq!(
+            storage
+                .count_issues_with_filters(&duplicate_filters)
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
