@@ -51,7 +51,6 @@ fn append_label_membership_filters(
     params: &mut Vec<SqliteValue>,
     labels_and: &[String],
     labels_or: &[String],
-    allow_uncorrelated_in: bool,
 ) {
     let mut unique_labels_and = Vec::with_capacity(labels_and.len());
     let mut seen_labels_and = HashSet::with_capacity(labels_and.len());
@@ -64,49 +63,23 @@ fn append_label_membership_filters(
     match unique_labels_and.as_slice() {
         [] => {}
         [label] => {
-            if allow_uncorrelated_in {
-                sql.push_str(" AND issues.id IN (SELECT issue_id FROM labels WHERE label = ?)");
-            } else {
-                sql.push_str(
-                    " AND EXISTS (
-                        SELECT 1
-                        FROM labels
-                        WHERE labels.issue_id = issues.id
-                          AND labels.label = ?
-                    )",
-                );
-            }
+            sql.push_str(" AND issues.id IN (SELECT issue_id FROM labels WHERE label = ?)");
             params.push(SqliteValue::from(label.as_str()));
         }
         _ => {
             let placeholders: Vec<String> =
                 unique_labels_and.iter().map(|_| "?".to_string()).collect();
-            if allow_uncorrelated_in {
-                let _ = write!(
-                    sql,
-                    " AND issues.id IN (
-                        SELECT issue_id
-                        FROM labels
-                        WHERE label IN ({})
-                        GROUP BY issue_id
-                        HAVING COUNT(DISTINCT label) = ?
-                    )",
-                    placeholders.join(",")
-                );
-            } else {
-                let _ = write!(
-                    sql,
-                    " AND EXISTS (
-                        SELECT 1
-                        FROM labels
-                        WHERE labels.issue_id = issues.id
-                          AND labels.label IN ({})
-                        GROUP BY labels.issue_id
-                        HAVING COUNT(DISTINCT labels.label) = ?
-                    )",
-                    placeholders.join(",")
-                );
-            }
+            let _ = write!(
+                sql,
+                " AND issues.id IN (
+                    SELECT issue_id
+                    FROM labels
+                    WHERE label IN ({})
+                    GROUP BY issue_id
+                    HAVING COUNT(DISTINCT label) = ?
+                )",
+                placeholders.join(",")
+            );
             for label in &unique_labels_and {
                 params.push(SqliteValue::from(label.as_str()));
             }
@@ -118,27 +91,60 @@ fn append_label_membership_filters(
 
     if !labels_or.is_empty() {
         let placeholders: Vec<String> = labels_or.iter().map(|_| "?".to_string()).collect();
-        if allow_uncorrelated_in {
-            let _ = write!(
-                sql,
-                " AND issues.id IN (SELECT issue_id FROM labels WHERE label IN ({}))",
-                placeholders.join(",")
-            );
-        } else {
-            let _ = write!(
-                sql,
-                " AND EXISTS (
-                    SELECT 1
-                    FROM labels
-                    WHERE labels.issue_id = issues.id
-                      AND labels.label IN ({})
-                )",
-                placeholders.join(",")
-            );
-        }
+        let _ = write!(
+            sql,
+            " AND issues.id IN (SELECT issue_id FROM labels WHERE label IN ({}))",
+            placeholders.join(",")
+        );
         for label in labels_or {
             params.push(SqliteValue::from(label.as_str()));
         }
+    }
+}
+
+fn append_label_and_membership_joins(
+    sql: &mut String,
+    params: &mut Vec<SqliteValue>,
+    labels_and: &[String],
+) {
+    let mut seen_labels_and = HashSet::with_capacity(labels_and.len());
+    for label in labels_and {
+        if !seen_labels_and.insert(label.as_str()) {
+            continue;
+        }
+        let alias = format!("labels_and_{}", seen_labels_and.len());
+        let _ = write!(
+            sql,
+            " JOIN labels AS {alias}
+              ON {alias}.issue_id = issues.id
+             AND {alias}.label = ?"
+        );
+        params.push(SqliteValue::from(label.as_str()));
+    }
+}
+
+fn append_label_or_membership_exists(
+    sql: &mut String,
+    params: &mut Vec<SqliteValue>,
+    labels_or: &[String],
+) {
+    if labels_or.is_empty() {
+        return;
+    }
+
+    let placeholders: Vec<String> = labels_or.iter().map(|_| "?".to_string()).collect();
+    let _ = write!(
+        sql,
+        " AND EXISTS (
+            SELECT 1
+            FROM labels
+            WHERE labels.issue_id = issues.id
+              AND labels.label IN ({})
+        )",
+        placeholders.join(",")
+    );
+    for label in labels_or {
+        params.push(SqliteValue::from(label.as_str()));
     }
 }
 // `fsqlite` starts returning false PRIMARY KEY conflicts when we rewrite
@@ -2415,8 +2421,7 @@ impl SqliteStorage {
                      deleted_at, deleted_by, delete_reason, original_type,
                      compaction_level, compacted_at, compacted_at_commit, original_size,
                      sender, ephemeral, pinned, is_template
-              FROM issues
-              WHERE 1=1",
+              FROM issues",
         );
 
         let mut params: Vec<SqliteValue> = Vec::new();
@@ -2429,13 +2434,27 @@ impl SqliteStorage {
                 && filters.title_contains.is_none()
                 && filters.updated_before.is_none()
                 && filters.updated_after.is_none();
-        append_label_membership_filters(
-            &mut sql,
-            &mut params,
-            filters.labels.as_deref().unwrap_or(&[]),
-            filters.labels_or.as_deref().unwrap_or(&[]),
-            label_filters_can_use_uncorrelated_in,
-        );
+        if label_filters_can_use_uncorrelated_in {
+            sql.push_str(" WHERE 1=1");
+            append_label_membership_filters(
+                &mut sql,
+                &mut params,
+                filters.labels.as_deref().unwrap_or(&[]),
+                filters.labels_or.as_deref().unwrap_or(&[]),
+            );
+        } else {
+            append_label_and_membership_joins(
+                &mut sql,
+                &mut params,
+                filters.labels.as_deref().unwrap_or(&[]),
+            );
+            sql.push_str(" WHERE 1=1");
+            append_label_or_membership_exists(
+                &mut sql,
+                &mut params,
+                filters.labels_or.as_deref().unwrap_or(&[]),
+            );
+        }
 
         if let Some(ref statuses) = filters.statuses
             && !statuses.is_empty()
@@ -2596,7 +2615,7 @@ impl SqliteStorage {
     /// Returns an error if the database query fails.
     #[allow(clippy::too_many_lines)]
     pub fn count_issues_with_filters(&self, filters: &ListFilters) -> Result<usize> {
-        let mut sql = String::from("SELECT COUNT(*) FROM issues WHERE 1=1");
+        let mut sql = String::from("SELECT COUNT(*) FROM issues");
 
         let mut params: Vec<SqliteValue> = Vec::new();
 
@@ -2608,13 +2627,27 @@ impl SqliteStorage {
                 && filters.title_contains.is_none()
                 && filters.updated_before.is_none()
                 && filters.updated_after.is_none();
-        append_label_membership_filters(
-            &mut sql,
-            &mut params,
-            filters.labels.as_deref().unwrap_or(&[]),
-            filters.labels_or.as_deref().unwrap_or(&[]),
-            label_filters_can_use_uncorrelated_in,
-        );
+        if label_filters_can_use_uncorrelated_in {
+            sql.push_str(" WHERE 1=1");
+            append_label_membership_filters(
+                &mut sql,
+                &mut params,
+                filters.labels.as_deref().unwrap_or(&[]),
+                filters.labels_or.as_deref().unwrap_or(&[]),
+            );
+        } else {
+            append_label_and_membership_joins(
+                &mut sql,
+                &mut params,
+                filters.labels.as_deref().unwrap_or(&[]),
+            );
+            sql.push_str(" WHERE 1=1");
+            append_label_or_membership_exists(
+                &mut sql,
+                &mut params,
+                filters.labels_or.as_deref().unwrap_or(&[]),
+            );
+        }
 
         if let Some(ref statuses) = filters.statuses
             && !statuses.is_empty()
@@ -2960,7 +2993,7 @@ impl SqliteStorage {
         apply_ordering: bool,
     ) -> (String, Vec<SqliteValue>) {
         let mut sql = String::from(projection.select_clause());
-        sql.push_str(" FROM issues WHERE 1=1");
+        sql.push_str(" FROM issues");
         let mut params: Vec<SqliteValue> = Vec::new();
 
         let label_filters_can_use_uncorrelated_in =
@@ -2968,13 +3001,19 @@ impl SqliteStorage {
                 && filters.priorities.as_ref().is_none_or(Vec::is_empty)
                 && filters.assignee.is_none()
                 && filters.parent.is_none();
-        append_label_membership_filters(
-            &mut sql,
-            &mut params,
-            &filters.labels_and,
-            &filters.labels_or,
-            label_filters_can_use_uncorrelated_in,
-        );
+        if label_filters_can_use_uncorrelated_in {
+            sql.push_str(" WHERE 1=1");
+            append_label_membership_filters(
+                &mut sql,
+                &mut params,
+                &filters.labels_and,
+                &filters.labels_or,
+            );
+        } else {
+            append_label_and_membership_joins(&mut sql, &mut params, &filters.labels_and);
+            sql.push_str(" WHERE 1=1");
+            append_label_or_membership_exists(&mut sql, &mut params, &filters.labels_or);
+        }
 
         // Ready condition 1: only `open` issues are "ready" (in_progress means
         // already claimed). Optionally include deferred issues when requested.
