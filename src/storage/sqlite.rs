@@ -52,6 +52,7 @@ fn append_label_membership_filters(
     labels_and: &[String],
     labels_or: &[String],
 ) {
+    let can_use_uncorrelated_in = params.is_empty();
     let mut unique_labels_and = Vec::with_capacity(labels_and.len());
     let mut seen_labels_and = HashSet::with_capacity(labels_and.len());
     for label in labels_and {
@@ -63,23 +64,49 @@ fn append_label_membership_filters(
     match unique_labels_and.as_slice() {
         [] => {}
         [label] => {
-            sql.push_str(" AND issues.id IN (SELECT issue_id FROM labels WHERE label = ?)");
+            if can_use_uncorrelated_in {
+                sql.push_str(" AND issues.id IN (SELECT issue_id FROM labels WHERE label = ?)");
+            } else {
+                sql.push_str(
+                    " AND EXISTS (
+                        SELECT 1
+                        FROM labels
+                        WHERE labels.issue_id = issues.id
+                          AND labels.label = ?
+                    )",
+                );
+            }
             params.push(SqliteValue::from(label.as_str()));
         }
         _ => {
             let placeholders: Vec<String> =
                 unique_labels_and.iter().map(|_| "?".to_string()).collect();
-            let _ = write!(
-                sql,
-                " AND issues.id IN (
-                    SELECT issue_id
-                    FROM labels
-                    WHERE label IN ({})
-                    GROUP BY issue_id
-                    HAVING COUNT(DISTINCT label) = ?
-                )",
-                placeholders.join(",")
-            );
+            if can_use_uncorrelated_in {
+                let _ = write!(
+                    sql,
+                    " AND issues.id IN (
+                        SELECT issue_id
+                        FROM labels
+                        WHERE label IN ({})
+                        GROUP BY issue_id
+                        HAVING COUNT(DISTINCT label) = ?
+                    )",
+                    placeholders.join(",")
+                );
+            } else {
+                let _ = write!(
+                    sql,
+                    " AND EXISTS (
+                        SELECT 1
+                        FROM labels
+                        WHERE labels.issue_id = issues.id
+                          AND labels.label IN ({})
+                        GROUP BY labels.issue_id
+                        HAVING COUNT(DISTINCT labels.label) = ?
+                    )",
+                    placeholders.join(",")
+                );
+            }
             for label in &unique_labels_and {
                 params.push(SqliteValue::from(label.as_str()));
             }
@@ -91,11 +118,24 @@ fn append_label_membership_filters(
 
     if !labels_or.is_empty() {
         let placeholders: Vec<String> = labels_or.iter().map(|_| "?".to_string()).collect();
-        let _ = write!(
-            sql,
-            " AND issues.id IN (SELECT issue_id FROM labels WHERE label IN ({}))",
-            placeholders.join(",")
-        );
+        if can_use_uncorrelated_in {
+            let _ = write!(
+                sql,
+                " AND issues.id IN (SELECT issue_id FROM labels WHERE label IN ({}))",
+                placeholders.join(",")
+            );
+        } else {
+            let _ = write!(
+                sql,
+                " AND EXISTS (
+                    SELECT 1
+                    FROM labels
+                    WHERE labels.issue_id = issues.id
+                      AND labels.label IN ({})
+                )",
+                placeholders.join(",")
+            );
+        }
         for label in labels_or {
             params.push(SqliteValue::from(label.as_str()));
         }
@@ -13048,34 +13088,10 @@ mod tests {
             ..Default::default()
         };
 
-        eprintln!(
-            "type-only: {:?}",
-            storage
-                .list_issues(&ListFilters {
-                    types: Some(vec![IssueType::Task]),
-                    ..Default::default()
-                })
-                .unwrap()
-                .into_iter()
-                .map(|issue| (issue.id, issue.issue_type.as_str().to_string()))
-                .collect::<Vec<_>>()
-        );
-        eprintln!(
-            "label-only: {:?}",
-            storage
-                .list_issues(&ListFilters {
-                    labels: Some(vec!["core".to_string()]),
-                    ..Default::default()
-                })
-                .unwrap()
-                .into_iter()
-                .map(|issue| (issue.id, issue.issue_type.as_str().to_string()))
-                .collect::<Vec<_>>()
-        );
-
         let issues = storage.list_issues(&filters).unwrap();
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].id, "bd-l5");
+        assert_eq!(storage.count_issues_with_filters(&filters).unwrap(), 1);
     }
 
     #[test]

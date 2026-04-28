@@ -16,8 +16,7 @@ use crate::storage::{SqliteStorage, StatsIssueRow};
 use chrono::Utc;
 use rich_rust::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -112,28 +111,14 @@ fn execute_inner(
     let has_potential_ready_candidates = all_issues
         .iter()
         .any(|issue| is_potential_ready_candidate(issue, &now));
-    let external_blockers =
-        if has_potential_ready_candidates && storage.has_external_dependencies(true)? {
-            if config_layer.is_none() {
-                config_layer = Some(load_stats_config_layer(
-                    beads_dir,
-                    storage,
-                    storage_ctx_for_config,
-                    cli,
-                )?);
-            }
-            let external_db_paths = config::external_project_db_paths(
-                config_layer
-                    .as_ref()
-                    .expect("stats config layer loaded for external dependency resolution"),
-                beads_dir,
-            );
-            let external_statuses =
-                storage.resolve_external_dependency_statuses(&external_db_paths, true)?;
-            Some(storage.external_blockers(&external_statuses)?)
-        } else {
-            None
-        };
+    let external_blockers = resolve_stats_external_blockers(
+        storage,
+        beads_dir,
+        storage_ctx_for_config,
+        cli,
+        &mut config_layer,
+        has_potential_ready_candidates,
+    )?;
 
     let summary = compute_summary(
         storage,
@@ -171,24 +156,15 @@ fn execute_inner(
         recent_activity,
     };
 
-    let use_color = if matches!(output_format, OutputFormat::Text | OutputFormat::Csv) {
-        if config_layer.is_none() {
-            config_layer = Some(load_stats_config_layer(
-                beads_dir,
-                storage,
-                storage_ctx_for_config,
-                cli,
-            )?);
-        }
-        config::should_use_color(
-            config_layer
-                .as_ref()
-                .expect("stats config layer loaded for human output color"),
-        )
-    } else {
-        false
-    };
-    let ctx = OutputContext::from_output_format(output_format, quiet, !use_color);
+    let ctx = stats_output_context(
+        output_format,
+        quiet,
+        beads_dir,
+        storage,
+        storage_ctx_for_config,
+        cli,
+        &mut config_layer,
+    )?;
 
     // Output based on mode
     if matches!(ctx.mode(), OutputMode::Quiet) {
@@ -212,6 +188,73 @@ fn execute_inner(
     }
 
     Ok(())
+}
+
+fn resolve_stats_external_blockers(
+    storage: &SqliteStorage,
+    beads_dir: &Path,
+    storage_ctx: Option<&config::OpenStorageResult>,
+    cli: &config::CliOverrides,
+    config_layer: &mut Option<config::ConfigLayer>,
+    has_potential_ready_candidates: bool,
+) -> Result<Option<HashMap<String, Vec<String>>>> {
+    if !has_potential_ready_candidates || !storage.has_external_dependencies(true)? {
+        return Ok(None);
+    }
+
+    let config_layer =
+        ensure_stats_config_layer(beads_dir, storage, storage_ctx, cli, config_layer)?;
+    let external_db_paths = config::external_project_db_paths(config_layer, beads_dir);
+    let external_statuses =
+        storage.resolve_external_dependency_statuses(&external_db_paths, true)?;
+    Ok(Some(storage.external_blockers(&external_statuses)?))
+}
+
+fn stats_output_context(
+    output_format: OutputFormat,
+    quiet: bool,
+    beads_dir: &Path,
+    storage: &SqliteStorage,
+    storage_ctx: Option<&config::OpenStorageResult>,
+    cli: &config::CliOverrides,
+    config_layer: &mut Option<config::ConfigLayer>,
+) -> Result<OutputContext> {
+    let use_color = if matches!(output_format, OutputFormat::Text | OutputFormat::Csv) {
+        config::should_use_color(ensure_stats_config_layer(
+            beads_dir,
+            storage,
+            storage_ctx,
+            cli,
+            config_layer,
+        )?)
+    } else {
+        false
+    };
+    Ok(OutputContext::from_output_format(
+        output_format,
+        quiet,
+        !use_color,
+    ))
+}
+
+fn ensure_stats_config_layer<'a>(
+    beads_dir: &Path,
+    storage: &SqliteStorage,
+    storage_ctx: Option<&config::OpenStorageResult>,
+    cli: &config::CliOverrides,
+    config_layer: &'a mut Option<config::ConfigLayer>,
+) -> Result<&'a config::ConfigLayer> {
+    if config_layer.is_none() {
+        *config_layer = Some(load_stats_config_layer(
+            beads_dir,
+            storage,
+            storage_ctx,
+            cli,
+        )?);
+    }
+    Ok(config_layer
+        .as_ref()
+        .expect("stats config layer loaded before use"))
 }
 
 fn load_stats_config_layer(
