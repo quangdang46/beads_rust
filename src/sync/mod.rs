@@ -3568,7 +3568,6 @@ struct PrefixRenameSeed {
 #[derive(Debug, Default)]
 struct ImportValidationPlan {
     record_count: usize,
-    ephemeral_count: usize,
     prefix_mismatches: Vec<PrefixRenameSeed>,
     occupied_ids: HashSet<String>,
 }
@@ -3577,12 +3576,6 @@ struct ImportMetadataMaps {
     meta_by_id: HashMap<String, crate::storage::sqlite::IssueMetadata>,
     id_by_ext_ref: HashMap<String, String>,
     id_by_hash: HashMap<String, String>,
-}
-
-impl ImportMetadataMaps {
-    fn is_empty(&self) -> bool {
-        self.meta_by_id.is_empty() && self.id_by_ext_ref.is_empty() && self.id_by_hash.is_empty()
-    }
 }
 
 fn parse_normalized_import_issue(trimmed: &str, line_num: usize) -> Result<Issue> {
@@ -3660,10 +3653,6 @@ fn collect_import_validation_plan(
                 input_path.display(),
                 line_num
             )));
-        }
-
-        if issue.ephemeral {
-            plan.ephemeral_count += 1;
         }
 
         if prefix_mismatch {
@@ -4052,19 +4041,14 @@ pub fn import_from_jsonl(
     let metadata = load_import_metadata_maps(storage)?;
 
     // Phase 1: Scan and Resolve IDs
-    let collision_renames = if metadata.is_empty() {
-        result.skipped_count += validation_plan.ephemeral_count;
-        HashMap::new()
-    } else {
-        scan_import_collision_renames(
-            input_path,
-            config,
-            &prefix_renames,
-            &metadata,
-            &mut result,
-            validation_plan.record_count,
-        )?
-    };
+    let collision_renames = scan_import_collision_renames(
+        input_path,
+        config,
+        &prefix_renames,
+        &metadata,
+        &mut result,
+        validation_plan.record_count,
+    )?;
 
     let jsonl_hash = compute_jsonl_hash(input_path)?;
     let observed_jsonl = observed_jsonl_witness(input_path)?;
