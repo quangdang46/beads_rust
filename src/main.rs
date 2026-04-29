@@ -615,6 +615,11 @@ const fn needs_write_lock(cmd: &Commands) -> bool {
         return true;
     }
     match cmd {
+        // Every command in this arm can open or snapshot the SQLite DB family.
+        // Serialize them before command execution so `--allow-stale`,
+        // `--no-auto-import`, and direct command-local open paths do not bypass
+        // the startup lock that protects recovery/schema/default metadata work.
+        //
         // Every sync mode must open storage inside `sync::execute`.
         // `--flush-only` looks like a "just rewrite JSONL" path but also calls
         // `finalize_export` inside a `with_write_transaction`, updating dirty
@@ -629,11 +634,33 @@ const fn needs_write_lock(cmd: &Commands) -> bool {
         // Doctor inspects a live SQLite DB family via snapshot copy + rollback
         // write probe, so it must serialize with writers — merged into this arm
         // (identical body as Sync/Init) to satisfy clippy::match_same_arms.
-        Commands::Sync(_) | Commands::Init { .. } | Commands::Doctor(_) => true,
-        Commands::Config { command } => matches!(
+        Commands::List(_)
+        | Commands::Show(_)
+        | Commands::Search(_)
+        | Commands::Ready(_)
+        | Commands::Blocked(_)
+        | Commands::Count(_)
+        | Commands::Stale(_)
+        | Commands::Lint(_)
+        | Commands::Stats(_)
+        | Commands::Status(_)
+        | Commands::Changelog(_)
+        | Commands::Graph(_)
+        | Commands::Comments(_)
+        | Commands::Dep { .. }
+        | Commands::Label { .. }
+        | Commands::Epic { .. }
+        | Commands::Query { .. }
+        | Commands::Orphans(_)
+        | Commands::Audit { .. }
+        | Commands::Info(_)
+        | Commands::Where
+        | Commands::Sync(_)
+        | Commands::Init { .. }
+        | Commands::Doctor(_) => true,
+        Commands::Config { command } => !matches!(
             command,
-            beads_rust::cli::ConfigCommands::Set { .. }
-                | beads_rust::cli::ConfigCommands::Delete { .. }
+            beads_rust::cli::ConfigCommands::Path | beads_rust::cli::ConfigCommands::Edit
         ),
         Commands::History(args) => matches!(
             args.command,
@@ -672,7 +699,8 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Dep { .. }
         | Commands::Label { .. }
         | Commands::Epic { .. }
-        | Commands::Query { .. } => true,
+        | Commands::Query { .. }
+        | Commands::Orphans(_) => true,
 
         Commands::Init { .. }
         | Commands::Sync(_)
@@ -685,7 +713,6 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Audit { .. }
         | Commands::Config { .. }
         | Commands::History(_)
-        | Commands::Orphans(_)
         | Commands::Agents(_) => false,
 
         #[cfg(feature = "mcp")]
@@ -1109,9 +1136,42 @@ mod tests {
     }
 
     #[test]
-    fn orphans_handles_freshness_without_global_auto_import() {
+    fn orphans_uses_preopen_auto_import_and_write_lock() {
         let command = Cli::parse_from(["br", "orphans"]).command;
-        assert!(!should_auto_import(&command));
+        assert!(should_auto_import(&command));
+        assert!(needs_write_lock(&command));
+    }
+
+    #[test]
+    fn direct_storage_inspection_commands_require_write_lock() {
+        let cases: &[&[&str]] = &[
+            &["br", "list"],
+            &["br", "audit", "summary"],
+            &["br", "config", "list"],
+            &["br", "info"],
+            &["br", "where"],
+        ];
+
+        for argv in cases {
+            let command = Cli::parse_from(*argv).command;
+            assert!(
+                needs_write_lock(&command),
+                "storage-opening command should serialize DB-family access: {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_path_and_edit_do_not_require_db_write_lock() {
+        let cases: &[&[&str]] = &[&["br", "config", "path"], &["br", "config", "edit"]];
+
+        for argv in cases {
+            let command = Cli::parse_from(*argv).command;
+            assert!(
+                !needs_write_lock(&command),
+                "config command should not lock when it does not inspect the DB: {command:?}"
+            );
+        }
     }
 
     #[test]
