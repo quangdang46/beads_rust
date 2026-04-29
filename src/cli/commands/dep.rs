@@ -2,8 +2,8 @@
 
 use super::{
     RoutedWorkspaceWriteLock, acquire_routed_workspace_write_lock,
-    auto_import_storage_ctx_if_stale, report_auto_flush_failure, resolve_issue_id,
-    retry_mutation_with_jsonl_recovery,
+    auto_import_storage_ctx_if_stale, finalize_batched_blocked_cache_refresh,
+    report_auto_flush_failure, resolve_issue_id, retry_mutation_with_jsonl_recovery,
 };
 use crate::cli::{
     DepAddArgs, DepCommands, DepCyclesArgs, DepDirection, DepListArgs, DepRemoveArgs, DepTreeArgs,
@@ -204,6 +204,15 @@ struct DepActionResult {
     action: String,
 }
 
+fn finalize_dep_mutation(
+    storage_ctx: &mut config::OpenStorageResult,
+    cache_dirty: bool,
+    command: &str,
+) -> Result<()> {
+    finalize_batched_blocked_cache_refresh(&mut storage_ctx.storage, cache_dirty, command)?;
+    storage_ctx.flush_no_db_if_dirty()
+}
+
 /// JSON output for dep list
 #[derive(Serialize)]
 struct DepListItem {
@@ -292,7 +301,7 @@ fn dep_add(
         },
     )?;
 
-    storage_ctx.flush_no_db_if_dirty()?;
+    finalize_dep_mutation(storage_ctx, added, "dep add")?;
     if auto_flush_external && let Err(error) = storage_ctx.auto_flush_if_enabled() {
         report_auto_flush_failure(
             ctx,
@@ -390,7 +399,7 @@ fn dep_remove(
         |storage| storage.remove_dependency(&issue_id, &depends_on_id, actor),
     )?;
 
-    storage_ctx.flush_no_db_if_dirty()?;
+    finalize_dep_mutation(storage_ctx, removed, "dep remove")?;
     if auto_flush_external && let Err(error) = storage_ctx.auto_flush_if_enabled() {
         report_auto_flush_failure(
             ctx,

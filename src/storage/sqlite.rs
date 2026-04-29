@@ -230,10 +230,9 @@ pub struct MutationContext {
     /// descendants) need their blocked-cache entries recomputed.  If `None`
     /// while `invalidate_blocked_cache` is true, the entire cache is rebuilt.
     pub cache_affected_ids: Option<HashSet<String>>,
-    /// When true, skip the eager post-commit cache refresh.  Reads will
-    /// compute blocked state in-memory until the next non-deferred write
-    /// rebuilds the cache.  This reduces DB write-lock contention for
-    /// high-frequency mutations like dep add/remove.
+    /// When true, skip the storage-layer post-commit cache refresh.  Command
+    /// callers that already hold `.write.lock` can finalize the cache once per
+    /// batch; direct reads compute blocked state in-memory if the marker remains.
     pub defer_cache_refresh: bool,
     pub force_flush: bool,
 }
@@ -242,10 +241,10 @@ pub struct MutationContext {
 enum BlockedCacheRefreshPlan {
     Full,
     Incremental(HashSet<String>),
-    /// The stale marker has been set inside the transaction; skip the eager
-    /// post-commit rebuild.  Reads will compute blocked state in-memory
-    /// until the next non-deferred write rebuilds the cache.  Eliminates a
-    /// second write transaction per dep add/remove.
+    /// The stale marker has been set inside the transaction; skip the
+    /// storage-layer post-commit rebuild.  Higher-level command batching can
+    /// refresh once after the batch, while direct reads compute in-memory if the
+    /// marker remains.
     Deferred,
 }
 
@@ -403,13 +402,13 @@ impl MutationContext {
         }
     }
 
-    /// Mark the blocked-cache as needing invalidation but defer the actual
-    /// rebuild to the next non-deferred write (reads compute in-memory).
+    /// Mark the blocked-cache as needing invalidation but defer the storage-layer
+    /// rebuild.  Higher-level command batching can refresh once after the batch;
+    /// reads compute in-memory if the marker remains.
     ///
     /// Use this for high-frequency write operations (dep add/remove) where the
-    /// caller does not immediately read blocked state and where eliminating the
-    /// second post-commit write transaction reduces DB lock contention under
-    /// concurrent agents.
+    /// caller can reconcile the cache at a command boundary instead of inside
+    /// every individual storage mutation.
     pub fn invalidate_cache_deferred(&mut self) {
         self.invalidate_blocked_cache = true;
         self.defer_cache_refresh = true;

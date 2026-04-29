@@ -202,38 +202,50 @@ pub(super) fn finalize_batched_blocked_cache_refresh(
         return Ok(());
     }
 
-    if storage.blocked_cache_marked_stale().unwrap_or(false) {
-        tracing::debug!(
+    if !storage.blocked_cache_marked_stale().unwrap_or(false)
+        && let Err(mark_error) = storage.mark_blocked_cache_stale()
+    {
+        tracing::warn!(
             command = command,
-            "Blocked cache already marked stale inside the mutation transaction; skipping eager batched refresh"
+            error = %mark_error,
+            "Failed to pre-mark blocked cache stale before batched refresh"
         );
-        return Ok(());
+        return storage
+            .rebuild_blocked_cache(true)
+            .map(|_| ())
+            .map_err(|rebuild_err| crate::error::BeadsError::WithContext {
+                context: format!(
+                    "failed to rebuild blocked cache after successful batched {command} mutation; \
+                     leaving the cache stale also failed first: {mark_error}"
+                ),
+                source: Box::new(rebuild_err),
+            });
     }
 
-    match storage.mark_blocked_cache_stale() {
-        Ok(()) => {
+    match storage.ensure_blocked_cache_fresh() {
+        Ok(rebuilt) => {
             tracing::debug!(
                 command = command,
-                "Blocked cache refresh deferred after successful batched mutation; cache remains marked stale"
+                rebuilt = rebuilt,
+                "Blocked cache refreshed after successful batched mutation"
             );
             Ok(())
         }
-        Err(mark_error) => {
+        Err(rebuild_error) => {
             tracing::warn!(
                 command = command,
-                error = %mark_error,
-                "Failed to pre-mark blocked cache stale before batched refresh"
+                error = %rebuild_error,
+                "Blocked cache refresh failed after successful batched mutation; preserving stale marker"
             );
-            storage
-                .rebuild_blocked_cache(true)
-                .map(|_| ())
-                .map_err(|rebuild_err| crate::error::BeadsError::WithContext {
+            storage.mark_blocked_cache_stale().map_err(|mark_error| {
+                crate::error::BeadsError::WithContext {
                     context: format!(
-                        "failed to rebuild blocked cache after successful batched {command} mutation; \
-                         leaving the cache stale also failed first: {mark_error}"
+                        "failed to preserve blocked cache stale marker after successful batched {command} mutation; \
+                         original refresh error: {rebuild_error}"
                     ),
-                    source: Box::new(rebuild_err),
-                })
+                    source: Box::new(mark_error),
+                }
+            })
         }
     }
 }
@@ -533,7 +545,7 @@ mod tests {
     }
 
     #[test]
-    fn finalize_batched_refresh_marks_cache_stale_when_rebuild_fails() {
+    fn finalize_batched_refresh_rebuilds_when_cache_table_is_missing() {
         let temp = TempDir::new().expect("tempdir");
         let db_path = temp.path().join("beads.db");
         let mut storage = SqliteStorage::open(&db_path).expect("storage");
@@ -542,19 +554,26 @@ mod tests {
             .expect("drop blocked cache table");
 
         finalize_batched_blocked_cache_refresh(&mut storage, true, "close")
-            .expect("batched refresh should degrade to a stale marker");
+            .expect("batched refresh should recreate missing cache table");
 
+        assert!(
+            !storage.blocked_cache_marked_stale().unwrap(),
+            "successful finalization should clear the stale marker"
+        );
+        let table_exists = storage
+            .execute_raw_query(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'blocked_issues_cache'",
+            )
+            .expect("query sqlite_master");
         assert_eq!(
-            storage
-                .get_metadata("blocked_cache_state")
-                .unwrap()
-                .as_deref(),
-            Some("stale")
+            table_exists.len(),
+            1,
+            "blocked cache table should be recreated"
         );
     }
 
     #[test]
-    fn finalize_batched_refresh_degrades_when_cache_was_already_stale() {
+    fn finalize_batched_refresh_clears_preexisting_stale_marker() {
         let temp = TempDir::new().expect("tempdir");
         let db_path = temp.path().join("beads.db");
         let mut storage = SqliteStorage::open(&db_path).expect("storage");
@@ -562,19 +581,12 @@ mod tests {
             .mark_blocked_cache_stale()
             .expect("mark cache stale before finalization");
 
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).expect("conn");
-        conn.execute("DROP TABLE blocked_issues_cache")
-            .expect("drop blocked cache table");
-
         finalize_batched_blocked_cache_refresh(&mut storage, true, "close")
-            .expect("pre-marked stale cache should let finalization degrade cleanly");
+            .expect("pre-marked stale cache should be rebuilt cleanly");
 
-        assert_eq!(
-            storage
-                .get_metadata("blocked_cache_state")
-                .unwrap()
-                .as_deref(),
-            Some("stale")
+        assert!(
+            !storage.blocked_cache_marked_stale().unwrap(),
+            "successful finalization should clear a preexisting stale marker"
         );
     }
 
