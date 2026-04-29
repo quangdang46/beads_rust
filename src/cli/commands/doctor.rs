@@ -789,12 +789,11 @@ fn warning_repair_verified(
     report: &DoctorReport,
     repaired_blocked_cache_stale: bool,
     repaired_partial_index_warnings: bool,
-    repaired_page_anomalies: bool,
 ) -> bool {
     report.ok
         && (!repaired_blocked_cache_stale || !report_has_blocked_cache_stale_finding(report))
         && (!repaired_partial_index_warnings || !report_has_partial_index_warnings(report))
-        && (!repaired_page_anomalies || !report_has_warn_level_page_anomaly(report))
+        && !report_has_warn_level_page_anomaly(report)
 }
 
 fn local_repair_message(local_repair: &LocalRepairResult) -> String {
@@ -3183,7 +3182,6 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 &post_warning_repair.report,
                 has_blocked_cache_stale,
                 has_partial_index_warnings,
-                has_warn_page_anomalies,
             );
             let repair_message = repair_outcome_message(
                 gitignore_repaired,
@@ -5062,7 +5060,7 @@ mod tests {
                 details: None,
             }],
         };
-        assert!(!warning_repair_verified(&dirty_report, false, false, true));
+        assert!(!warning_repair_verified(&dirty_report, false, false));
 
         let clean_report = DoctorReport {
             ok: true,
@@ -5075,6 +5073,31 @@ mod tests {
                 details: None,
             }],
         };
-        assert!(warning_repair_verified(&clean_report, false, false, true));
+        assert!(warning_repair_verified(&clean_report, false, false));
+    }
+
+    #[test]
+    fn warning_repair_verified_rejects_page_warning_introduced_by_other_repair() {
+        let report = DoctorReport {
+            ok: true,
+            workspace_health: None,
+            reliability_audit: None,
+            checks: vec![
+                CheckResult {
+                    name: "db.recoverable_anomalies".to_string(),
+                    status: CheckStatus::Ok,
+                    message: None,
+                    details: None,
+                },
+                CheckResult {
+                    name: "sqlite3.integrity_check".to_string(),
+                    status: CheckStatus::Warn,
+                    message: Some("Page 55: never used".to_string()),
+                    details: None,
+                },
+            ],
+        };
+
+        assert!(!warning_repair_verified(&report, true, false));
     }
 }
