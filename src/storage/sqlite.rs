@@ -7137,6 +7137,23 @@ impl SqliteStorage {
         })
     }
 
+    /// Check whether the project has any active issues using default
+    /// user-facing visibility.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn has_active_issues(&self) -> Result<bool> {
+        let rows = self.conn.query(
+            "SELECT 1
+             FROM issues
+             WHERE status NOT IN ('closed', 'tombstone')
+               AND (is_template = 0 OR is_template IS NULL)
+             LIMIT 1",
+        )?;
+        Ok(!rows.is_empty())
+    }
+
     /// Get full issue details.
     ///
     /// # Errors
