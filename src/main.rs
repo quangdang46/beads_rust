@@ -255,7 +255,22 @@ fn main() {
             commands::epic::execute(&command, cli.json, &overrides, &output_ctx)
         }
         Commands::Label { command } => {
-            commands::label::execute(&command, cli.json, &overrides, &output_ctx)
+            if let Some(res) = storage_result.as_ref() {
+                match commands::label::execute_with_storage(
+                    &command,
+                    cli.json,
+                    &output_ctx,
+                    &res.storage,
+                ) {
+                    Ok(true) => Ok(()),
+                    Ok(false) => {
+                        commands::label::execute(&command, cli.json, &overrides, &output_ctx)
+                    }
+                    Err(err) => Err(err),
+                }
+            } else {
+                commands::label::execute(&command, cli.json, &overrides, &output_ctx)
+            }
         }
         Commands::Count(args) => {
             if let Some(res) = storage_result.as_ref() {
