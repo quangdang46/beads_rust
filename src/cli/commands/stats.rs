@@ -157,6 +157,10 @@ fn execute_inner(
         recent_activity,
     };
 
+    if matches!(early_ctx.mode(), OutputMode::Quiet) {
+        return Ok(());
+    }
+
     let ctx = stats_output_context(
         output_format,
         quiet,
@@ -168,10 +172,6 @@ fn execute_inner(
     )?;
 
     // Output based on mode
-    if matches!(ctx.mode(), OutputMode::Quiet) {
-        return Ok(());
-    }
-
     match output_format {
         OutputFormat::Json => {
             ctx.json_pretty(&output);
