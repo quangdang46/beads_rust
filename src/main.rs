@@ -45,41 +45,37 @@ fn main() {
     let should_auto_import_now =
         command_supports_auto_import && !cli.allow_stale && !ctx.no_auto_import();
     let should_auto_flush_now = is_mutating && !ctx.no_auto_flush();
-    let should_preopen_storage = should_preopen_storage(
-        storage_enabled,
-        should_auto_import_now,
-        should_auto_flush_now,
-    );
+    let needs_preopened_storage_context = should_auto_import_now || should_auto_flush_now;
+    let should_preopen_storage =
+        should_preopen_storage(storage_enabled, needs_preopened_storage_context);
     let command_needs_write_lock = needs_write_lock(&cli.command);
 
     // Phase 1.5: Acquire exclusive write lock before any DB-family open that
-    // may apply schema, recover, quarantine sidecars, or write metadata.
+    // may apply schema, recover, quarantine sidecars, write metadata, or read
+    // from fsqlite while another process is in a write transaction.
     //
     // Issue #243: frankensqlite deadlocks when multiple processes attempt
     // concurrent writes to the same database file. Serialize all mutating
     // operations through a blocking flock on `.beads/.write.lock`. Normal
-    // storage open is not guaranteed read-only in recovery/schema paths, so
-    // writable preopen paths also acquire it before Phase 2. The read-only
-    // auto-import probe is the exception: it defers the lock until the probe
-    // proves an import is needed and the code reopens writable storage.
-    let read_only_auto_import_probe = should_auto_import_now && overrides.read_only_fast_open;
-    let write_lock = if should_acquire_startup_write_lock(
-        command_needs_write_lock,
-        should_preopen_storage,
-        read_only_auto_import_probe,
-    ) && ctx.is_initialized()
-    {
-        let lock_timeout = ctx.write_lock_timeout();
-        match ctx.beads_dir.as_deref().map(|beads_dir| {
-            beads_rust::sync::blocking_write_lock_with_timeout(beads_dir, lock_timeout)
-        }) {
-            Some(Ok(lock)) => Some(lock),
-            Some(Err(e)) => handle_error(&e, json_error_mode, color_error_mode),
-            None => None,
-        }
-    } else {
-        None
-    };
+    // storage open is not guaranteed read-only in recovery/schema paths, and
+    // fsqlite can still return SQLITE_BUSY for read-only SELECTs during
+    // concurrent writers, so every preopened DB command acquires the advisory
+    // lock before Phase 2.
+    let write_lock =
+        if should_acquire_startup_write_lock(command_needs_write_lock, should_preopen_storage)
+            && ctx.is_initialized()
+        {
+            let lock_timeout = ctx.write_lock_timeout();
+            match ctx.beads_dir.as_deref().map(|beads_dir| {
+                beads_rust::sync::blocking_write_lock_with_timeout(beads_dir, lock_timeout)
+            }) {
+                Some(Ok(lock)) => Some(lock),
+                Some(Err(e)) => handle_error(&e, json_error_mode, color_error_mode),
+                None => None,
+            }
+        } else {
+            None
+        };
 
     // Phase 2: Open Storage (One-time)
     let mut storage_result = if should_preopen_storage {
@@ -561,18 +557,16 @@ fn execute_create_command(
 
 const fn should_preopen_storage(
     storage_enabled: bool,
-    needs_bootstrap_context: bool,
-    should_auto_flush_now: bool,
+    needs_preopened_storage_context: bool,
 ) -> bool {
-    storage_enabled && (needs_bootstrap_context || should_auto_flush_now)
+    storage_enabled && needs_preopened_storage_context
 }
 
 const fn should_acquire_startup_write_lock(
     command_needs_write_lock: bool,
     should_preopen_storage: bool,
-    read_only_auto_import_probe: bool,
 ) -> bool {
-    command_needs_write_lock || (should_preopen_storage && !read_only_auto_import_probe)
+    command_needs_write_lock || should_preopen_storage
 }
 
 /// Determine if a command potentially mutates data and triggers auto-flush.
@@ -1272,25 +1266,24 @@ mod tests {
 
     #[test]
     fn preopen_storage_skips_commands_without_bootstrap_or_flush_work() {
-        assert!(!should_preopen_storage(true, false, false));
+        assert!(!should_preopen_storage(true, false));
     }
 
     #[test]
     fn preopen_storage_keeps_mutating_auto_flush_path() {
-        assert!(should_preopen_storage(true, false, true));
+        assert!(should_preopen_storage(true, true));
     }
 
     #[test]
     fn preopen_storage_keeps_bootstrap_path_for_staleness_checks() {
-        assert!(should_preopen_storage(true, true, false));
+        assert!(should_preopen_storage(true, true));
     }
 
     #[test]
     fn preopen_storage_requires_write_lock_before_open() {
-        assert!(should_acquire_startup_write_lock(false, true, false));
-        assert!(should_acquire_startup_write_lock(true, false, false));
-        assert!(should_acquire_startup_write_lock(true, true, true));
-        assert!(!should_acquire_startup_write_lock(false, false, false));
-        assert!(!should_acquire_startup_write_lock(false, true, true));
+        assert!(should_acquire_startup_write_lock(false, true));
+        assert!(should_acquire_startup_write_lock(true, false));
+        assert!(should_acquire_startup_write_lock(true, true));
+        assert!(!should_acquire_startup_write_lock(false, false));
     }
 }
