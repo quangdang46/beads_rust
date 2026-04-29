@@ -3270,9 +3270,7 @@ impl SqliteStorage {
                 && filters.priorities.as_ref().is_none_or(Vec::is_empty)
                 && filters.assignee.is_none()
                 && filters.parent.is_none();
-        if should_scan_ready_by_created_at(filters, sort) {
-            sql.push_str(" FROM issues INDEXED BY idx_issues_created_at WHERE 1=1");
-        } else if label_filters_can_use_uncorrelated_in {
+        if label_filters_can_use_uncorrelated_in {
             sql.push_str(" FROM issues WHERE 1=1");
             append_label_membership_filters(
                 &mut sql,
@@ -7715,27 +7713,6 @@ fn ready_hybrid_high_bucket_priorities(priorities: Option<&[Priority]>) -> Vec<P
                 .collect()
         },
     )
-}
-
-fn should_scan_ready_by_created_at(filters: &ReadyFilters, sort: ReadySortPolicy) -> bool {
-    sort == ReadySortPolicy::Oldest
-        && !filters.include_deferred
-        && !filters.unassigned
-        && filters.labels_and.is_empty()
-        && filters.labels_or.is_empty()
-        && filters.types.as_ref().is_none_or(Vec::is_empty)
-        && filters.assignee.is_none()
-        && filters.parent.is_none()
-        && filters
-            .priorities
-            .as_deref()
-            .is_some_and(priorities_cover_ready_high_bucket)
-}
-
-fn priorities_cover_ready_high_bucket(priorities: &[Priority]) -> bool {
-    priorities.len() == 2
-        && priorities.contains(&Priority::CRITICAL)
-        && priorities.contains(&Priority::HIGH)
 }
 
 fn parse_status(s: Option<&str>) -> Status {
@@ -13889,41 +13866,6 @@ mod tests {
 
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].id, "bd-legacy-ready");
-    }
-
-    #[test]
-    fn test_ready_high_bucket_query_uses_created_at_index_for_default_limited_hybrid() {
-        let filters = ReadyFilters {
-            priorities: Some(vec![Priority::CRITICAL, Priority::HIGH]),
-            limit: Some(20),
-            ..ReadyFilters::default()
-        };
-
-        assert!(should_scan_ready_by_created_at(
-            &filters,
-            ReadySortPolicy::Oldest
-        ));
-        let (sql, params) = SqliteStorage::build_ready_issue_candidates_query(
-            &filters,
-            ReadySortPolicy::Oldest,
-            true,
-            true,
-            ReadyIssueProjection::Command,
-            true,
-        );
-        assert!(sql.contains("FROM issues INDEXED BY idx_issues_created_at"));
-        assert_eq!(params.len(), 2);
-
-        let filtered = ReadyFilters {
-            assignee: Some("agent".to_string()),
-            priorities: Some(vec![Priority::CRITICAL, Priority::HIGH]),
-            limit: Some(20),
-            ..ReadyFilters::default()
-        };
-        assert!(!should_scan_ready_by_created_at(
-            &filtered,
-            ReadySortPolicy::Oldest
-        ));
     }
 
     #[test]
