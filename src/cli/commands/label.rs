@@ -51,6 +51,37 @@ pub fn execute(
     }
 }
 
+/// Execute a label subcommand when the caller already has suitable storage.
+///
+/// Returns `Ok(true)` when the command was handled. Commands that need routing,
+/// mutation, or issue-ID resolution return `Ok(false)` so the caller can fall
+/// back to the normal command path.
+///
+/// # Errors
+///
+/// Returns an error if the read-only label query fails.
+pub fn execute_with_storage(
+    command: &LabelCommands,
+    json: bool,
+    ctx: &OutputContext,
+    storage: &SqliteStorage,
+) -> Result<bool> {
+    match command {
+        LabelCommands::ListAll => {
+            label_list_all(storage, json, ctx)?;
+            Ok(true)
+        }
+        LabelCommands::List(args) if args.issue.is_none() => {
+            label_list_unique(storage, ctx)?;
+            Ok(true)
+        }
+        LabelCommands::Add(_)
+        | LabelCommands::Remove(_)
+        | LabelCommands::List(_)
+        | LabelCommands::Rename(_) => Ok(false),
+    }
+}
+
 /// JSON output for label add/remove operations.
 #[derive(Serialize)]
 struct LabelActionResult {
@@ -440,25 +471,31 @@ fn label_list(
             }
         }
     } else {
-        // List all unique labels (without counts - use list-all for counts)
-        let labels_with_counts = storage.get_unique_labels_with_counts()?;
-        let unique_labels: Vec<String> = labels_with_counts.into_iter().map(|(l, _)| l).collect();
+        label_list_unique(storage, ctx)?;
+    }
 
-        if ctx.is_json() {
-            ctx.json_pretty(&unique_labels);
-        } else if ctx.is_toon() {
-            ctx.toon(&unique_labels);
-        } else if ctx.is_quiet() {
-            return Ok(());
-        } else if matches!(ctx.mode(), OutputMode::Rich) {
-            render_unique_labels_rich(&unique_labels, ctx);
-        } else if unique_labels.is_empty() {
-            println!("No labels in project.");
-        } else {
-            println!("Labels ({} total):", unique_labels.len());
-            for label in &unique_labels {
-                println!("  {}", label_display_text(label));
-            }
+    Ok(())
+}
+
+fn label_list_unique(storage: &SqliteStorage, ctx: &OutputContext) -> Result<()> {
+    // List all unique labels (without counts - use list-all for counts)
+    let labels_with_counts = storage.get_unique_labels_with_counts()?;
+    let unique_labels: Vec<String> = labels_with_counts.into_iter().map(|(l, _)| l).collect();
+
+    if ctx.is_json() {
+        ctx.json_pretty(&unique_labels);
+    } else if ctx.is_toon() {
+        ctx.toon(&unique_labels);
+    } else if ctx.is_quiet() {
+        return Ok(());
+    } else if matches!(ctx.mode(), OutputMode::Rich) {
+        render_unique_labels_rich(&unique_labels, ctx);
+    } else if unique_labels.is_empty() {
+        println!("No labels in project.");
+    } else {
+        println!("Labels ({} total):", unique_labels.len());
+        for label in &unique_labels {
+            println!("  {}", label_display_text(label));
         }
     }
 
