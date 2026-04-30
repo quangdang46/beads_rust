@@ -59,25 +59,23 @@ fn main() {
     // operations through a blocking flock on `.beads/.write.lock`. Normal
     // storage open is not guaranteed read-only in recovery/schema paths, and
     // fsqlite can still return SQLITE_BUSY for read-only SELECTs during
-    // concurrent writers, so every preopened DB command acquires the advisory
-    // lock before Phase 2.
-    let write_lock = if should_acquire_startup_write_lock(
-        command_needs_write_lock,
-        should_preopen_storage,
-        overrides.read_only_fast_open,
-    ) && ctx.is_initialized()
-    {
-        let lock_timeout = ctx.write_lock_timeout();
-        match ctx.beads_dir.as_deref().map(|beads_dir| {
-            beads_rust::sync::blocking_write_lock_with_timeout(beads_dir, lock_timeout)
-        }) {
-            Some(Ok(lock)) => Some(lock),
-            Some(Err(e)) => handle_error(&e, json_error_mode, color_error_mode),
-            None => None,
-        }
-    } else {
-        None
-    };
+    // concurrent writers, so every DB-family command acquires the advisory lock
+    // before Phase 2.
+    let write_lock =
+        if should_acquire_startup_write_lock(command_needs_write_lock, should_preopen_storage)
+            && ctx.is_initialized()
+        {
+            let lock_timeout = ctx.write_lock_timeout();
+            match ctx.beads_dir.as_deref().map(|beads_dir| {
+                beads_rust::sync::blocking_write_lock_with_timeout(beads_dir, lock_timeout)
+            }) {
+                Some(Ok(lock)) => Some(lock),
+                Some(Err(e)) => handle_error(&e, json_error_mode, color_error_mode),
+                None => None,
+            }
+        } else {
+            None
+        };
 
     // Phase 2: Open Storage (One-time)
     let mut storage_result = if should_preopen_storage {
@@ -574,9 +572,8 @@ const fn should_preopen_storage(
 const fn should_acquire_startup_write_lock(
     command_needs_write_lock: bool,
     should_preopen_storage: bool,
-    read_only_fast_open: bool,
 ) -> bool {
-    should_preopen_storage || (command_needs_write_lock && !read_only_fast_open)
+    command_needs_write_lock || should_preopen_storage
 }
 
 /// Determine if a command potentially mutates data and triggers auto-flush.
@@ -1026,17 +1023,17 @@ mod tests {
     }
 
     #[test]
-    fn read_only_fast_open_skips_eager_startup_write_lock() {
+    fn read_only_fast_open_does_not_bypass_required_startup_write_lock() {
         assert!(
-            !should_acquire_startup_write_lock(true, false, true),
-            "read-only fast-open commands should not serialize at startup when no preopen is needed"
+            should_acquire_startup_write_lock(true, false),
+            "read-only fast-open commands still touch storage and must serialize at startup"
         );
         assert!(
-            should_acquire_startup_write_lock(true, true, true),
+            should_acquire_startup_write_lock(true, true),
             "auto-import or auto-flush preopen still requires the startup lock"
         );
         assert!(
-            should_acquire_startup_write_lock(true, false, false),
+            should_acquire_startup_write_lock(false, true),
             "non-fast-open DB-family commands must keep the startup lock"
         );
     }
@@ -1368,11 +1365,9 @@ mod tests {
 
     #[test]
     fn preopen_storage_requires_write_lock_before_open() {
-        assert!(should_acquire_startup_write_lock(false, true, false));
-        assert!(should_acquire_startup_write_lock(false, true, true));
-        assert!(should_acquire_startup_write_lock(true, false, false));
-        assert!(should_acquire_startup_write_lock(true, true, false));
-        assert!(!should_acquire_startup_write_lock(false, false, false));
-        assert!(!should_acquire_startup_write_lock(true, false, true));
+        assert!(should_acquire_startup_write_lock(false, true));
+        assert!(should_acquire_startup_write_lock(true, false));
+        assert!(should_acquire_startup_write_lock(true, true));
+        assert!(!should_acquire_startup_write_lock(false, false));
     }
 }
