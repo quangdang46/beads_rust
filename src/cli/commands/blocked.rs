@@ -91,21 +91,28 @@ fn execute_inner(
         .or_else(|| preloaded_storage_ctx.map(|ctx| &ctx.storage))
         .or_else(|| owned_storage_ctx.as_ref().map(|ctx| &ctx.storage))
         .expect("blocked should have an open storage handle");
-    let config_layer =
-        if let Some(storage_ctx) = preloaded_storage_ctx.or(owned_storage_ctx.as_ref()) {
-            storage_ctx.load_config(overrides)?
-        } else {
-            crate::config::load_config(beads_dir, Some(storage), overrides)?
-        };
-
-    let external_db_paths = external_project_db_paths(&config_layer, beads_dir);
-    let use_color = should_use_color(&config_layer);
     let output_format = resolve_output_format_basic_with_outer_mode(
         args.format,
         outer_ctx.inherited_output_mode(),
         args.robot,
     );
     let quiet = overrides.quiet.unwrap_or(false);
+    let has_external_dependencies = storage.has_external_dependencies(true)?;
+    let needs_config = has_external_dependencies
+        || matches!(output_format, OutputFormat::Text | OutputFormat::Csv);
+    let config_layer = if needs_config {
+        Some(
+            if let Some(storage_ctx) = preloaded_storage_ctx.or(owned_storage_ctx.as_ref()) {
+                storage_ctx.load_config(overrides)?
+            } else {
+                crate::config::load_config(beads_dir, Some(storage), overrides)?
+            },
+        )
+    } else {
+        None
+    };
+    let use_color = matches!(output_format, OutputFormat::Text | OutputFormat::Csv)
+        && config_layer.as_ref().is_some_and(should_use_color);
     let ctx = OutputContext::from_output_format(output_format, quiet, !use_color);
 
     // Get blocked issues from cache
@@ -127,45 +134,52 @@ fn execute_inner(
         })
         .collect();
 
-    let external_statuses =
-        storage.resolve_external_dependency_statuses(&external_db_paths, true)?;
-    let mut external_blockers = storage.external_blockers(&external_statuses)?;
+    if has_external_dependencies {
+        let external_db_paths = external_project_db_paths(
+            config_layer
+                .as_ref()
+                .expect("external dependencies require config"),
+            beads_dir,
+        );
+        let external_statuses =
+            storage.resolve_external_dependency_statuses(&external_db_paths, true)?;
+        let mut external_blockers = storage.external_blockers(&external_statuses)?;
+        if !external_blockers.is_empty() {
+            let mut by_id: std::collections::HashMap<String, usize> = blocked_issues
+                .iter()
+                .enumerate()
+                .map(|(idx, bi)| (bi.issue.id.clone(), idx))
+                .collect();
 
-    if !external_blockers.is_empty() {
-        let mut by_id: std::collections::HashMap<String, usize> = blocked_issues
-            .iter()
-            .enumerate()
-            .map(|(idx, bi)| (bi.issue.id.clone(), idx))
-            .collect();
-
-        let mut external_ids_to_fetch = Vec::new();
-        for (issue_id, blockers) in &external_blockers {
-            if let Some(idx) = by_id.get(issue_id).copied() {
-                let entry = &mut blocked_issues[idx];
-                entry.blocked_by.extend(blockers.clone());
-                entry.blocked_by.sort();
-                entry.blocked_by.dedup();
-                entry.blocked_by_count = entry.blocked_by.len();
-            } else {
-                external_ids_to_fetch.push(issue_id.clone());
-            }
-        }
-
-        if !external_ids_to_fetch.is_empty() {
-            let fetched_issues = storage.get_issues_by_ids(&external_ids_to_fetch)?;
-            for issue in fetched_issues {
-                if !include_in_blocked_list(&issue.status) {
-                    continue;
+            let mut external_ids_to_fetch = Vec::new();
+            for (issue_id, blockers) in &external_blockers {
+                if let Some(idx) = by_id.get(issue_id).copied() {
+                    let entry = &mut blocked_issues[idx];
+                    entry.blocked_by.extend(blockers.clone());
+                    entry.blocked_by.sort();
+                    entry.blocked_by.dedup();
+                    entry.blocked_by_count = entry.blocked_by.len();
+                } else {
+                    external_ids_to_fetch.push(issue_id.clone());
                 }
-                if let Some(blockers) = external_blockers.remove(&issue.id) {
-                    let blocked_by_count = blockers.len();
-                    let issue_id = issue.id.clone();
-                    blocked_issues.push(BlockedIssue {
-                        blocked_by_count,
-                        blocked_by: blockers,
-                        issue,
-                    });
-                    by_id.insert(issue_id, blocked_issues.len() - 1);
+            }
+
+            if !external_ids_to_fetch.is_empty() {
+                let fetched_issues = storage.get_issues_by_ids(&external_ids_to_fetch)?;
+                for issue in fetched_issues {
+                    if !include_in_blocked_list(&issue.status) {
+                        continue;
+                    }
+                    if let Some(blockers) = external_blockers.remove(&issue.id) {
+                        let blocked_by_count = blockers.len();
+                        let issue_id = issue.id.clone();
+                        blocked_issues.push(BlockedIssue {
+                            blocked_by_count,
+                            blocked_by: blockers,
+                            issue,
+                        });
+                        by_id.insert(issue_id, blocked_issues.len() - 1);
+                    }
                 }
             }
         }
