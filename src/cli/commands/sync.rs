@@ -112,10 +112,11 @@ pub fn execute(
     _json: bool,
     cli: &config::CliOverrides,
     ctx: &OutputContext,
+    startup_write_lock_held: bool,
 ) -> Result<()> {
     validate_sync_mode_args(args)?;
 
-    let mut startup = prepare_sync_startup(args, cli)?;
+    let mut startup = prepare_sync_startup(args, cli, startup_write_lock_held)?;
 
     maybe_delegate_rebuild(args, &mut startup.open_result)?;
 
@@ -134,7 +135,11 @@ pub fn execute(
 /// Resolve path policy and open storage before dispatch. Keeping this separate
 /// from `execute` makes the command's startup phase distinct from the
 /// status/export/import/merge operation handlers below.
-fn prepare_sync_startup(args: &SyncArgs, cli: &config::CliOverrides) -> Result<SyncStartupState> {
+fn prepare_sync_startup(
+    args: &SyncArgs,
+    cli: &config::CliOverrides,
+    startup_write_lock_held: bool,
+) -> Result<SyncStartupState> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let startup = config::load_startup_config_with_paths(&beads_dir, cli.db.as_ref())?;
     let allow_external_jsonl = args.allow_external_jsonl
@@ -153,8 +158,15 @@ fn prepare_sync_startup(args: &SyncArgs, cli: &config::CliOverrides) -> Result<S
         "Resolved sync path policy"
     );
 
-    let open_result =
-        config::open_storage_with_startup_config(startup, cli, should_defer_jsonl_recovery(args))?;
+    let open_result = if startup_write_lock_held {
+        config::open_storage_with_startup_config_under_write_lock(
+            startup,
+            cli,
+            should_defer_jsonl_recovery(args),
+        )?
+    } else {
+        config::open_storage_with_startup_config(startup, cli, should_defer_jsonl_recovery(args))?
+    };
 
     Ok(SyncStartupState {
         beads_dir,
@@ -2200,9 +2212,9 @@ mod tests {
         SyncOperation, auto_rebuild_semantic_conflict_field,
         auto_rebuild_semantic_flag_conflict_reason, detect_prefix_from_jsonl,
         jsonl_contains_duplicate_external_refs, jsonl_contains_prefix_mismatch,
-        merge_conflict_resolution, should_defer_jsonl_recovery, should_render_human_sync_output,
-        sync_operation, validate_operator_requested_sync_path, validate_sync_mode_args,
-        validate_sync_paths,
+        merge_conflict_resolution, prepare_sync_startup, should_defer_jsonl_recovery,
+        should_render_human_sync_output, sync_operation, validate_operator_requested_sync_path,
+        validate_sync_mode_args, validate_sync_paths,
     };
     use crate::cli::SyncArgs;
     use crate::config::{self, CliOverrides};
@@ -2392,6 +2404,44 @@ mod tests {
             ..SyncArgs::default()
         };
         assert!(!should_defer_jsonl_recovery(&merge));
+    }
+
+    #[test]
+    fn sync_status_fast_open_miss_reuses_caller_write_lock_for_rebuild() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        let issue = make_test_issue("bd-sync-selflock", "Recovered while caller holds lock");
+        fs::write(
+            &jsonl_path,
+            format!("{}\n", serde_json::to_string(&issue).unwrap()),
+        )
+        .unwrap();
+        let _held_lock = crate::sync::blocking_write_lock(&beads_dir).unwrap();
+        let args = SyncArgs {
+            status: true,
+            ..SyncArgs::default()
+        };
+        let cli = CliOverrides {
+            db: Some(db_path.clone()),
+            lock_timeout: Some(1),
+            read_only_fast_open: true,
+            ..CliOverrides::default()
+        };
+
+        let startup = prepare_sync_startup(&args, &cli, true)
+            .expect("caller-held write lock should not be reacquired on fast-open miss");
+
+        assert!(db_path.is_file(), "missing DB should rebuild from JSONL");
+        assert!(
+            startup
+                .open_result
+                .storage
+                .id_exists("bd-sync-selflock")
+                .unwrap()
+        );
     }
 
     #[test]

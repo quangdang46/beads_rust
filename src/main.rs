@@ -308,7 +308,13 @@ fn main() {
                 commands::blocked::execute(&args, cli.json || args.robot, &overrides, &output_ctx)
             }
         }
-        Commands::Sync(args) => commands::sync::execute(&args, cli.json, &overrides, &output_ctx),
+        Commands::Sync(args) => commands::sync::execute(
+            &args,
+            cli.json,
+            &overrides,
+            &output_ctx,
+            write_lock.is_some(),
+        ),
         Commands::Doctor(args) => commands::doctor::execute(&args, &overrides, &output_ctx),
         Commands::Info(args) => commands::info::execute(&args, &overrides, &output_ctx),
         Commands::Schema(args) => commands::schema::execute(&args, &overrides, &output_ctx),
