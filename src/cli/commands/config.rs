@@ -290,6 +290,7 @@ fn load_db_layer_without_recovery(paths: &ConfigPaths) -> ConfigLayer {
             layer.runtime.insert(key.to_string(), value.to_string());
         }
 
+        conn.close()?;
         Ok(layer)
     }) {
         Ok(layer) => layer,
@@ -480,11 +481,11 @@ fn edit_config() -> Result<()> {
         .unwrap_or_else(|_| "vi".to_string());
     let (program, editor_args) = parse_editor_command(&editor)?;
 
-    // Open editor
-    let status = Command::new(&program)
-        .args(&editor_args)
-        .arg(&config_path)
-        .status()?;
+    // Open an allowlisted editor. EDITOR/VISUAL may carry flags, but the
+    // executable itself is constrained so a poisoned environment cannot turn
+    // `br config edit` into a generic process launcher.
+    let mut command = AllowedEditor::from_program(&program)?.command();
+    let status = command.args(&editor_args).arg(&config_path).status()?;
 
     if !status.success() {
         eprintln!("Editor exited with status: {status}");
@@ -503,6 +504,100 @@ fn parse_editor_command(editor: &str) -> Result<(String, Vec<String>)> {
     };
     Ok((program.clone(), args.to_vec()))
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AllowedEditor {
+    Code,
+    CodeInsiders,
+    Codium,
+    Emacs,
+    Helix,
+    Hx,
+    Mate,
+    Micro,
+    Nano,
+    Notepad,
+    Subl,
+    True,
+    Vi,
+    Vim,
+    Vscodium,
+    Zed,
+}
+
+impl AllowedEditor {
+    fn from_program(program: &str) -> Result<Self> {
+        let name = Path::new(program)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(program)
+            .trim();
+        let normalized = name.strip_suffix(".exe").unwrap_or(name);
+
+        match normalized {
+            "code" => Ok(Self::Code),
+            "code-insiders" => Ok(Self::CodeInsiders),
+            "codium" => Ok(Self::Codium),
+            "emacs" => Ok(Self::Emacs),
+            "helix" => Ok(Self::Helix),
+            "hx" => Ok(Self::Hx),
+            "mate" => Ok(Self::Mate),
+            "micro" => Ok(Self::Micro),
+            "nano" => Ok(Self::Nano),
+            "notepad" => Ok(Self::Notepad),
+            "subl" => Ok(Self::Subl),
+            "true" => Ok(Self::True),
+            "vi" => Ok(Self::Vi),
+            "vim" => Ok(Self::Vim),
+            "vscodium" => Ok(Self::Vscodium),
+            "zed" => Ok(Self::Zed),
+            _ => Err(BeadsError::Config(format!(
+                "Unsupported editor '{program}'. Set EDITOR or VISUAL to one of: {}",
+                ALLOWED_EDITORS.join(", ")
+            ))),
+        }
+    }
+
+    fn command(self) -> Command {
+        match self {
+            Self::Code => Command::new("code"),
+            Self::CodeInsiders => Command::new("code-insiders"),
+            Self::Codium => Command::new("codium"),
+            Self::Emacs => Command::new("emacs"),
+            Self::Helix => Command::new("helix"),
+            Self::Hx => Command::new("hx"),
+            Self::Mate => Command::new("mate"),
+            Self::Micro => Command::new("micro"),
+            Self::Nano => Command::new("nano"),
+            Self::Notepad => Command::new("notepad"),
+            Self::Subl => Command::new("subl"),
+            Self::True => Command::new("true"),
+            Self::Vi => Command::new("vi"),
+            Self::Vim => Command::new("vim"),
+            Self::Vscodium => Command::new("vscodium"),
+            Self::Zed => Command::new("zed"),
+        }
+    }
+}
+
+const ALLOWED_EDITORS: &[&str] = &[
+    "code",
+    "code-insiders",
+    "codium",
+    "emacs",
+    "helix",
+    "hx",
+    "mate",
+    "micro",
+    "nano",
+    "notepad",
+    "subl",
+    "true",
+    "vi",
+    "vim",
+    "vscodium",
+    "zed",
+];
 
 /// Get a specific config value.
 fn get_config_value(
@@ -1182,6 +1277,20 @@ mod tests {
         let (program, args) = parse_editor_command("\"my editor\" --flag").unwrap();
         assert_eq!(program, "my editor");
         assert_eq!(args, vec!["--flag"]);
+    }
+
+    #[test]
+    fn test_allowed_editor_accepts_absolute_common_editor_path() {
+        assert_eq!(
+            AllowedEditor::from_program("/usr/bin/vim").unwrap(),
+            AllowedEditor::Vim
+        );
+    }
+
+    #[test]
+    fn test_allowed_editor_rejects_unknown_program() {
+        let err = AllowedEditor::from_program("custom-editor").unwrap_err();
+        assert!(err.to_string().contains("Unsupported editor"));
     }
 
     #[test]

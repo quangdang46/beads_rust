@@ -234,6 +234,7 @@ fn saved_queries_from_db(db_path: &Path) -> BTreeSet<String> {
             }
         }
 
+        conn.close()?;
         Ok(queries)
     }) else {
         return BTreeSet::new();

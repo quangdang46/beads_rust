@@ -711,7 +711,7 @@ fn write_probe_after_repair(db_path: &Path) -> bool {
         Ok(())
     })();
 
-    match probe {
+    let probe_ok = match probe {
         Ok(()) => {
             tracing::info!("Post-repair write probe passed");
             true
@@ -722,7 +722,14 @@ fn write_probe_after_repair(db_path: &Path) -> bool {
             let _ = conn.execute("ROLLBACK");
             false
         }
+    };
+
+    if let Err(err) = conn.close() {
+        tracing::warn!(error = %err, "Post-repair write probe connection close failed");
+        return false;
     }
+
+    probe_ok
 }
 
 /// Return true if any integrity check reported WARN-level page anomalies
@@ -1472,6 +1479,13 @@ fn repair_partial_indexes(db_path: &Path, repair: &mut LocalRepairResult) {
                         "REINDEX failed; partial-index warnings may persist"
                     );
                 }
+            }
+            if let Err(err) = conn.close() {
+                tracing::warn!(
+                    path = %db_path.display(),
+                    error = %err,
+                    "REINDEX connection close failed"
+                );
             }
         }
         Err(err) => {
@@ -2998,6 +3012,7 @@ fn inspect_existing_doctor_database(
         }
         check_sync_metadata(&conn, snapshot_db_path, jsonl_path, checks);
         check_issue_write_probe(&conn, checks);
+        conn.close()?;
         Ok(())
     }) {
         Ok(()) => {

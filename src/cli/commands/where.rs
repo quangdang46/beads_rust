@@ -113,7 +113,7 @@ fn configured_prefix_from_db_without_recovery(db_path: &Path) -> Option<String> 
     config::with_database_family_snapshot(db_path, |snapshot_db_path| {
         let conn = Connection::open(snapshot_db_path.to_string_lossy().into_owned())?;
 
-        Ok(conn
+        let prefix = conn
             .query(
                 "SELECT value FROM config \
                  WHERE key IN ('issue_prefix', 'issue-prefix', 'prefix') \
@@ -132,7 +132,9 @@ fn configured_prefix_from_db_without_recovery(db_path: &Path) -> Option<String> 
                     .map(str::to_string)
             })
             .map(|prefix| prefix.trim().to_string())
-            .filter(|prefix| !prefix.is_empty()))
+            .filter(|prefix| !prefix.is_empty());
+        conn.close()?;
+        Ok(prefix)
     })
     .ok()
     .flatten()
@@ -146,7 +148,7 @@ fn prefix_from_db_without_recovery(db_path: &Path) -> Option<String> {
 
         config::with_database_family_snapshot(db_path, |snapshot_db_path| {
             let conn = Connection::open(snapshot_db_path.to_string_lossy().into_owned())?;
-            Ok(conn
+            let prefix = conn
                 .query("SELECT id FROM issues ORDER BY rowid LIMIT 1")
                 .ok()
                 .and_then(|rows| rows.first().cloned())
@@ -155,7 +157,9 @@ fn prefix_from_db_without_recovery(db_path: &Path) -> Option<String> {
                         .and_then(SqliteValue::as_text)
                         .map(str::to_string)
                 })
-                .and_then(|id| parse_id(&id).ok().map(|parsed| parsed.prefix)))
+                .and_then(|id| parse_id(&id).ok().map(|parsed| parsed.prefix));
+            conn.close()?;
+            Ok(prefix)
         })
         .ok()
         .flatten()

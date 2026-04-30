@@ -166,6 +166,7 @@ fn load_info_snapshot_without_recovery(
             None
         };
 
+        conn.close()?;
         Ok(InfoSnapshot {
             issue_count,
             config_map,
