@@ -3295,7 +3295,12 @@ impl SqliteStorage {
         // is healthy; fallback callers filter them in Rust after directly
         // recomputing the blocker graph from dependencies.
         if exclude_blocked_in_sql {
-            sql.push_str(" AND issues.id NOT IN (SELECT issue_id FROM blocked_issues_cache)");
+            sql.push_str(
+                " AND NOT EXISTS (
+                    SELECT 1 FROM blocked_issues_cache
+                    WHERE blocked_issues_cache.issue_id = issues.id
+                )",
+            );
         }
 
         // Ready condition 3: `defer_until` is NULL or <= now (unless `include_deferred`)
