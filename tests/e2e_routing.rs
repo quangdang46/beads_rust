@@ -1739,7 +1739,7 @@ fn e2e_routing_graph_external_issue_via_main_workspace() {
     let routed_parent = routed_partial_id(&parent_id);
     let graph = run_br(
         &main_workspace,
-        ["graph", &routed_parent, "--json"],
+        ["--lock-timeout", "5", "graph", &routed_parent, "--json"],
         "graph_external_via_route",
     );
     assert!(graph.status.success(), "graph failed: {}", graph.stderr);

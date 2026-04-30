@@ -81,7 +81,7 @@ pub fn execute(args: &GraphArgs, cli: &config::CliOverrides, ctx: &OutputContext
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let route_cli = routed_cli_for_graph(cli, args, &beads_dir)?;
     let (storage_ctx, _routed_write_lock) = open_storage_for_graph(args, &route_cli, &beads_dir)?;
-    execute_with_storage_ctx(args, &route_cli, ctx, &beads_dir, &storage_ctx)
+    execute_graph_with_storage_ctx(args, &route_cli, ctx, &storage_ctx)
 }
 
 fn routed_cli_for_graph(
