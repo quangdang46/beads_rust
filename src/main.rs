@@ -725,6 +725,7 @@ const fn should_auto_import(cmd: &Commands) -> bool {
 
 const fn supports_read_only_fast_open(cmd: &Commands) -> bool {
     match cmd {
+        Commands::Sync(args) => args.status,
         Commands::Stats(args) | Commands::Status(args) => args.no_activity,
         Commands::List(_)
         | Commands::Show(_)
@@ -744,6 +745,7 @@ const fn supports_read_only_fast_open(cmd: &Commands) -> bool {
 const fn supports_auto_import_read_only_probe(cmd: &Commands) -> bool {
     match cmd {
         Commands::List(_) => true,
+        Commands::Sync(args) => args.status,
         Commands::Stats(args) | Commands::Status(args) => args.no_activity,
         _ => false,
     }
@@ -975,6 +977,15 @@ mod tests {
 
         let status_no_activity = Cli::parse_from(["br", "status", "--no-activity"]);
         assert!(build_cli_overrides(&status_no_activity).read_only_fast_open);
+
+        let sync_status = Cli::parse_from(["br", "sync", "--status"]);
+        assert!(build_cli_overrides(&sync_status).read_only_fast_open);
+
+        let sync_flush = Cli::parse_from(["br", "sync", "--flush-only"]);
+        assert!(!build_cli_overrides(&sync_flush).read_only_fast_open);
+
+        let sync_import = Cli::parse_from(["br", "sync", "--import-only"]);
+        assert!(!build_cli_overrides(&sync_import).read_only_fast_open);
 
         let ready = Cli::parse_from(["br", "--no-auto-import", "--no-auto-flush", "ready"]);
         assert!(build_cli_overrides(&ready).read_only_fast_open);
