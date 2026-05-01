@@ -945,9 +945,8 @@ fn backfill_storage_null_in_default_columns(conn: &Connection) {
         if !table_exists(conn, table) || !column_exists(conn, table, column) {
             continue;
         }
-        let sql = format!(
-            "UPDATE {table} SET {column} = {default} WHERE typeof({column}) = 'null'"
-        );
+        let sql =
+            format!("UPDATE {table} SET {column} = {default} WHERE typeof({column}) = 'null'");
         if let Err(err) = conn.execute(&sql) {
             tracing::warn!(
                 table = table,
