@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use tracing::{debug, info};
 
@@ -1112,7 +1112,6 @@ fn parse_recent_activity_cache(
         .ok()?;
 
     if entry.repo_root != repo_ctx.repo_root.to_string_lossy()
-        || entry.repo_head != repo_ctx.head
         || entry.pathspec != pathspec
         || entry.hours != hours
         || entry
@@ -1122,7 +1121,55 @@ fn parse_recent_activity_cache(
         return None;
     }
 
-    Some(entry.activity)
+    if entry.repo_head == repo_ctx.head
+        || zero_activity_cache_covers_current_head(&entry, repo_ctx, pathspec)
+    {
+        Some(entry.activity)
+    } else {
+        None
+    }
+}
+
+fn zero_activity_cache_covers_current_head(
+    entry: &RecentActivityCacheEntry,
+    repo_ctx: &GitRepoContext,
+    pathspec: &str,
+) -> bool {
+    if entry.valid_until_epoch.is_some()
+        || entry.activity.commit_count != 0
+        || entry.activity.total_changes != 0
+        || !looks_like_git_oid(&entry.repo_head)
+        || !looks_like_git_oid(&repo_ctx.head)
+    {
+        return false;
+    }
+
+    let range = format!("{}..{}", entry.repo_head, repo_ctx.head);
+    let Ok(status) = git_command()
+        .args(["diff", "--quiet", &range, "--", pathspec])
+        .current_dir(&repo_ctx.repo_root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    else {
+        return false;
+    };
+
+    if status.success() {
+        debug!(
+            cached_head = %entry.repo_head,
+            current_head = %repo_ctx.head,
+            pathspec,
+            "Reusing zero-activity stats cache across a code-only HEAD change"
+        );
+        true
+    } else {
+        false
+    }
+}
+
+fn looks_like_git_oid(value: &str) -> bool {
+    (4..=64).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn recent_activity_cache_policy(
@@ -1853,6 +1900,84 @@ mod tests {
     fn write_issue_jsonl(path: &Path, issue: &Issue) {
         let line = serde_json::to_string(issue).expect("serialize issue");
         fs::write(path, format!("{line}\n")).expect("write issue jsonl");
+    }
+
+    #[test]
+    fn test_zero_activity_cache_reused_across_code_only_head_change() {
+        let temp = TempDir::new().expect("tempdir");
+        git(temp.path(), &["init", "-q"]);
+        git(temp.path(), &["config", "user.email", "tester@example.com"]);
+        git(temp.path(), &["config", "user.name", "Tester"]);
+
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        let issue = make_issue("bd-cache", Status::Open, IssueType::Task);
+        write_issue_jsonl(&jsonl_path, &issue);
+        git(temp.path(), &["add", ".beads/issues.jsonl"]);
+        git(temp.path(), &["commit", "-q", "-m", "seed issue jsonl"]);
+        let cached_head = git_stdout(temp.path(), &["rev-parse", "HEAD"]);
+
+        fs::write(temp.path().join("README.md"), "code-only change\n").expect("write readme");
+        git(temp.path(), &["add", "README.md"]);
+        git(temp.path(), &["commit", "-q", "-m", "code only"]);
+        let repo_ctx = GitRepoContext {
+            repo_root: temp.path().to_path_buf(),
+            head: git_stdout(temp.path(), &["rev-parse", "HEAD"]),
+        };
+
+        let activity = RecentActivity {
+            hours_tracked: 24,
+            commit_count: 0,
+            issues_created: 0,
+            issues_closed: 0,
+            issues_updated: 0,
+            issues_reopened: 0,
+            total_changes: 0,
+        };
+        let cache_entry = RecentActivityCacheEntry {
+            repo_root: temp.path().to_string_lossy().into_owned(),
+            repo_head: cached_head,
+            pathspec: ".beads/issues.jsonl".to_string(),
+            hours: 24,
+            valid_until_epoch: None,
+            activity,
+        };
+        let raw = serde_json::to_string(&cache_entry).expect("serialize cache entry");
+
+        assert!(
+            parse_recent_activity_cache(
+                &raw,
+                &repo_ctx,
+                ".beads/issues.jsonl",
+                24,
+                Utc::now().timestamp(),
+            )
+            .is_some(),
+            "code-only commits should not invalidate a zero-activity cache"
+        );
+
+        let mut changed_issue = issue;
+        changed_issue.title = "Issue bd-cache updated".to_string();
+        write_issue_jsonl(&jsonl_path, &changed_issue);
+        git(temp.path(), &["add", ".beads/issues.jsonl"]);
+        git(temp.path(), &["commit", "-q", "-m", "touch issue jsonl"]);
+        let repo_ctx = GitRepoContext {
+            repo_root: temp.path().to_path_buf(),
+            head: git_stdout(temp.path(), &["rev-parse", "HEAD"]),
+        };
+
+        assert!(
+            parse_recent_activity_cache(
+                &raw,
+                &repo_ctx,
+                ".beads/issues.jsonl",
+                24,
+                Utc::now().timestamp(),
+            )
+            .is_none(),
+            "issue JSONL changes must force a fresh activity scan"
+        );
     }
 
     #[test]
