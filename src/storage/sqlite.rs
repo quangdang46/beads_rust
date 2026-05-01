@@ -9040,9 +9040,19 @@ fn dedupe_preserving_order(values: &[String]) -> Vec<String> {
 
 impl Drop for SqliteStorage {
     fn drop(&mut self) {
-        // Do not checkpoint on drop. Read-only CLI commands were turning
-        // teardown into a write-like operation, which created spurious busy
-        // failures under parallel read traffic.
+        // Read-only commands leave `mutation_count` at zero, so they keep
+        // the original "no checkpoint on teardown" behaviour that prevents
+        // spurious busy failures under parallel read traffic. Mutating
+        // commands that committed since the last periodic checkpoint —
+        // including the abnormal-exit case where signal-induced shutdown
+        // (`crate::shutdown`) returns from main without re-entering
+        // `with_write_transaction` — get one final TRUNCATE here so WAL
+        // frames are not stranded on disk after the process ends (#270).
+        if self.mutation_count > 0
+            && let Err(e) = self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        {
+            tracing::debug!(error = %e, "WAL checkpoint on drop failed (non-fatal)");
+        }
         // Explicitly close the connection to avoid fsqlite drop_close warnings.
         let _ = self.conn.close_in_place();
     }
@@ -14496,6 +14506,66 @@ mod tests {
             Some("false".to_string())
         );
         assert_eq!(storage.get_metadata(BLOCKED_CACHE_STATE_KEY).unwrap(), None);
+    }
+
+    /// Regression: a normal Drop of a mutating storage handle must
+    /// drain the WAL so the next process opens a checkpointed file
+    /// instead of inheriting WAL frames from the previous one (#270).
+    /// The companion case — a read-only handle leaving the WAL
+    /// untouched at teardown — keeps the existing busy-failure
+    /// avoidance described in the Drop impl's comment.
+    #[test]
+    fn test_drop_checkpoints_wal_for_mutating_handles_only() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("drop-checkpoint.db");
+        let wal_path = {
+            let mut p = db_path.clone();
+            let mut name = p.file_name().unwrap().to_os_string();
+            name.push("-wal");
+            p.set_file_name(name);
+            p
+        };
+
+        // Mutating handle: insert a row, then drop. The Drop impl
+        // should issue a TRUNCATE checkpoint so the WAL drains to the
+        // main DB file before the next open.
+        {
+            let mut storage = SqliteStorage::open(&db_path).unwrap();
+            let now = Utc::now();
+            let issue = make_issue("bd-drop-1", "drop-checkpoint", Status::Open, 2, None, now, None);
+            storage.create_issue(&issue, "tester").unwrap();
+            assert!(
+                storage.mutation_count > 0,
+                "create_issue must increment mutation_count for the Drop checkpoint heuristic to fire"
+            );
+        }
+
+        // After drop, fsqlite may keep the WAL sidecar around as a
+        // zero-length file or remove it entirely depending on the
+        // mode of TRUNCATE. Either is acceptable; what we forbid is a
+        // WAL file that still carries unchecked frames.
+        let wal_size_after_mutating_drop = fs::metadata(&wal_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert_eq!(
+            wal_size_after_mutating_drop, 0,
+            "Drop of a mutating handle must truncate the WAL; got {wal_size_after_mutating_drop} bytes"
+        );
+
+        // Read-only handle: open, read nothing, drop. Must NOT
+        // checkpoint — that would re-introduce the busy-failure class
+        // the original "no checkpoint on drop" comment was guarding.
+        // The cheapest behavioural assertion we can write without
+        // peeking at internals is that mutation_count stayed at zero
+        // for the read-only handle, which is exactly the gate the
+        // Drop impl checks before deciding to checkpoint.
+        {
+            let storage = SqliteStorage::open(&db_path).unwrap();
+            assert_eq!(
+                storage.mutation_count, 0,
+                "open + read-only inspection must not increment mutation_count"
+            );
+        }
     }
 
     /// Regression test for beads_rust-ok70: verify that status-change updates

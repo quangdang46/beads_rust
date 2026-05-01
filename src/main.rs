@@ -19,6 +19,13 @@ static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 fn main() {
     CompleteEnv::with_factory(Cli::command).complete();
 
+    // Install SIGINT/SIGTERM/SIGHUP handlers before any storage opens so
+    // an interrupt during a long-running command unwinds through main
+    // and lets `SqliteStorage::Drop` flush the WAL (#270). The handler
+    // is process-global and idempotent, so calling it from clap's
+    // completion subprocess (above) would also be safe.
+    beads_rust::shutdown::install();
+
     let cli = Cli::parse();
     let json_error_mode = should_render_errors_as_json(&cli);
     let color_error_mode = should_color_human_errors_for_cli(&cli);
@@ -422,6 +429,17 @@ fn main() {
     // Handle command result
     if let Err(e) = result {
         handle_error(&e, json_error_mode, color_error_mode);
+    }
+
+    // Cooperative shutdown: if a SIGINT/SIGTERM/SIGHUP arrived while
+    // the command was executing, skip the auto-flush phase and let
+    // every local — including `storage_result` — drop on the way out
+    // of `main`, so `SqliteStorage::Drop` checkpoints the WAL before
+    // the process exits (#270).
+    if let Some(exit_code) = beads_rust::shutdown::exit_code() {
+        drop(storage_result);
+        drop(write_lock);
+        std::process::exit(exit_code);
     }
 
     // Phase 5: Auto-Flush (with advisory flock to serialize concurrent access)
