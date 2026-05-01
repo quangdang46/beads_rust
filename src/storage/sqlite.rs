@@ -734,14 +734,10 @@ impl SqliteStorage {
             path.to_string_lossy().as_ref(),
             OpenFlags::SQLITE_OPEN_READ_ONLY,
         )?;
-        if runtime_schema_compatible(&conn) {
-            return Ok(Some(Self {
-                conn,
-                mutation_count: 0,
-            }));
-        }
-
-        Ok(None)
+        Ok(Some(Self {
+            conn,
+            mutation_count: 0,
+        }))
     }
 
     /// Open an in-memory database for testing.
