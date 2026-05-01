@@ -43,11 +43,13 @@ static INSTALLED: OnceLock<()> = OnceLock::new();
 ///
 /// # Behaviour
 ///
-/// * The first signal flips [`is_requested`] and records the exit code
-///   `128 + signo`. The main thread is responsible for noticing this
+/// * The first signal records the exit code `128 + signo` and flips
+///   [`is_requested`]. The main thread is responsible for noticing the
 ///   flag at a safe checkpoint and returning from `main`.
-/// * The second matching signal calls `libc::_exit` immediately so a
-///   user can always escape a hung command by hitting Ctrl-C twice.
+/// * The second matching signal calls
+///   [`signal_hook::low_level::exit`] (an async-signal-safe `_exit`
+///   wrapper) immediately so a user can always escape a hung command
+///   by hitting Ctrl-C twice.
 ///
 /// Idempotent: subsequent calls return without re-installing.
 pub fn install() {
@@ -98,21 +100,33 @@ fn install_unix() {
         .spawn(move || {
             for signo in signals.forever() {
                 let exit = 128 + signo;
-                // First signal: cooperatively notify main; second: hard
-                // exit. `compare_exchange` ensures both fields advance
-                // atomically so a racing reader never sees the flag set
-                // without the matching exit code.
-                if SHUTDOWN_REQUESTED
-                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-                {
-                    SHUTDOWN_EXIT_CODE.store(exit, Ordering::Release);
-                } else {
+                // Publish in this exact order:
+                //   1. Reserve the exit code via `compare_exchange`
+                //      from 0 → `exit`. Only the first writer wins, so
+                //      a re-entrant signal cannot overwrite the value
+                //      a `main` thread reader is about to consume.
+                //   2. Set the "requested" flag with `Release`
+                //      ordering. Any reader that observes the flag set
+                //      via an `Acquire` load is therefore guaranteed
+                //      to also see the matching exit code (Step 1
+                //      happens-before Step 2 by program order, and
+                //      the Release on Step 2 publishes both writes
+                //      together).
+                //
+                // Reversing this order would let `is_requested()`
+                // return true while `exit_code()` still saw the
+                // initial 0, which would cause a racing main thread
+                // to silently miss the signal.
+                let was_first = SHUTDOWN_EXIT_CODE
+                    .compare_exchange(0, exit, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok();
+                SHUTDOWN_REQUESTED.store(true, Ordering::Release);
+                if !was_first {
                     // Second strike: bypass main, accept that any
                     // remaining WAL frames are forfeit — the user
-                    // explicitly asked to bail out now. signal-hook's
-                    // `low_level::exit` wraps `_exit` and is documented
-                    // as async-signal-safe for exactly this case.
+                    // explicitly asked to bail out now.
+                    // `signal_hook::low_level::exit` wraps `_exit`
+                    // and is async-signal-safe for exactly this case.
                     signal_hook::low_level::exit(exit);
                 }
             }
