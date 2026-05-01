@@ -1977,6 +1977,114 @@ fn check_recoverable_anomalies(conn: &Connection, checks: &mut Vec<CheckResult>)
     Ok(())
 }
 
+/// (table, column, fix_sql) tuples for every NOT NULL DEFAULT column that
+/// can hold a storage-class NULL on legacy databases. Mirrors the schema
+/// bootstrap's v8 migration in `backfill_storage_null_in_default_columns`
+/// — a doctor warning here means a NULL appeared *after* migration ran
+/// (issue #269 covers the legacy backfill, #177 the typeof-vs-IS-NULL
+/// rationale).
+const NULL_DEFAULT_CHECKS: &[(&str, &str, &str)] = &[
+    // issues
+    (
+        "issues",
+        "description",
+        "UPDATE issues SET description = '' WHERE typeof(description) = 'null'",
+    ),
+    (
+        "issues",
+        "design",
+        "UPDATE issues SET design = '' WHERE typeof(design) = 'null'",
+    ),
+    (
+        "issues",
+        "acceptance_criteria",
+        "UPDATE issues SET acceptance_criteria = '' WHERE typeof(acceptance_criteria) = 'null'",
+    ),
+    (
+        "issues",
+        "notes",
+        "UPDATE issues SET notes = '' WHERE typeof(notes) = 'null'",
+    ),
+    (
+        "issues",
+        "status",
+        "UPDATE issues SET status = 'open' WHERE typeof(status) = 'null'",
+    ),
+    (
+        "issues",
+        "priority",
+        "UPDATE issues SET priority = 2 WHERE typeof(priority) = 'null'",
+    ),
+    (
+        "issues",
+        "issue_type",
+        "UPDATE issues SET issue_type = 'task' WHERE typeof(issue_type) = 'null'",
+    ),
+    (
+        "issues",
+        "source_repo",
+        "UPDATE issues SET source_repo = '.' WHERE typeof(source_repo) = 'null'",
+    ),
+    (
+        "issues",
+        "ephemeral",
+        "UPDATE issues SET ephemeral = 0 WHERE typeof(ephemeral) = 'null'",
+    ),
+    (
+        "issues",
+        "pinned",
+        "UPDATE issues SET pinned = 0 WHERE typeof(pinned) = 'null'",
+    ),
+    (
+        "issues",
+        "is_template",
+        "UPDATE issues SET is_template = 0 WHERE typeof(is_template) = 'null'",
+    ),
+    // dependencies
+    (
+        "dependencies",
+        "type",
+        "UPDATE dependencies SET type = 'blocks' WHERE typeof(type) = 'null'",
+    ),
+    (
+        "dependencies",
+        "created_by",
+        "UPDATE dependencies SET created_by = '' WHERE typeof(created_by) = 'null'",
+    ),
+    // comments
+    (
+        "comments",
+        "author",
+        "UPDATE comments SET author = '' WHERE typeof(author) = 'null'",
+    ),
+    (
+        "comments",
+        "text",
+        "UPDATE comments SET text = '' WHERE typeof(text) = 'null'",
+    ),
+    (
+        "comments",
+        "created_at",
+        "UPDATE comments SET created_at = CURRENT_TIMESTAMP WHERE typeof(created_at) = 'null'",
+    ),
+    // events
+    (
+        "events",
+        "event_type",
+        "UPDATE events SET event_type = '' WHERE typeof(event_type) = 'null'",
+    ),
+    (
+        "events",
+        "actor",
+        "UPDATE events SET actor = '' WHERE typeof(actor) = 'null'",
+    ),
+    (
+        "events",
+        "created_at",
+        "UPDATE events SET created_at = CURRENT_TIMESTAMP WHERE typeof(created_at) = 'null'",
+    ),
+];
+
 /// Check for NULL values in NOT NULL columns that should have DEFAULTs.
 ///
 /// Detects rows inserted before the `DEFAULT ''` was added to the schema
@@ -1987,112 +2095,7 @@ fn check_null_defaults(conn: &Connection, checks: &mut Vec<CheckResult>) {
     // that cause IS NULL predicates to silently return 0 rows even when NULLs
     // exist in the table.  typeof() bypasses the index and checks the actual
     // storage class.  See issue #177 for details.
-    // Mirror the NOT NULL DEFAULT clauses declared in `schema::SCHEMA_SQL`
-    // and the *_COLUMNS migration constants. Schema-bootstrap auto-heals
-    // these via the v8 migration (`backfill_storage_null_in_default_columns`),
-    // so a doctor warning here means a row was inserted with a storage NULL
-    // *after* the migration ran — issue #269 covers the legacy backfill.
-    let queries: &[(&str, &str, &str)] = &[
-        // issues
-        (
-            "issues",
-            "description",
-            "UPDATE issues SET description = '' WHERE typeof(description) = 'null'",
-        ),
-        (
-            "issues",
-            "design",
-            "UPDATE issues SET design = '' WHERE typeof(design) = 'null'",
-        ),
-        (
-            "issues",
-            "acceptance_criteria",
-            "UPDATE issues SET acceptance_criteria = '' WHERE typeof(acceptance_criteria) = 'null'",
-        ),
-        (
-            "issues",
-            "notes",
-            "UPDATE issues SET notes = '' WHERE typeof(notes) = 'null'",
-        ),
-        (
-            "issues",
-            "status",
-            "UPDATE issues SET status = 'open' WHERE typeof(status) = 'null'",
-        ),
-        (
-            "issues",
-            "priority",
-            "UPDATE issues SET priority = 2 WHERE typeof(priority) = 'null'",
-        ),
-        (
-            "issues",
-            "issue_type",
-            "UPDATE issues SET issue_type = 'task' WHERE typeof(issue_type) = 'null'",
-        ),
-        (
-            "issues",
-            "source_repo",
-            "UPDATE issues SET source_repo = '.' WHERE typeof(source_repo) = 'null'",
-        ),
-        (
-            "issues",
-            "ephemeral",
-            "UPDATE issues SET ephemeral = 0 WHERE typeof(ephemeral) = 'null'",
-        ),
-        (
-            "issues",
-            "pinned",
-            "UPDATE issues SET pinned = 0 WHERE typeof(pinned) = 'null'",
-        ),
-        (
-            "issues",
-            "is_template",
-            "UPDATE issues SET is_template = 0 WHERE typeof(is_template) = 'null'",
-        ),
-        // dependencies
-        (
-            "dependencies",
-            "type",
-            "UPDATE dependencies SET type = 'blocks' WHERE typeof(type) = 'null'",
-        ),
-        (
-            "dependencies",
-            "created_by",
-            "UPDATE dependencies SET created_by = '' WHERE typeof(created_by) = 'null'",
-        ),
-        // comments
-        (
-            "comments",
-            "author",
-            "UPDATE comments SET author = '' WHERE typeof(author) = 'null'",
-        ),
-        (
-            "comments",
-            "text",
-            "UPDATE comments SET text = '' WHERE typeof(text) = 'null'",
-        ),
-        (
-            "comments",
-            "created_at",
-            "UPDATE comments SET created_at = CURRENT_TIMESTAMP WHERE typeof(created_at) = 'null'",
-        ),
-        // events
-        (
-            "events",
-            "event_type",
-            "UPDATE events SET event_type = '' WHERE typeof(event_type) = 'null'",
-        ),
-        (
-            "events",
-            "actor",
-            "UPDATE events SET actor = '' WHERE typeof(actor) = 'null'",
-        ),
-        (
-            "events",
-            "created_at",
-            "UPDATE events SET created_at = CURRENT_TIMESTAMP WHERE typeof(created_at) = 'null'",
-        ),
-    ];
+    let queries: &[(&str, &str, &str)] = NULL_DEFAULT_CHECKS;
 
     let mut null_findings = Vec::new();
 

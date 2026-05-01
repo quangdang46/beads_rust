@@ -911,10 +911,13 @@ fn rebuild_issues_table_inner(conn: &Connection, existing_columns: &[String]) ->
 ///
 /// Idempotent: rows that already hold the default are not rewritten.
 /// Tables/columns that don't exist on the current schema are skipped.
-fn backfill_storage_null_in_default_columns(conn: &Connection) -> Result<()> {
+///
+/// Best-effort: per-column failures are logged but do not abort the
+/// caller, so a single broken column never blocks bootstrap.
+fn backfill_storage_null_in_default_columns(conn: &Connection) {
     // (table, column, default_sql_literal). Mirrors the NOT NULL DEFAULT
     // clauses in SCHEMA_SQL and the *_COLUMNS migration constants.
-    let columns: &[(&str, &str, &str)] = &[
+    const COLUMNS: &[(&str, &str, &str)] = &[
         // issues
         ("issues", "description", "''"),
         ("issues", "design", "''"),
@@ -938,15 +941,13 @@ fn backfill_storage_null_in_default_columns(conn: &Connection) -> Result<()> {
         ("events", "actor", "''"),
     ];
 
-    for (table, column, default) in columns {
+    for (table, column, default) in COLUMNS {
         if !table_exists(conn, table) || !column_exists(conn, table, column) {
             continue;
         }
         let sql = format!(
             "UPDATE {table} SET {column} = {default} WHERE typeof({column}) = 'null'"
         );
-        // Best-effort: a single column failing to backfill must not block
-        // schema migration for the rest of the database.
         if let Err(err) = conn.execute(&sql) {
             tracing::warn!(
                 table = table,
@@ -956,7 +957,6 @@ fn backfill_storage_null_in_default_columns(conn: &Connection) -> Result<()> {
             );
         }
     }
-    Ok(())
 }
 
 fn kv_table_uses_primary_key(conn: &Connection, table: &str) -> bool {
@@ -1313,7 +1313,7 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
         tracing::info!(
             "Migrating database to schema version 8 (backfill storage-NULL in NOT NULL DEFAULT columns)"
         );
-        backfill_storage_null_in_default_columns(conn)?;
+        backfill_storage_null_in_default_columns(conn);
     }
 
     // Note: source_repo and is_template column backfills are handled in
