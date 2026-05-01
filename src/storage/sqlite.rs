@@ -271,6 +271,11 @@ enum ReadyIssueProjection {
     Command,
 }
 
+struct ReadyReadinessProbe {
+    has_candidate_status: bool,
+    blocked_cache_stale: bool,
+}
+
 struct IssueDetailRelationPresence {
     has_labels: bool,
     has_dependencies: bool,
@@ -547,6 +552,36 @@ impl SqliteStorage {
             Err(fsqlite_error::FrankenError::QueryReturnedNoRows) => Ok(false),
             Err(error) => Err(error.into()),
         }
+    }
+
+    fn ready_readiness_probe(&self, include_deferred: bool) -> Result<ReadyReadinessProbe> {
+        let sql = if include_deferred {
+            "SELECT
+                EXISTS(SELECT 1 FROM issues WHERE status IN ('open', 'deferred') LIMIT 1),
+                EXISTS(SELECT 1 FROM metadata WHERE key = ? AND value = ? LIMIT 1)"
+        } else {
+            "SELECT
+                EXISTS(SELECT 1 FROM issues WHERE status = 'open' LIMIT 1),
+                EXISTS(SELECT 1 FROM metadata WHERE key = ? AND value = ? LIMIT 1)"
+        };
+        let row = self.conn.query_row_with_params(
+            sql,
+            &[
+                SqliteValue::from(BLOCKED_CACHE_STATE_KEY),
+                SqliteValue::from(BLOCKED_CACHE_STATE_STALE),
+            ],
+        )?;
+
+        Ok(ReadyReadinessProbe {
+            has_candidate_status: row
+                .get(0)
+                .and_then(SqliteValue::as_integer)
+                .is_some_and(|value| value != 0),
+            blocked_cache_stale: row
+                .get(1)
+                .and_then(SqliteValue::as_integer)
+                .is_some_and(|value| value != 0),
+        })
     }
 
     fn apply_blocked_cache_refresh_plan(
@@ -3217,9 +3252,14 @@ impl SqliteStorage {
         sort: ReadySortPolicy,
         projection: ReadyIssueProjection,
     ) -> Result<Vec<Issue>> {
+        let readiness = self.ready_readiness_probe(filters.include_deferred)?;
+        if !readiness.has_candidate_status {
+            return Ok(Vec::new());
+        }
+
         // Read-only path: if the cache is stale, compute blocked IDs in memory
         // instead of persisting (issue #216 — read ops must not write).
-        if self.blocked_cache_marked_stale()? {
+        if readiness.blocked_cache_stale {
             let blocked_ids = match Self::compute_blocked_issues_map_impl(&self.conn) {
                 Ok(map) => map.into_keys().collect(),
                 Err(error) => self.recover_blocked_ids("ready_issues_stale", &error)?,
@@ -13982,6 +14022,34 @@ mod tests {
 
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].id, "bd-legacy-ready");
+    }
+
+    #[test]
+    fn test_get_ready_issues_skips_stale_cache_work_when_no_candidate_status() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 3, 12, 0, 0, 0).unwrap();
+        let mut closed = make_issue(
+            "bd-closed",
+            "Closed issue",
+            Status::Closed,
+            2,
+            None,
+            now,
+            None,
+        );
+        closed.closed_at = Some(now);
+        storage.create_issue(&closed, "tester").unwrap();
+        storage.mark_blocked_cache_stale().unwrap();
+
+        let ready = storage
+            .get_ready_issues(&ReadyFilters::default(), ReadySortPolicy::Priority)
+            .unwrap();
+
+        assert!(ready.is_empty());
+        assert!(
+            storage.blocked_cache_marked_stale().unwrap(),
+            "read-only ready query must not refresh or clear stale blocked-cache metadata"
+        );
     }
 
     #[test]
