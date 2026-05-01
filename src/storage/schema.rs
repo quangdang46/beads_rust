@@ -7,7 +7,7 @@ use crate::error::{BeadsError, Result};
 use crate::model::{IssueType, Priority, Status};
 use crate::util::content_hash_from_parts;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 7;
+pub const CURRENT_SCHEMA_VERSION: i32 = 8;
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 
 /// The complete SQL schema for the beads database.
@@ -900,6 +900,65 @@ fn rebuild_issues_table_inner(conn: &Connection, existing_columns: &[String]) ->
     Ok(())
 }
 
+/// Backfill storage-class NULL values in NOT NULL DEFAULT columns.
+///
+/// SQLite's `ALTER TABLE ADD COLUMN ... NOT NULL DEFAULT ...` enforces the
+/// default for new and existing rows, but legacy databases — predating
+/// br's current migration code, or carrying history from Go bd or raw
+/// `sqlite3` edits — can hold storage-class NULLs in such columns. The
+/// `typeof(col) = 'null'` predicate detects these directly even when
+/// partial indexes cause `IS NULL` to silently miss them (see #269).
+///
+/// Idempotent: rows that already hold the default are not rewritten.
+/// Tables/columns that don't exist on the current schema are skipped.
+fn backfill_storage_null_in_default_columns(conn: &Connection) -> Result<()> {
+    // (table, column, default_sql_literal). Mirrors the NOT NULL DEFAULT
+    // clauses in SCHEMA_SQL and the *_COLUMNS migration constants.
+    let columns: &[(&str, &str, &str)] = &[
+        // issues
+        ("issues", "description", "''"),
+        ("issues", "design", "''"),
+        ("issues", "acceptance_criteria", "''"),
+        ("issues", "notes", "''"),
+        ("issues", "status", "'open'"),
+        ("issues", "priority", "2"),
+        ("issues", "issue_type", "'task'"),
+        ("issues", "source_repo", "'.'"),
+        ("issues", "ephemeral", "0"),
+        ("issues", "pinned", "0"),
+        ("issues", "is_template", "0"),
+        // dependencies
+        ("dependencies", "type", "'blocks'"),
+        ("dependencies", "created_by", "''"),
+        // comments
+        ("comments", "author", "''"),
+        ("comments", "text", "''"),
+        // events
+        ("events", "event_type", "''"),
+        ("events", "actor", "''"),
+    ];
+
+    for (table, column, default) in columns {
+        if !table_exists(conn, table) || !column_exists(conn, table, column) {
+            continue;
+        }
+        let sql = format!(
+            "UPDATE {table} SET {column} = {default} WHERE typeof({column}) = 'null'"
+        );
+        // Best-effort: a single column failing to backfill must not block
+        // schema migration for the rest of the database.
+        if let Err(err) = conn.execute(&sql) {
+            tracing::warn!(
+                table = table,
+                column = column,
+                error = %err,
+                "backfill of storage-NULL default failed; continuing"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn kv_table_uses_primary_key(conn: &Connection, table: &str) -> bool {
     // Use PRAGMA table_info instead of sqlite_master to detect whether
     // the `key` column is declared as PRIMARY KEY.  fsqlite's in-memory
@@ -1238,6 +1297,23 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
     if user_version < 7 && table_exists(conn, "issues") {
         tracing::info!("Migrating database to schema version 7 (Go bd content hashes)");
         rebuild_content_hashes_for_go_parity(conn)?;
+    }
+
+    // v8: Backfill storage-class NULL values in NOT NULL DEFAULT columns.
+    //
+    // Older databases — particularly those carrying history from Go bd or
+    // br versions where ALTER TABLE ADD COLUMN ran without a DEFAULT
+    // clause — accumulate storage-class NULL in columns declared NOT NULL
+    // DEFAULT. `PRAGMA integrity_check` then flags these as constraint
+    // violations even though `WHERE col IS NULL` won't always match them
+    // (the planner can use partial indexes that bypass the check). We use
+    // `typeof(col) = 'null'` to detect storage-class NULLs directly and
+    // backfill with each column's declared default. See issue #269.
+    if user_version < 8 {
+        tracing::info!(
+            "Migrating database to schema version 8 (backfill storage-NULL in NOT NULL DEFAULT columns)"
+        );
+        backfill_storage_null_in_default_columns(conn)?;
     }
 
     // Note: source_repo and is_template column backfills are handled in
