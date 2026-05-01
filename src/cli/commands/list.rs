@@ -181,16 +181,20 @@ fn execute_inner(
             let use_full_relation_scan =
                 should_use_full_relation_scan(args, client_filters, user_limit, user_offset);
             let issues_with_counts: Vec<IssueWithCounts> = if use_full_relation_scan {
-                let mut issues_with_counts: Vec<IssueWithCounts> = issues
+                let mut relation_metadata = storage.get_all_list_relation_metadata()?;
+                issues
                     .into_iter()
-                    .map(|issue| IssueWithCounts {
-                        issue,
-                        dependency_count: 0,
-                        dependent_count: 0,
+                    .map(|mut issue| {
+                        let metadata = relation_metadata.remove(&issue.id).unwrap_or_default();
+                        issue.labels = metadata.labels;
+
+                        IssueWithCounts {
+                            issue,
+                            dependency_count: metadata.dependency_count,
+                            dependent_count: metadata.dependent_count,
+                        }
                     })
-                    .collect();
-                storage.populate_all_list_relation_metadata(&mut issues_with_counts)?;
-                issues_with_counts
+                    .collect()
             } else {
                 let issue_ids: Vec<String> = issues.iter().map(|i| i.id.clone()).collect();
                 let mut labels_map = storage.get_labels_for_issues(&issue_ids)?;
