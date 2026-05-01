@@ -1,7 +1,7 @@
 //! `SQLite` storage implementation.
 
 use crate::error::{BeadsError, Result};
-use crate::format::{IssueDetails, IssueWithDependencyMetadata};
+use crate::format::{IssueDetails, IssueWithCounts, IssueWithDependencyMetadata};
 use crate::model::{Comment, DependencyType, Event, EventType, Issue, IssueType, Priority, Status};
 use crate::storage::events::get_events;
 use crate::storage::schema::CURRENT_SCHEMA_VERSION;
@@ -40,6 +40,7 @@ const WAL_CHECKPOINT_INTERVAL: u32 = 50;
 const DEFAULT_BUSY_TIMEOUT_MS: u64 = 0;
 const SQLITE_VAR_LIMIT: usize = 900;
 
+#[cfg(test)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ListRelationMetadata {
     pub(crate) labels: Vec<String>,
@@ -5744,6 +5745,7 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if any database query fails.
+    #[cfg(test)]
     pub(crate) fn get_all_list_relation_metadata(
         &self,
     ) -> Result<HashMap<String, ListRelationMetadata>> {
@@ -5793,6 +5795,60 @@ impl SqliteStorage {
         }
 
         Ok(map)
+    }
+
+    /// Populate labels plus dependency/dependent counts for already-selected
+    /// list rows without allocating a second per-issue metadata map.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any database query fails.
+    pub(crate) fn populate_all_list_relation_metadata(
+        &self,
+        issues: &mut [IssueWithCounts],
+    ) -> Result<()> {
+        if issues.is_empty() {
+            return Ok(());
+        }
+
+        let issue_indices: HashMap<String, usize> = issues
+            .iter()
+            .enumerate()
+            .map(|(index, issue)| (issue.issue.id.clone(), index))
+            .collect();
+
+        let label_rows = self
+            .conn
+            .query("SELECT issue_id, label FROM labels ORDER BY issue_id, label")?;
+        for row in &label_rows {
+            let Some(issue_id) = row.get(0).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            let Some(label) = row.get(1).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            if let Some(index) = issue_indices.get(issue_id) {
+                issues[*index].issue.labels.push(label.to_string());
+            }
+        }
+
+        let dependency_rows = self
+            .conn
+            .query("SELECT issue_id, depends_on_id FROM dependencies")?;
+        for row in &dependency_rows {
+            if let Some(issue_id) = row.get(0).and_then(SqliteValue::as_text)
+                && let Some(index) = issue_indices.get(issue_id)
+            {
+                issues[*index].dependency_count += 1;
+            }
+            if let Some(depends_on_id) = row.get(1).and_then(SqliteValue::as_text)
+                && let Some(index) = issue_indices.get(depends_on_id)
+            {
+                issues[*index].dependent_count += 1;
+            }
+        }
+
+        Ok(())
     }
 
     /// Get all labels attached to exportable issues.
@@ -10010,6 +10066,38 @@ mod tests {
             assert_eq!(
                 entry.map_or(0, |metadata| metadata.dependent_count),
                 *dependent_counts.get(id).unwrap_or(&0)
+            );
+        }
+
+        let mut decorated = storage
+            .list_issues(&ListFilters::default())
+            .unwrap()
+            .into_iter()
+            .map(|issue| IssueWithCounts {
+                issue,
+                dependency_count: 0,
+                dependent_count: 0,
+            })
+            .collect::<Vec<_>>();
+        storage
+            .populate_all_list_relation_metadata(&mut decorated)
+            .unwrap();
+
+        for issue in decorated {
+            let entry = metadata.get(issue.issue.id.as_str());
+            assert_eq!(
+                issue.issue.labels.as_slice(),
+                entry
+                    .map(|metadata| metadata.labels.as_slice())
+                    .unwrap_or(&[])
+            );
+            assert_eq!(
+                issue.dependency_count,
+                entry.map_or(0, |metadata| metadata.dependency_count)
+            );
+            assert_eq!(
+                issue.dependent_count,
+                entry.map_or(0, |metadata| metadata.dependent_count)
             );
         }
     }
