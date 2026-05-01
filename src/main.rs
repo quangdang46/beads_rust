@@ -744,6 +744,7 @@ const fn supports_read_only_fast_open(cmd: &Commands) -> bool {
             command: None | Some(beads_rust::cli::CommentCommands::List(_)),
             ..
         }) => true,
+        Commands::Label { command } => is_read_only_label_listing(command),
         _ => false,
     }
 }
@@ -751,9 +752,23 @@ const fn supports_read_only_fast_open(cmd: &Commands) -> bool {
 const fn supports_auto_import_read_only_probe(cmd: &Commands) -> bool {
     match cmd {
         Commands::List(_) => true,
+        Commands::Label { command } => is_read_only_label_listing(command),
         Commands::Sync(args) => args.status,
         Commands::Stats(args) | Commands::Status(args) => args.no_activity,
         _ => false,
+    }
+}
+
+const fn is_read_only_label_listing(command: &beads_rust::cli::LabelCommands) -> bool {
+    match command {
+        beads_rust::cli::LabelCommands::ListAll
+        | beads_rust::cli::LabelCommands::List(beads_rust::cli::LabelListArgs { issue: None }) => {
+            true
+        }
+        beads_rust::cli::LabelCommands::Add(_)
+        | beads_rust::cli::LabelCommands::Remove(_)
+        | beads_rust::cli::LabelCommands::List(_)
+        | beads_rust::cli::LabelCommands::Rename(_) => false,
     }
 }
 
@@ -1015,6 +1030,22 @@ mod tests {
         ]);
         assert!(build_cli_overrides(&comments_shorthand).read_only_fast_open);
 
+        let label_list_all = Cli::parse_from(["br", "label", "list-all"]);
+        assert!(build_cli_overrides(&label_list_all).read_only_fast_open);
+
+        let label_list_unique = Cli::parse_from(["br", "label", "list"]);
+        assert!(build_cli_overrides(&label_list_unique).read_only_fast_open);
+
+        let label_list_issue = Cli::parse_from([
+            "br",
+            "--no-auto-import",
+            "--no-auto-flush",
+            "label",
+            "list",
+            "bd-abc",
+        ]);
+        assert!(!build_cli_overrides(&label_list_issue).read_only_fast_open);
+
         let missing_auto_flush = Cli::parse_from(["br", "--no-auto-import", "ready"]);
         assert!(!build_cli_overrides(&missing_auto_flush).read_only_fast_open);
 
@@ -1026,6 +1057,18 @@ mod tests {
             "write path",
         ]);
         assert!(!build_cli_overrides(&mutating).read_only_fast_open);
+
+        let label_add = Cli::parse_from([
+            "br",
+            "--no-auto-import",
+            "--no-auto-flush",
+            "label",
+            "add",
+            "bd-abc",
+            "--label",
+            "bug",
+        ]);
+        assert!(!build_cli_overrides(&label_add).read_only_fast_open);
 
         let comments_add = Cli::parse_from([
             "br",
