@@ -19,6 +19,15 @@ if [[ ! -f scripts/dev-local-frankensqlite.toml ]]; then
   exit 1
 fi
 
+# `git update-index --skip-worktree` requires the file to be in the index.
+# Bail early with an actionable message instead of letting that fail later.
+if ! git ls-files --error-unmatch Cargo.lock >/dev/null 2>&1; then
+  echo "error: Cargo.lock is not tracked in this branch" >&2
+  echo "       this script depends on the Cargo.lock-tracking commit; rebase or" >&2
+  echo "       update to a branch where Cargo.lock is committed before activating" >&2
+  exit 1
+fi
+
 if [[ ! -d ../frankensqlite/crates/fsqlite ]]; then
   echo "error: sibling frankensqlite checkout not found at ../frankensqlite" >&2
   echo "       run \`git clone https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite\` first" >&2

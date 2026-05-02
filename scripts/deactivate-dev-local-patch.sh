@@ -8,6 +8,11 @@ set -euo pipefail
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
 
+if ! git ls-files --error-unmatch Cargo.lock >/dev/null 2>&1; then
+  echo "error: Cargo.lock is not tracked in this branch — nothing to deactivate" >&2
+  exit 1
+fi
+
 # Only remove `.cargo/config.toml` if its first line matches the dev-local
 # template marker. Anything else is a contributor-authored config that this
 # script must not clobber.
@@ -26,8 +31,9 @@ if git ls-files -v Cargo.lock | grep -q '^S'; then
   echo "Cargo.lock: skip-worktree off"
 fi
 
-# `git restore` is the modern equivalent of `git checkout -- Cargo.lock`.
-# Both restore the worktree from the index/HEAD, but `restore` won't trip
-# safety wrappers that gate on `git checkout -- <path>`.
-git restore Cargo.lock
+# Restore explicitly from HEAD (not the index). Plain `git restore` defaults
+# to `--source=index`, which would resurrect any staged-but-uncommitted edits
+# the contributor might have on Cargo.lock — almost never what they want when
+# tearing down a dev-local cargo session.
+git restore --source=HEAD --worktree Cargo.lock
 echo "Cargo.lock: restored from HEAD"
