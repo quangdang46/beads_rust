@@ -88,7 +88,7 @@ pub fn execute(
     ctx: &OutputContext,
 ) -> Result<()> {
     let Some(beads_dir) = config::discover_optional_beads_dir_with_cli(cli)? else {
-        output_empty(resolve_render_mode(json, ctx.mode()), ctx);
+        output_empty(resolve_render_mode(json, ctx.mode()), ctx)?;
         return Ok(());
     };
 
@@ -139,10 +139,25 @@ fn execute_inner(
     let prefix = config::id_config_from_layer(&config_layer).prefix;
     let render_mode = resolve_render_mode(json, ctx.mode());
     validate_fix_render_mode(args, render_mode)?;
+
+    // Get all open and in_progress issues first. If there are no candidate
+    // issues, no commit reference can become an orphan, so skip the expensive
+    // git history scan entirely.
+    let filters = ListFilters {
+        statuses: Some(vec![Status::Open, Status::InProgress]),
+        ..Default::default()
+    };
+    let issues = storage.list_issues(&filters)?;
+    if issues.is_empty() {
+        output_empty(render_mode, ctx)?;
+        return Ok(());
+    }
+    debug!(total_issues = issues.len(), "Scanning for orphaned issues");
+
     let Some(repo_root) = git_repo_root_for_path(&storage_ctx.paths.jsonl_path)
         .or_else(|| git_repo_root_for_path(beads_dir))
     else {
-        output_empty(render_mode, ctx);
+        output_empty(render_mode, ctx)?;
         return Ok(());
     };
 
@@ -155,17 +170,9 @@ fn execute_inner(
     );
 
     if commit_refs.is_empty() {
-        output_empty(render_mode, ctx);
+        output_empty(render_mode, ctx)?;
         return Ok(());
     }
-
-    // Get all open and in_progress issues
-    let filters = ListFilters {
-        statuses: Some(vec![Status::Open, Status::InProgress]),
-        ..Default::default()
-    };
-    let issues = storage.list_issues(&filters)?;
-    debug!(total_issues = issues.len(), "Scanning for orphaned issues");
 
     // Build a map of issue_id -> (commit_hash, commit_message)
     // We already have latest-first from git log, so first occurrence wins
@@ -208,7 +215,7 @@ fn execute_inner(
     debug!(orphan_count = orphans.len(), "Scanning for orphaned issues");
 
     if orphans.is_empty() {
-        output_empty(render_mode, ctx);
+        output_empty(render_mode, ctx)?;
         return Ok(());
     }
 
@@ -220,11 +227,7 @@ fn execute_inner(
             } else {
                 // Robot mode requests JSON even though the shared output context only
                 // sees global flags.
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&orphans)
-                        .expect("Failed to serialize JSON output")
-                );
+                println!("{}", serde_json::to_string_pretty(&orphans)?);
             }
         }
         OrphanRenderMode::Toon => {
@@ -433,7 +436,7 @@ fn parse_git_log<R: BufRead>(reader: R, prefix: &str) -> Result<Vec<(String, Str
 }
 
 /// Output empty result in appropriate format.
-fn output_empty(render_mode: OrphanRenderMode, ctx: &OutputContext) {
+fn output_empty(render_mode: OrphanRenderMode, ctx: &OutputContext) -> Result<()> {
     let empty: Vec<OrphanIssue> = Vec::new();
     match render_mode {
         OrphanRenderMode::Quiet => {}
@@ -441,10 +444,7 @@ fn output_empty(render_mode: OrphanRenderMode, ctx: &OutputContext) {
             if ctx.is_json() {
                 ctx.json_pretty(&empty);
             } else {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&empty).expect("Failed to serialize JSON output")
-                );
+                println!("{}", serde_json::to_string_pretty(&empty)?);
             }
         }
         OrphanRenderMode::Toon => {
@@ -463,6 +463,7 @@ fn output_empty(render_mode: OrphanRenderMode, ctx: &OutputContext) {
             println!("✓ No orphaned issues found");
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]

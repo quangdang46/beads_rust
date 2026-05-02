@@ -767,10 +767,18 @@ const fn supports_read_only_fast_open(cmd: &Commands) -> bool {
         | Commands::Blocked(_)
         | Commands::Count(_)
         | Commands::Stale(_)
+        | Commands::Lint(_)
+        | Commands::Changelog(_)
+        | Commands::Graph(_)
+        | Commands::Orphans(beads_rust::cli::OrphansArgs { fix: false, .. })
         | Commands::Comments(beads_rust::cli::CommentsArgs {
             command: None | Some(beads_rust::cli::CommentCommands::List(_)),
             ..
-        }) => true,
+        })
+        | Commands::Epic {
+            command: beads_rust::cli::EpicCommands::Status(_),
+        } => true,
+        Commands::Dep { command } => is_read_only_dep_command(command),
         Commands::Label { command } => is_read_only_label_listing(command),
         _ => false,
     }
@@ -783,6 +791,15 @@ const fn supports_auto_import_read_only_probe(cmd: &Commands) -> bool {
         Commands::Sync(args) => args.status,
         Commands::Stats(args) | Commands::Status(args) => args.no_activity,
         _ => false,
+    }
+}
+
+const fn is_read_only_dep_command(command: &beads_rust::cli::DepCommands) -> bool {
+    match command {
+        beads_rust::cli::DepCommands::List(_)
+        | beads_rust::cli::DepCommands::Tree(_)
+        | beads_rust::cli::DepCommands::Cycles(_) => true,
+        beads_rust::cli::DepCommands::Add(_) | beads_rust::cli::DepCommands::Remove(_) => false,
     }
 }
 
@@ -1046,6 +1063,15 @@ mod tests {
         let ready = Cli::parse_from(["br", "--no-auto-import", "--no-auto-flush", "ready"]);
         assert!(build_cli_overrides(&ready).read_only_fast_open);
 
+        let changelog = Cli::parse_from([
+            "br",
+            "--no-auto-import",
+            "--no-auto-flush",
+            "changelog",
+            "--json",
+        ]);
+        assert!(build_cli_overrides(&changelog).read_only_fast_open);
+
         let comments_list = Cli::parse_from([
             "br",
             "--no-auto-import",
@@ -1118,6 +1144,101 @@ mod tests {
             "write path",
         ]);
         assert!(!build_cli_overrides(&comments_add).read_only_fast_open);
+    }
+
+    #[test]
+    fn read_only_fast_open_covers_lint_command() {
+        let lint = Cli::parse_from([
+            "br",
+            "--no-auto-import",
+            "--no-auto-flush",
+            "lint",
+            "--json",
+        ]);
+        assert!(build_cli_overrides(&lint).read_only_fast_open);
+    }
+
+    #[test]
+    fn read_only_fast_open_covers_epic_status_only() {
+        let status = Cli::parse_from([
+            "br",
+            "--no-auto-import",
+            "--no-auto-flush",
+            "epic",
+            "status",
+        ]);
+        assert!(build_cli_overrides(&status).read_only_fast_open);
+
+        let close_eligible = Cli::parse_from([
+            "br",
+            "--no-auto-import",
+            "--no-auto-flush",
+            "epic",
+            "close-eligible",
+            "--dry-run",
+        ]);
+        assert!(!build_cli_overrides(&close_eligible).read_only_fast_open);
+    }
+
+    #[test]
+    fn read_only_fast_open_covers_graph_and_read_only_dep_commands() {
+        let dep_tree = Cli::parse_from([
+            "br",
+            "--no-auto-import",
+            "--no-auto-flush",
+            "dep",
+            "tree",
+            "bd-abc",
+        ]);
+        assert!(build_cli_overrides(&dep_tree).read_only_fast_open);
+
+        let dep_cycles =
+            Cli::parse_from(["br", "--no-auto-import", "--no-auto-flush", "dep", "cycles"]);
+        assert!(build_cli_overrides(&dep_cycles).read_only_fast_open);
+
+        let graph_all = Cli::parse_from([
+            "br",
+            "--no-auto-import",
+            "--no-auto-flush",
+            "graph",
+            "--all",
+        ]);
+        assert!(build_cli_overrides(&graph_all).read_only_fast_open);
+
+        let dep_add = Cli::parse_from([
+            "br",
+            "--no-auto-import",
+            "--no-auto-flush",
+            "dep",
+            "add",
+            "bd-abc",
+            "bd-def",
+        ]);
+        assert!(!build_cli_overrides(&dep_add).read_only_fast_open);
+    }
+
+    #[test]
+    fn read_only_fast_open_covers_non_fix_orphans_scan() {
+        let orphans = Cli::parse_from(["br", "--no-auto-import", "--no-auto-flush", "orphans"]);
+        assert!(build_cli_overrides(&orphans).read_only_fast_open);
+
+        let orphans_json = Cli::parse_from([
+            "br",
+            "--no-auto-import",
+            "--no-auto-flush",
+            "orphans",
+            "--json",
+        ]);
+        assert!(build_cli_overrides(&orphans_json).read_only_fast_open);
+
+        let orphans_fix = Cli::parse_from([
+            "br",
+            "--no-auto-import",
+            "--no-auto-flush",
+            "orphans",
+            "--fix",
+        ]);
+        assert!(!build_cli_overrides(&orphans_fix).read_only_fast_open);
     }
 
     #[test]

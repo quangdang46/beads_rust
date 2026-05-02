@@ -210,6 +210,10 @@ fn load_epic_statuses(storage: &SqliteStorage) -> Result<Vec<EpicStatus>> {
         ..Default::default()
     };
     let epics = storage.list_issues(&filters)?;
+    if epics.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let counts = storage.get_epic_counts()?;
 
     let mut statuses = Vec::new();
