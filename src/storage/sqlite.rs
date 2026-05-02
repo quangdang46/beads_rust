@@ -1001,10 +1001,10 @@ impl SqliteStorage {
                 "has_missing_issue_reference: disallowed table/column pair ({table}, {column})"
             )));
         }
-        let external_dependency_filter = if table == "dependencies" && column == "depends_on_id" {
-            " AND depends_on_id NOT LIKE 'external:%'"
-        } else {
-            ""
+        let external_dependency_filter = match (table, column) {
+            ("dependencies", "issue_id") => " AND issue_id NOT LIKE 'external:%'",
+            ("dependencies", "depends_on_id") => " AND depends_on_id NOT LIKE 'external:%'",
+            _ => "",
         };
         let row = self.conn.query_row(&format!(
             "SELECT COUNT(*) FROM {table} WHERE {column} NOT IN (SELECT id FROM issues){external_dependency_filter}"
@@ -1014,8 +1014,9 @@ impl SqliteStorage {
 
     /// Return FK-like issue references that point at missing local issues.
     ///
-    /// External dependency targets are intentionally allowed because the
-    /// schema supports cross-project blockers through `external:*` IDs.
+    /// External dependency endpoints are intentionally allowed because the
+    /// schema supports cross-project blockers and external parent-child rows
+    /// through `external:*` IDs.
     ///
     /// # Errors
     ///
@@ -9907,6 +9908,39 @@ mod tests {
         assert!(storage.has_external_dependencies(true).unwrap());
         assert!(storage.has_external_dependencies(false).unwrap());
         assert!(storage.may_have_blocked_command_results().unwrap());
+    }
+
+    #[test]
+    fn test_missing_issue_references_allows_external_dependency_endpoints() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 3, 3, 0, 0, 0).unwrap();
+        let local = make_issue("bd-local", "Local issue", Status::Open, 2, None, t1, None);
+        let mut epic = make_issue("bd-epic", "Epic issue", Status::Open, 2, None, t1, None);
+        epic.issue_type = IssueType::Epic;
+
+        storage.create_issue(&local, "tester").unwrap();
+        storage.create_issue(&epic, "tester").unwrap();
+        storage
+            .add_dependency("bd-local", "external:target:cap", "blocks", "tester")
+            .unwrap();
+        insert_external_parent_child_dependency(&storage, "external:child:cap", "bd-epic", t1);
+
+        assert!(
+            !storage
+                .has_missing_issue_reference("dependencies", "depends_on_id")
+                .unwrap(),
+            "external dependency targets are valid cross-project blockers"
+        );
+        assert!(
+            !storage
+                .has_missing_issue_reference("dependencies", "issue_id")
+                .unwrap(),
+            "external parent-child children are valid cross-project endpoints"
+        );
+        assert_eq!(
+            storage.missing_issue_references().unwrap(),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
