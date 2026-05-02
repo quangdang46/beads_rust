@@ -162,8 +162,10 @@ fn execute_inner(
 
             let mut external_ids_to_fetch = Vec::new();
             for (issue_id, blockers) in &external_blockers {
-                if let Some(idx) = by_id.get(issue_id).copied() {
-                    let entry = &mut blocked_issues[idx];
+                if let Some(entry) = by_id
+                    .get(issue_id)
+                    .and_then(|idx| blocked_issues.get_mut(*idx))
+                {
                     entry.blocked_by.extend(blockers.clone());
                     entry.blocked_by.sort();
                     entry.blocked_by.dedup();
@@ -292,6 +294,8 @@ fn sort_blocked_issues(issues: &mut [BlockedIssue]) {
         let pb = b.issue.priority.0;
         pa.cmp(&pb)
             .then_with(|| b.blocked_by_count.cmp(&a.blocked_by_count))
+            .then_with(|| b.issue.created_at.cmp(&a.issue.created_at))
+            .then_with(|| a.issue.id.cmp(&b.issue.id))
     });
 }
 
@@ -666,6 +670,20 @@ mod tests {
         assert_eq!(issues[2].issue.id, "b"); // P1, 1 blocker
         assert_eq!(issues[3].issue.id, "a"); // P2
         info!("test_sort_by_priority_then_blocker_count: assertions passed");
+    }
+
+    #[test]
+    fn test_sort_ties_by_created_at_desc_then_id() {
+        let mut newer = make_blocked_issue("c", "newer", 1, 1);
+        newer.issue.created_at = Utc.with_ymd_and_hms(2025, 1, 2, 0, 0, 0).unwrap();
+        let older_a = make_blocked_issue("a", "older a", 1, 1);
+        let older_b = make_blocked_issue("b", "older b", 1, 1);
+        let mut issues = vec![older_b, newer, older_a];
+
+        sort_blocked_issues(&mut issues);
+
+        let ids: Vec<&str> = issues.iter().map(|issue| issue.issue.id.as_str()).collect();
+        assert_eq!(ids, vec!["c", "a", "b"]);
     }
 
     #[test]
