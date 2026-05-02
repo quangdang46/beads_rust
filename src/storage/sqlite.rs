@@ -4084,7 +4084,7 @@ impl SqliteStorage {
                      pinned, is_template
               FROM issues
               WHERE status NOT IN ('closed', 'tombstone')
-              ORDER BY priority ASC, created_at DESC",
+              ORDER BY priority ASC, created_at DESC, id ASC",
         )?;
 
         let mut blocked_issues = Vec::new();
@@ -4613,7 +4613,7 @@ impl SqliteStorage {
               FROM issues i
               INNER JOIN blocked_issues_cache bc ON i.id = bc.issue_id
               WHERE i.status NOT IN ('closed', 'tombstone')
-              ORDER BY i.priority ASC, i.created_at DESC",
+              ORDER BY i.priority ASC, i.created_at DESC, i.id ASC",
         ) {
             Ok(rows) => rows,
             Err(error) => {
@@ -6227,7 +6227,7 @@ impl SqliteStorage {
              FROM dependencies d
              LEFT JOIN issues i ON d.depends_on_id = i.id
              WHERE d.issue_id = ?
-            ORDER BY i.priority ASC, i.created_at DESC",
+            ORDER BY i.priority ASC, i.created_at DESC, d.depends_on_id ASC",
             &[SqliteValue::from(issue_id)],
         )?;
 
@@ -6250,7 +6250,7 @@ impl SqliteStorage {
              FROM dependencies d
              LEFT JOIN issues i ON d.issue_id = i.id
              WHERE d.depends_on_id = ?
-            ORDER BY i.priority ASC, i.created_at DESC",
+            ORDER BY i.priority ASC, i.created_at DESC, d.issue_id ASC",
             &[SqliteValue::from(issue_id)],
         )?;
 
@@ -6272,7 +6272,7 @@ impl SqliteStorage {
              FROM dependencies d
              LEFT JOIN issues i ON d.issue_id = i.id
              WHERE d.type IN ('blocks', 'conditional-blocks', 'waits-for', 'parent-child')
-             ORDER BY i.priority ASC, i.created_at DESC",
+             ORDER BY i.priority ASC, i.created_at DESC, d.issue_id ASC",
         )?;
 
         let mut map: HashMap<String, Vec<IssueWithDependencyMetadata>> = HashMap::new();
@@ -13520,8 +13520,24 @@ mod tests {
         let created_at = Utc.with_ymd_and_hms(2025, 8, 4, 0, 0, 0).unwrap();
 
         for issue in [
-            make_issue("bd-list-b", "Tie B", Status::Open, 1, None, created_at, None),
-            make_issue("bd-list-a", "Tie A", Status::Open, 1, None, created_at, None),
+            make_issue(
+                "bd-list-b",
+                "Tie B",
+                Status::Open,
+                1,
+                None,
+                created_at,
+                None,
+            ),
+            make_issue(
+                "bd-list-a",
+                "Tie A",
+                Status::Open,
+                1,
+                None,
+                created_at,
+                None,
+            ),
             make_issue(
                 "bd-list-c",
                 "Later",
