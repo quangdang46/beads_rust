@@ -125,6 +125,12 @@ last-touched
 # Local history backups
 .br_history/
 
+# DB-family recovery artifacts (truncated WAL/SHM, quarantined sidecars)
+# — same lifecycle as .br_history/, written by recovery paths and
+# `br doctor --repair`. Filename suffix `.truncated-wal` slips past the
+# generic `*.db-wal` glob above, so it needs an explicit entry (#271).
+.br_recovery/
+
 # Sync state (local-only, per-machine)
 .sync.lock
 sync_base.jsonl
