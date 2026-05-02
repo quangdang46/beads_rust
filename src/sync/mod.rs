@@ -3899,13 +3899,14 @@ fn cleanup_import_orphans_in_tx(storage: &SqliteStorage) -> Result<usize> {
     let mut orphans_cleaned = 0usize;
 
     for (table, col) in orphan_tables {
-        let sql = if *table == "dependencies" && *col == "depends_on_id" {
-            format!(
-                "DELETE FROM {table} WHERE {col} NOT IN (SELECT id FROM issues) AND {col} NOT LIKE 'external:%'"
-            )
-        } else {
-            format!("DELETE FROM {table} WHERE {col} NOT IN (SELECT id FROM issues)")
+        let external_dependency_filter = match (*table, *col) {
+            ("dependencies", "issue_id") => " AND issue_id NOT LIKE 'external:%'",
+            ("dependencies", "depends_on_id") => " AND depends_on_id NOT LIKE 'external:%'",
+            _ => "",
         };
+        let sql = format!(
+            "DELETE FROM {table} WHERE {col} NOT IN (SELECT id FROM issues){external_dependency_filter}"
+        );
         orphans_cleaned += storage.execute_raw_count(&sql)?;
     }
 
@@ -6509,6 +6510,41 @@ mod tests {
             .and_then(SqliteValue::as_integer)
             .unwrap_or(0);
         assert_eq!(fk_enabled, 1, "foreign key enforcement should be restored");
+    }
+
+    #[test]
+    fn test_import_orphan_cleanup_preserves_external_dependency_endpoints() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let mut epic = make_test_issue("bd-epic", "Epic");
+        epic.issue_type = IssueType::Epic;
+        storage.create_issue(&epic, "tester").unwrap();
+
+        storage
+            .execute_test_sql(
+                "PRAGMA foreign_keys = OFF;
+                 INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
+                 VALUES ('external:child:cap', 'bd-epic', 'parent-child', '2026-01-01T00:00:00Z', 'tester');
+                 INSERT INTO comments (issue_id, author, text, created_at)
+                 VALUES ('missing-issue', 'tester', 'dangling', '2026-01-01T00:00:00Z');
+                 PRAGMA foreign_keys = ON;",
+            )
+            .unwrap();
+
+        let cleaned = cleanup_import_orphans_in_tx(&storage).unwrap();
+
+        assert_eq!(cleaned, 1, "only the real local orphan should be removed");
+        let external_rows = storage
+            .execute_raw_query(
+                "SELECT issue_id, depends_on_id
+                 FROM dependencies
+                 WHERE issue_id = 'external:child:cap'",
+            )
+            .unwrap();
+        assert_eq!(
+            external_rows.len(),
+            1,
+            "external dependency endpoints must survive import cleanup"
+        );
     }
 
     #[test]
