@@ -15,7 +15,7 @@ use crate::sync::{
 };
 use crate::util::id::{normalize_prefix, parse_id};
 use crate::validation::{CommentValidator, IssueValidator};
-use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use fsqlite::Connection;
 use fsqlite::compat::{OpenFlags, open_with_flags};
 use fsqlite_error::FrankenError;
@@ -45,6 +45,16 @@ pub(crate) struct ListRelationMetadata {
     pub(crate) labels: Vec<String>,
     pub(crate) dependency_count: usize,
     pub(crate) dependent_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChangelogIssueRow {
+    pub(crate) id: String,
+    pub(crate) title: String,
+    pub(crate) priority: Priority,
+    pub(crate) issue_type: IssueType,
+    pub(crate) created_at: DateTime<Utc>,
+    pub(crate) closed_at: Option<DateTime<Utc>>,
 }
 
 fn unique_label_refs(labels: &[String]) -> Vec<&String> {
@@ -2697,24 +2707,24 @@ impl SqliteStorage {
                         let secondary_order = if filters.reverse { "ASC" } else { "DESC" };
                         let _ = write!(
                             sql,
-                            " ORDER BY priority {order}, created_at {secondary_order}"
+                            " ORDER BY priority {order}, created_at {secondary_order}, id ASC"
                         );
                     }
                     "created_at" | "created" => {
                         let order = if filters.reverse { "ASC" } else { "DESC" };
-                        let _ = write!(sql, " ORDER BY created_at {order}");
+                        let _ = write!(sql, " ORDER BY created_at {order}, id ASC");
                     }
                     "updated_at" | "updated" => {
                         let order = if filters.reverse { "ASC" } else { "DESC" };
-                        let _ = write!(sql, " ORDER BY updated_at {order}");
+                        let _ = write!(sql, " ORDER BY updated_at {order}, id ASC");
                     }
                     "title" => {
                         // Case-insensitive sort for title
-                        let _ = write!(sql, " ORDER BY title COLLATE NOCASE {order}");
+                        let _ = write!(sql, " ORDER BY title COLLATE NOCASE {order}, id ASC");
                     }
                     _ => {
                         // Default fallback
-                        sql.push_str(" ORDER BY priority ASC, created_at DESC");
+                        sql.push_str(" ORDER BY priority ASC, created_at DESC, id ASC");
                     }
                 }
             } else if filters.reverse {
@@ -2766,6 +2776,31 @@ impl SqliteStorage {
         for row in &rows {
             issues.push(Self::stats_issue_from_row(row)?);
         }
+        Ok(issues)
+    }
+
+    /// Get lean closed issue rows for changelog rendering.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails or a stored timestamp is invalid.
+    pub(crate) fn list_changelog_issues(&self) -> Result<Vec<ChangelogIssueRow>> {
+        let rows = self.conn.query(
+            r"SELECT id, title, priority, issue_type, created_at, closed_at
+              FROM issues
+              WHERE status = 'closed'
+                AND (is_template = 0 OR is_template IS NULL)",
+        )?;
+        let mut issues = Vec::with_capacity(rows.len());
+        for row in &rows {
+            issues.push(Self::changelog_issue_from_row(row)?);
+        }
+        issues.sort_unstable_by(|left, right| {
+            left.priority
+                .cmp(&right.priority)
+                .then_with(|| right.created_at.cmp(&left.created_at))
+                .then_with(|| left.id.cmp(&right.id))
+        });
         Ok(issues)
     }
 
@@ -3241,32 +3276,32 @@ impl SqliteStorage {
                     let secondary_order = if filters.reverse { "ASC" } else { "DESC" };
                     let _ = write!(
                         sql,
-                        " ORDER BY priority {order}, created_at {secondary_order}"
+                        " ORDER BY priority {order}, created_at {secondary_order}, id ASC"
                     );
                 }
                 "created_at" | "created" => {
                     let order = if filters.reverse { "ASC" } else { "DESC" };
-                    let _ = write!(sql, " ORDER BY created_at {order}");
+                    let _ = write!(sql, " ORDER BY created_at {order}, id ASC");
                 }
                 "updated_at" | "updated" => {
                     let order = if filters.reverse { "ASC" } else { "DESC" };
-                    let _ = write!(sql, " ORDER BY updated_at {order}");
+                    let _ = write!(sql, " ORDER BY updated_at {order}, id ASC");
                 }
                 "title" => {
-                    let _ = write!(sql, " ORDER BY title COLLATE NOCASE {order}");
+                    let _ = write!(sql, " ORDER BY title COLLATE NOCASE {order}, id ASC");
                 }
                 _ => {
                     if filters.reverse {
-                        sql.push_str(" ORDER BY priority DESC, created_at ASC");
+                        sql.push_str(" ORDER BY priority DESC, created_at ASC, id ASC");
                     } else {
-                        sql.push_str(" ORDER BY priority ASC, created_at DESC");
+                        sql.push_str(" ORDER BY priority ASC, created_at DESC, id ASC");
                     }
                 }
             }
         } else if filters.reverse {
-            sql.push_str(" ORDER BY priority DESC, created_at ASC");
+            sql.push_str(" ORDER BY priority DESC, created_at ASC, id ASC");
         } else {
-            sql.push_str(" ORDER BY priority ASC, created_at DESC");
+            sql.push_str(" ORDER BY priority ASC, created_at DESC, id ASC");
         }
 
         match (filters.limit, filters.offset) {
@@ -3501,14 +3536,16 @@ impl SqliteStorage {
             match sort {
                 ReadySortPolicy::Hybrid => {
                     sql.push_str(
-                        " ORDER BY CASE WHEN priority <= 1 THEN 0 ELSE 1 END, created_at ASC",
+                        " ORDER BY CASE WHEN issues.priority <= 1 THEN 0 ELSE 1 END, issues.created_at ASC, issues.id ASC",
                     );
                 }
                 ReadySortPolicy::Priority => {
-                    sql.push_str(" ORDER BY priority ASC, created_at ASC");
+                    sql.push_str(
+                        " ORDER BY issues.priority ASC, issues.created_at ASC, issues.id ASC",
+                    );
                 }
                 ReadySortPolicy::Oldest => {
-                    sql.push_str(" ORDER BY created_at ASC");
+                    sql.push_str(" ORDER BY issues.created_at ASC, issues.id ASC");
                 }
             }
         }
@@ -7575,6 +7612,30 @@ impl SqliteStorage {
         })
     }
 
+    fn changelog_issue_from_row(row: &fsqlite::Row) -> Result<ChangelogIssueRow> {
+        let get_str = |idx: usize| -> String {
+            row.get(idx)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .to_string()
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let get_opt_i32 = |idx: usize| -> Option<i32> {
+            row.get(idx)
+                .and_then(SqliteValue::as_integer)
+                .map(|value| value as i32)
+        };
+
+        Ok(ChangelogIssueRow {
+            id: get_str(0),
+            title: get_str(1),
+            priority: Priority(get_opt_i32(2).unwrap_or_else(|| Priority::default().0)),
+            issue_type: parse_issue_type(row.get(3).and_then(SqliteValue::as_text)),
+            created_at: parse_datetime_value(row.get(4))?,
+            closed_at: parse_opt_datetime_value(row.get(5))?,
+        })
+    }
+
     /// Get metadata for all active issues.
     ///
     /// This is used to pre-populate caches for graph traversals, avoiding N+1 queries.
@@ -8087,6 +8148,10 @@ fn parse_datetime(s: &str) -> Result<DateTime<Utc>> {
         return Ok(DateTime::<Utc>::UNIX_EPOCH);
     }
 
+    if let Some(dt) = parse_canonical_utc_datetime(s) {
+        return Ok(dt);
+    }
+
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
         return Ok(dt.with_timezone(&Utc));
     }
@@ -8096,6 +8161,77 @@ fn parse_datetime(s: &str) -> Result<DateTime<Utc>> {
     }
 
     Err(BeadsError::Config(format!("unparseable datetime: {s}")))
+}
+
+fn parse_canonical_utc_datetime(s: &str) -> Option<DateTime<Utc>> {
+    let bytes = s.as_bytes();
+    if bytes.len() < 20
+        || bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || !matches!(bytes.get(10), Some(b'T' | b't' | b' '))
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
+    {
+        return None;
+    }
+
+    let year = i32::try_from(parse_fixed_digits(bytes, 0, 4)?).ok()?;
+    let month = parse_fixed_digits(bytes, 5, 2)?;
+    let day = parse_fixed_digits(bytes, 8, 2)?;
+    let hour = parse_fixed_digits(bytes, 11, 2)?;
+    let minute = parse_fixed_digits(bytes, 14, 2)?;
+    let second = parse_fixed_digits(bytes, 17, 2)?;
+
+    let mut index = 19;
+    let nanos = if bytes.get(index) == Some(&b'.') {
+        index += 1;
+        let mut nanos = 0_u32;
+        let mut digits = 0_u32;
+        while let Some(&byte) = bytes.get(index) {
+            let Some(digit) = decimal_digit(byte) else {
+                break;
+            };
+            if digits == 9 {
+                return None;
+            }
+            nanos = nanos.saturating_mul(10).saturating_add(digit);
+            digits += 1;
+            index += 1;
+        }
+        if digits == 0 {
+            return None;
+        }
+        for _ in digits..9 {
+            nanos = nanos.saturating_mul(10);
+        }
+        nanos
+    } else {
+        0
+    };
+
+    match bytes.get(index..) {
+        Some(b"Z" | b"z" | b"+00:00") => {}
+        _ => return None,
+    }
+
+    let date = NaiveDate::from_ymd_opt(year, month, day)?;
+    let time = NaiveTime::from_hms_nano_opt(hour, minute, second, nanos)?;
+    Some(Utc.from_utc_datetime(&NaiveDateTime::new(date, time)))
+}
+
+fn parse_fixed_digits(bytes: &[u8], start: usize, len: usize) -> Option<u32> {
+    let mut value = 0_u32;
+    for &byte in bytes.get(start..start.checked_add(len)?)? {
+        value = value
+            .saturating_mul(10)
+            .saturating_add(decimal_digit(byte)?);
+    }
+    Some(value)
+}
+
+fn decimal_digit(byte: u8) -> Option<u32> {
+    byte.is_ascii_digit()
+        .then_some(u32::from(byte.saturating_sub(b'0')))
 }
 
 /// Decode a DATETIME column that may be stored as TEXT (canonical RFC 3339),
@@ -13379,6 +13515,100 @@ mod tests {
     }
 
     #[test]
+    fn test_list_issues_custom_sort_limit_uses_id_tiebreaker() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let created_at = Utc.with_ymd_and_hms(2025, 8, 4, 0, 0, 0).unwrap();
+
+        for issue in [
+            make_issue("bd-list-b", "Tie B", Status::Open, 1, None, created_at, None),
+            make_issue("bd-list-a", "Tie A", Status::Open, 1, None, created_at, None),
+            make_issue(
+                "bd-list-c",
+                "Later",
+                Status::Open,
+                2,
+                None,
+                created_at - chrono::Duration::days(1),
+                None,
+            ),
+        ] {
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        let issues = storage
+            .list_issues(&ListFilters {
+                sort: Some("created".to_string()),
+                limit: Some(2),
+                ..ListFilters::default()
+            })
+            .unwrap();
+        let ids: Vec<_> = issues.iter().map(|issue| issue.id.as_str()).collect();
+
+        assert_eq!(ids, vec!["bd-list-a", "bd-list-b"]);
+    }
+
+    #[test]
+    fn test_list_changelog_issues_matches_closed_list_projection() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 8, 1, 0, 0, 0).unwrap();
+        let t2 = Utc.with_ymd_and_hms(2025, 8, 2, 0, 0, 0).unwrap();
+        let t3 = Utc.with_ymd_and_hms(2025, 8, 3, 0, 0, 0).unwrap();
+
+        let mut closed_low = make_issue("bd-low", "Low", Status::Closed, 2, None, t1, None);
+        closed_low.closed_at = Some(t3);
+        let mut closed_high_new =
+            make_issue("bd-high-new", "High New", Status::Closed, 1, None, t3, None);
+        closed_high_new.closed_at = Some(t3);
+        let mut closed_high_old =
+            make_issue("bd-high-old", "High Old", Status::Closed, 1, None, t2, None);
+        closed_high_old.closed_at = Some(t2);
+        let open_issue = make_issue("bd-open", "Open", Status::Open, 0, None, t3, None);
+        let mut template = make_issue("bd-template", "Template", Status::Closed, 0, None, t3, None);
+        template.closed_at = Some(t3);
+        template.is_template = true;
+
+        for issue in [
+            closed_low,
+            closed_high_new,
+            closed_high_old,
+            open_issue,
+            template,
+        ] {
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        let filters = ListFilters {
+            statuses: Some(vec![Status::Closed]),
+            include_closed: true,
+            ..ListFilters::default()
+        };
+        let expected: Vec<_> = storage
+            .list_issues(&filters)
+            .unwrap()
+            .into_iter()
+            .map(|issue| ChangelogIssueRow {
+                id: issue.id,
+                title: issue.title,
+                priority: issue.priority,
+                issue_type: issue.issue_type,
+                created_at: issue.created_at,
+                closed_at: issue.closed_at,
+            })
+            .collect();
+
+        let actual = storage.list_changelog_issues().unwrap();
+
+        assert_eq!(
+            actual
+                .iter()
+                .map(|issue| issue.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["bd-high-new", "bd-high-old", "bd-low"]
+        );
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn test_search_issues_full_text() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 9, 1, 0, 0, 0).unwrap();
@@ -13605,6 +13835,57 @@ mod tests {
             .map(|issue| issue.id.as_str())
             .collect();
         assert_eq!(ids, vec!["bd-s-page-c"]);
+    }
+
+    #[test]
+    fn test_search_issues_limit_uses_id_tiebreaker() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let created_at = Utc.with_ymd_and_hms(2025, 9, 4, 0, 0, 0).unwrap();
+
+        for issue in [
+            make_issue(
+                "bd-search-b",
+                "authentication tie b",
+                Status::Open,
+                1,
+                None,
+                created_at,
+                None,
+            ),
+            make_issue(
+                "bd-search-a",
+                "authentication tie a",
+                Status::Open,
+                1,
+                None,
+                created_at,
+                None,
+            ),
+            make_issue(
+                "bd-search-c",
+                "authentication later",
+                Status::Open,
+                2,
+                None,
+                created_at - chrono::Duration::days(1),
+                None,
+            ),
+        ] {
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        let results = storage
+            .search_issues(
+                "authentication",
+                &ListFilters {
+                    limit: Some(2),
+                    ..ListFilters::default()
+                },
+            )
+            .unwrap();
+        let ids: Vec<_> = results.iter().map(|issue| issue.id.as_str()).collect();
+
+        assert_eq!(ids, vec!["bd-search-a", "bd-search-b"]);
     }
 
     #[test]
@@ -14219,6 +14500,59 @@ mod tests {
     }
 
     #[test]
+    fn test_get_ready_issues_limited_sql_sort_uses_id_tiebreaker() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let created_at = Utc.with_ymd_and_hms(2026, 3, 13, 0, 0, 0).unwrap();
+
+        for issue in [
+            make_issue(
+                "bd-tie-b",
+                "Tie inserted first",
+                Status::Open,
+                1,
+                None,
+                created_at,
+                None,
+            ),
+            make_issue(
+                "bd-tie-a",
+                "Tie inserted second",
+                Status::Open,
+                1,
+                None,
+                created_at,
+                None,
+            ),
+            make_issue(
+                "bd-low",
+                "Low priority",
+                Status::Open,
+                3,
+                None,
+                created_at + chrono::Duration::seconds(1),
+                None,
+            ),
+        ] {
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        let ids: Vec<String> = storage
+            .get_ready_issues(
+                &ReadyFilters {
+                    limit: Some(2),
+                    ..ReadyFilters::default()
+                },
+                ReadySortPolicy::Hybrid,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|issue| issue.id)
+            .collect();
+
+        assert_eq!(ids, ["bd-tie-a", "bd-tie-b"]);
+    }
+
+    #[test]
     fn test_get_ready_issues_excludes_in_progress() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc::now();
@@ -14386,6 +14720,22 @@ mod tests {
         let result = parse_datetime("2026-02-26T19:54:42.715824474Z").unwrap();
         assert_eq!(result.year(), 2026);
         assert_eq!(result.month(), 2);
+    }
+
+    #[test]
+    fn test_parse_canonical_utc_datetime_matches_rfc3339_parser() {
+        let raw = "2026-01-16T07:21:09.280348123+00:00";
+        let fast = parse_canonical_utc_datetime(raw).expect("canonical UTC timestamp");
+        let general = DateTime::parse_from_rfc3339(raw)
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(fast, general);
+        assert_eq!(fast.timestamp_subsec_nanos(), 280_348_123);
+    }
+
+    #[test]
+    fn test_parse_canonical_utc_datetime_leaves_non_utc_offsets_to_fallback() {
+        assert!(parse_canonical_utc_datetime("2026-01-16T07:21:09.280348123+01:00").is_none());
     }
 
     #[test]

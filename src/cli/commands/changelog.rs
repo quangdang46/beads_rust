@@ -7,9 +7,8 @@ use crate::cli::ChangelogArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::sanitize_terminal_inline;
-use crate::model::{Issue, Status};
 use crate::output::{OutputContext, OutputMode};
-use crate::storage::ListFilters;
+use crate::storage::ChangelogIssueRow;
 use crate::util::time::{parse_flexible_timestamp, parse_relative_time};
 use chrono::{DateTime, Utc};
 use rich_rust::prelude::*;
@@ -101,14 +100,9 @@ pub fn execute_with_storage_ctx(
 
     debug!(since = %since_label, "Filtering closed issues for changelog");
 
-    let filters = ListFilters {
-        statuses: Some(vec![Status::Closed]),
-        include_closed: true,
-        ..Default::default()
-    };
-    let issues = storage.list_issues(&filters)?;
+    let issues = storage.list_changelog_issues()?;
 
-    let mut grouped: BTreeMap<String, Vec<Issue>> = BTreeMap::new();
+    let mut grouped: BTreeMap<String, Vec<ChangelogIssueRow>> = BTreeMap::new();
     for issue in issues {
         if let Some(since_dt) = since_dt {
             let Some(closed_at) = issue.closed_at else {
