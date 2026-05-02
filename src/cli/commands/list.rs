@@ -13,7 +13,8 @@ use crate::format::{
 };
 use crate::model::{IssueType, Priority, Status};
 use crate::output::{IssueTable, IssueTableColumns, OutputContext, OutputMode};
-use crate::storage::{ListFilters, ListJsonIssueRow};
+use crate::storage::ListFilters;
+use crate::storage::sqlite::ListJsonIssueRow;
 use chrono::Utc;
 use serde::Serialize;
 use std::collections::HashSet;
