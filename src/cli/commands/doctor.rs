@@ -1220,46 +1220,61 @@ fn repair_database_from_jsonl(
 
     restore_tombstones_after_rebuild(&mut storage, &preserved_tombstones)?;
 
-    let fk_violations = storage.execute_raw_query("PRAGMA foreign_key_check")?.len();
-
-    if fk_violations > 0 {
-        tracing::warn!(
-            violations = fk_violations,
-            "FK violations found after repair import; cleaning orphans"
-        );
-        for table in &[
-            "dependencies",
-            "labels",
-            "comments",
-            "events",
-            "dirty_issues",
-            "export_hashes",
-            "blocked_issues_cache",
-            "child_counters",
-        ] {
-            let col = if *table == "child_counters" {
-                "parent_id"
-            } else {
-                "issue_id"
-            };
-            let cleanup = format!("DELETE FROM {table} WHERE {col} NOT IN (SELECT id FROM issues)");
-            storage.execute_raw(&cleanup)?;
-        }
-
-        let remaining_fk_violations = storage.execute_raw_query("PRAGMA foreign_key_check")?.len();
-        if remaining_fk_violations > 0 {
-            return Err(BeadsError::Config(format!(
-                "Repair import finished with {remaining_fk_violations} foreign key violation(s) still present"
-            )));
-        }
-    }
+    let fk_violations_cleaned = cleanup_repair_missing_issue_references(&storage)?;
 
     Ok(DoctorRepairResult {
         imported: import_result.imported_count,
         skipped: import_result.skipped_count,
-        fk_violations_cleaned: fk_violations,
+        fk_violations_cleaned,
         verified_backups,
     })
+}
+
+fn cleanup_repair_missing_issue_references(storage: &SqliteStorage) -> Result<usize> {
+    let missing_references = storage.missing_issue_references()?;
+    if missing_references.is_empty() {
+        return Ok(0);
+    }
+
+    tracing::warn!(
+        references = ?missing_references,
+        "Missing issue references found after repair import; cleaning local orphans"
+    );
+
+    let orphan_tables = &[
+        ("dependencies", "issue_id"),
+        ("dependencies", "depends_on_id"),
+        ("labels", "issue_id"),
+        ("comments", "issue_id"),
+        ("events", "issue_id"),
+        ("dirty_issues", "issue_id"),
+        ("export_hashes", "issue_id"),
+        ("blocked_issues_cache", "issue_id"),
+        ("child_counters", "parent_id"),
+    ];
+    let mut cleaned = 0usize;
+
+    for (table, col) in orphan_tables {
+        let external_dependency_filter = match (*table, *col) {
+            ("dependencies", "issue_id") => " AND issue_id NOT LIKE 'external:%'",
+            ("dependencies", "depends_on_id") => " AND depends_on_id NOT LIKE 'external:%'",
+            _ => "",
+        };
+        let cleanup = format!(
+            "DELETE FROM {table} WHERE {col} NOT IN (SELECT id FROM issues){external_dependency_filter}"
+        );
+        cleaned += storage.execute_raw_count(&cleanup)?;
+    }
+
+    let remaining = storage.missing_issue_references()?;
+    if !remaining.is_empty() {
+        return Err(BeadsError::Config(format!(
+            "Repair import finished with orphaned issue references still present: {}",
+            remaining.join(", ")
+        )));
+    }
+
+    Ok(cleaned)
 }
 
 fn preflight_jsonl_rebuild_authority(jsonl_path: &Path) -> Result<()> {
@@ -3581,6 +3596,41 @@ mod tests {
             dependencies: Vec::new(),
             comments: Vec::new(),
         }
+    }
+
+    #[test]
+    fn test_repair_orphan_cleanup_preserves_external_dependency_endpoints() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let mut epic = sample_issue("bd-epic", "Epic");
+        epic.issue_type = IssueType::Epic;
+        storage.create_issue(&epic, "tester").unwrap();
+
+        storage
+            .execute_test_sql(
+                "PRAGMA foreign_keys = OFF;
+                 INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
+                 VALUES ('external:child:cap', 'bd-epic', 'parent-child', '2026-01-01T00:00:00Z', 'tester');
+                 INSERT INTO comments (issue_id, author, text, created_at)
+                 VALUES ('missing-issue', 'tester', 'dangling', '2026-01-01T00:00:00Z');
+                 PRAGMA foreign_keys = ON;",
+            )
+            .unwrap();
+
+        let cleaned = cleanup_repair_missing_issue_references(&storage).unwrap();
+
+        assert_eq!(cleaned, 1, "only the real local orphan should be removed");
+        let external_rows = storage
+            .execute_raw_query(
+                "SELECT issue_id, depends_on_id
+                 FROM dependencies
+                 WHERE issue_id = 'external:child:cap'",
+            )
+            .unwrap();
+        assert_eq!(
+            external_rows.len(),
+            1,
+            "external dependency endpoints must survive doctor repair cleanup"
+        );
     }
 
     #[test]
