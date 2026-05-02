@@ -778,7 +778,7 @@ const fn supports_read_only_fast_open(cmd: &Commands) -> bool {
 
 const fn supports_auto_import_read_only_probe(cmd: &Commands) -> bool {
     match cmd {
-        Commands::List(_) => true,
+        Commands::List(_) | Commands::Count(_) => true,
         Commands::Label { command } => is_read_only_label_listing(command),
         Commands::Sync(args) => args.status,
         Commands::Stats(args) | Commands::Status(args) => args.no_activity,
@@ -1070,6 +1070,9 @@ mod tests {
 
         let label_list_unique = Cli::parse_from(["br", "label", "list"]);
         assert!(build_cli_overrides(&label_list_unique).read_only_fast_open);
+
+        let count = Cli::parse_from(["br", "count", "--by", "status"]);
+        assert!(build_cli_overrides(&count).read_only_fast_open);
 
         let label_list_issue = Cli::parse_from([
             "br",
