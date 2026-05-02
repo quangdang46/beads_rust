@@ -87,8 +87,11 @@ pub fn execute(
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
+    let render_mode = resolve_render_mode(json, ctx.mode());
+    validate_fix_render_mode(args, render_mode)?;
+
     let Some(beads_dir) = config::discover_optional_beads_dir_with_cli(cli)? else {
-        output_empty(resolve_render_mode(json, ctx.mode()), ctx)?;
+        output_empty(render_mode, ctx)?;
         return Ok(());
     };
 

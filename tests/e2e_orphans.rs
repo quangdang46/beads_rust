@@ -497,6 +497,30 @@ fn e2e_orphans_fix_before_init_returns_empty() {
 }
 
 #[test]
+fn e2e_orphans_fix_before_init_rejects_machine_output() {
+    common::init_test_logging();
+    info!("e2e_orphans_fix_before_init_rejects_machine_output: starting");
+    let workspace = BrWorkspace::new();
+
+    let orphans = run_br_with_stdin(
+        &workspace,
+        ["--json", "orphans", "--fix"],
+        "\n",
+        "orphans_fix_json_no_init",
+    );
+    assert!(
+        !orphans.status.success(),
+        "orphans --fix --json should fail before init"
+    );
+    assert!(
+        orphans.stderr.contains("--fix is interactive"),
+        "expected interactive-mode error, got: {}",
+        orphans.stderr
+    );
+    info!("e2e_orphans_fix_before_init_rejects_machine_output: assertions passed");
+}
+
+#[test]
 fn e2e_orphans_not_git_repo_returns_empty() {
     common::init_test_logging();
     info!("e2e_orphans_not_git_repo_returns_empty: starting");
