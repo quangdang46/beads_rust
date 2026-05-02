@@ -4670,10 +4670,12 @@ impl SqliteStorage {
                  ),
                  EXISTS(
                      SELECT 1
-                     FROM dependencies INDEXED BY idx_dependencies_issue
-                     WHERE issue_id >= 'external:'
-                       AND issue_id < 'external;'
-                       AND type = 'parent-child'
+                     FROM dependencies d INDEXED BY idx_dependencies_issue
+                     JOIN issues p ON d.depends_on_id = p.id
+                     WHERE d.issue_id >= 'external:'
+                       AND d.issue_id < 'external;'
+                       AND d.type = 'parent-child'
+                       AND p.issue_type = 'epic'
                      LIMIT 1
                  )",
         ) {
@@ -4725,12 +4727,23 @@ impl SqliteStorage {
             return Ok(true);
         }
 
-        let parent_sql = "SELECT 1
+        let parent_sql = if blocking_only {
+            "SELECT 1
+             FROM dependencies d INDEXED BY idx_dependencies_issue
+             JOIN issues p ON d.depends_on_id = p.id
+             WHERE d.issue_id >= 'external:'
+               AND d.issue_id < 'external;'
+               AND d.type = 'parent-child'
+               AND p.issue_type = 'epic'
+             LIMIT 1"
+        } else {
+            "SELECT 1
              FROM dependencies INDEXED BY idx_dependencies_issue
              WHERE issue_id >= 'external:'
                AND issue_id < 'external;'
                AND type = 'parent-child'
-             LIMIT 1";
+             LIMIT 1"
+        };
         let rows = self.conn.query(parent_sql)?;
         Ok(!rows.is_empty())
     }
@@ -4854,12 +4867,16 @@ impl SqliteStorage {
             }
         }
 
-        // 2. Local parents blocked by external children
+        // 2. Local epic parents blocked by external children. This mirrors
+        // `load_local_open_child_blockers_impl`: child-open rollup is an epic
+        // aggregation rule, not a property of every parent-child edge.
         let rows = self.conn.query(
-            "SELECT depends_on_id, issue_id
-             FROM dependencies
-             WHERE issue_id LIKE 'external:%'
-               AND type = 'parent-child'",
+            "SELECT d.depends_on_id, d.issue_id
+             FROM dependencies d
+             JOIN issues p ON d.depends_on_id = p.id
+             WHERE d.issue_id LIKE 'external:%'
+               AND d.type = 'parent-child'
+               AND p.issue_type = 'epic'",
         )?;
 
         for row in &rows {
@@ -9394,6 +9411,31 @@ mod tests {
         }
     }
 
+    fn insert_external_parent_child_dependency(
+        storage: &SqliteStorage,
+        external_child: &str,
+        parent_id: &str,
+        created_at: DateTime<Utc>,
+    ) {
+        // Temporarily disable FK checks for the raw INSERT since external
+        // children do not exist in the local issues table.
+        storage.conn.execute("PRAGMA foreign_keys = OFF").unwrap();
+        storage
+            .conn
+            .execute_with_params(
+                "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
+                 VALUES (?, ?, 'parent-child', ?, ?)",
+                &[
+                    SqliteValue::from(external_child),
+                    SqliteValue::from(parent_id),
+                    SqliteValue::from(created_at.to_rfc3339()),
+                    SqliteValue::from("tester"),
+                ],
+            )
+            .unwrap();
+        storage.conn.execute("PRAGMA foreign_keys = ON").unwrap();
+    }
+
     #[test]
     fn test_open_memory() {
         let storage = SqliteStorage::open_memory();
@@ -9774,29 +9816,95 @@ mod tests {
     fn test_has_external_dependencies_detects_external_parent_child_children() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 3, 3, 0, 0, 0).unwrap();
-        let parent = make_issue("bd-p1", "Parent", Status::Open, 2, None, t1, None);
+        let mut parent = make_issue("bd-p1", "Parent", Status::Open, 2, None, t1, None);
+        parent.issue_type = IssueType::Epic;
         storage.create_issue(&parent, "tester").unwrap();
 
-        // Temporarily disable FK checks for the raw INSERT since
-        // external:extproj:child doesn't exist in the issues table.
-        storage.conn.execute("PRAGMA foreign_keys = OFF").unwrap();
-        storage
-            .conn
-            .execute_with_params(
-                "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
-                 VALUES (?, ?, 'parent-child', ?, ?)",
-                &[
-                    SqliteValue::from("external:extproj:child"),
-                    SqliteValue::from("bd-p1"),
-                    SqliteValue::from(t1.to_rfc3339()),
-                    SqliteValue::from("tester"),
-                ],
-            )
-            .unwrap();
-        storage.conn.execute("PRAGMA foreign_keys = ON").unwrap();
+        insert_external_parent_child_dependency(&storage, "external:extproj:child", "bd-p1", t1);
 
         assert!(storage.has_external_dependencies(true).unwrap());
         assert!(storage.has_external_dependencies(false).unwrap());
+        assert!(storage.may_have_blocked_command_results().unwrap());
+    }
+
+    #[test]
+    fn test_external_parent_child_task_parent_is_not_blocked_candidate() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 3, 4, 0, 0, 0).unwrap();
+        let parent = make_issue(
+            "bd-task-parent",
+            "Task Parent",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&parent, "tester").unwrap();
+
+        insert_external_parent_child_dependency(
+            &storage,
+            "external:extproj:task-child",
+            "bd-task-parent",
+            t1,
+        );
+
+        assert!(!storage.has_external_dependencies(true).unwrap());
+        assert!(storage.has_external_dependencies(false).unwrap());
+        assert!(!storage.may_have_blocked_command_results().unwrap());
+    }
+
+    #[test]
+    fn test_external_parent_child_child_only_blocks_epic_parent() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 3, 6, 0, 0, 0).unwrap();
+        let task_parent = make_issue(
+            "bd-task-parent",
+            "Task Parent",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let mut epic_parent = make_issue(
+            "bd-epic-parent",
+            "Epic Parent",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        epic_parent.issue_type = IssueType::Epic;
+        storage.create_issue(&task_parent, "tester").unwrap();
+        storage.create_issue(&epic_parent, "tester").unwrap();
+
+        for (external_child, parent_id) in [
+            ("external:extproj:task-child", "bd-task-parent"),
+            ("external:extproj:epic-child", "bd-epic-parent"),
+        ] {
+            insert_external_parent_child_dependency(&storage, external_child, parent_id, t1);
+        }
+
+        let external_statuses = HashMap::from([
+            ("external:extproj:task-child".to_string(), false),
+            ("external:extproj:epic-child".to_string(), false),
+        ]);
+        let blockers = storage.external_blockers(&external_statuses).unwrap();
+
+        assert!(
+            !blockers.contains_key("bd-task-parent"),
+            "external children should not make non-epic parents blocked"
+        );
+        let epic_blockers = blockers
+            .get("bd-epic-parent")
+            .expect("external child should block epic parent");
+        assert_eq!(epic_blockers.len(), 1);
+        assert_eq!(
+            epic_blockers.first().map(String::as_str),
+            Some("external:extproj:epic-child:child-blocked")
+        );
     }
 
     #[test]
