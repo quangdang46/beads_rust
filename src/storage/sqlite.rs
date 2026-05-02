@@ -4954,10 +4954,12 @@ impl SqliteStorage {
              WHERE depends_on_id LIKE 'external:%'
                AND type IN ('blocks', 'conditional-blocks', 'waits-for')
              UNION
-             SELECT DISTINCT issue_id
-             FROM dependencies
-             WHERE issue_id LIKE 'external:%'
-               AND type = 'parent-child'"
+             SELECT DISTINCT d.issue_id
+             FROM dependencies d
+             JOIN issues p ON d.depends_on_id = p.id
+             WHERE d.issue_id LIKE 'external:%'
+               AND d.type = 'parent-child'
+               AND p.issue_type = 'epic'"
         } else {
             "SELECT DISTINCT depends_on_id
              FROM dependencies
@@ -9882,6 +9884,75 @@ mod tests {
         assert!(!storage.has_external_dependencies(true).unwrap());
         assert!(storage.has_external_dependencies(false).unwrap());
         assert!(!storage.may_have_blocked_command_results().unwrap());
+    }
+
+    #[test]
+    fn test_blocking_only_external_resolution_skips_non_epic_external_children() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 3, 5, 0, 0, 0).unwrap();
+        let direct = make_issue(
+            "bd-direct",
+            "Direct blocker",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let task_parent = make_issue(
+            "bd-task-parent",
+            "Task Parent",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let mut epic_parent = make_issue(
+            "bd-epic-parent",
+            "Epic Parent",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        epic_parent.issue_type = IssueType::Epic;
+
+        for issue in [direct, task_parent, epic_parent] {
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+        storage
+            .add_dependency(
+                "bd-direct",
+                "external:direct:capability",
+                "blocks",
+                "tester",
+            )
+            .unwrap();
+        insert_external_parent_child_dependency(
+            &storage,
+            "external:extproj:task-child",
+            "bd-task-parent",
+            t1,
+        );
+        insert_external_parent_child_dependency(
+            &storage,
+            "external:extproj:epic-child",
+            "bd-epic-parent",
+            t1,
+        );
+
+        let statuses = storage
+            .resolve_external_dependency_statuses(&HashMap::new(), true)
+            .unwrap();
+
+        assert_eq!(statuses.get("external:direct:capability"), Some(&false));
+        assert_eq!(statuses.get("external:extproj:epic-child"), Some(&false));
+        assert!(
+            !statuses.contains_key("external:extproj:task-child"),
+            "blocking-only resolution should not query external children of non-epic parents"
+        );
     }
 
     #[test]
