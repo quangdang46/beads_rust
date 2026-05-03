@@ -13,7 +13,7 @@ use std::sync::Arc;
 use fastmcp_rust::{
     Content, McpContext, McpError, McpErrorCode, McpResult, Tool, ToolAnnotations, ToolHandler,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::error::{BeadsError, ErrorCode, StructuredError};
 use crate::model::{Comment, DependencyType, Issue, IssueType, Priority, Status};
@@ -403,6 +403,22 @@ fn storage_read_warning(operation: &str, err: &crate::BeadsError) -> serde_json:
 
 fn open(state: &BeadsState) -> McpResult<SqliteStorage> {
     state.open_read_storage().map_err(beads_to_mcp)
+}
+
+fn cached_read_json<F>(state: &BeadsState, key: String, build: F) -> McpResult<Value>
+where
+    F: FnOnce(&SqliteStorage) -> McpResult<Value>,
+{
+    if let Some(value) = state.cached_read_json(&key) {
+        return Ok(value);
+    }
+
+    let before = state.capture_read_snapshot_witness();
+    let storage = open(state)?;
+    let value = build(&storage)?;
+    state.store_read_json_snapshot(key, before, &value);
+
+    Ok(value)
 }
 
 // ---------------------------------------------------------------------------
@@ -989,6 +1005,51 @@ fn build_list_filters(
     })
 }
 
+fn list_issues_json(storage: &SqliteStorage, args: &Value) -> McpResult<Value> {
+    let mut coercions: Vec<String> = Vec::new();
+    let filters = build_list_filters(args, &mut coercions)?;
+
+    let search_query = optional_str_arg(args, "search")?;
+
+    let issues = if let Some(raw_q) = search_query.as_deref() {
+        if let Some(q) = sanitize_search(raw_q) {
+            storage.search_issues(&q, &filters).map_err(beads_to_mcp)?
+        } else {
+            // Bare wildcard — fall back to list (no search filter)
+            coercions.push(format!(
+                "search '{raw_q}' was a bare wildcard, returning all"
+            ));
+            storage.list_issues(&filters).map_err(beads_to_mcp)?
+        }
+    } else {
+        storage.list_issues(&filters).map_err(beads_to_mcp)?
+    };
+
+    let mut result = json!({
+        "count": issues.len(),
+        "issues": issues.iter().map(issue_json).collect::<Vec<_>>(),
+    });
+
+    // Contextual next_actions
+    if issues.is_empty() {
+        result["next_actions"] = json!([
+            "No issues matched. Try broadening filters or removing some.",
+            "Use project_overview to see what's in the tracker"
+        ]);
+    } else {
+        result["next_actions"] = json!([
+            "Use show_issue with an issue ID for full details",
+            "Narrow results with additional filters"
+        ]);
+    }
+
+    if !coercions.is_empty() {
+        result["coercions"] = json!(coercions);
+    }
+
+    Ok(result)
+}
+
 pub struct ListIssuesTool(Arc<BeadsState>);
 impl ListIssuesTool {
     pub fn new(state: Arc<BeadsState>) -> Self {
@@ -1072,48 +1133,8 @@ impl ToolHandler for ListIssuesTool {
     }
 
     fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
-        let storage = open(&self.0)?;
-        let mut coercions: Vec<String> = Vec::new();
-        let filters = build_list_filters(&args, &mut coercions)?;
-
-        let search_query = optional_str_arg(&args, "search")?;
-
-        let issues = if let Some(raw_q) = search_query.as_deref() {
-            if let Some(q) = sanitize_search(raw_q) {
-                storage.search_issues(&q, &filters).map_err(beads_to_mcp)?
-            } else {
-                // Bare wildcard — fall back to list (no search filter)
-                coercions.push(format!(
-                    "search '{raw_q}' was a bare wildcard, returning all"
-                ));
-                storage.list_issues(&filters).map_err(beads_to_mcp)?
-            }
-        } else {
-            storage.list_issues(&filters).map_err(beads_to_mcp)?
-        };
-
-        let mut result = json!({
-            "count": issues.len(),
-            "issues": issues.iter().map(issue_json).collect::<Vec<_>>(),
-        });
-
-        // Contextual next_actions
-        if issues.is_empty() {
-            result["next_actions"] = json!([
-                "No issues matched. Try broadening filters or removing some.",
-                "Use project_overview to see what's in the tracker"
-            ]);
-        } else {
-            result["next_actions"] = json!([
-                "Use show_issue with an issue ID for full details",
-                "Narrow results with additional filters"
-            ]);
-        }
-
-        if !coercions.is_empty() {
-            result["coercions"] = json!(coercions);
-        }
-
+        let key = format!("tool:list_issues:{}", args);
+        let result = cached_read_json(&self.0, key, |storage| list_issues_json(storage, &args))?;
         Ok(vec![Content::text(result.to_string())])
     }
 }
@@ -2060,6 +2081,104 @@ impl ToolHandler for ManageDependenciesTool {
 // 7. project_overview
 // ---------------------------------------------------------------------------
 
+fn project_overview_json(state: &BeadsState, storage: &SqliteStorage) -> McpResult<Value> {
+    let total = storage.count_all_issues().map_err(beads_to_mcp)?;
+    let active = storage.count_active_issues().map_err(beads_to_mcp)?;
+    let labels = storage
+        .get_unique_labels_with_counts()
+        .map_err(beads_to_mcp)?;
+    let blocked = storage.get_blocked_issues().map_err(beads_to_mcp)?;
+    let dirty = storage.get_dirty_issue_count().map_err(beads_to_mcp)?;
+
+    let ready_filters = ReadyFilters::default();
+    let ready = storage
+        .get_ready_issues(&ready_filters, ReadySortPolicy::Hybrid)
+        .map_err(beads_to_mcp)?;
+
+    // In-progress and deferred counts
+    let in_progress_filters = ListFilters {
+        statuses: Some(vec![Status::InProgress]),
+        include_closed: false,
+        limit: Some(50),
+        ..ListFilters::default()
+    };
+    let in_progress = storage
+        .list_issues(&in_progress_filters)
+        .map_err(beads_to_mcp)?;
+
+    let deferred_filters = ListFilters {
+        statuses: Some(vec![Status::Deferred]),
+        include_closed: false,
+        include_deferred: true,
+        limit: Some(50),
+        ..ListFilters::default()
+    };
+    let deferred = storage
+        .list_issues(&deferred_filters)
+        .map_err(beads_to_mcp)?;
+
+    let prefix = state.issue_prefix.as_deref().unwrap_or("br");
+
+    Ok(json!({
+        "project": {
+            "beads_dir": state.beads_dir.display().to_string(),
+            "issue_prefix": prefix,
+        },
+        "counts": {
+            "total": total,
+            "active": active,
+            "blocked": blocked.len(),
+            "ready": ready.len(),
+            "in_progress": in_progress.len(),
+            "deferred": deferred.len(),
+            "dirty_unsaved": dirty,
+        },
+        "top_labels": labels.iter().take(15).map(|(name, count)| {
+            json!({"label": name, "count": count})
+        }).collect::<Vec<_>>(),
+        "blocked_issues": blocked.iter().take(10).map(|(issue, blockers)| {
+            json!({
+                "id": issue.id,
+                "title": issue.title,
+                "blocked_by": blockers,
+            })
+        }).collect::<Vec<_>>(),
+        "ready_issues": ready.iter().take(10).map(|issue| {
+            json!({
+                "id": issue.id,
+                "title": issue.title,
+                "priority": issue.priority,
+                "type": issue.issue_type,
+            })
+        }).collect::<Vec<_>>(),
+        "discovery": {
+            "resources": [
+                "beads://schema — valid field values, aliases, and bead anatomy guidance",
+                "beads://labels — all labels with counts",
+                "beads://issues/ready — actionable work",
+                "beads://issues/blocked — stuck items with blockers",
+                "beads://issues/bottlenecks — highest-impact blockers (bv-style)",
+                "beads://graph/health — dependency graph health metrics",
+                "beads://issues/in_progress — current work",
+                "beads://issues/deferred — deferred items",
+                "beads://events/recent — latest audit trail",
+                "beads://project/info — project metadata"
+            ],
+            "prompts": [
+                "triage — guided backlog triage workflow",
+                "status_report — project status report generation",
+                "plan_next_work — graph-aware work planning (bottlenecks, quick wins)",
+                "polish_backlog — review issue quality and dependency health"
+            ]
+        },
+        "next_actions": [
+            "Use list_issues to explore specific subsets",
+            "Use show_issue to dig into a specific issue",
+            "Use create_issue to add new work items"
+        ]
+    }))
+}
+
 pub struct ProjectOverviewTool(Arc<BeadsState>);
 impl ProjectOverviewTool {
     pub fn new(state: Arc<BeadsState>) -> Self {
@@ -2100,104 +2219,9 @@ impl ToolHandler for ProjectOverviewTool {
 
     fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
         let _ = args;
-        let storage = open(&self.0)?;
-
-        let total = storage.count_all_issues().map_err(beads_to_mcp)?;
-        let active = storage.count_active_issues().map_err(beads_to_mcp)?;
-        let labels = storage
-            .get_unique_labels_with_counts()
-            .map_err(beads_to_mcp)?;
-        let blocked = storage.get_blocked_issues().map_err(beads_to_mcp)?;
-        let dirty = storage.get_dirty_issue_count().map_err(beads_to_mcp)?;
-
-        let ready_filters = ReadyFilters::default();
-        let ready = storage
-            .get_ready_issues(&ready_filters, ReadySortPolicy::Hybrid)
-            .map_err(beads_to_mcp)?;
-
-        // In-progress and deferred counts
-        let in_progress_filters = ListFilters {
-            statuses: Some(vec![Status::InProgress]),
-            include_closed: false,
-            limit: Some(50),
-            ..ListFilters::default()
-        };
-        let in_progress = storage
-            .list_issues(&in_progress_filters)
-            .map_err(beads_to_mcp)?;
-
-        let deferred_filters = ListFilters {
-            statuses: Some(vec![Status::Deferred]),
-            include_closed: false,
-            include_deferred: true,
-            limit: Some(50),
-            ..ListFilters::default()
-        };
-        let deferred = storage
-            .list_issues(&deferred_filters)
-            .map_err(beads_to_mcp)?;
-
-        let prefix = self.0.issue_prefix.as_deref().unwrap_or("br");
-
-        let result = json!({
-            "project": {
-                "beads_dir": self.0.beads_dir.display().to_string(),
-                "issue_prefix": prefix,
-            },
-            "counts": {
-                "total": total,
-                "active": active,
-                "blocked": blocked.len(),
-                "ready": ready.len(),
-                "in_progress": in_progress.len(),
-                "deferred": deferred.len(),
-                "dirty_unsaved": dirty,
-            },
-            "top_labels": labels.iter().take(15).map(|(name, count)| {
-                json!({"label": name, "count": count})
-            }).collect::<Vec<_>>(),
-            "blocked_issues": blocked.iter().take(10).map(|(issue, blockers)| {
-                json!({
-                    "id": issue.id,
-                    "title": issue.title,
-                    "blocked_by": blockers,
-                })
-            }).collect::<Vec<_>>(),
-            "ready_issues": ready.iter().take(10).map(|issue| {
-                json!({
-                    "id": issue.id,
-                    "title": issue.title,
-                    "priority": issue.priority,
-                    "type": issue.issue_type,
-                })
-            }).collect::<Vec<_>>(),
-            "discovery": {
-                "resources": [
-                    "beads://schema — valid field values, aliases, and bead anatomy guidance",
-                    "beads://labels — all labels with counts",
-                    "beads://issues/ready — actionable work",
-                    "beads://issues/blocked — stuck items with blockers",
-                    "beads://issues/bottlenecks — highest-impact blockers (bv-style)",
-                    "beads://graph/health — dependency graph health metrics",
-                    "beads://issues/in_progress — current work",
-                    "beads://issues/deferred — deferred items",
-                    "beads://events/recent — latest audit trail",
-                    "beads://project/info — project metadata"
-                ],
-                "prompts": [
-                    "triage — guided backlog triage workflow",
-                    "status_report — project status report generation",
-                    "plan_next_work — graph-aware work planning (bottlenecks, quick wins)",
-                    "polish_backlog — review issue quality and dependency health"
-                ]
-            },
-            "next_actions": [
-                "Use list_issues to explore specific subsets",
-                "Use show_issue to dig into a specific issue",
-                "Use create_issue to add new work items"
-            ]
-        });
-
+        let result = cached_read_json(&self.0, "tool:project_overview".to_string(), |storage| {
+            project_overview_json(&self.0, storage)
+        })?;
         Ok(vec![Content::text(result.to_string())])
     }
 }
@@ -2205,22 +2229,27 @@ impl ToolHandler for ProjectOverviewTool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CreateIssueTool, ManageDependenciesTool, UpdateIssueTool, build_list_filters,
-        generate_issue_id_with_checked_lookup, issue_not_found_err, next_available_child_id,
-        optional_label_array_arg, optional_string_array_arg, parse_update_fields,
+        CreateIssueTool, ListIssuesTool, ManageDependenciesTool, ProjectOverviewTool,
+        UpdateIssueTool, build_list_filters, generate_issue_id_with_checked_lookup,
+        issue_not_found_err, list_issues_json, next_available_child_id, optional_label_array_arg,
+        optional_string_array_arg, parse_update_fields, project_overview_json,
         storage_read_warning,
     };
     use crate::error::BeadsError;
-    use crate::mcp::BeadsState;
+    use crate::mcp::{BeadsState, McpReadSnapshotCache};
     use crate::model::{DependencyType, Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
     use chrono::{TimeZone, Utc};
-    use fastmcp_rust::{Cx, McpContext, McpErrorCode, ToolHandler};
+    use fastmcp_rust::{Content, Cx, McpContext, McpErrorCode, ToolHandler};
     use serde_json::json;
-    use std::{cell::Cell, fs, sync::Arc};
+    use std::{cell::Cell, fs, sync::Arc, time::Instant};
     use tempfile::TempDir;
 
     fn mcp_test_state(temp: &TempDir) -> Arc<BeadsState> {
+        mcp_test_state_with_read_snapshot(temp, false)
+    }
+
+    fn mcp_test_state_with_read_snapshot(temp: &TempDir, read_snapshot: bool) -> Arc<BeadsState> {
         let beads_dir = temp.path().join(".beads");
         fs::create_dir_all(&beads_dir).expect("create beads dir");
         let db_path = beads_dir.join("beads.db");
@@ -2233,7 +2262,192 @@ mod tests {
             allow_external_jsonl: false,
             actor: "mcp-test".to_string(),
             issue_prefix: Some("br".to_string()),
+            read_snapshot_cache: read_snapshot
+                .then(|| std::sync::Mutex::new(McpReadSnapshotCache::default())),
         })
+    }
+
+    fn insert_test_issue(state: &BeadsState, id: &str, title: &str) {
+        let mut storage = SqliteStorage::open(&state.db_path).expect("open storage");
+        let now = Utc::now();
+        let issue = Issue {
+            id: id.to_string(),
+            title: title.to_string(),
+            status: Status::Open,
+            priority: Priority::MEDIUM,
+            issue_type: IssueType::Task,
+            created_at: now,
+            updated_at: now,
+            ..Issue::default()
+        };
+        storage
+            .create_issue(&issue, "mcp-test")
+            .expect("create issue");
+    }
+
+    fn content_json(contents: &[Content]) -> serde_json::Value {
+        let [Content::Text { text }] = contents else {
+            return json!({"unexpected_content": format!("{contents:?}")});
+        };
+        serde_json::from_str(text)
+            .unwrap_or_else(|err| json!({"parse_error": err.to_string(), "text": text}))
+    }
+
+    #[test]
+    fn project_overview_snapshot_matches_direct_json_and_invalidates() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state_with_read_snapshot(&temp, true);
+        insert_test_issue(&state, "br-mcp-cache-1", "cached overview first issue");
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let tool = ProjectOverviewTool::new(Arc::clone(&state));
+
+        let first_content = tool
+            .call(&ctx, json!({}))
+            .expect("cached project overview call");
+        let first = content_json(&first_content);
+        let direct = {
+            let storage = SqliteStorage::open(&state.db_path).expect("open storage");
+            project_overview_json(&state, &storage).expect("direct overview")
+        };
+        assert_eq!(first, direct);
+
+        insert_test_issue(&state, "br-mcp-cache-2", "cached overview second issue");
+        fs::write(&state.jsonl_path, "{\"id\":\"br-mcp-cache-2\"}\n")
+            .expect("update jsonl witness");
+
+        let second_content = tool
+            .call(&ctx, json!({}))
+            .expect("fresh project overview after witness mismatch");
+        let second = content_json(&second_content);
+        assert_eq!(second["counts"]["total"].as_u64(), Some(2));
+    }
+
+    #[test]
+    fn list_issues_snapshot_matches_direct_json_and_invalidates() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state_with_read_snapshot(&temp, true);
+        insert_test_issue(&state, "br-mcp-list-1", "cached list first issue");
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let tool = ListIssuesTool::new(Arc::clone(&state));
+        let args = json!({"limit": 10, "sort": "created"});
+
+        let first_content = tool
+            .call(&ctx, args.clone())
+            .expect("cached list_issues call");
+        let first = content_json(&first_content);
+        let direct = {
+            let storage = SqliteStorage::open(&state.db_path).expect("open storage");
+            list_issues_json(&storage, &args).expect("direct list")
+        };
+        assert_eq!(first, direct);
+
+        insert_test_issue(&state, "br-mcp-list-2", "cached list second issue");
+        fs::write(&state.jsonl_path, "{\"id\":\"br-mcp-list-2\"}\n").expect("update jsonl witness");
+
+        let second_content = tool
+            .call(&ctx, args)
+            .expect("fresh list_issues after witness mismatch");
+        let second = content_json(&second_content);
+        assert_eq!(second["count"].as_u64(), Some(2));
+    }
+
+    #[test]
+    #[ignore = "perf probe for MCP read snapshot evidence"]
+    fn mcp_read_snapshot_perf_probe() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state_with_read_snapshot(&temp, true);
+        for index in 0..250 {
+            insert_test_issue(
+                &state,
+                &format!("br-mcp-perf-{index:04}"),
+                &format!("MCP perf issue {index:04}"),
+            );
+        }
+
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let overview_tool = ProjectOverviewTool::new(Arc::clone(&state));
+        let list_tool = ListIssuesTool::new(Arc::clone(&state));
+        let list_args = json!({"limit": 250, "sort": "created"});
+        let iterations = 250_u32;
+
+        let direct_overview = {
+            let started = Instant::now();
+            let mut last = serde_json::Value::Null;
+            for _ in 0..iterations {
+                let storage = SqliteStorage::open(&state.db_path).expect("open storage");
+                last = project_overview_json(&state, &storage).expect("direct overview");
+            }
+            (started.elapsed(), last)
+        };
+
+        let first_cached_overview = overview_tool
+            .call(&ctx, json!({}))
+            .expect("warm overview snapshot");
+        assert_eq!(content_json(&first_cached_overview), direct_overview.1);
+
+        let cached_overview = {
+            let started = Instant::now();
+            let mut last = serde_json::Value::Null;
+            for _ in 0..iterations {
+                let content = overview_tool
+                    .call(&ctx, json!({}))
+                    .expect("cached overview call");
+                last = content_json(&content);
+            }
+            (started.elapsed(), last)
+        };
+        assert_eq!(cached_overview.1, direct_overview.1);
+
+        let direct_list = {
+            let started = Instant::now();
+            let mut last = serde_json::Value::Null;
+            for _ in 0..iterations {
+                let storage = SqliteStorage::open(&state.db_path).expect("open storage");
+                last = list_issues_json(&storage, &list_args).expect("direct list");
+            }
+            (started.elapsed(), last)
+        };
+
+        let first_cached_list = list_tool
+            .call(&ctx, list_args.clone())
+            .expect("warm list snapshot");
+        assert_eq!(content_json(&first_cached_list), direct_list.1);
+
+        let cached_list = {
+            let started = Instant::now();
+            let mut last = serde_json::Value::Null;
+            for _ in 0..iterations {
+                let content = list_tool
+                    .call(&ctx, list_args.clone())
+                    .expect("cached list call");
+                last = content_json(&content);
+            }
+            (started.elapsed(), last)
+        };
+        assert_eq!(cached_list.1, direct_list.1);
+
+        let direct_overview_ns = direct_overview.0.as_nanos();
+        let cached_overview_ns = cached_overview.0.as_nanos();
+        let direct_list_ns = direct_list.0.as_nanos();
+        let cached_list_ns = cached_list.0.as_nanos();
+
+        println!(
+            "{}",
+            json!({
+                "issues": 250,
+                "iterations": iterations,
+                "project_overview": {
+                    "direct_total_ns": direct_overview_ns,
+                    "cached_total_ns": cached_overview_ns,
+                    "speedup": direct_overview_ns as f64 / cached_overview_ns.max(1) as f64,
+                },
+                "list_issues": {
+                    "direct_total_ns": direct_list_ns,
+                    "cached_total_ns": cached_list_ns,
+                    "speedup": direct_list_ns as f64 / cached_list_ns.max(1) as f64,
+                },
+            })
+        );
     }
 
     #[test]
