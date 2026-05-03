@@ -11,7 +11,7 @@ use fsqlite::compat::{OpenFlags, open_with_flags};
 use fsqlite_types::SqliteValue;
 use rich_rust::prelude::*;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tracing::debug;
 
@@ -32,6 +32,7 @@ struct ProjectionInfo {
     schema_version: String,
     blocked_cache_state: String,
     blocked_cache_stale: bool,
+    parity_status: String,
     rebuild_needed: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     rebuild_reasons: Vec<String>,
@@ -41,6 +42,14 @@ struct ProjectionInfo {
     dependency_rows: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cached_blocked_rows: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    direct_blocked_rows: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cached_missing_rows: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cached_extra_rows: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cached_mismatched_rows: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     child_counter_rows: Option<usize>,
 }
@@ -276,10 +285,16 @@ fn build_projection_info(conn: &Connection) -> ProjectionInfo {
     let blocked_cache_stale = blocked_cache_state == "stale";
     let cached_blocked_rows = projection_row_count(conn, "blocked_issues_cache");
     let child_counter_rows = projection_row_count(conn, "child_counters");
+    let direct_blocked_map = compute_direct_blocked_map(conn);
+    let cached_blocked_map = load_cached_blocked_map(conn);
+    let parity = projection_parity(cached_blocked_map.as_ref(), direct_blocked_map.as_ref());
 
     let mut rebuild_reasons = Vec::new();
     if blocked_cache_stale {
         rebuild_reasons.push("blocked_cache_marked_stale".to_string());
+    }
+    if parity.has_mismatch() {
+        rebuild_reasons.push("blocked_cache_content_mismatch".to_string());
     }
     if cached_blocked_rows.is_none() {
         rebuild_reasons.push("blocked_issues_cache_missing".to_string());
@@ -292,13 +307,230 @@ fn build_projection_info(conn: &Connection) -> ProjectionInfo {
         schema_version: "br.graph-projections.v1".to_string(),
         blocked_cache_state,
         blocked_cache_stale,
+        parity_status: parity.status,
         rebuild_needed: !rebuild_reasons.is_empty(),
         rebuild_reasons,
         issue_rows: query_issue_count(conn),
         dependency_rows: projection_row_count(conn, "dependencies"),
         cached_blocked_rows,
+        direct_blocked_rows: direct_blocked_map.as_ref().map(HashMap::len),
+        cached_missing_rows: parity.missing_rows,
+        cached_extra_rows: parity.extra_rows,
+        cached_mismatched_rows: parity.mismatched_rows,
         child_counter_rows,
     }
+}
+
+struct ProjectionParity {
+    status: String,
+    missing_rows: Option<usize>,
+    extra_rows: Option<usize>,
+    mismatched_rows: Option<usize>,
+}
+
+impl ProjectionParity {
+    fn has_mismatch(&self) -> bool {
+        [self.missing_rows, self.extra_rows, self.mismatched_rows]
+            .into_iter()
+            .flatten()
+            .any(|count| count > 0)
+    }
+}
+
+fn projection_parity(
+    cached: Option<&HashMap<String, Vec<String>>>,
+    direct: Option<&HashMap<String, Vec<String>>>,
+) -> ProjectionParity {
+    let (Some(cached), Some(direct)) = (cached, direct) else {
+        return ProjectionParity {
+            status: "unavailable".to_string(),
+            missing_rows: None,
+            extra_rows: None,
+            mismatched_rows: None,
+        };
+    };
+
+    let missing = direct.keys().filter(|id| !cached.contains_key(*id)).count();
+    let extra = cached.keys().filter(|id| !direct.contains_key(*id)).count();
+    let mismatched = direct
+        .iter()
+        .filter(|(id, blockers)| {
+            cached
+                .get(id.as_str())
+                .is_some_and(|cached_blockers| cached_blockers != *blockers)
+        })
+        .count();
+    let status = if missing == 0 && extra == 0 && mismatched == 0 {
+        "matches"
+    } else {
+        "mismatch"
+    };
+
+    ProjectionParity {
+        status: status.to_string(),
+        missing_rows: Some(missing),
+        extra_rows: Some(extra),
+        mismatched_rows: Some(mismatched),
+    }
+}
+
+fn compute_direct_blocked_map(conn: &Connection) -> Option<HashMap<String, Vec<String>>> {
+    let mut blocked = load_direct_blockers(conn)?;
+    let children_by_parent = load_local_parent_child_edges(conn)?;
+    propagate_blocked_parents(&mut blocked, &children_by_parent);
+    for (parent_id, mut blockers) in load_local_open_child_blockers(conn)? {
+        blocked.entry(parent_id).or_default().append(&mut blockers);
+    }
+    normalize_blocker_map(&mut blocked);
+    Some(blocked)
+}
+
+fn load_cached_blocked_map(conn: &Connection) -> Option<HashMap<String, Vec<String>>> {
+    let rows = conn
+        .query("SELECT issue_id, blocked_by FROM blocked_issues_cache")
+        .ok()?;
+    let mut cached = HashMap::new();
+    for row in &rows {
+        let Some(issue_id) = row.get(0).and_then(SqliteValue::as_text) else {
+            continue;
+        };
+        let blockers_json = row.get(1).and_then(SqliteValue::as_text)?;
+        let mut blockers: Vec<String> = serde_json::from_str(blockers_json).ok()?;
+        blockers.sort();
+        blockers.dedup();
+        cached.insert(issue_id.to_string(), blockers);
+    }
+    Some(cached)
+}
+
+fn load_direct_blockers(conn: &Connection) -> Option<HashMap<String, Vec<String>>> {
+    let rows = conn
+        .query(
+            "SELECT DISTINCT d.issue_id, d.depends_on_id || ':' || COALESCE(i.status, 'unknown')
+             FROM dependencies d
+             LEFT JOIN issues i ON d.depends_on_id = i.id
+             WHERE d.type IN ('blocks', 'conditional-blocks', 'waits-for')
+               AND d.depends_on_id NOT LIKE 'external:%'
+               AND (
+                 i.status NOT IN ('closed', 'tombstone')
+                 OR i.id IS NULL
+               )
+               AND (i.is_template = 0 OR i.is_template IS NULL OR i.id IS NULL)",
+        )
+        .ok()?;
+    let mut blocked = HashMap::new();
+    for row in &rows {
+        let Some(issue_id) = row.get(0).and_then(SqliteValue::as_text) else {
+            continue;
+        };
+        let Some(blocker_ref) = row.get(1).and_then(SqliteValue::as_text) else {
+            continue;
+        };
+        if issue_id.is_empty() || blocker_ref.is_empty() {
+            continue;
+        }
+        blocked
+            .entry(issue_id.to_string())
+            .or_insert_with(Vec::new)
+            .push(blocker_ref.to_string());
+    }
+    Some(blocked)
+}
+
+fn load_local_parent_child_edges(conn: &Connection) -> Option<HashMap<String, Vec<String>>> {
+    let rows = conn
+        .query(
+            "SELECT issue_id, depends_on_id
+             FROM dependencies
+             WHERE type = 'parent-child'
+               AND issue_id NOT LIKE 'external:%'
+               AND depends_on_id NOT LIKE 'external:%'",
+        )
+        .ok()?;
+    let mut children_by_parent = HashMap::new();
+    for row in &rows {
+        let Some(child_id) = row.get(0).and_then(SqliteValue::as_text) else {
+            continue;
+        };
+        let Some(parent_id) = row.get(1).and_then(SqliteValue::as_text) else {
+            continue;
+        };
+        children_by_parent
+            .entry(parent_id.to_string())
+            .or_insert_with(Vec::new)
+            .push(child_id.to_string());
+    }
+    Some(children_by_parent)
+}
+
+fn load_local_open_child_blockers(conn: &Connection) -> Option<HashMap<String, Vec<String>>> {
+    let rows = conn
+        .query(
+            "SELECT DISTINCT d.depends_on_id as parent_id, d.issue_id || ':child-open' as blocker
+             FROM dependencies d
+             JOIN issues i ON d.issue_id = i.id
+             JOIN issues p ON d.depends_on_id = p.id
+             WHERE d.type = 'parent-child'
+               AND p.issue_type = 'epic'
+               AND i.status NOT IN ('closed', 'tombstone')
+               AND (i.is_template = 0 OR i.is_template IS NULL)
+               AND d.depends_on_id NOT LIKE 'external:%'
+               AND d.issue_id NOT LIKE 'external:%'",
+        )
+        .ok()?;
+    let mut blockers_by_parent = HashMap::new();
+    for row in &rows {
+        let Some(parent_id) = row.get(0).and_then(SqliteValue::as_text) else {
+            continue;
+        };
+        let Some(blocker) = row.get(1).and_then(SqliteValue::as_text) else {
+            continue;
+        };
+        if parent_id.is_empty() || blocker.is_empty() {
+            continue;
+        }
+        blockers_by_parent
+            .entry(parent_id.to_string())
+            .or_insert_with(Vec::new)
+            .push(blocker.to_string());
+    }
+    Some(blockers_by_parent)
+}
+
+fn propagate_blocked_parents(
+    blocked: &mut HashMap<String, Vec<String>>,
+    children_by_parent: &HashMap<String, Vec<String>>,
+) {
+    if children_by_parent.is_empty() || blocked.is_empty() {
+        return;
+    }
+
+    let mut queue: Vec<String> = blocked.keys().cloned().collect();
+    let mut seen = HashSet::new();
+    while let Some(parent_id) = queue.pop() {
+        if !seen.insert(parent_id.clone()) {
+            continue;
+        }
+        if let Some(children) = children_by_parent.get(&parent_id) {
+            for child_id in children {
+                let marker = format!("{parent_id}:parent-blocked");
+                let entry = blocked.entry(child_id.clone()).or_default();
+                if entry.contains(&marker) {
+                    continue;
+                }
+                entry.push(marker);
+                queue.push(child_id.clone());
+            }
+        }
+    }
+}
+
+fn normalize_blocker_map(blocked: &mut HashMap<String, Vec<String>>) {
+    blocked.retain(|_, blockers| {
+        blockers.sort();
+        blockers.dedup();
+        !blockers.is_empty()
+    });
 }
 
 fn metadata_value(conn: &Connection, key: &str) -> Option<String> {
@@ -473,8 +705,24 @@ fn print_projection_human(projections: &ProjectionInfo) {
             "no"
         }
     );
+    println!(
+        "  Cache parity: {}",
+        info_display_text(&projections.parity_status)
+    );
     if let Some(count) = projections.cached_blocked_rows {
         println!("  Cached blocked rows: {count}");
+    }
+    if let Some(count) = projections.direct_blocked_rows {
+        println!("  Direct blocked rows: {count}");
+    }
+    if let Some(count) = projections.cached_missing_rows {
+        println!("  Missing cache rows: {count}");
+    }
+    if let Some(count) = projections.cached_extra_rows {
+        println!("  Extra cache rows: {count}");
+    }
+    if let Some(count) = projections.cached_mismatched_rows {
+        println!("  Mismatched cache rows: {count}");
     }
     if let Some(count) = projections.child_counter_rows {
         println!("  Child counter rows: {count}");
@@ -630,8 +878,16 @@ fn append_projection_rich(content: &mut Text, projections: &ProjectionInfo, ctx:
         "not needed"
     });
     content.append("\n");
+    content.append_styled("  Parity   ", theme.dimmed.clone());
+    content.append(&info_display_text(&projections.parity_status));
+    content.append("\n");
     if let Some(count) = projections.cached_blocked_rows {
         content.append_styled("  Cached   ", theme.dimmed.clone());
+        content.append(&count.to_string());
+        content.append(" blocked rows\n");
+    }
+    if let Some(count) = projections.direct_blocked_rows {
+        content.append_styled("  Direct   ", theme.dimmed.clone());
         content.append(&count.to_string());
         content.append(" blocked rows\n");
     }
@@ -915,10 +1171,15 @@ mod tests {
         assert_eq!(projections.schema_version, "br.graph-projections.v1");
         assert_eq!(projections.blocked_cache_state, "fresh");
         assert!(!projections.blocked_cache_stale);
+        assert_eq!(projections.parity_status, "matches");
         assert!(!projections.rebuild_needed);
         assert_eq!(projections.issue_rows, Some(2));
         assert_eq!(projections.dependency_rows, Some(1));
         assert_eq!(projections.cached_blocked_rows, Some(1));
+        assert_eq!(projections.direct_blocked_rows, Some(1));
+        assert_eq!(projections.cached_missing_rows, Some(0));
+        assert_eq!(projections.cached_extra_rows, Some(0));
+        assert_eq!(projections.cached_mismatched_rows, Some(0));
     }
 
     #[test]
@@ -953,10 +1214,86 @@ mod tests {
 
         assert_eq!(projections.blocked_cache_state, "stale");
         assert!(projections.blocked_cache_stale);
+        assert_eq!(projections.parity_status, "matches");
         assert!(projections.rebuild_needed);
         assert_eq!(
             projections.rebuild_reasons,
             vec!["blocked_cache_marked_stale".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_collect_info_output_reports_projection_parity_mismatch() {
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).unwrap();
+        std::fs::write(
+            beads_dir.join("metadata.json"),
+            r#"{"database":"beads.db","jsonl_export":"issues.jsonl"}"#,
+        )
+        .unwrap();
+
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let blocker = crate::model::Issue {
+            id: "bd-real-blocker".to_string(),
+            title: "Real blocker".to_string(),
+            issue_type: crate::model::IssueType::Task,
+            priority: crate::model::Priority::HIGH,
+            ..crate::model::Issue::default()
+        };
+        let target = crate::model::Issue {
+            id: "bd-parity-target".to_string(),
+            title: "Target".to_string(),
+            issue_type: crate::model::IssueType::Task,
+            priority: crate::model::Priority::LOW,
+            ..crate::model::Issue::default()
+        };
+        storage.create_issue(&blocker, "test").unwrap();
+        storage.create_issue(&target, "test").unwrap();
+        storage
+            .add_dependency(
+                &target.id,
+                &blocker.id,
+                crate::model::DependencyType::Blocks.as_str(),
+                "test",
+            )
+            .unwrap();
+        assert!(storage.ensure_blocked_cache_fresh().unwrap());
+        storage
+            .execute_test_sql(
+                "UPDATE blocked_issues_cache
+                 SET blocked_by = '[\"bd-other:open\"]'
+                 WHERE issue_id = 'bd-parity-target'",
+            )
+            .unwrap();
+        drop(storage);
+
+        let _guard = DirGuard::new(temp.path());
+        let output = collect_info_output(
+            &InfoArgs {
+                projections: true,
+                ..InfoArgs::default()
+            },
+            &CliOverrides::default(),
+        )
+        .unwrap();
+        let projections = output.projections.as_ref().unwrap();
+
+        assert_eq!(projections.blocked_cache_state, "fresh");
+        assert_eq!(projections.parity_status, "mismatch");
+        assert!(projections.rebuild_needed);
+        assert_eq!(projections.direct_blocked_rows, Some(1));
+        assert_eq!(projections.cached_missing_rows, Some(0));
+        assert_eq!(projections.cached_extra_rows, Some(0));
+        assert_eq!(projections.cached_mismatched_rows, Some(1));
+        assert!(
+            projections
+                .rebuild_reasons
+                .contains(&"blocked_cache_content_mismatch".to_string())
         );
     }
 
