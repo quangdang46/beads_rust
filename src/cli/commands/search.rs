@@ -154,8 +154,12 @@ fn render_search_results(
 
     match output_format {
         OutputFormat::Json => {
-            let issues_with_counts = attach_counts(storage, issues)?;
-            early_ctx.json_pretty(&issues_with_counts);
+            let mut relation_metadata = load_search_relation_metadata(storage, &issues)?;
+            early_ctx.json_array(
+                issues
+                    .into_iter()
+                    .map(|issue| issue_with_counts(issue, &mut relation_metadata)),
+            );
             return Ok(());
         }
         OutputFormat::Toon => {
@@ -232,32 +236,64 @@ fn render_search_results(
     Ok(())
 }
 
+#[derive(Default)]
+struct SearchRelationMetadata {
+    labels_by_id: HashMap<String, Vec<String>>,
+    dependency_counts: HashMap<String, usize>,
+    dependent_counts: HashMap<String, usize>,
+}
+
+fn load_search_relation_metadata(
+    storage: &SqliteStorage,
+    issues: &[Issue],
+) -> Result<SearchRelationMetadata> {
+    if issues.is_empty() {
+        return Ok(SearchRelationMetadata::default());
+    }
+
+    let issue_ids: Vec<String> = issues.iter().map(|issue| issue.id.clone()).collect();
+    let labels_by_id = storage.get_labels_for_issues(&issue_ids)?;
+    let (dependency_counts, dependent_counts) =
+        storage.count_relation_counts_for_issues(&issue_ids)?;
+
+    Ok(SearchRelationMetadata {
+        labels_by_id,
+        dependency_counts,
+        dependent_counts,
+    })
+}
+
+fn issue_with_counts(
+    mut issue: Issue,
+    relation_metadata: &mut SearchRelationMetadata,
+) -> IssueWithCounts {
+    let dependency_count = *relation_metadata
+        .dependency_counts
+        .get(&issue.id)
+        .unwrap_or(&0);
+    let dependent_count = *relation_metadata
+        .dependent_counts
+        .get(&issue.id)
+        .unwrap_or(&0);
+    if let Some(labels) = relation_metadata.labels_by_id.remove(&issue.id) {
+        issue.labels = labels;
+    }
+    IssueWithCounts {
+        issue,
+        dependency_count,
+        dependent_count,
+    }
+}
+
 fn attach_counts(
     storage: &SqliteStorage,
     issues: Vec<crate::model::Issue>,
 ) -> Result<Vec<IssueWithCounts>> {
-    if issues.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let issue_ids: Vec<String> = issues.iter().map(|issue| issue.id.clone()).collect();
-    let mut labels_map = storage.get_labels_for_issues(&issue_ids)?;
-    let (dep_counts, dependent_counts) = storage.count_relation_counts_for_issues(&issue_ids)?;
+    let mut relation_metadata = load_search_relation_metadata(storage, &issues)?;
 
     Ok(issues
         .into_iter()
-        .map(|mut issue| {
-            let dependency_count = *dep_counts.get(&issue.id).unwrap_or(&0);
-            let dependent_count = *dependent_counts.get(&issue.id).unwrap_or(&0);
-            if let Some(labels) = labels_map.remove(&issue.id) {
-                issue.labels = labels;
-            }
-            IssueWithCounts {
-                issue,
-                dependency_count,
-                dependent_count,
-            }
-        })
+        .map(|issue| issue_with_counts(issue, &mut relation_metadata))
         .collect())
 }
 
@@ -738,6 +774,26 @@ mod tests {
         let results = storage.search_issues("xyz", &filters).expect("search");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "bd-xyz");
+    }
+
+    #[test]
+    fn issue_with_counts_applies_relation_metadata() {
+        let issue = make_issue("bd-001", "Search result", None, Utc::now());
+        let mut relation_metadata = SearchRelationMetadata {
+            labels_by_id: std::collections::HashMap::from([(
+                "bd-001".to_string(),
+                vec!["perf".to_string(), "search".to_string()],
+            )]),
+            dependency_counts: std::collections::HashMap::from([("bd-001".to_string(), 2)]),
+            dependent_counts: std::collections::HashMap::from([("bd-001".to_string(), 3)]),
+        };
+
+        let output = issue_with_counts(issue, &mut relation_metadata);
+
+        assert_eq!(output.issue.labels, vec!["perf", "search"]);
+        assert_eq!(output.dependency_count, 2);
+        assert_eq!(output.dependent_count, 3);
+        assert!(relation_metadata.labels_by_id.is_empty());
     }
 
     #[test]
