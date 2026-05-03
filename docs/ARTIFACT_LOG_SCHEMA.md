@@ -98,6 +98,50 @@ Written at test completion:
 | `run_count` | integer | Yes | Number of commands executed |
 | `timestamp` | string | Yes | RFC3339 completion timestamp |
 
+### 4. Startup Matrix Manifest (startup-matrix-manifest.json)
+
+Storage-open and startup performance bundles include a manifest that makes each
+startup state explicit and keeps raw evidence discoverable even when aggregation
+fails.
+
+```json
+{
+  "schema_version": "br.startup-matrix.v1",
+  "matrix_name": "storage-open-smoke",
+  "generated_at": "2026-05-03T01:00:00Z",
+  "states": [
+    {
+      "state": "clean",
+      "command_log_path": "logs/clean.log",
+      "timing_summary_path": "timing/clean.json",
+      "syscall_summary_path": "syscalls/clean.txt",
+      "rss_summary_path": "rss/clean.json",
+      "raw_artifact_paths": ["raw/clean.trace"]
+    }
+  ],
+  "aggregation": {
+    "status": "ok",
+    "raw_evidence_preserved": true,
+    "error": null
+  }
+}
+```
+
+Required `state` values are:
+
+- `clean`
+- `stale`
+- `routed`
+- `no_db`
+- `read_only_fast_open`
+- `sync_status`
+- `recovery_anomaly`
+
+Each state must reference a command log, timing summary, syscall summary, and RSS
+summary using relative paths inside the bundle. Raw artifact references are
+optional for successful aggregation, but partial or failed aggregation must set
+`raw_evidence_preserved` to `true` and keep at least one raw artifact reference.
+
 ## Directory Structure
 
 ```
@@ -110,6 +154,15 @@ target/test-artifacts/
         ├── 0001_init.stderr      # Captured stderr (if non-empty)
         ├── before.snapshot.json  # File tree snapshot
         └── after.snapshot.json   # File tree snapshot
+
+target/perf-artifacts/
+└── <startup-matrix-run>/
+    ├── startup-matrix-manifest.json
+    ├── logs/
+    ├── timing/
+    ├── syscalls/
+    ├── rss/
+    └── raw/
 ```
 
 ## Validation Rules
@@ -122,6 +175,10 @@ target/test-artifacts/
 4. **Path safety**: All paths must be relative (no `..` traversal)
 5. **Exit codes**: Must be integer in range [-128, 255]
 6. **Size values**: Must be non-negative integers
+7. **Startup state coverage**: Startup matrix manifests must include every
+   required startup state exactly once
+8. **Aggregation evidence**: Partial or failed startup matrix aggregation must
+   preserve raw evidence references
 
 ### Cross-Platform Normalization
 

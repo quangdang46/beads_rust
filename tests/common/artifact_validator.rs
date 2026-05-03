@@ -7,8 +7,20 @@
 
 use chrono::DateTime;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
+
+const STARTUP_MATRIX_MANIFEST: &str = "startup-matrix-manifest.json";
+const REQUIRED_STARTUP_STATES: &[&str] = &[
+    "clean",
+    "stale",
+    "routed",
+    "no_db",
+    "read_only_fast_open",
+    "sync_status",
+    "recovery_anomaly",
+];
 
 /// Validation result with detailed error context
 #[derive(Debug)]
@@ -113,6 +125,37 @@ pub struct Summary {
     pub passed: bool,
     pub run_count: usize,
     pub timestamp: String,
+}
+
+/// Manifest for storage-open/startup matrix performance bundles.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartupMatrixManifest {
+    pub schema_version: String,
+    pub matrix_name: String,
+    pub generated_at: String,
+    pub states: Vec<StartupMatrixState>,
+    pub aggregation: StartupMatrixAggregation,
+}
+
+/// One startup state measured by the matrix.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartupMatrixState {
+    pub state: String,
+    pub command_log_path: String,
+    pub timing_summary_path: String,
+    pub syscall_summary_path: String,
+    pub rss_summary_path: String,
+    #[serde(default)]
+    pub raw_artifact_paths: Vec<String>,
+}
+
+/// Aggregation outcome for a startup matrix bundle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartupMatrixAggregation {
+    pub status: String,
+    pub raw_evidence_preserved: bool,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// Artifact validator
@@ -395,6 +438,248 @@ impl ArtifactValidator {
         result
     }
 
+    /// Validate a startup matrix manifest file.
+    pub fn validate_startup_matrix_manifest_file(&self, path: &Path) -> ValidationResult {
+        let content = match fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) => {
+                return ValidationResult::ok().with_error(ValidationError {
+                    line: None,
+                    field: None,
+                    message: format!("Failed to read file: {e}"),
+                });
+            }
+        };
+
+        self.validate_startup_matrix_manifest_content(&content)
+    }
+
+    /// Validate startup matrix manifest JSON content.
+    pub fn validate_startup_matrix_manifest_content(&self, content: &str) -> ValidationResult {
+        let manifest = match Self::parse_startup_matrix_manifest(content) {
+            Ok(manifest) => manifest,
+            Err(error) => return ValidationResult::ok().with_error(error),
+        };
+
+        self.validate_startup_matrix_manifest(&manifest)
+    }
+
+    fn parse_startup_matrix_manifest(
+        content: &str,
+    ) -> Result<StartupMatrixManifest, ValidationError> {
+        serde_json::from_str(content).map_err(|e| ValidationError {
+            line: None,
+            field: None,
+            message: format!("Invalid startup matrix manifest JSON: {e}"),
+        })
+    }
+
+    fn validate_startup_matrix_manifest(
+        &self,
+        manifest: &StartupMatrixManifest,
+    ) -> ValidationResult {
+        let mut result = ValidationResult::ok();
+
+        if manifest.schema_version.trim().is_empty() {
+            result = result.with_error(ValidationError {
+                line: None,
+                field: Some("schema_version".to_string()),
+                message: "Schema version cannot be empty".to_string(),
+            });
+        }
+
+        if manifest.matrix_name.trim().is_empty() {
+            result = result.with_error(ValidationError {
+                line: None,
+                field: Some("matrix_name".to_string()),
+                message: "Matrix name cannot be empty".to_string(),
+            });
+        }
+
+        if DateTime::parse_from_rfc3339(&manifest.generated_at).is_err() {
+            result = result.with_error(ValidationError {
+                line: None,
+                field: Some("generated_at".to_string()),
+                message: format!("Invalid RFC3339 timestamp: {}", manifest.generated_at),
+            });
+        }
+
+        result = result.merge(Self::validate_startup_matrix_states(&manifest.states));
+        result = result.merge(self.validate_startup_matrix_aggregation(manifest));
+
+        result
+    }
+
+    fn validate_startup_matrix_states(states: &[StartupMatrixState]) -> ValidationResult {
+        let mut result = ValidationResult::ok();
+        let mut seen = BTreeSet::new();
+
+        for state in states {
+            if !seen.insert(state.state.as_str()) {
+                result = result.with_error(ValidationError {
+                    line: None,
+                    field: Some("states".to_string()),
+                    message: format!("Duplicate startup state: {}", state.state),
+                });
+            }
+
+            for (field, path) in [
+                ("command_log_path", &state.command_log_path),
+                ("timing_summary_path", &state.timing_summary_path),
+                ("syscall_summary_path", &state.syscall_summary_path),
+                ("rss_summary_path", &state.rss_summary_path),
+            ] {
+                result = result.merge(Self::validate_relative_artifact_path(field, path));
+            }
+
+            for path in &state.raw_artifact_paths {
+                result = result.merge(Self::validate_relative_artifact_path(
+                    "raw_artifact_paths",
+                    path,
+                ));
+            }
+        }
+
+        for required in REQUIRED_STARTUP_STATES {
+            if !seen.contains(required) {
+                result = result.with_error(ValidationError {
+                    line: None,
+                    field: Some("states".to_string()),
+                    message: format!("Missing required startup state: {required}"),
+                });
+            }
+        }
+
+        result
+    }
+
+    #[allow(clippy::unused_self)]
+    fn validate_startup_matrix_aggregation(
+        &self,
+        manifest: &StartupMatrixManifest,
+    ) -> ValidationResult {
+        let mut result = ValidationResult::ok();
+        let status = manifest.aggregation.status.as_str();
+
+        if !matches!(status, "ok" | "partial" | "failed") {
+            result = result.with_error(ValidationError {
+                line: None,
+                field: Some("aggregation.status".to_string()),
+                message: format!("Must be 'ok', 'partial', or 'failed', got: {status}"),
+            });
+        }
+
+        if status != "ok" && !manifest.aggregation.raw_evidence_preserved {
+            result = result.with_error(ValidationError {
+                line: None,
+                field: Some("aggregation.raw_evidence_preserved".to_string()),
+                message: "Raw evidence must be preserved when aggregation is partial or failed"
+                    .to_string(),
+            });
+        }
+
+        if status != "ok"
+            && manifest
+                .states
+                .iter()
+                .all(|state| state.raw_artifact_paths.is_empty())
+        {
+            result = result.with_error(ValidationError {
+                line: None,
+                field: Some("states.raw_artifact_paths".to_string()),
+                message: "Aggregation failure must keep at least one raw artifact reference"
+                    .to_string(),
+            });
+        }
+
+        result
+    }
+
+    fn validate_relative_artifact_path(field: &str, path: &str) -> ValidationResult {
+        let mut result = ValidationResult::ok();
+
+        if path.trim().is_empty() {
+            return result.with_error(ValidationError {
+                line: None,
+                field: Some(field.to_string()),
+                message: "Path cannot be empty".to_string(),
+            });
+        }
+
+        if path.starts_with('/') || path.contains(':') {
+            result = result.with_error(ValidationError {
+                line: None,
+                field: Some(field.to_string()),
+                message: format!("Path must be relative: {path}"),
+            });
+        }
+
+        if path.contains("..") {
+            result = result.with_error(ValidationError {
+                line: None,
+                field: Some(field.to_string()),
+                message: format!("Path traversal detected: {path}"),
+            });
+        }
+
+        result
+    }
+
+    /// Validate a startup matrix bundle directory, including referenced files.
+    pub fn validate_startup_matrix_bundle_dir(&self, dir: &Path) -> ValidationResult {
+        let manifest_path = dir.join(STARTUP_MATRIX_MANIFEST);
+        let content = match fs::read_to_string(&manifest_path) {
+            Ok(c) => c,
+            Err(e) => {
+                return ValidationResult::ok().with_error(ValidationError {
+                    line: None,
+                    field: Some(STARTUP_MATRIX_MANIFEST.to_string()),
+                    message: format!("Failed to read startup matrix manifest: {e}"),
+                });
+            }
+        };
+
+        let manifest = match Self::parse_startup_matrix_manifest(&content) {
+            Ok(manifest) => manifest,
+            Err(error) => return ValidationResult::ok().with_error(error),
+        };
+
+        let mut result = self.validate_startup_matrix_manifest(&manifest);
+        for state in &manifest.states {
+            for path in [
+                &state.command_log_path,
+                &state.timing_summary_path,
+                &state.syscall_summary_path,
+                &state.rss_summary_path,
+            ] {
+                result = result.merge(Self::validate_bundle_file_exists(dir, path));
+            }
+
+            for path in &state.raw_artifact_paths {
+                result = result.merge(Self::validate_bundle_file_exists(dir, path));
+            }
+        }
+
+        result
+    }
+
+    fn validate_bundle_file_exists(dir: &Path, relative_path: &str) -> ValidationResult {
+        let path_result = Self::validate_relative_artifact_path("artifact_path", relative_path);
+        if !path_result.valid {
+            return path_result;
+        }
+
+        if !dir.join(relative_path).is_file() {
+            return ValidationResult::ok().with_error(ValidationError {
+                line: None,
+                field: Some(relative_path.to_string()),
+                message: "Referenced startup matrix artifact is missing".to_string(),
+            });
+        }
+
+        ValidationResult::ok()
+    }
+
     /// Validate an entire artifact directory
     pub fn validate_artifact_dir(&self, dir: &Path) -> ValidationResult {
         let mut result = ValidationResult::ok();
@@ -424,6 +709,10 @@ impl ArtifactValidator {
             }
         }
 
+        if dir.join(STARTUP_MATRIX_MANIFEST).exists() {
+            result = result.merge(self.validate_startup_matrix_bundle_dir(dir));
+        }
+
         result
     }
 }
@@ -431,6 +720,7 @@ impl ArtifactValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn valid_event_passes() {
@@ -510,5 +800,108 @@ mod tests {
                 .iter()
                 .any(|e| e.field.as_deref() == Some("suite"))
         );
+    }
+
+    fn startup_state_json(state: &str) -> String {
+        format!(
+            r#"{{"state":"{state}","command_log_path":"logs/{state}.log","timing_summary_path":"timing/{state}.json","syscall_summary_path":"syscalls/{state}.txt","rss_summary_path":"rss/{state}.json","raw_artifact_paths":["raw/{state}.trace"]}}"#
+        )
+    }
+
+    fn startup_manifest_json(states: &[&str], status: &str, raw_preserved: bool) -> String {
+        let states = states
+            .iter()
+            .map(|state| startup_state_json(state))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            r#"{{"schema_version":"br.startup-matrix.v1","matrix_name":"smoke","generated_at":"2026-05-03T01:00:00Z","states":[{states}],"aggregation":{{"status":"{status}","raw_evidence_preserved":{raw_preserved}}}}}"#
+        )
+    }
+
+    fn write_startup_bundle_files(dir: &Path, states: &[&str]) {
+        for subdir in ["logs", "timing", "syscalls", "rss", "raw"] {
+            fs::create_dir_all(dir.join(subdir)).expect("create startup matrix subdir");
+        }
+
+        for state in states {
+            for path in [
+                format!("logs/{state}.log"),
+                format!("timing/{state}.json"),
+                format!("syscalls/{state}.txt"),
+                format!("rss/{state}.json"),
+                format!("raw/{state}.trace"),
+            ] {
+                fs::write(dir.join(path), "startup matrix smoke artifact")
+                    .expect("write startup matrix artifact");
+            }
+        }
+    }
+
+    #[test]
+    fn valid_startup_matrix_manifest_passes() {
+        let validator = ArtifactValidator::new();
+        let content = startup_manifest_json(REQUIRED_STARTUP_STATES, "ok", true);
+        let result = validator.validate_startup_matrix_manifest_content(&content);
+        assert!(result.valid, "Errors: {:?}", result.errors);
+    }
+
+    #[test]
+    fn startup_matrix_manifest_requires_all_states() {
+        let validator = ArtifactValidator::new();
+        let states_without_recovery_anomaly = REQUIRED_STARTUP_STATES
+            .iter()
+            .copied()
+            .filter(|state| *state != "recovery_anomaly")
+            .collect::<Vec<_>>();
+        let content = startup_manifest_json(&states_without_recovery_anomaly, "ok", true);
+        let result = validator.validate_startup_matrix_manifest_content(&content);
+        assert!(!result.valid);
+        assert!(result.errors.iter().any(|error| {
+            error
+                .message
+                .contains("Missing required startup state: recovery_anomaly")
+        }));
+    }
+
+    #[test]
+    fn startup_matrix_failed_aggregation_requires_raw_evidence() {
+        let validator = ArtifactValidator::new();
+        let content = startup_manifest_json(REQUIRED_STARTUP_STATES, "failed", false);
+        let result = validator.validate_startup_matrix_manifest_content(&content);
+        assert!(!result.valid);
+        assert!(
+            result.errors.iter().any(|error| {
+                error.field.as_deref() == Some("aggregation.raw_evidence_preserved")
+            })
+        );
+    }
+
+    #[test]
+    fn startup_matrix_bundle_validates_referenced_files() {
+        let validator = ArtifactValidator::new();
+        let dir = tempdir().expect("create tempdir");
+        let manifest = startup_manifest_json(REQUIRED_STARTUP_STATES, "ok", true);
+        fs::write(dir.path().join(STARTUP_MATRIX_MANIFEST), manifest)
+            .expect("write startup matrix manifest");
+        write_startup_bundle_files(dir.path(), REQUIRED_STARTUP_STATES);
+
+        let result = validator.validate_startup_matrix_bundle_dir(dir.path());
+        assert!(result.valid, "Errors: {:?}", result.errors);
+
+        let incomplete_dir = tempdir().expect("create incomplete tempdir");
+        let manifest = startup_manifest_json(REQUIRED_STARTUP_STATES, "ok", true);
+        fs::write(
+            incomplete_dir.path().join(STARTUP_MATRIX_MANIFEST),
+            manifest,
+        )
+        .expect("write incomplete startup matrix manifest");
+        let incomplete = validator.validate_startup_matrix_bundle_dir(incomplete_dir.path());
+        assert!(!incomplete.valid);
+        assert!(incomplete.errors.iter().any(|error| {
+            error
+                .message
+                .contains("Referenced startup matrix artifact is missing")
+        }));
     }
 }
