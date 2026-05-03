@@ -16,7 +16,7 @@ use fastmcp_rust::{
 use serde_json::json;
 
 use crate::error::{BeadsError, ErrorCode, StructuredError};
-use crate::model::{Comment, Issue, IssueType, Priority, Status};
+use crate::model::{Comment, DependencyType, Issue, IssueType, Priority, Status};
 use crate::storage::{IssueUpdate, ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage};
 use crate::validation::{CommentValidator, IssueValidator, LabelValidator};
 
@@ -1959,6 +1959,9 @@ impl ToolHandler for ManageDependenciesTool {
                 let dep_type_raw =
                     optional_str_arg(&args, "dep_type")?.unwrap_or_else(|| "blocks".to_string());
                 let (dep_type_str, dep_coercion) = parse_dep_type(&dep_type_raw)?;
+                let dep_type = dep_type_str
+                    .parse::<DependencyType>()
+                    .map_err(beads_to_mcp)?;
 
                 // Read-only pre-validation
                 {
@@ -1966,10 +1969,11 @@ impl ToolHandler for ManageDependenciesTool {
                     require_valid_issue(&storage, &id)?;
                     require_valid_issue(&storage, &depends_on)?;
 
-                    // Check for cycles with structured error
-                    if storage
-                        .would_create_cycle(&id, &depends_on, true)
-                        .map_err(beads_to_mcp)?
+                    // Only dependency types that affect ready work participate in cycle checks.
+                    if dep_type.is_blocking()
+                        && storage
+                            .would_create_cycle(&id, &depends_on, true)
+                            .map_err(beads_to_mcp)?
                     {
                         return Err(McpError::with_data(
                             McpErrorCode::ToolExecutionError,
@@ -2201,14 +2205,14 @@ impl ToolHandler for ProjectOverviewTool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CreateIssueTool, UpdateIssueTool, build_list_filters,
+        CreateIssueTool, ManageDependenciesTool, UpdateIssueTool, build_list_filters,
         generate_issue_id_with_checked_lookup, issue_not_found_err, next_available_child_id,
         optional_label_array_arg, optional_string_array_arg, parse_update_fields,
         storage_read_warning,
     };
     use crate::error::BeadsError;
     use crate::mcp::BeadsState;
-    use crate::model::{Issue, IssueType, Priority, Status};
+    use crate::model::{DependencyType, Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
     use chrono::{TimeZone, Utc};
     use fastmcp_rust::{Cx, McpContext, McpErrorCode, ToolHandler};
@@ -2385,6 +2389,64 @@ mod tests {
             issue.content_hash.as_deref(),
             Some(expected_hash.as_str()),
             "MCP-created issues should persist the same content hash as CLI-created issues"
+        );
+    }
+
+    #[test]
+    fn manage_dependencies_allows_non_blocking_reverse_links() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let create_tool = CreateIssueTool::new(Arc::clone(&state));
+
+        create_tool
+            .call(&ctx, json!({ "title": "First dependency endpoint" }))
+            .expect("create first issue");
+        create_tool
+            .call(&ctx, json!({ "title": "Second dependency endpoint" }))
+            .expect("create second issue");
+
+        let storage = SqliteStorage::open(&state.db_path).expect("open storage");
+        let ids = storage.get_all_ids().expect("ids");
+        assert_eq!(ids.len(), 2);
+        drop(storage);
+
+        let first = ids[0].clone();
+        let second = ids[1].clone();
+        let deps_tool = ManageDependenciesTool::new(Arc::clone(&state));
+
+        deps_tool
+            .call(
+                &ctx,
+                json!({
+                    "action": "add",
+                    "id": second.clone(),
+                    "depends_on": first.clone(),
+                    "dep_type": "blocks"
+                }),
+            )
+            .expect("add blocking dependency");
+
+        deps_tool
+            .call(
+                &ctx,
+                json!({
+                    "action": "add",
+                    "id": first.clone(),
+                    "depends_on": second.clone(),
+                    "dep_type": "related"
+                }),
+            )
+            .expect("related reverse link should not be rejected as a blocking cycle");
+
+        let storage = SqliteStorage::open(&state.db_path).expect("reopen storage");
+        let deps = storage
+            .get_dependencies_full(&first)
+            .expect("load dependencies");
+        assert!(
+            deps.iter().any(|dep| {
+                dep.depends_on_id == second && dep.dep_type == DependencyType::Related
+            })
         );
     }
 
