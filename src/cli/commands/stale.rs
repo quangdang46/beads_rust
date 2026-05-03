@@ -73,7 +73,6 @@ fn execute_inner(args: &StaleArgs, ctx: &OutputContext, storage: &SqliteStorage)
     filters.reverse = true; // updated_at default is DESC, so reverse gets ASC
 
     let stale = storage.list_issues(&filters)?;
-    let stale_output: Vec<StaleIssue> = stale.iter().cloned().map(StaleIssue::from).collect();
 
     // Output based on mode
     if matches!(ctx.mode(), OutputMode::Quiet) {
@@ -83,9 +82,10 @@ fn execute_inner(args: &StaleArgs, ctx: &OutputContext, storage: &SqliteStorage)
     if matches!(ctx.mode(), OutputMode::Rich) {
         render_stale_rich(&stale, now, args.days, ctx);
     } else if ctx.is_toon() {
+        let stale_output = stale_issue_outputs(&stale);
         ctx.toon(&stale_output);
     } else if ctx.is_json() {
-        ctx.json(&stale_output);
+        ctx.json_array(stale.iter().map(stale_issue_output));
     } else {
         println!(
             "Stale issues ({} not updated in {}+ days):",
@@ -120,6 +120,23 @@ fn execute_inner(args: &StaleArgs, ctx: &OutputContext, storage: &SqliteStorage)
     }
 
     Ok(())
+}
+
+fn stale_issue_outputs(stale: &[Issue]) -> Vec<StaleIssue> {
+    stale.iter().map(stale_issue_output).collect()
+}
+
+fn stale_issue_output(issue: &Issue) -> StaleIssue {
+    StaleIssue {
+        created_at: issue.created_at,
+        id: issue.id.clone(),
+        issue_type: issue.issue_type.clone(),
+        priority: issue.priority,
+        status: issue.status.clone(),
+        title: issue.title.clone(),
+        updated_at: issue.updated_at,
+        assignee: issue.assignee.clone(),
+    }
 }
 
 fn parse_statuses(values: &[String]) -> Result<Vec<Status>> {
@@ -277,6 +294,27 @@ mod tests {
 
         assert!(!rendered.chars().any(char::is_control));
         assert_eq!(rendered, "bd-1\\u{1b}]52;c;bad\\u{7}");
+    }
+
+    #[test]
+    fn test_stale_issue_output_iterator_matches_materialized_outputs() {
+        let now = Utc::now();
+        let issues = vec![
+            make_issue("bd-1", now - Duration::days(10)),
+            make_issue("bd-2", now - Duration::days(40)),
+        ];
+
+        let streamed: Vec<StaleIssue> = issues.iter().map(stale_issue_output).collect();
+        let materialized: Vec<StaleIssue> = issues.iter().cloned().map(StaleIssue::from).collect();
+
+        let streamed_json = serde_json::to_vec(&streamed).expect("serialize streamed stale output");
+        let materialized_json =
+            serde_json::to_vec(&materialized).expect("serialize materialized stale output");
+        assert_eq!(streamed_json, materialized_json);
+
+        let helper_json = serde_json::to_vec(&stale_issue_outputs(&issues))
+            .expect("serialize helper stale output");
+        assert_eq!(helper_json, materialized_json);
     }
 
     /// Filter and sort stale issues for testing purposes.
