@@ -4254,14 +4254,20 @@ impl SqliteStorage {
         high_bucket_filters.priorities = Some(priorities);
         high_bucket_filters.limit = Some(limit);
 
-        let summary_issues = self.query_ready_issue_candidates_with_projection(
+        let mut summary_issues = self.query_ready_issue_candidates_with_projection(
             &high_bucket_filters,
             ReadySortPolicy::Oldest,
-            exclude_blocked_in_sql,
-            true,
+            false,
+            false,
             ReadyIssueProjection::Summary,
         )?;
-        if summary_issues.len() == limit {
+        if exclude_blocked_in_sql {
+            let blocked_ids = self.get_blocked_ids()?;
+            summary_issues.retain(|issue| !blocked_ids.contains(issue.id.as_str()));
+        }
+
+        if summary_issues.len() >= limit {
+            summary_issues.truncate(limit);
             if projection == ReadyIssueProjection::Summary {
                 return Ok(Some(summary_issues));
             }
@@ -10749,6 +10755,95 @@ mod tests {
         }
     }
 
+    type ReadyTextFields = (
+        String,
+        String,
+        Status,
+        Priority,
+        IssueType,
+        DateTime<Utc>,
+        DateTime<Utc>,
+    );
+
+    fn ready_text_fields(issue: Issue) -> ReadyTextFields {
+        (
+            issue.id,
+            issue.title,
+            issue.status,
+            issue.priority,
+            issue.issue_type,
+            issue.created_at,
+            issue.updated_at,
+        )
+    }
+
+    fn ready_summary_projection_fixture() -> SqliteStorage {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let created_at = Utc.with_ymd_and_hms(2026, 3, 20, 12, 0, 0).unwrap();
+
+        let mut ready = make_issue(
+            "bd-ready-summary",
+            "Ready summary issue",
+            Status::Open,
+            1,
+            Some("alice"),
+            created_at,
+            None,
+        );
+        ready.description = Some("Description should stay cold".to_string());
+        ready.design = Some("Design should stay cold".repeat(128));
+        ready.acceptance_criteria = Some("AC should stay cold".repeat(128));
+        ready.notes = Some("Notes should stay cold".repeat(128));
+        ready.owner = Some("product".to_string());
+        ready.estimated_minutes = Some(45);
+        ready.created_by = Some("agent".to_string());
+        ready.updated_at = created_at + chrono::Duration::minutes(5);
+
+        let issues = [
+            ready,
+            make_issue(
+                "bd-ready-summary-other",
+                "Other ready summary issue",
+                Status::Open,
+                2,
+                None,
+                created_at + chrono::Duration::minutes(1),
+                None,
+            ),
+            make_issue(
+                "bd-ready-summary-blocker",
+                "Blocker",
+                Status::Open,
+                0,
+                None,
+                created_at + chrono::Duration::minutes(2),
+                None,
+            ),
+            make_issue(
+                "bd-ready-summary-blocked",
+                "Blocked",
+                Status::Open,
+                1,
+                None,
+                created_at + chrono::Duration::minutes(3),
+                None,
+            ),
+        ];
+        for issue in &issues {
+            storage.create_issue(issue, "tester").unwrap();
+        }
+        storage
+            .add_dependency(
+                "bd-ready-summary-blocked",
+                "bd-ready-summary-blocker",
+                "blocks",
+                "tester",
+            )
+            .unwrap();
+
+        storage
+    }
+
     fn blocker_id_from_ref_for_test(blocker_ref: &str) -> String {
         blocker_ref
             .rsplit_once(':')
@@ -13529,84 +13624,14 @@ mod tests {
 
     #[test]
     fn test_get_ready_summary_issues_for_command_output_matches_full_text_fields() {
-        let mut storage = SqliteStorage::open_memory().unwrap();
-        let created_at = Utc.with_ymd_and_hms(2026, 3, 20, 12, 0, 0).unwrap();
-
-        let mut ready = make_issue(
-            "bd-ready-summary",
-            "Ready summary issue",
-            Status::Open,
-            1,
-            Some("alice"),
-            created_at,
-            None,
-        );
-        ready.description = Some("Description should stay cold".to_string());
-        ready.design = Some("Design should stay cold".repeat(128));
-        ready.acceptance_criteria = Some("AC should stay cold".repeat(128));
-        ready.notes = Some("Notes should stay cold".repeat(128));
-        ready.owner = Some("product".to_string());
-        ready.estimated_minutes = Some(45);
-        ready.created_by = Some("agent".to_string());
-        ready.updated_at = created_at + chrono::Duration::minutes(5);
-
-        let other_ready = make_issue(
-            "bd-ready-summary-other",
-            "Other ready summary issue",
-            Status::Open,
-            2,
-            None,
-            created_at + chrono::Duration::minutes(1),
-            None,
-        );
-        let blocker = make_issue(
-            "bd-ready-summary-blocker",
-            "Blocker",
-            Status::Open,
-            0,
-            None,
-            created_at + chrono::Duration::minutes(2),
-            None,
-        );
-        let blocked = make_issue(
-            "bd-ready-summary-blocked",
-            "Blocked",
-            Status::Open,
-            1,
-            None,
-            created_at + chrono::Duration::minutes(3),
-            None,
-        );
-
-        storage.create_issue(&ready, "tester").unwrap();
-        storage.create_issue(&other_ready, "tester").unwrap();
-        storage.create_issue(&blocker, "tester").unwrap();
-        storage.create_issue(&blocked, "tester").unwrap();
-        storage
-            .add_dependency(
-                "bd-ready-summary-blocked",
-                "bd-ready-summary-blocker",
-                "blocks",
-                "tester",
-            )
-            .unwrap();
+        let storage = ready_summary_projection_fixture();
 
         let filters = ReadyFilters::default();
         let full = storage
             .get_ready_issues(&filters, ReadySortPolicy::Priority)
             .unwrap()
             .into_iter()
-            .map(|issue| {
-                (
-                    issue.id,
-                    issue.title,
-                    issue.status,
-                    issue.priority,
-                    issue.issue_type,
-                    issue.created_at,
-                    issue.updated_at,
-                )
-            })
+            .map(ready_text_fields)
             .collect::<Vec<_>>();
         let projected_raw = storage
             .get_ready_summary_issues_for_command_output(&filters, ReadySortPolicy::Priority)
@@ -13626,17 +13651,7 @@ mod tests {
 
         let projected = projected_raw
             .into_iter()
-            .map(|issue| {
-                (
-                    issue.id,
-                    issue.title,
-                    issue.status,
-                    issue.priority,
-                    issue.issue_type,
-                    issue.created_at,
-                    issue.updated_at,
-                )
-            })
+            .map(ready_text_fields)
             .collect::<Vec<_>>();
 
         assert_eq!(projected, full);
@@ -13710,6 +13725,63 @@ mod tests {
         assert!(summary[0].acceptance_criteria.is_none());
         assert!(summary[0].notes.is_none());
         assert!(summary[0].assignee.is_none());
+    }
+
+    #[test]
+    fn test_limited_ready_hybrid_summary_window_skips_blocked_candidates() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let created_at = Utc.with_ymd_and_hms(2026, 3, 20, 12, 0, 0).unwrap();
+
+        let blocker = make_issue(
+            "bd-ready-window-blocker",
+            "Window blocker",
+            Status::Open,
+            0,
+            None,
+            created_at,
+            None,
+        );
+        let blocked_first = make_issue(
+            "bd-ready-window-blocked-first",
+            "Blocked first ready candidate",
+            Status::Open,
+            0,
+            None,
+            created_at + chrono::Duration::seconds(1),
+            None,
+        );
+        let unblocked_second = make_issue(
+            "bd-ready-window-unblocked-second",
+            "Unblocked second ready candidate",
+            Status::Open,
+            0,
+            None,
+            created_at + chrono::Duration::seconds(2),
+            None,
+        );
+
+        storage.create_issue(&blocker, "tester").unwrap();
+        storage.create_issue(&blocked_first, "tester").unwrap();
+        storage.create_issue(&unblocked_second, "tester").unwrap();
+        storage
+            .add_dependency(
+                "bd-ready-window-blocked-first",
+                "bd-ready-window-blocker",
+                "blocks",
+                "tester",
+            )
+            .unwrap();
+
+        let filters = ReadyFilters {
+            limit: Some(1),
+            ..ReadyFilters::default()
+        };
+        let issues = storage
+            .get_ready_summary_issues_for_command_output(&filters, ReadySortPolicy::Hybrid)
+            .unwrap();
+
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].id, "bd-ready-window-blocker");
     }
 
     #[test]
