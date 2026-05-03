@@ -154,16 +154,16 @@ fn execute_inner(
 
     debug!(filters = ?filters, sort = ?sort_policy, "Applied ready filters");
 
-    // Get ready issues from storage (blocked cache only) while avoiding
-    // heavyweight issue columns that never reach ready output.
-    let mut ready_issues = storage.get_ready_issues_for_command_output(&filters, sort_policy)?;
+    let mut ready_issues =
+        get_ready_issues_for_output(storage, &filters, sort_policy, output_format)?;
 
     if !ready_issues.is_empty() && storage.has_external_dependencies(true)? {
         if args.limit > 0 {
             // External filtering can remove early rows, so reload all local
             // candidates before applying the final user-visible limit.
             filters.limit = None;
-            ready_issues = storage.get_ready_issues_for_command_output(&filters, sort_policy)?;
+            ready_issues =
+                get_ready_issues_for_output(storage, &filters, sort_policy, output_format)?;
         }
         let external_db_paths = config::external_project_db_paths(&load_config_layer()?, beads_dir);
         let external_statuses =
@@ -254,6 +254,22 @@ fn empty_ready_message(storage: &SqliteStorage) -> Result<&'static str> {
     } else {
         "✨ All work complete — no issues to work on"
     })
+}
+
+fn get_ready_issues_for_output(
+    storage: &SqliteStorage,
+    filters: &ReadyFilters,
+    sort_policy: ReadySortPolicy,
+    output_format: OutputFormat,
+) -> Result<Vec<crate::model::Issue>> {
+    match output_format {
+        OutputFormat::Text | OutputFormat::Csv => {
+            storage.get_ready_summary_issues_for_command_output(filters, sort_policy)
+        }
+        OutputFormat::Json | OutputFormat::Toon => {
+            storage.get_ready_issues_for_command_output(filters, sort_policy)
+        }
+    }
 }
 
 fn format_ready_line(

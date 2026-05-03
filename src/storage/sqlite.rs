@@ -335,10 +335,11 @@ impl BlockedCacheRefreshPlan {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum ReadyIssueProjection {
     Full,
     Command,
+    Summary,
 }
 
 #[derive(Clone, Copy)]
@@ -407,6 +408,9 @@ impl ReadyIssueProjection {
                          issue_type, assignee, owner, estimated_minutes, created_at, created_by,
                          updated_at"
             }
+            Self::Summary => {
+                r"SELECT id, title, status, priority, issue_type, created_at, updated_at"
+            }
         }
     }
 
@@ -414,6 +418,7 @@ impl ReadyIssueProjection {
         match self {
             Self::Full => SqliteStorage::issue_from_row(row),
             Self::Command => SqliteStorage::ready_issue_from_row(row),
+            Self::Summary => SqliteStorage::command_summary_issue_from_row(row),
         }
     }
 }
@@ -3972,6 +3977,24 @@ impl SqliteStorage {
         self.get_ready_issues_with_projection(filters, sort, ReadyIssueProjection::Command)
     }
 
+    /// Get ready issues optimized for compact text command rendering.
+    ///
+    /// Hydrates only the columns read by ready text/table output and ordering.
+    /// Structured JSON/TOON callers should use
+    /// [`Self::get_ready_issues_for_command_output`] to preserve the existing
+    /// schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_ready_summary_issues_for_command_output(
+        &self,
+        filters: &ReadyFilters,
+        sort: ReadySortPolicy,
+    ) -> Result<Vec<Issue>> {
+        self.get_ready_issues_with_projection(filters, sort, ReadyIssueProjection::Summary)
+    }
+
     fn get_ready_issues_with_projection(
         &self,
         filters: &ReadyFilters,
@@ -4231,18 +4254,63 @@ impl SqliteStorage {
         high_bucket_filters.priorities = Some(priorities);
         high_bucket_filters.limit = Some(limit);
 
-        let issues = self.query_ready_issue_candidates_with_projection(
+        let summary_issues = self.query_ready_issue_candidates_with_projection(
             &high_bucket_filters,
             ReadySortPolicy::Oldest,
             exclude_blocked_in_sql,
             true,
-            projection,
+            ReadyIssueProjection::Summary,
         )?;
-        if issues.len() == limit {
-            Ok(Some(issues))
+        if summary_issues.len() == limit {
+            if projection == ReadyIssueProjection::Summary {
+                return Ok(Some(summary_issues));
+            }
+
+            let ids: Vec<String> = summary_issues.into_iter().map(|issue| issue.id).collect();
+            Ok(Some(self.get_ready_issues_by_ids_with_projection(
+                &ids, projection,
+            )?))
         } else {
             Ok(None)
         }
+    }
+
+    fn get_ready_issues_by_ids_with_projection(
+        &self,
+        ids: &[String],
+        projection: ReadyIssueProjection,
+    ) -> Result<Vec<Issue>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut by_id = HashMap::with_capacity(ids.len());
+        for chunk in ids.chunks(SQLITE_VAR_LIMIT) {
+            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+            let sql = format!(
+                "{} FROM issues WHERE id IN ({})",
+                projection.select_clause(),
+                placeholders.join(",")
+            );
+            let params: Vec<SqliteValue> = chunk
+                .iter()
+                .map(|id| SqliteValue::from(id.as_str()))
+                .collect();
+            let rows = self.conn.query_with_params(&sql, &params)?;
+            for row in &rows {
+                let issue = projection.parse_row(row)?;
+                by_id.insert(issue.id.clone(), issue);
+            }
+        }
+
+        let mut issues = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(issue) = by_id.remove(id) {
+                issues.push(issue);
+            }
+        }
+
+        Ok(issues)
     }
 
     fn query_ready_issues_without_cache_with_projection(
@@ -13457,6 +13525,191 @@ mod tests {
             .collect();
 
         assert_eq!(projected, full);
+    }
+
+    #[test]
+    fn test_get_ready_summary_issues_for_command_output_matches_full_text_fields() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let created_at = Utc.with_ymd_and_hms(2026, 3, 20, 12, 0, 0).unwrap();
+
+        let mut ready = make_issue(
+            "bd-ready-summary",
+            "Ready summary issue",
+            Status::Open,
+            1,
+            Some("alice"),
+            created_at,
+            None,
+        );
+        ready.description = Some("Description should stay cold".to_string());
+        ready.design = Some("Design should stay cold".repeat(128));
+        ready.acceptance_criteria = Some("AC should stay cold".repeat(128));
+        ready.notes = Some("Notes should stay cold".repeat(128));
+        ready.owner = Some("product".to_string());
+        ready.estimated_minutes = Some(45);
+        ready.created_by = Some("agent".to_string());
+        ready.updated_at = created_at + chrono::Duration::minutes(5);
+
+        let other_ready = make_issue(
+            "bd-ready-summary-other",
+            "Other ready summary issue",
+            Status::Open,
+            2,
+            None,
+            created_at + chrono::Duration::minutes(1),
+            None,
+        );
+        let blocker = make_issue(
+            "bd-ready-summary-blocker",
+            "Blocker",
+            Status::Open,
+            0,
+            None,
+            created_at + chrono::Duration::minutes(2),
+            None,
+        );
+        let blocked = make_issue(
+            "bd-ready-summary-blocked",
+            "Blocked",
+            Status::Open,
+            1,
+            None,
+            created_at + chrono::Duration::minutes(3),
+            None,
+        );
+
+        storage.create_issue(&ready, "tester").unwrap();
+        storage.create_issue(&other_ready, "tester").unwrap();
+        storage.create_issue(&blocker, "tester").unwrap();
+        storage.create_issue(&blocked, "tester").unwrap();
+        storage
+            .add_dependency(
+                "bd-ready-summary-blocked",
+                "bd-ready-summary-blocker",
+                "blocks",
+                "tester",
+            )
+            .unwrap();
+
+        let filters = ReadyFilters::default();
+        let full = storage
+            .get_ready_issues(&filters, ReadySortPolicy::Priority)
+            .unwrap()
+            .into_iter()
+            .map(|issue| {
+                (
+                    issue.id,
+                    issue.title,
+                    issue.status,
+                    issue.priority,
+                    issue.issue_type,
+                    issue.created_at,
+                    issue.updated_at,
+                )
+            })
+            .collect::<Vec<_>>();
+        let projected_raw = storage
+            .get_ready_summary_issues_for_command_output(&filters, ReadySortPolicy::Priority)
+            .unwrap();
+        let projected_issue = projected_raw
+            .iter()
+            .find(|issue| issue.id == "bd-ready-summary")
+            .unwrap();
+        assert!(projected_issue.description.is_none());
+        assert!(projected_issue.design.is_none());
+        assert!(projected_issue.acceptance_criteria.is_none());
+        assert!(projected_issue.notes.is_none());
+        assert!(projected_issue.assignee.is_none());
+        assert!(projected_issue.owner.is_none());
+        assert!(projected_issue.estimated_minutes.is_none());
+        assert!(projected_issue.created_by.is_none());
+
+        let projected = projected_raw
+            .into_iter()
+            .map(|issue| {
+                (
+                    issue.id,
+                    issue.title,
+                    issue.status,
+                    issue.priority,
+                    issue.issue_type,
+                    issue.created_at,
+                    issue.updated_at,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(projected, full);
+    }
+
+    #[test]
+    fn test_limited_ready_hybrid_hydrates_command_projection_after_summary_window() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let created_at = Utc.with_ymd_and_hms(2026, 3, 20, 12, 0, 0).unwrap();
+
+        let mut first = make_issue(
+            "bd-ready-window-first",
+            "First visible ready issue",
+            Status::Open,
+            1,
+            Some("alice"),
+            created_at,
+            None,
+        );
+        first.description = Some("Visible description".to_string());
+        first.acceptance_criteria = Some("Visible acceptance criteria".to_string());
+        first.notes = Some("Visible notes".to_string());
+        first.owner = Some("product".to_string());
+        first.estimated_minutes = Some(30);
+        first.created_by = Some("agent".to_string());
+        first.updated_at = created_at + chrono::Duration::minutes(5);
+
+        let second = make_issue(
+            "bd-ready-window-second",
+            "Second ready issue",
+            Status::Open,
+            1,
+            None,
+            created_at + chrono::Duration::minutes(1),
+            None,
+        );
+
+        storage.create_issue(&first, "tester").unwrap();
+        storage.create_issue(&second, "tester").unwrap();
+
+        let filters = ReadyFilters {
+            limit: Some(1),
+            ..ReadyFilters::default()
+        };
+        let command = storage
+            .get_ready_issues_for_command_output(&filters, ReadySortPolicy::Hybrid)
+            .unwrap();
+
+        assert_eq!(command.len(), 1);
+        assert_eq!(command[0].id, "bd-ready-window-first");
+        assert_eq!(
+            command[0].description.as_deref(),
+            Some("Visible description")
+        );
+        assert_eq!(
+            command[0].acceptance_criteria.as_deref(),
+            Some("Visible acceptance criteria")
+        );
+        assert_eq!(command[0].notes.as_deref(), Some("Visible notes"));
+        assert_eq!(command[0].assignee.as_deref(), Some("alice"));
+        assert_eq!(command[0].owner.as_deref(), Some("product"));
+        assert_eq!(command[0].estimated_minutes, Some(30));
+        assert_eq!(command[0].created_by.as_deref(), Some("agent"));
+
+        let summary = storage
+            .get_ready_summary_issues_for_command_output(&filters, ReadySortPolicy::Hybrid)
+            .unwrap();
+        assert_eq!(summary.len(), 1);
+        assert_eq!(summary[0].id, "bd-ready-window-first");
+        assert!(summary[0].description.is_none());
+        assert!(summary[0].acceptance_criteria.is_none());
+        assert!(summary[0].notes.is_none());
+        assert!(summary[0].assignee.is_none());
     }
 
     #[test]
