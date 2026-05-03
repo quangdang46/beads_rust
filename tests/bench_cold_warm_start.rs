@@ -34,6 +34,9 @@
 
 mod common;
 
+use common::artifact_validator::{
+    ArtifactValidator, StartupMatrixAggregation, StartupMatrixManifest, StartupMatrixState,
+};
 use common::binary_discovery::{DiscoveredBinaries, discover_binaries};
 use common::dataset_registry::{IsolatedDataset, KnownDataset};
 use serde::{Deserialize, Serialize};
@@ -122,6 +125,15 @@ struct RunResult {
     stdout: Vec<u8>,
 }
 
+/// Captured command output for startup matrix artifact bundles.
+struct StartupMatrixRun {
+    duration: Duration,
+    exit_code: i32,
+    success: bool,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
 /// Run a command and measure execution time.
 fn run_command(binary_path: &Path, args: &[&str], cwd: &Path) -> RunResult {
     let start = Instant::now();
@@ -142,6 +154,50 @@ fn run_command(binary_path: &Path, args: &[&str], cwd: &Path) -> RunResult {
         success: output.status.success(),
         stdout: output.stdout,
     }
+}
+
+/// Run a command for the startup matrix and keep enough raw evidence for a bundle.
+fn run_startup_matrix_command(
+    binary_path: &Path,
+    args: &[&str],
+    cwd: &Path,
+    env_vars: &[(&str, String)],
+) -> std::io::Result<StartupMatrixRun> {
+    let mut command = Command::new(binary_path);
+    command.args(args).current_dir(cwd);
+    for key in [
+        "BD_ACTOR",
+        "BD_DB",
+        "BD_DATABASE",
+        "BEADS_DIR",
+        "BEADS_JSONL",
+        "BEADS_CACHE_DIR",
+        "BR_OUTPUT_FORMAT",
+        "TOON_DEFAULT_FORMAT",
+        "TOON_STATS",
+    ] {
+        command.env_remove(key);
+    }
+    command.env("NO_COLOR", "1");
+    command.env("RUST_BACKTRACE", "1");
+    command.env("HOME", cwd);
+    for (key, value) in env_vars {
+        command.env(key, value);
+    }
+
+    let start = Instant::now();
+    let output = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+
+    Ok(StartupMatrixRun {
+        duration: start.elapsed(),
+        exit_code: output.status.code().unwrap_or(-1),
+        success: output.status.success(),
+        stdout: output.stdout,
+        stderr: output.stderr,
+    })
 }
 
 /// Measure cold and warm start for a single command.
@@ -335,8 +391,202 @@ const BENCHMARK_COMMANDS: &[(&str, &[&str])] = &[
     ("sync_status", &["sync", "--status"]),
 ];
 
+const STARTUP_MATRIX_STATES: &[&str] = &[
+    "clean",
+    "stale",
+    "routed",
+    "no_db",
+    "read_only_fast_open",
+    "sync_status",
+    "recovery_anomaly",
+];
+
 /// Number of warm runs per command.
 const WARM_RUNS: usize = 5;
+
+fn startup_matrix_args(state: &str) -> &'static [&'static str] {
+    match state {
+        "no_db" => &["--no-db", "list", "--json"],
+        "read_only_fast_open" => &["--no-auto-import", "--no-auto-flush", "list", "--json"],
+        "stale" | "sync_status" | "recovery_anomaly" => &["sync", "--status", "--json"],
+        _ => &["list", "--json"],
+    }
+}
+
+fn prepare_startup_matrix_workspace(
+    br_path: &Path,
+    state: &str,
+) -> std::io::Result<(TempDir, PathBuf)> {
+    let (temp_dir, root) = create_br_workspace(br_path, 3)?;
+
+    match state {
+        "stale" => {
+            let output = Command::new(br_path)
+                .args(["create", "Startup matrix stale marker", "--no-auto-flush"])
+                .current_dir(&root)
+                .output()?;
+            if !output.status.success() {
+                return Err(std::io::Error::other(format!(
+                    "startup matrix stale setup failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                )));
+            }
+        }
+        "recovery_anomaly" => {
+            let recovery_dir = root.join(".beads").join(".br_recovery");
+            fs::create_dir_all(&recovery_dir)?;
+            fs::write(
+                recovery_dir.join("startup-matrix-leftover.txt"),
+                "synthetic recovery artifact for startup matrix smoke\n",
+            )?;
+        }
+        _ => {}
+    }
+
+    Ok((temp_dir, root))
+}
+
+fn write_startup_matrix_state_artifacts(
+    bundle_dir: &Path,
+    state: &str,
+    args: &[&str],
+    cwd: &Path,
+    env_vars: &[(&str, String)],
+    run: &StartupMatrixRun,
+) -> std::io::Result<StartupMatrixState> {
+    for subdir in ["logs", "timing", "syscalls", "rss", "raw"] {
+        fs::create_dir_all(bundle_dir.join(subdir))?;
+    }
+
+    let command_log_path = format!("logs/{state}.log");
+    let timing_summary_path = format!("timing/{state}.json");
+    let syscall_summary_path = format!("syscalls/{state}.json");
+    let rss_summary_path = format!("rss/{state}.json");
+    let stdout_path = format!("raw/{state}.stdout");
+    let stderr_path = format!("raw/{state}.stderr");
+
+    let env_keys = env_vars.iter().map(|(key, _)| *key).collect::<Vec<_>>();
+    let duration_ms = run.duration.as_secs_f64() * 1000.0;
+    let command_log = format!(
+        "state: {state}\nargs: {args:?}\ncwd: {}\nenv_keys: {env_keys:?}\nexit_code: {}\nsuccess: {}\nduration_ms: {duration_ms:.3}\nstdout_len: {}\nstderr_len: {}\n",
+        cwd.display(),
+        run.exit_code,
+        run.success,
+        run.stdout.len(),
+        run.stderr.len()
+    );
+    fs::write(bundle_dir.join(&command_log_path), command_log)?;
+    fs::write(bundle_dir.join(&stdout_path), &run.stdout)?;
+    fs::write(bundle_dir.join(&stderr_path), &run.stderr)?;
+
+    let timing_summary = serde_json::json!({
+        "state": state,
+        "args": args,
+        "cwd": cwd.display().to_string(),
+        "env_keys": env_keys,
+        "duration_ms": duration_ms,
+        "exit_code": run.exit_code,
+        "success": run.success,
+        "stdout_bytes": run.stdout.len(),
+        "stderr_bytes": run.stderr.len(),
+    });
+    fs::write(
+        bundle_dir.join(&timing_summary_path),
+        serde_json::to_string_pretty(&timing_summary)?,
+    )?;
+
+    let syscall_summary = serde_json::json!({
+        "state": state,
+        "collector": "startup_matrix_smoke",
+        "status": "not_collected",
+        "reason": "smoke runner records the required artifact slot without requiring strace or elevated privileges",
+    });
+    fs::write(
+        bundle_dir.join(&syscall_summary_path),
+        serde_json::to_string_pretty(&syscall_summary)?,
+    )?;
+
+    let rss_summary = serde_json::json!({
+        "state": state,
+        "collector": "startup_matrix_smoke",
+        "status": "not_collected",
+        "reason": "smoke runner records the required artifact slot; full matrix runners can replace this with platform RSS capture",
+    });
+    fs::write(
+        bundle_dir.join(&rss_summary_path),
+        serde_json::to_string_pretty(&rss_summary)?,
+    )?;
+
+    Ok(StartupMatrixState {
+        state: state.to_string(),
+        command_log_path,
+        timing_summary_path,
+        syscall_summary_path,
+        rss_summary_path,
+        raw_artifact_paths: vec![stdout_path, stderr_path],
+    })
+}
+
+fn write_startup_matrix_smoke_bundle(
+    br_path: &Path,
+    bundle_dir: &Path,
+) -> std::io::Result<StartupMatrixManifest> {
+    fs::create_dir_all(bundle_dir)?;
+    let mut states = Vec::with_capacity(STARTUP_MATRIX_STATES.len());
+
+    for &state in STARTUP_MATRIX_STATES {
+        let (_workspace_guard, workspace_root) = prepare_startup_matrix_workspace(br_path, state)?;
+        let routed_cwd = if state == "routed" {
+            Some(TempDir::new()?)
+        } else {
+            None
+        };
+        let cwd = routed_cwd
+            .as_ref()
+            .map_or(workspace_root.as_path(), tempfile::TempDir::path);
+        let env_vars = if state == "routed" {
+            vec![(
+                "BEADS_DIR",
+                workspace_root.join(".beads").display().to_string(),
+            )]
+        } else {
+            Vec::new()
+        };
+        let args = startup_matrix_args(state);
+        let run = run_startup_matrix_command(br_path, args, cwd, &env_vars)?;
+        if !run.success {
+            return Err(std::io::Error::other(format!(
+                "startup matrix state {state} failed with code {}; stdout={}; stderr={}",
+                run.exit_code,
+                String::from_utf8_lossy(&run.stdout),
+                String::from_utf8_lossy(&run.stderr)
+            )));
+        }
+
+        states.push(write_startup_matrix_state_artifacts(
+            bundle_dir, state, args, cwd, &env_vars, &run,
+        )?);
+    }
+
+    let manifest = StartupMatrixManifest {
+        schema_version: "br.startup-matrix.v1".to_string(),
+        matrix_name: "storage-open-smoke".to_string(),
+        generated_at: chrono::Utc::now().to_rfc3339(),
+        states,
+        aggregation: StartupMatrixAggregation {
+            status: "ok".to_string(),
+            raw_evidence_preserved: true,
+            error: None,
+        },
+    };
+
+    fs::write(
+        bundle_dir.join("startup-matrix-manifest.json"),
+        serde_json::to_string_pretty(&manifest)?,
+    )?;
+
+    Ok(manifest)
+}
 
 /// Run cold/warm benchmarks for a single dataset.
 fn benchmark_cold_warm(
@@ -935,6 +1185,38 @@ fn cold_warm_real_datasets() {
         write_results_json(&all_results, &output_path).expect("write results");
         println!("\nResults written to: {}", output_path.display());
     }
+}
+
+/// Smoke runner for the storage-open startup matrix artifact bundle.
+#[test]
+fn startup_matrix_smoke_bundle_covers_storage_open_states() -> std::io::Result<()> {
+    let br_path = assert_cmd::cargo::cargo_bin!("br");
+    let run_id = format!(
+        "startup-matrix-smoke-{}-{}",
+        chrono::Utc::now().format("%Y%m%dT%H%M%S%fZ"),
+        std::process::id()
+    );
+    let bundle_dir = PathBuf::from("target").join("perf-artifacts").join(run_id);
+
+    let manifest = write_startup_matrix_smoke_bundle(br_path, &bundle_dir)?;
+    let validation = ArtifactValidator::new().validate_startup_matrix_bundle_dir(&bundle_dir);
+    assert!(
+        validation.valid,
+        "startup matrix bundle should validate: {:?}",
+        validation.errors
+    );
+
+    let mut states = manifest
+        .states
+        .iter()
+        .map(|state| state.state.as_str())
+        .collect::<Vec<_>>();
+    states.sort_unstable();
+    let mut expected = STARTUP_MATRIX_STATES.to_vec();
+    expected.sort_unstable();
+    assert_eq!(states, expected);
+
+    Ok(())
 }
 
 /// Unit test for cold/warm ratio calculation.
