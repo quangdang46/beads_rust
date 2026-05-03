@@ -1,0 +1,659 @@
+//! Pure contracts for future `.write.lock` write combining.
+//!
+//! This module deliberately does not route commands through a combiner. It
+//! defines the compatibility allowlist and request/result envelope shapes that a
+//! future explicit combiner can use once output parity and failure-injection
+//! tests exist.
+
+use crate::cli::{
+    CloseArgs, Commands, CommentAddArgs, CommentCommands, CreateArgs, DepAddArgs, DepCommands,
+    DepRemoveArgs, ReopenArgs, UpdateArgs,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+/// Schema version for write-combining request and result envelopes.
+pub const WRITE_COMBINING_SCHEMA_VERSION: &str = "br.write-combining.v1";
+
+/// Whether a CLI command can enter the future write-combining queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "class", content = "value")]
+pub enum CommandCompatibility {
+    /// The command is in the conservative allowlist.
+    Candidate(CompatibleMutation),
+    /// The command must use the existing direct path.
+    DirectOnly(DirectOnlyReason),
+}
+
+impl CommandCompatibility {
+    /// Return the compatible mutation family, if this command can be queued.
+    #[must_use]
+    pub const fn candidate_family(self) -> Option<CompatibleMutation> {
+        match self {
+            Self::Candidate(family) => Some(family),
+            Self::DirectOnly(_) => None,
+        }
+    }
+}
+
+/// Mutation families that are eligible for future write-combining proofs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompatibleMutation {
+    /// A simple issue create with explicit CLI fields and no bulk file input.
+    CreateIssue,
+    /// An explicit inline comment add.
+    AddComment,
+    /// An explicit issue update limited to direct issue fields or labels.
+    UpdateIssue,
+    /// An explicit issue close without follow-up suggestion output.
+    CloseIssue,
+    /// An explicit issue reopen.
+    ReopenIssue,
+    /// An explicit dependency add without metadata side payloads.
+    AddDependency,
+    /// An explicit dependency removal.
+    RemoveDependency,
+}
+
+/// Why a command must stay on the direct path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectOnlyReason {
+    /// The command is read-only, so queueing would only add overhead.
+    ReadOnly,
+    /// The command can affect storage topology, external files, repair policy,
+    /// or another side effect outside the first combiner allowlist.
+    UnsafeCommand,
+    /// The command uses file or stdin-style payloads that need direct handling.
+    FileInput,
+    /// The command is a preview and should not enter a mutating queue.
+    DryRun,
+    /// The command relies on last-touched state or an implicit target.
+    MissingExplicitTarget,
+    /// The command has no direct payload after validation.
+    MissingPayload,
+    /// The command uses a real but not-yet-proven option for this family.
+    UnsupportedOption,
+}
+
+/// Output mode requested by a queued caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CombinedOutputMode {
+    /// Machine-readable JSON.
+    Json,
+    /// Token-efficient TOON.
+    Toon,
+    /// Plain human text.
+    Plain,
+    /// Quiet mode.
+    Quiet,
+}
+
+/// Auto-flush result attached to a combined mutation result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CombinedFlushOutcome {
+    /// The caller disabled or did not request auto-flush.
+    NotRequested,
+    /// The shared flush succeeded for this caller's committed mutation.
+    Succeeded,
+    /// SQLite committed, but the JSONL export failed.
+    FailedAfterCommit,
+}
+
+/// Request envelope for a future explicit combiner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MutationEnvelope {
+    /// Envelope schema version.
+    pub schema_version: String,
+    /// Caller-provided key used to detect accepted requests after crashes.
+    pub idempotency_key: String,
+    /// Actor to preserve in audit events.
+    pub actor: String,
+    /// Compatible mutation family.
+    pub family: CompatibleMutation,
+    /// Requested output mode.
+    pub output_mode: CombinedOutputMode,
+    /// Absolute caller deadline in Unix milliseconds.
+    pub deadline_unix_ms: u64,
+    /// Serialized command arguments for the compatible family.
+    pub arguments: Value,
+}
+
+impl MutationEnvelope {
+    /// Build an envelope with the current schema version.
+    #[must_use]
+    pub fn new(
+        idempotency_key: impl Into<String>,
+        actor: impl Into<String>,
+        family: CompatibleMutation,
+        output_mode: CombinedOutputMode,
+        deadline_unix_ms: u64,
+        arguments: Value,
+    ) -> Self {
+        Self {
+            schema_version: WRITE_COMBINING_SCHEMA_VERSION.to_string(),
+            idempotency_key: idempotency_key.into(),
+            actor: actor.into(),
+            family,
+            output_mode,
+            deadline_unix_ms,
+            arguments,
+        }
+    }
+
+    /// Validate envelope invariants that are independent of storage state.
+    pub fn validate(&self) -> std::result::Result<(), EnvelopeValidationError> {
+        if self.schema_version != WRITE_COMBINING_SCHEMA_VERSION {
+            return Err(EnvelopeValidationError::UnsupportedSchemaVersion);
+        }
+        if self.idempotency_key.trim().is_empty() {
+            return Err(EnvelopeValidationError::EmptyIdempotencyKey);
+        }
+        if self.actor.trim().is_empty() {
+            return Err(EnvelopeValidationError::EmptyActor);
+        }
+        if self.deadline_unix_ms == 0 {
+            return Err(EnvelopeValidationError::MissingDeadline);
+        }
+        Ok(())
+    }
+}
+
+/// Storage-independent envelope validation errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvelopeValidationError {
+    /// The envelope uses a schema version this binary does not support.
+    UnsupportedSchemaVersion,
+    /// The idempotency key is empty or whitespace.
+    EmptyIdempotencyKey,
+    /// The actor is empty or whitespace.
+    EmptyActor,
+    /// The caller did not provide a bounded deadline.
+    MissingDeadline,
+}
+
+/// Per-caller result shape for a future combiner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MutationResult {
+    /// The idempotency key from the accepted envelope.
+    pub idempotency_key: String,
+    /// Mutation family that was applied.
+    pub family: CompatibleMutation,
+    /// Process-style exit code to preserve CLI surfaces.
+    pub exit_code: i32,
+    /// Captured stdout for this caller.
+    pub stdout: String,
+    /// Captured stderr for this caller.
+    pub stderr: String,
+    /// Auto-flush result visible to this caller.
+    pub flush: CombinedFlushOutcome,
+}
+
+/// Classify a parsed CLI command for future write-combining eligibility.
+#[must_use]
+pub fn classify_command(command: &Commands) -> CommandCompatibility {
+    match command {
+        Commands::Create(args) => classify_create(args),
+        Commands::Comments(args) => args.command.as_ref().map_or(
+            CommandCompatibility::DirectOnly(DirectOnlyReason::ReadOnly),
+            |command| match command {
+                CommentCommands::Add(args) => classify_comment_add(args),
+                CommentCommands::List(_) => {
+                    CommandCompatibility::DirectOnly(DirectOnlyReason::ReadOnly)
+                }
+            },
+        ),
+        Commands::Update(args) => classify_update(args),
+        Commands::Close(args) => classify_close(args),
+        Commands::Reopen(args) => classify_reopen(args),
+        Commands::Dep { command } => classify_dependency(command),
+        Commands::List(_)
+        | Commands::Show(_)
+        | Commands::Search(_)
+        | Commands::Ready(_)
+        | Commands::Blocked(_)
+        | Commands::Count(_)
+        | Commands::Stale(_)
+        | Commands::Lint(_)
+        | Commands::Stats(_)
+        | Commands::Status(_)
+        | Commands::Changelog(_)
+        | Commands::Graph(_)
+        | Commands::Info(_)
+        | Commands::Schema(_)
+        | Commands::Where
+        | Commands::Version(_)
+        | Commands::Completions(_)
+        | Commands::Query { .. } => CommandCompatibility::DirectOnly(DirectOnlyReason::ReadOnly),
+        _ => CommandCompatibility::DirectOnly(DirectOnlyReason::UnsafeCommand),
+    }
+}
+
+fn classify_create(args: &CreateArgs) -> CommandCompatibility {
+    if args.dry_run {
+        return CommandCompatibility::DirectOnly(DirectOnlyReason::DryRun);
+    }
+    if args.file.is_some() {
+        return CommandCompatibility::DirectOnly(DirectOnlyReason::FileInput);
+    }
+    if args.title.is_none() && args.title_flag.is_none() {
+        return CommandCompatibility::DirectOnly(DirectOnlyReason::MissingPayload);
+    }
+    if args.ephemeral || args.parent.is_some() || !args.deps.is_empty() {
+        return CommandCompatibility::DirectOnly(DirectOnlyReason::UnsupportedOption);
+    }
+    CommandCompatibility::Candidate(CompatibleMutation::CreateIssue)
+}
+
+fn classify_comment_add(args: &CommentAddArgs) -> CommandCompatibility {
+    if args.file.is_some() {
+        return CommandCompatibility::DirectOnly(DirectOnlyReason::FileInput);
+    }
+    if args.message.as_ref().is_none_or(String::is_empty) && args.text.is_empty() {
+        return CommandCompatibility::DirectOnly(DirectOnlyReason::MissingPayload);
+    }
+    CommandCompatibility::Candidate(CompatibleMutation::AddComment)
+}
+
+fn classify_update(args: &UpdateArgs) -> CommandCompatibility {
+    if args.ids.is_empty() {
+        return CommandCompatibility::DirectOnly(DirectOnlyReason::MissingExplicitTarget);
+    }
+    if has_unsupported_update_option(args) {
+        return CommandCompatibility::DirectOnly(DirectOnlyReason::UnsupportedOption);
+    }
+    if has_supported_update_payload(args) {
+        CommandCompatibility::Candidate(CompatibleMutation::UpdateIssue)
+    } else {
+        CommandCompatibility::DirectOnly(DirectOnlyReason::MissingPayload)
+    }
+}
+
+fn has_supported_update_payload(args: &UpdateArgs) -> bool {
+    args.title.is_some()
+        || args.description.is_some()
+        || args.status.is_some()
+        || args.priority.is_some()
+        || args.type_.is_some()
+        || args.assignee.is_some()
+        || args.claim
+        || !args.add_label.is_empty()
+        || !args.remove_label.is_empty()
+        || !args.set_labels.is_empty()
+}
+
+fn has_unsupported_update_option(args: &UpdateArgs) -> bool {
+    args.design.is_some()
+        || args.acceptance_criteria.is_some()
+        || args.notes.is_some()
+        || args.owner.is_some()
+        || args.force
+        || args.due.is_some()
+        || args.defer.is_some()
+        || args.estimate.is_some()
+        || args.parent.is_some()
+        || args.external_ref.is_some()
+        || args.session.is_some()
+}
+
+fn classify_close(args: &CloseArgs) -> CommandCompatibility {
+    if args.ids.is_empty() {
+        return CommandCompatibility::DirectOnly(DirectOnlyReason::MissingExplicitTarget);
+    }
+    if args.force || args.suggest_next {
+        return CommandCompatibility::DirectOnly(DirectOnlyReason::UnsupportedOption);
+    }
+    CommandCompatibility::Candidate(CompatibleMutation::CloseIssue)
+}
+
+fn classify_reopen(args: &ReopenArgs) -> CommandCompatibility {
+    if args.ids.is_empty() {
+        return CommandCompatibility::DirectOnly(DirectOnlyReason::MissingExplicitTarget);
+    }
+    CommandCompatibility::Candidate(CompatibleMutation::ReopenIssue)
+}
+
+fn classify_dependency(command: &DepCommands) -> CommandCompatibility {
+    match command {
+        DepCommands::Add(args) => classify_dependency_add(args),
+        DepCommands::Remove(args) => classify_dependency_remove(args),
+        DepCommands::List(_) | DepCommands::Tree(_) | DepCommands::Cycles(_) => {
+            CommandCompatibility::DirectOnly(DirectOnlyReason::ReadOnly)
+        }
+    }
+}
+
+fn classify_dependency_add(args: &DepAddArgs) -> CommandCompatibility {
+    if args.metadata.is_some() {
+        CommandCompatibility::DirectOnly(DirectOnlyReason::UnsupportedOption)
+    } else {
+        CommandCompatibility::Candidate(CompatibleMutation::AddDependency)
+    }
+}
+
+fn classify_dependency_remove(_args: &DepRemoveArgs) -> CommandCompatibility {
+    CommandCompatibility::Candidate(CompatibleMutation::RemoveDependency)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::{CommentListArgs, CommentsArgs, DepListArgs, DepRemoveArgs, DepTreeArgs};
+    use serde_json::json;
+    use std::path::PathBuf;
+
+    #[test]
+    fn classifies_simple_create_as_candidate() {
+        let command = Commands::Create(CreateArgs {
+            title: Some("claim ready work".to_string()),
+            ..CreateArgs::default()
+        });
+
+        assert_eq!(
+            classify_command(&command),
+            CommandCompatibility::Candidate(CompatibleMutation::CreateIssue)
+        );
+    }
+
+    #[test]
+    fn create_with_bulk_file_stays_direct() {
+        let command = Commands::Create(CreateArgs {
+            file: Some(PathBuf::from("issues.md")),
+            title: Some("bulk".to_string()),
+            ..CreateArgs::default()
+        });
+
+        assert_eq!(
+            classify_command(&command),
+            CommandCompatibility::DirectOnly(DirectOnlyReason::FileInput)
+        );
+    }
+
+    #[test]
+    fn create_with_dependency_stays_direct_until_proven() {
+        let command = Commands::Create(CreateArgs {
+            title: Some("child".to_string()),
+            parent: Some("br-parent".to_string()),
+            ..CreateArgs::default()
+        });
+
+        assert_eq!(
+            classify_command(&command),
+            CommandCompatibility::DirectOnly(DirectOnlyReason::UnsupportedOption)
+        );
+    }
+
+    #[test]
+    fn comment_add_requires_inline_payload() {
+        let command = Commands::Comments(CommentsArgs {
+            command: Some(CommentCommands::Add(CommentAddArgs {
+                id: "br-1".to_string(),
+                text: Vec::new(),
+                file: None,
+                author: None,
+                message: Some("done".to_string()),
+            })),
+            id: None,
+            wrap: false,
+        });
+
+        assert_eq!(
+            classify_command(&command),
+            CommandCompatibility::Candidate(CompatibleMutation::AddComment)
+        );
+    }
+
+    #[test]
+    fn comment_file_input_stays_direct() {
+        let command = Commands::Comments(CommentsArgs {
+            command: Some(CommentCommands::Add(CommentAddArgs {
+                id: "br-1".to_string(),
+                text: Vec::new(),
+                file: Some(PathBuf::from("comment.md")),
+                author: None,
+                message: None,
+            })),
+            id: None,
+            wrap: false,
+        });
+
+        assert_eq!(
+            classify_command(&command),
+            CommandCompatibility::DirectOnly(DirectOnlyReason::FileInput)
+        );
+    }
+
+    #[test]
+    fn comment_list_is_read_only() {
+        let command = Commands::Comments(CommentsArgs {
+            command: Some(CommentCommands::List(CommentListArgs {
+                id: "br-1".to_string(),
+                wrap: false,
+            })),
+            id: None,
+            wrap: false,
+        });
+
+        assert_eq!(
+            classify_command(&command),
+            CommandCompatibility::DirectOnly(DirectOnlyReason::ReadOnly)
+        );
+    }
+
+    #[test]
+    fn explicit_status_update_is_candidate() {
+        let command = Commands::Update(UpdateArgs {
+            ids: vec!["br-1".to_string()],
+            status: Some("in_progress".to_string()),
+            ..UpdateArgs::default()
+        });
+
+        assert_eq!(
+            classify_command(&command),
+            CommandCompatibility::Candidate(CompatibleMutation::UpdateIssue)
+        );
+    }
+
+    #[test]
+    fn implicit_update_target_stays_direct() {
+        let command = Commands::Update(UpdateArgs {
+            status: Some("in_progress".to_string()),
+            ..UpdateArgs::default()
+        });
+
+        assert_eq!(
+            classify_command(&command),
+            CommandCompatibility::DirectOnly(DirectOnlyReason::MissingExplicitTarget)
+        );
+    }
+
+    #[test]
+    fn unsupported_update_option_stays_direct() {
+        let command = Commands::Update(UpdateArgs {
+            ids: vec!["br-1".to_string()],
+            parent: Some("br-parent".to_string()),
+            ..UpdateArgs::default()
+        });
+
+        assert_eq!(
+            classify_command(&command),
+            CommandCompatibility::DirectOnly(DirectOnlyReason::UnsupportedOption)
+        );
+    }
+
+    #[test]
+    fn close_and_reopen_need_explicit_ids() {
+        let close = Commands::Close(CloseArgs {
+            ids: vec!["br-1".to_string()],
+            ..CloseArgs::default()
+        });
+        let reopen = Commands::Reopen(ReopenArgs {
+            ids: vec!["br-1".to_string()],
+            ..ReopenArgs::default()
+        });
+
+        assert_eq!(
+            classify_command(&close),
+            CommandCompatibility::Candidate(CompatibleMutation::CloseIssue)
+        );
+        assert_eq!(
+            classify_command(&reopen),
+            CommandCompatibility::Candidate(CompatibleMutation::ReopenIssue)
+        );
+    }
+
+    #[test]
+    fn close_suggest_next_stays_direct() {
+        let command = Commands::Close(CloseArgs {
+            ids: vec!["br-1".to_string()],
+            suggest_next: true,
+            ..CloseArgs::default()
+        });
+
+        assert_eq!(
+            classify_command(&command),
+            CommandCompatibility::DirectOnly(DirectOnlyReason::UnsupportedOption)
+        );
+    }
+
+    #[test]
+    fn dependency_add_and_remove_are_candidates() {
+        let add = Commands::Dep {
+            command: DepCommands::Add(DepAddArgs {
+                issue: "br-1".to_string(),
+                depends_on: "br-2".to_string(),
+                dep_type: "blocks".to_string(),
+                metadata: None,
+            }),
+        };
+        let remove = Commands::Dep {
+            command: DepCommands::Remove(DepRemoveArgs {
+                issue: "br-1".to_string(),
+                depends_on: "br-2".to_string(),
+            }),
+        };
+
+        assert_eq!(
+            classify_command(&add),
+            CommandCompatibility::Candidate(CompatibleMutation::AddDependency)
+        );
+        assert_eq!(
+            classify_command(&remove),
+            CommandCompatibility::Candidate(CompatibleMutation::RemoveDependency)
+        );
+    }
+
+    #[test]
+    fn dependency_metadata_stays_direct() {
+        let command = Commands::Dep {
+            command: DepCommands::Add(DepAddArgs {
+                issue: "br-1".to_string(),
+                depends_on: "br-2".to_string(),
+                dep_type: "blocks".to_string(),
+                metadata: Some("{\"source\":\"import\"}".to_string()),
+            }),
+        };
+
+        assert_eq!(
+            classify_command(&command),
+            CommandCompatibility::DirectOnly(DirectOnlyReason::UnsupportedOption)
+        );
+    }
+
+    #[test]
+    fn read_only_dependency_commands_stay_direct() {
+        let list = Commands::Dep {
+            command: DepCommands::List(DepListArgs {
+                issue: "br-1".to_string(),
+                direction: crate::cli::DepDirection::Down,
+                dep_type: None,
+                format: None,
+                stats: false,
+            }),
+        };
+        let tree = Commands::Dep {
+            command: DepCommands::Tree(DepTreeArgs {
+                issue: "br-1".to_string(),
+                direction: crate::cli::DepDirection::Down,
+                max_depth: 10,
+                format: "text".to_string(),
+            }),
+        };
+
+        assert_eq!(
+            classify_command(&list),
+            CommandCompatibility::DirectOnly(DirectOnlyReason::ReadOnly)
+        );
+        assert_eq!(
+            classify_command(&tree),
+            CommandCompatibility::DirectOnly(DirectOnlyReason::ReadOnly)
+        );
+    }
+
+    #[test]
+    fn read_only_and_unsafe_commands_do_not_enter_queue() {
+        assert_eq!(
+            classify_command(&Commands::Where),
+            CommandCompatibility::DirectOnly(DirectOnlyReason::ReadOnly)
+        );
+        assert_eq!(
+            classify_command(&Commands::Init {
+                prefix: None,
+                force: false,
+                backend: None,
+            }),
+            CommandCompatibility::DirectOnly(DirectOnlyReason::UnsafeCommand)
+        );
+    }
+
+    #[test]
+    fn envelope_new_sets_schema_and_validates() {
+        let envelope = MutationEnvelope::new(
+            "request-1",
+            "DustyPuma",
+            CompatibleMutation::CreateIssue,
+            CombinedOutputMode::Json,
+            1_900_000_000_000,
+            json!({"title": "burst"}),
+        );
+
+        assert_eq!(envelope.schema_version, WRITE_COMBINING_SCHEMA_VERSION);
+        assert_eq!(envelope.validate(), Ok(()));
+    }
+
+    #[test]
+    fn envelope_validation_rejects_missing_identity_fields() {
+        let mut envelope = MutationEnvelope::new(
+            "request-1",
+            "DustyPuma",
+            CompatibleMutation::CreateIssue,
+            CombinedOutputMode::Json,
+            1,
+            json!({}),
+        );
+
+        envelope.idempotency_key = "  ".to_string();
+        assert_eq!(
+            envelope.validate(),
+            Err(EnvelopeValidationError::EmptyIdempotencyKey)
+        );
+
+        envelope.idempotency_key = "request-1".to_string();
+        envelope.actor.clear();
+        assert_eq!(
+            envelope.validate(),
+            Err(EnvelopeValidationError::EmptyActor)
+        );
+
+        envelope.actor = "DustyPuma".to_string();
+        envelope.deadline_unix_ms = 0;
+        assert_eq!(
+            envelope.validate(),
+            Err(EnvelopeValidationError::MissingDeadline)
+        );
+    }
+}

@@ -15,6 +15,7 @@
 //! - [`error`] - Error types and handling
 //! - [`format`] - Output formatting (text, JSON)
 //! - [`util`] - Utility functions (hashing, time, paths)
+//! - [`write_combining`] - Compatibility contracts for future write combining
 
 #![forbid(unsafe_code)]
 // Lint configuration is in Cargo.toml [lints.clippy] section
@@ -34,6 +35,7 @@ pub mod storage;
 pub mod sync;
 pub mod util;
 pub mod validation;
+pub mod write_combining;
 
 #[cfg(feature = "mcp")]
 pub mod mcp;
