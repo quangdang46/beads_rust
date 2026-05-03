@@ -92,6 +92,7 @@ pub enum AnomalyClass {
         actual: bool,
     },
     BlockedCacheContentMismatch,
+    ReadyProjectionContentMismatch,
     ExportHashMismatch {
         db_hash: String,
         jsonl_hash: String,
@@ -131,6 +132,7 @@ impl AnomalyClass {
             Self::NullInNotNullColumn { .. } => "null_in_not_null_column",
             Self::DirtyFlagMismatch { .. } => "dirty_flag_mismatch",
             Self::BlockedCacheContentMismatch => "blocked_cache_content_mismatch",
+            Self::ReadyProjectionContentMismatch => "ready_projection_content_mismatch",
             Self::ExportHashMismatch { .. } => "export_hash_mismatch",
             Self::ChildCountDrift { .. } => "child_count_drift",
             Self::WriteProbeFailed { .. } => "write_probe_failed",
@@ -163,6 +165,7 @@ impl AnomalyClass {
             | Self::NullInNotNullColumn { .. }
             | Self::DirtyFlagMismatch { .. }
             | Self::BlockedCacheContentMismatch
+            | Self::ReadyProjectionContentMismatch
             | Self::ExportHashMismatch { .. }
             | Self::ChildCountDrift { .. }
             | Self::JournalSidecarPresent
@@ -233,6 +236,9 @@ impl fmt::Display for AnomalyClass {
             }
             Self::BlockedCacheContentMismatch => {
                 f.write_str("blocked_issues_cache content differs from dependency graph")
+            }
+            Self::ReadyProjectionContentMismatch => {
+                f.write_str("ready projection content differs from direct dependency graph")
             }
             Self::ExportHashMismatch {
                 db_hash,
