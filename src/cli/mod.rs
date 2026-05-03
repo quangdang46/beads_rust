@@ -1209,6 +1209,10 @@ pub struct InfoArgs {
     #[arg(long)]
     pub schema: bool,
 
+    /// Include graph projection/cache health details
+    #[arg(long)]
+    pub projections: bool,
+
     /// Show recent changes and exit
     #[arg(long = "whats-new", conflicts_with = "thanks")]
     pub whats_new: bool,

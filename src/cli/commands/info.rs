@@ -28,6 +28,24 @@ struct SchemaInfo {
 }
 
 #[derive(Serialize)]
+struct ProjectionInfo {
+    schema_version: String,
+    blocked_cache_state: String,
+    blocked_cache_stale: bool,
+    rebuild_needed: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    rebuild_reasons: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    issue_rows: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dependency_rows: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cached_blocked_rows: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    child_counter_rows: Option<usize>,
+}
+
+#[derive(Serialize)]
 struct InfoOutput {
     database_path: String,
     beads_dir: String,
@@ -46,6 +64,8 @@ struct InfoOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     schema: Option<SchemaInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    projections: Option<ProjectionInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     db_size: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     jsonl_path: Option<String>,
@@ -59,6 +79,7 @@ struct InfoSnapshot {
     config_map: Option<HashMap<String, String>>,
     detected_prefix: Option<String>,
     schema: Option<SchemaInfo>,
+    projections: Option<ProjectionInfo>,
 }
 
 /// Execute the info command.
@@ -134,6 +155,7 @@ fn collect_info_output(args: &InfoArgs, cli: &config::CliOverrides) -> Result<In
         issue_count: snapshot.issue_count,
         config: snapshot.config_map,
         schema: snapshot.schema,
+        projections: snapshot.projections,
         db_size,
         jsonl_path: Some(
             canonicalize_lossy(&startup.paths.jsonl_path)
@@ -212,12 +234,14 @@ fn collect_info_snapshot(args: &InfoArgs, conn: &Connection) -> InfoSnapshot {
     } else {
         None
     };
+    let projections = args.projections.then(|| build_projection_info(conn));
 
     InfoSnapshot {
         issue_count,
         config_map,
         detected_prefix,
         schema,
+        projections,
     }
 }
 
@@ -243,6 +267,65 @@ fn load_config_map(conn: &Connection) -> Option<HashMap<String, String>> {
     }
 
     (!config_map.is_empty()).then_some(config_map)
+}
+
+fn build_projection_info(conn: &Connection) -> ProjectionInfo {
+    let blocked_cache_state = metadata_value(conn, "blocked_cache_state")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "fresh".to_string());
+    let blocked_cache_stale = blocked_cache_state == "stale";
+    let cached_blocked_rows = projection_row_count(conn, "blocked_issues_cache");
+    let child_counter_rows = projection_row_count(conn, "child_counters");
+
+    let mut rebuild_reasons = Vec::new();
+    if blocked_cache_stale {
+        rebuild_reasons.push("blocked_cache_marked_stale".to_string());
+    }
+    if cached_blocked_rows.is_none() {
+        rebuild_reasons.push("blocked_issues_cache_missing".to_string());
+    }
+    if child_counter_rows.is_none() {
+        rebuild_reasons.push("child_counters_missing".to_string());
+    }
+
+    ProjectionInfo {
+        schema_version: "br.graph-projections.v1".to_string(),
+        blocked_cache_state,
+        blocked_cache_stale,
+        rebuild_needed: !rebuild_reasons.is_empty(),
+        rebuild_reasons,
+        issue_rows: query_issue_count(conn),
+        dependency_rows: projection_row_count(conn, "dependencies"),
+        cached_blocked_rows,
+        child_counter_rows,
+    }
+}
+
+fn metadata_value(conn: &Connection, key: &str) -> Option<String> {
+    conn.query_row_with_params(
+        "SELECT value FROM metadata WHERE key = ? LIMIT 1",
+        &[SqliteValue::from(key)],
+    )
+    .ok()
+    .and_then(|row| {
+        row.get(0)
+            .and_then(SqliteValue::as_text)
+            .map(str::to_string)
+    })
+}
+
+fn projection_row_count(conn: &Connection, table: &str) -> Option<usize> {
+    let sql = match table {
+        "blocked_issues_cache" => "SELECT COUNT(*) FROM blocked_issues_cache",
+        "child_counters" => "SELECT COUNT(*) FROM child_counters",
+        "dependencies" => "SELECT COUNT(*) FROM dependencies",
+        _ => return None,
+    };
+
+    conn.query_row(sql)
+        .ok()
+        .and_then(|row| row.get(0).and_then(SqliteValue::as_integer))
+        .and_then(|count| usize::try_from(count).ok())
 }
 
 fn build_schema_info(
@@ -369,6 +452,39 @@ fn print_human(info: &InfoOutput) {
             );
         }
     }
+
+    if let Some(projections) = &info.projections {
+        print_projection_human(projections);
+    }
+}
+
+fn print_projection_human(projections: &ProjectionInfo) {
+    println!();
+    println!("Graph projections:");
+    println!(
+        "  Blocked cache: {}",
+        info_display_text(&projections.blocked_cache_state)
+    );
+    println!(
+        "  Rebuild needed: {}",
+        if projections.rebuild_needed {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    if let Some(count) = projections.cached_blocked_rows {
+        println!("  Cached blocked rows: {count}");
+    }
+    if let Some(count) = projections.child_counter_rows {
+        println!("  Child counter rows: {count}");
+    }
+    if !projections.rebuild_reasons.is_empty() {
+        println!(
+            "  Rebuild reasons: {}",
+            info_display_list(projections.rebuild_reasons.iter().map(String::as_str))
+        );
+    }
 }
 
 #[allow(clippy::unnecessary_wraps)]
@@ -486,6 +602,10 @@ fn render_info_rich(info: &InfoOutput, ctx: &OutputContext) {
         }
     }
 
+    if let Some(projections) = &info.projections {
+        append_projection_rich(&mut content, projections, ctx);
+    }
+
     let panel = Panel::from_rich_text(&content, width)
         .title(Text::styled(
             "Project Information",
@@ -494,6 +614,32 @@ fn render_info_rich(info: &InfoOutput, ctx: &OutputContext) {
         .box_style(theme.box_style);
 
     console.print_renderable(&panel);
+}
+
+fn append_projection_rich(content: &mut Text, projections: &ProjectionInfo, ctx: &OutputContext) {
+    let theme = ctx.theme();
+    content.append("\n");
+    content.append_styled("Graph projections\n", theme.section.clone());
+    content.append_styled("  Blocked  ", theme.dimmed.clone());
+    content.append(&info_display_text(&projections.blocked_cache_state));
+    content.append("\n");
+    content.append_styled("  Rebuild  ", theme.dimmed.clone());
+    content.append(if projections.rebuild_needed {
+        "needed"
+    } else {
+        "not needed"
+    });
+    content.append("\n");
+    if let Some(count) = projections.cached_blocked_rows {
+        content.append_styled("  Cached   ", theme.dimmed.clone());
+        content.append(&count.to_string());
+        content.append(" blocked rows\n");
+    }
+    if let Some(count) = projections.child_counter_rows {
+        content.append_styled("  Children ", theme.dimmed.clone());
+        content.append(&count.to_string());
+        content.append(" counter rows\n");
+    }
 }
 
 /// Format bytes as human-readable size.
@@ -709,6 +855,108 @@ mod tests {
                 .as_ref()
                 .and_then(|schema| schema.detected_prefix.as_deref()),
             Some("bd")
+        );
+    }
+
+    #[test]
+    fn test_collect_info_output_reports_fresh_projection_health() {
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).unwrap();
+        std::fs::write(
+            beads_dir.join("metadata.json"),
+            r#"{"database":"beads.db","jsonl_export":"issues.jsonl"}"#,
+        )
+        .unwrap();
+
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let blocker = crate::model::Issue {
+            id: "bd-blocker".to_string(),
+            title: "Blocker".to_string(),
+            issue_type: crate::model::IssueType::Task,
+            priority: crate::model::Priority::HIGH,
+            ..crate::model::Issue::default()
+        };
+        let target = crate::model::Issue {
+            id: "bd-target".to_string(),
+            title: "Target".to_string(),
+            issue_type: crate::model::IssueType::Task,
+            priority: crate::model::Priority::LOW,
+            ..crate::model::Issue::default()
+        };
+        storage.create_issue(&blocker, "test").unwrap();
+        storage.create_issue(&target, "test").unwrap();
+        storage
+            .add_dependency(
+                &target.id,
+                &blocker.id,
+                crate::model::DependencyType::Blocks.as_str(),
+                "test",
+            )
+            .unwrap();
+        assert!(storage.ensure_blocked_cache_fresh().unwrap());
+        drop(storage);
+
+        let _guard = DirGuard::new(temp.path());
+        let output = collect_info_output(
+            &InfoArgs {
+                projections: true,
+                ..InfoArgs::default()
+            },
+            &CliOverrides::default(),
+        )
+        .unwrap();
+        let projections = output.projections.as_ref().unwrap();
+
+        assert_eq!(projections.schema_version, "br.graph-projections.v1");
+        assert_eq!(projections.blocked_cache_state, "fresh");
+        assert!(!projections.blocked_cache_stale);
+        assert!(!projections.rebuild_needed);
+        assert_eq!(projections.issue_rows, Some(2));
+        assert_eq!(projections.dependency_rows, Some(1));
+        assert_eq!(projections.cached_blocked_rows, Some(1));
+    }
+
+    #[test]
+    fn test_collect_info_output_reports_stale_projection_rebuild_needed() {
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).unwrap();
+        std::fs::write(
+            beads_dir.join("metadata.json"),
+            r#"{"database":"beads.db","jsonl_export":"issues.jsonl"}"#,
+        )
+        .unwrap();
+
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        storage.mark_blocked_cache_stale().unwrap();
+        drop(storage);
+
+        let _guard = DirGuard::new(temp.path());
+        let output = collect_info_output(
+            &InfoArgs {
+                projections: true,
+                ..InfoArgs::default()
+            },
+            &CliOverrides::default(),
+        )
+        .unwrap();
+        let projections = output.projections.as_ref().unwrap();
+
+        assert_eq!(projections.blocked_cache_state, "stale");
+        assert!(projections.blocked_cache_stale);
+        assert!(projections.rebuild_needed);
+        assert_eq!(
+            projections.rebuild_reasons,
+            vec!["blocked_cache_marked_stale".to_string()]
         );
     }
 
