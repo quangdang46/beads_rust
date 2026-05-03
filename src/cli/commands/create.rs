@@ -34,6 +34,18 @@ pub struct CreateConfig {
 /// default take over.
 pub(crate) fn canonical_source_repo(beads_dir: &Path) -> Option<String> {
     let parent = beads_dir.parent()?;
+    let parent = if parent.as_os_str().is_empty()
+        && beads_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| matches!(name, ".beads" | "_beads"))
+    {
+        Path::new(".")
+    } else if parent.as_os_str().is_empty() {
+        return None;
+    } else {
+        parent
+    };
     let canonical = parent
         .canonicalize()
         .unwrap_or_else(|_| parent.to_path_buf());
@@ -1145,6 +1157,16 @@ mod tests {
             canonical_source_repo(&beads_dir).as_deref(),
             Some("widget_engine"),
         );
+    }
+
+    #[test]
+    fn canonical_source_repo_uses_cwd_basename_for_relative_beads_dir() {
+        let expected = std::env::current_dir()
+            .expect("current dir")
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned());
+        assert_eq!(canonical_source_repo(Path::new(".beads")), expected.clone());
+        assert_eq!(canonical_source_repo(Path::new("_beads")), expected);
     }
 
     #[test]
