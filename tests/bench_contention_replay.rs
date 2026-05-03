@@ -279,6 +279,44 @@ fn run_contention_lab(profile: ContentionProfile) -> io::Result<ContentionRun> {
     Ok(ContentionRun { trace, trace_path })
 }
 
+fn synthetic_successful_contention_trace(
+    profile: ContentionProfile,
+) -> io::Result<ContentionTrace> {
+    let plan = build_plan(&profile);
+    let plan_hash = hash_json(&plan)?;
+    let lock_released_at_ms = profile.lock_hold_ms;
+    let events = plan
+        .into_iter()
+        .map(|planned| ContentionEvent {
+            worker_id: planned.worker_id,
+            event_index: planned.event_index,
+            command_kind: planned.command_kind,
+            command: planned.command,
+            scheduled_at_ms: planned.scheduled_at_ms,
+            started_at_ms: 0,
+            ended_at_ms: lock_released_at_ms.saturating_add(1),
+            lock_wait_ms: lock_released_at_ms,
+            auto_import_event: AutoImportEvent::NotApplicableForMutation,
+            auto_flush_event: AutoFlushEvent::AttemptedAfterSuccessfulMutation,
+            exit_code: 0,
+            stdout_hash: hash_bytes(b"synthetic-success"),
+            stderr_hash: hash_bytes(b""),
+            replay_seed: planned.replay_seed,
+        })
+        .collect::<Vec<_>>();
+    let summary = summarize_events(&events, true, true);
+
+    Ok(ContentionTrace {
+        schema_version: TRACE_SCHEMA_VERSION.to_string(),
+        profile,
+        replay_seed: events.first().map_or(0, |event| event.replay_seed),
+        plan_hash,
+        lock_released_at_ms,
+        events,
+        summary,
+    })
+}
+
 fn run_planned_command(
     root: &Path,
     planned: PlannedCommand,
@@ -687,6 +725,42 @@ fn contention_profiles_share_trace_schema_and_seeded_plan() {
         build_plan(&ci)[0].command_kind,
         build_plan(&manual)[0].command_kind
     );
+}
+
+#[test]
+fn manual_64_worker_projection_fits_one_default_batch() -> io::Result<()> {
+    let trace =
+        synthetic_successful_contention_trace(ContentionProfile::manual_64_worker_profile(64_064))?;
+    let projection = project_write_combining_from_trace(&trace, BatchLimits::default())?;
+
+    assert_eq!(trace.schema_version, TRACE_SCHEMA_VERSION);
+    assert_eq!(trace.summary.total_workers, 64);
+    assert_eq!(trace.summary.successful_commands, 64);
+    assert_eq!(trace.summary.failed_commands, 0);
+    assert_eq!(
+        projection.schema_version,
+        WRITE_COMBINING_PROJECTION_SCHEMA_VERSION
+    );
+    assert_eq!(projection.batch_limit.max_envelopes, 64);
+    assert_eq!(projection.direct_lock_acquisitions, 64);
+    assert_eq!(projection.projected_lock_acquisitions, 1);
+    assert_eq!(projection.saved_lock_acquisitions, 63);
+    assert_eq!(projection.accepted_envelopes, 64);
+    assert_eq!(projection.skipped_envelopes, 0);
+    assert!(
+        projection.used_argument_bytes <= projection.batch_limit.max_argument_bytes,
+        "64 projected create envelopes should stay within the default argument budget"
+    );
+    assert!(
+        projection.direct_total_lock_wait_ms > projection.projected_single_batch_wait_ms,
+        "64-agent projection should reduce direct lock-wait exposure"
+    );
+    let projection_path = write_write_combining_projection_artifact(&trace.profile, &projection)?;
+    assert!(
+        projection_path.is_file(),
+        "64-worker projection artifact should exist"
+    );
+    Ok(())
 }
 
 #[test]
