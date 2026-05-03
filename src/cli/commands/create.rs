@@ -1133,6 +1133,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn canonical_source_repo_uses_repo_basename() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo_root = temp.path().join("widget_engine");
+        let beads_dir = repo_root.join(".beads");
+        std::fs::create_dir_all(&beads_dir).expect("create .beads");
+        assert_eq!(
+            canonical_source_repo(&beads_dir).as_deref(),
+            Some("widget_engine"),
+        );
+    }
+
+    #[test]
+    fn canonical_source_repo_returns_none_for_pathological_locations() {
+        // The empty path has no parent, so we cannot derive a name.
+        assert!(canonical_source_repo(Path::new("")).is_none());
+        // Filesystem root has a parent of "/" with no file_name component.
+        assert!(canonical_source_repo(Path::new("/.beads")).is_none());
+    }
+
+    #[test]
+    fn canonical_source_repo_creates_issue_with_repo_owner_value() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo_root = temp.path().join("source_repo_probe");
+        let beads_dir = repo_root.join(".beads");
+        std::fs::create_dir_all(&beads_dir).expect("create .beads");
+
+        let mut storage = setup_memory_storage();
+        let mut config = default_config();
+        config.source_repo = canonical_source_repo(&beads_dir);
+        let args = default_args();
+
+        let issue = create_issue_impl(&mut storage, &args, &config).expect("create");
+        assert_eq!(
+            issue.source_repo.as_deref(),
+            Some("source_repo_probe"),
+            "new issues must store the canonical repo basename, not '.'",
+        );
+    }
+
     fn setup_memory_storage() -> SqliteStorage {
         SqliteStorage::open_memory().expect("failed to open memory db")
     }
