@@ -341,6 +341,12 @@ enum ReadyIssueProjection {
     Command,
 }
 
+#[derive(Clone, Copy)]
+enum BlockedIssueProjection {
+    Full,
+    Command,
+}
+
 struct ReadyReadinessProbe {
     has_candidate_status: bool,
     blocked_cache_stale: bool,
@@ -402,6 +408,59 @@ impl ReadyIssueProjection {
         match self {
             Self::Full => SqliteStorage::issue_from_row(row),
             Self::Command => SqliteStorage::ready_issue_from_row(row),
+        }
+    }
+}
+
+impl BlockedIssueProjection {
+    const fn cached_select_clause(self) -> &'static str {
+        match self {
+            Self::Full => {
+                r"SELECT i.id, i.content_hash, i.title, i.description, i.design, i.acceptance_criteria, i.notes,
+                     i.status, i.priority, i.issue_type, i.assignee, i.owner, i.estimated_minutes,
+                     i.created_at, i.created_by, i.updated_at, i.closed_at, i.close_reason, i.closed_by_session,
+                     i.due_at, i.defer_until, i.external_ref, i.source_system, i.source_repo,
+                     i.deleted_at, i.deleted_by, i.delete_reason, i.original_type, i.compaction_level,
+                     i.compacted_at, i.compacted_at_commit, i.original_size, i.sender, i.ephemeral,
+                     i.pinned, i.is_template,
+                     bc.blocked_by"
+            }
+            Self::Command => {
+                r"SELECT i.id, i.title, i.description, i.status, i.priority, i.issue_type,
+                         i.created_at, i.created_by, i.updated_at, bc.blocked_by"
+            }
+        }
+    }
+
+    const fn map_select_clause(self) -> &'static str {
+        match self {
+            Self::Full => {
+                r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
+                     status, priority, issue_type, assignee, owner, estimated_minutes,
+                     created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
+                     due_at, defer_until, external_ref, source_system, source_repo,
+                     deleted_at, deleted_by, delete_reason, original_type, compaction_level,
+                     compacted_at, compacted_at_commit, original_size, sender, ephemeral,
+                     pinned, is_template"
+            }
+            Self::Command => {
+                r"SELECT id, title, description, status, priority, issue_type,
+                         created_at, created_by, updated_at"
+            }
+        }
+    }
+
+    const fn cached_blocked_by_index(self) -> usize {
+        match self {
+            Self::Full => 36,
+            Self::Command => 9,
+        }
+    }
+
+    fn parse_issue(self, row: &fsqlite::Row) -> Result<Issue> {
+        match self {
+            Self::Full => SqliteStorage::issue_from_row(row),
+            Self::Command => SqliteStorage::blocked_command_issue_from_row(row),
         }
     }
 }
@@ -4257,30 +4316,26 @@ impl SqliteStorage {
             .collect()
     }
 
-    fn load_blocked_issues_from_map(
+    fn load_blocked_issues_from_map_with_projection(
         &self,
         blocked_issues_map: &HashMap<String, Vec<String>>,
+        projection: BlockedIssueProjection,
     ) -> Result<Vec<(Issue, Vec<String>)>> {
         if blocked_issues_map.is_empty() {
             return Ok(Vec::new());
         }
 
-        let rows = self.conn.query(
-            r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
-                     status, priority, issue_type, assignee, owner, estimated_minutes,
-                     created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
-                     due_at, defer_until, external_ref, source_system, source_repo,
-                     deleted_at, deleted_by, delete_reason, original_type, compaction_level,
-                     compacted_at, compacted_at_commit, original_size, sender, ephemeral,
-                     pinned, is_template
-              FROM issues
-              WHERE status NOT IN ('closed', 'tombstone')
-              ORDER BY priority ASC, created_at DESC, id ASC",
-        )?;
+        let sql = format!(
+            "{} FROM issues
+             WHERE status NOT IN ('closed', 'tombstone')
+             ORDER BY priority ASC, created_at DESC, id ASC",
+            projection.map_select_clause()
+        );
+        let rows = self.conn.query(&sql)?;
 
         let mut blocked_issues = Vec::new();
         for row in &rows {
-            let issue = Self::issue_from_row(row)?;
+            let issue = projection.parse_issue(row)?;
             if let Some(blockers) = blocked_issues_map.get(issue.id.as_str()) {
                 blocked_issues.push((issue, blockers.clone()));
             }
@@ -4781,6 +4836,26 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_blocked_issues(&self) -> Result<Vec<(Issue, Vec<String>)>> {
+        self.get_blocked_issues_with_projection(BlockedIssueProjection::Full)
+    }
+
+    /// Get blocked issues optimized for `blocked` command rendering.
+    ///
+    /// Hydrates only the issue columns consumed by blocked JSON/TOON/text
+    /// output, avoiding large overflow-page reads for fields that never reach
+    /// the user-facing result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_blocked_issues_for_command_output(&self) -> Result<Vec<(Issue, Vec<String>)>> {
+        self.get_blocked_issues_with_projection(BlockedIssueProjection::Command)
+    }
+
+    fn get_blocked_issues_with_projection(
+        &self,
+        projection: BlockedIssueProjection,
+    ) -> Result<Vec<(Issue, Vec<String>)>> {
         // Read-only path: if the cache is stale, compute in memory instead of
         // persisting (issue #216 — read ops must not write).
         if self.blocked_cache_marked_stale()? {
@@ -4790,42 +4865,42 @@ impl SqliteStorage {
                     self.recover_blocked_issues_map("get_blocked_issues_stale", &error)?
                 }
             };
-            return self.load_blocked_issues_from_map(&blocked_issues_map);
+            return self
+                .load_blocked_issues_from_map_with_projection(&blocked_issues_map, projection);
         }
-        let rows = match self.conn.query(
-            r"SELECT i.id, i.content_hash, i.title, i.description, i.design, i.acceptance_criteria, i.notes,
-                     i.status, i.priority, i.issue_type, i.assignee, i.owner, i.estimated_minutes,
-                     i.created_at, i.created_by, i.updated_at, i.closed_at, i.close_reason, i.closed_by_session,
-                     i.due_at, i.defer_until, i.external_ref, i.source_system, i.source_repo,
-                     i.deleted_at, i.deleted_by, i.delete_reason, i.original_type, i.compaction_level,
-                     i.compacted_at, i.compacted_at_commit, i.original_size, i.sender, i.ephemeral,
-                     i.pinned, i.is_template,
-                     bc.blocked_by
-              FROM issues i
-              INNER JOIN blocked_issues_cache bc ON i.id = bc.issue_id
-              WHERE i.status NOT IN ('closed', 'tombstone')
-              ORDER BY i.priority ASC, i.created_at DESC, i.id ASC",
-        ) {
+        let sql = format!(
+            "{} FROM issues i
+             INNER JOIN blocked_issues_cache bc ON i.id = bc.issue_id
+             WHERE i.status NOT IN ('closed', 'tombstone')
+             ORDER BY i.priority ASC, i.created_at DESC, i.id ASC",
+            projection.cached_select_clause()
+        );
+        let rows = match self.conn.query(&sql) {
             Ok(rows) => rows,
             Err(error) => {
                 let blocked_issues_map =
                     self.recover_blocked_issues_map("get_blocked_issues_query", &error)?;
-                return self.load_blocked_issues_from_map(&blocked_issues_map);
+                return self
+                    .load_blocked_issues_from_map_with_projection(&blocked_issues_map, projection);
             }
         };
 
         let mut blocked_issues = Vec::new();
         for row in &rows {
-            let issue = Self::issue_from_row(row)?;
+            let issue = projection.parse_issue(row)?;
             let blockers = match parse_blocked_by_json(
                 &issue.id,
-                row.get(36).and_then(SqliteValue::as_text),
+                row.get(projection.cached_blocked_by_index())
+                    .and_then(SqliteValue::as_text),
             ) {
                 Ok(blockers) => blockers,
                 Err(error) => {
                     let blocked_issues_map =
                         self.recover_blocked_issues_map("get_blocked_issues_parse", &error)?;
-                    return self.load_blocked_issues_from_map(&blocked_issues_map);
+                    return self.load_blocked_issues_from_map_with_projection(
+                        &blocked_issues_map,
+                        projection,
+                    );
                 }
             };
             blocked_issues.push((issue, blockers));
@@ -7858,6 +7933,69 @@ impl SqliteStorage {
         })
     }
 
+    fn blocked_command_issue_from_row(row: &fsqlite::Row) -> Result<Issue> {
+        let get_str = |idx: usize| -> String {
+            row.get(idx)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .to_string()
+        };
+        let get_non_empty_str = |idx: usize| -> Option<String> {
+            row.get(idx)
+                .and_then(SqliteValue::as_text)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let get_opt_i32 = |idx: usize| -> Option<i32> {
+            row.get(idx)
+                .and_then(SqliteValue::as_integer)
+                .map(|value| value as i32)
+        };
+
+        Ok(Issue {
+            id: get_str(0),
+            content_hash: None,
+            title: get_str(1),
+            description: get_non_empty_str(2),
+            design: None,
+            acceptance_criteria: None,
+            notes: None,
+            status: parse_status(row.get(3).and_then(SqliteValue::as_text)),
+            priority: Priority(get_opt_i32(4).unwrap_or_else(|| Priority::default().0)),
+            issue_type: parse_issue_type(row.get(5).and_then(SqliteValue::as_text)),
+            assignee: None,
+            owner: None,
+            estimated_minutes: None,
+            created_at: parse_datetime_value(row.get(6))?,
+            created_by: get_non_empty_str(7),
+            updated_at: parse_datetime_value(row.get(8))?,
+            closed_at: None,
+            close_reason: None,
+            closed_by_session: None,
+            due_at: None,
+            defer_until: None,
+            external_ref: None,
+            source_system: None,
+            source_repo: None,
+            deleted_at: None,
+            deleted_by: None,
+            delete_reason: None,
+            original_type: None,
+            compaction_level: None,
+            compacted_at: None,
+            compacted_at_commit: None,
+            original_size: None,
+            sender: None,
+            ephemeral: false,
+            pinned: false,
+            is_template: false,
+            labels: vec![],
+            dependencies: vec![],
+            comments: vec![],
+        })
+    }
+
     fn stats_issue_from_row(row: &fsqlite::Row) -> Result<StatsIssueRow> {
         let get_str = |idx: usize| -> String {
             row.get(idx)
@@ -9762,7 +9900,7 @@ impl SqliteStorage {
 #[allow(clippy::similar_names)]
 mod tests {
     use super::*;
-    use crate::format::ReadyIssue;
+    use crate::format::{BlockedIssueOutput, ReadyIssue};
     use crate::model::{Issue, IssueType, Priority, Status};
     use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
     use std::fs;
@@ -9817,6 +9955,34 @@ mod tests {
             labels: vec![],
             dependencies: vec![],
             comments: vec![],
+        }
+    }
+
+    fn blocker_id_from_ref_for_test(blocker_ref: &str) -> String {
+        blocker_ref
+            .rsplit_once(':')
+            .map_or(blocker_ref, |(prefix, _)| prefix)
+            .to_string()
+    }
+
+    fn blocked_issue_output_for_test(
+        (issue, blockers): (Issue, Vec<String>),
+    ) -> BlockedIssueOutput {
+        BlockedIssueOutput {
+            blocked_by: blockers
+                .iter()
+                .map(|blocker_ref| blocker_id_from_ref_for_test(blocker_ref))
+                .collect(),
+            blocked_by_count: blockers.len(),
+            created_at: issue.created_at,
+            created_by: issue.created_by,
+            description: issue.description,
+            id: issue.id,
+            issue_type: issue.issue_type,
+            priority: issue.priority,
+            status: issue.status,
+            title: issue.title,
+            updated_at: issue.updated_at,
         }
     }
 
@@ -12568,6 +12734,141 @@ mod tests {
             .collect();
 
         assert_eq!(projected, full);
+    }
+
+    #[test]
+    fn test_get_blocked_issues_for_command_output_matches_full_blocked_output() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let created_at = Utc.with_ymd_and_hms(2026, 4, 1, 9, 0, 0).unwrap();
+
+        let blocker = make_issue(
+            "bd-blocker-detailed",
+            "Blocker",
+            Status::Open,
+            0,
+            None,
+            created_at,
+            None,
+        );
+        let mut blocked = make_issue(
+            "bd-blocked-detailed",
+            "Blocked detailed issue",
+            Status::Open,
+            2,
+            None,
+            created_at + chrono::Duration::minutes(1),
+            None,
+        );
+        let large_unused = "unused overflow payload ".repeat(256);
+        blocked.description = Some("Visible blocked description".to_string());
+        blocked.design = Some(large_unused.clone());
+        blocked.acceptance_criteria = Some(large_unused.clone());
+        blocked.notes = Some(large_unused);
+        blocked.created_by = Some("agent".to_string());
+        blocked.updated_at = created_at + chrono::Duration::minutes(5);
+        blocked.source_repo = Some("repo".to_string());
+        blocked.sender = Some("cli".to_string());
+
+        storage.create_issue(&blocker, "tester").unwrap();
+        storage.create_issue(&blocked, "tester").unwrap();
+        storage
+            .add_dependency(
+                "bd-blocked-detailed",
+                "bd-blocker-detailed",
+                "blocks",
+                "tester",
+            )
+            .unwrap();
+
+        let full: Vec<_> = storage
+            .get_blocked_issues()
+            .unwrap()
+            .into_iter()
+            .map(blocked_issue_output_for_test)
+            .collect();
+        let projected_raw = storage.get_blocked_issues_for_command_output().unwrap();
+        let projected_issue = &projected_raw
+            .iter()
+            .find(|(issue, _)| issue.id == "bd-blocked-detailed")
+            .unwrap()
+            .0;
+        assert!(projected_issue.design.is_none());
+        assert!(projected_issue.acceptance_criteria.is_none());
+        assert!(projected_issue.notes.is_none());
+        assert!(projected_issue.source_repo.is_none());
+        assert!(projected_issue.sender.is_none());
+
+        let projected: Vec<_> = projected_raw
+            .into_iter()
+            .map(blocked_issue_output_for_test)
+            .collect();
+
+        assert_eq!(
+            serde_json::to_value(projected).unwrap(),
+            serde_json::to_value(full).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_get_blocked_issues_for_command_output_falls_back_when_cache_table_missing() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let created_at = Utc.with_ymd_and_hms(2026, 4, 1, 10, 0, 0).unwrap();
+        let blocker = make_issue("bd-b1", "Blocker", Status::Open, 1, None, created_at, None);
+        let mut blocked = make_issue(
+            "bd-c1",
+            "Blocked issue",
+            Status::Open,
+            2,
+            None,
+            created_at + chrono::Duration::minutes(1),
+            None,
+        );
+        blocked.description = Some("Visible description".to_string());
+        blocked.design = Some("unused design".repeat(512));
+        let ready = make_issue(
+            "bd-r1",
+            "Ready issue",
+            Status::Open,
+            3,
+            None,
+            created_at + chrono::Duration::minutes(2),
+            None,
+        );
+        storage.create_issue(&blocker, "tester").unwrap();
+        storage.create_issue(&blocked, "tester").unwrap();
+        storage.create_issue(&ready, "tester").unwrap();
+        storage
+            .add_dependency("bd-c1", "bd-b1", "blocks", "tester")
+            .unwrap();
+
+        storage
+            .conn
+            .execute("DROP TABLE blocked_issues_cache")
+            .unwrap();
+
+        let full: Vec<_> = storage
+            .get_blocked_issues()
+            .unwrap()
+            .into_iter()
+            .map(blocked_issue_output_for_test)
+            .collect();
+        let projected_raw = storage.get_blocked_issues_for_command_output().unwrap();
+        let projected_issue = &projected_raw
+            .iter()
+            .find(|(issue, _)| issue.id == "bd-c1")
+            .unwrap()
+            .0;
+        assert!(projected_issue.design.is_none());
+
+        let projected: Vec<_> = projected_raw
+            .into_iter()
+            .map(blocked_issue_output_for_test)
+            .collect();
+
+        assert_eq!(
+            serde_json::to_value(projected).unwrap(),
+            serde_json::to_value(full).unwrap()
+        );
     }
 
     #[test]

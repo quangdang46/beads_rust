@@ -125,7 +125,7 @@ fn execute_inner(
     let ctx = OutputContext::from_output_format(output_format, quiet, !use_color);
 
     // Get blocked issues from cache
-    let blocked_raw = storage.get_blocked_issues()?;
+    let blocked_raw = storage.get_blocked_issues_for_command_output()?;
 
     tracing::debug!(
         count = blocked_raw.len(),
