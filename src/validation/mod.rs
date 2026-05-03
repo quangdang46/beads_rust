@@ -378,11 +378,11 @@ impl LabelValidator {
 
         if !label
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ':')
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ':' || c == '/')
         {
             return Err(ValidationError::new(
                 "label",
-                "invalid characters (only alphanumeric, hyphen, underscore, colon allowed)",
+                "invalid characters (only alphanumeric, hyphen, underscore, colon, slash allowed)",
             ));
         }
 
@@ -731,6 +731,11 @@ mod tests {
     #[test]
     fn label_validation_allows_namespaced_labels() {
         assert!(LabelValidator::validate("team:backend").is_ok());
+    }
+
+    #[test]
+    fn label_validation_allows_path_style_labels() {
+        assert!(LabelValidator::validate("sys/stat").is_ok());
     }
 
     #[test]

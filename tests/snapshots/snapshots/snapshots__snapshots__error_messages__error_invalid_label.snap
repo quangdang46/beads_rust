@@ -2,4 +2,4 @@
 source: tests/snapshots/error_messages.rs
 expression: normalize_output(&output.stderr)
 ---
-Error: Validation failed: label: invalid characters (only alphanumeric, hyphen, underscore, colon allowed)
+Error: Validation failed: label: invalid characters (only alphanumeric, hyphen, underscore, colon, slash allowed)

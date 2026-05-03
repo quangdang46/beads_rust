@@ -1504,6 +1504,52 @@ fn push_cli_rerun_overrides(rerun: &mut Vec<String>, cli: &config::CliOverrides)
     }
 }
 
+fn integrity_check_is_clean(messages: &[String]) -> bool {
+    messages.len() == 1 && messages[0].trim().eq_ignore_ascii_case("ok")
+}
+
+fn repair_import_integrity_if_needed(
+    storage: &mut crate::storage::SqliteStorage,
+    beads_dir: &Path,
+    cli: &config::CliOverrides,
+    jsonl_path: &Path,
+    db_path: &Path,
+    show_progress: bool,
+) -> Result<()> {
+    let messages = storage.integrity_check_messages()?;
+    if integrity_check_is_clean(&messages) {
+        return Ok(());
+    }
+
+    warn!(
+        db_path = %db_path.display(),
+        integrity_messages = ?messages,
+        "Post-import maintenance left SQLite integrity warnings; rebuilding DB from JSONL"
+    );
+
+    let jsonl_filter = scan_jsonl_for_tombstone_filter(jsonl_path)?;
+    let preserved_tombstones =
+        tombstones_missing_from_jsonl_tombstones(snapshot_tombstones(storage), &jsonl_filter);
+
+    // Close the dirty connection before rebuilding the same file path.
+    let placeholder = crate::storage::SqliteStorage::open_memory()?;
+    let dirty_storage = std::mem::replace(storage, placeholder);
+    drop(dirty_storage);
+
+    let startup = config::load_startup_config_with_paths(beads_dir, cli.db.as_ref())?;
+    let (mut rebuilt_storage, _, _) = config::repair_database_from_jsonl(
+        beads_dir,
+        db_path,
+        jsonl_path,
+        cli.lock_timeout,
+        &startup.merged_config,
+        show_progress,
+    )?;
+    restore_tombstones_after_rebuild(&mut rebuilt_storage, &preserved_tombstones)?;
+    *storage = rebuilt_storage;
+    Ok(())
+}
+
 fn auto_rebuild_semantic_flag_conflict_reason(
     args: &SyncArgs,
     cli: &config::CliOverrides,
@@ -1925,40 +1971,47 @@ fn execute_import(
         import_result.tombstone_skipped += preserved_resurrection_attempts;
     }
 
-    // Post-rebuild VACUUM + REINDEX to eliminate B-tree/index corruption
-    // artifacts that frankensqlite's bulk-insert path can leave behind after
-    // `reset_data_tables()` + bulk import.  This mirrors what
-    // `rebuild_database_family` (used by `br doctor --repair` and auto
-    // recovery) does at the equivalent chokepoint.
+    // Update the source JSONL content hash before post-import maintenance.
+    // Metadata table/index writes are part of the same B-tree surface that
+    // triggered frankentorch-dbp, so compaction must be the final storage
+    // mutation in this path.
+    let content_hash = compute_jsonl_hash(jsonl_path)?;
+    storage.set_metadata(METADATA_JSONL_CONTENT_HASH, &content_hash)?;
+
+    // Post-import VACUUM + REINDEX to eliminate B-tree/index corruption
+    // artifacts that frankensqlite's bulk-insert and metadata-update paths
+    // can leave behind.  This mirrors what `rebuild_database_family` (used
+    // by `br doctor --repair` and auto recovery) does at the equivalent
+    // chokepoint.
     //
-    // Without this, `br sync --import-only --force` / `--rebuild` can produce
-    // a DB where C sqlite3's `PRAGMA integrity_check` reports
-    // "database disk image is malformed" and where later write-transaction
-    // reads (inside `update_issue`) silently return zero rows for an ID that
-    // `br show` can still find — leading to the "Issue not found" error and
-    // secondary on-disk corruption seen in issue #248.
-    //
-    // The non-force import path does not drop/recreate tables, so it does
-    // not need this hardening.  Keeping the VACUUM/REINDEX scoped to the
-    // force/rebuild branch avoids paying the cost on every `br sync` run.
-    if args.force || args.rebuild {
+    // Without this, large `br sync --import-only` runs can produce a DB
+    // where C sqlite3's `PRAGMA integrity_check` reports free-space or
+    // index-entry corruption.  Force/rebuild imports hit this through
+    // `reset_data_tables()` + bulk import (issue #248); the FrankenTorch
+    // current-JSONL reproducer hit the plain import path through metadata
+    // table/index churn after importing hundreds of rows.
+    let import_rewrote_storage = import_result.imported_count > 0
+        || import_result.blocked_cache_entries > 0
+        || import_result.child_counter_entries > 0;
+    if args.force || args.rebuild || import_rewrote_storage {
         // Drain the WAL before VACUUM/REINDEX so the snapshot they operate
         // on matches what's actually on disk. Without this, fsqlite's
         // post-import MVCC state lags behind and VACUUM fails silently with
         // "database is busy (snapshot conflict on pages)", leaving the
-        // free-space / partial-index corruption that triggered issue #248.
+        // free-space / partial-index corruption that triggered issue #248
+        // and frankentorch-dbp.
         if let Err(e) = storage.checkpoint_full() {
             warn!(
                 error = %e,
                 db_path = %db_path.display(),
-                "Full WAL checkpoint after force/rebuild import failed (non-fatal)"
+                "Full WAL checkpoint after JSONL import failed (non-fatal)"
             );
         }
         if let Err(e) = storage.execute_raw("VACUUM") {
-            warn!(error = %e, "VACUUM after force/rebuild import failed (non-fatal); DB may still contain free-space corruption");
+            warn!(error = %e, "VACUUM after JSONL import failed (non-fatal); DB may still contain free-space corruption");
         }
         if let Err(e) = storage.execute_raw("REINDEX") {
-            warn!(error = %e, "REINDEX after force/rebuild import failed (non-fatal); partial-index entries may be inconsistent");
+            warn!(error = %e, "REINDEX after JSONL import failed (non-fatal); partial-index entries may be inconsistent");
         }
         // Final compaction via `VACUUM INTO` + atomic rename. fsqlite's
         // in-place VACUUM does not truncate the trailing pages that its
@@ -1989,11 +2042,28 @@ fn execute_import(
                 return Err(err);
             }
         }
+        if args.rename_prefix {
+            let messages = storage.integrity_check_messages()?;
+            if !integrity_check_is_clean(&messages) {
+                return Err(BeadsError::Validation {
+                    field: "rename-prefix".to_string(),
+                    reason: format!(
+                        "post-import integrity repair is required but cannot replay --rename-prefix semantics; re-run with --rebuild after resolving integrity warnings: {}",
+                        messages.join("; ")
+                    ),
+                });
+            }
+        } else {
+            repair_import_integrity_if_needed(
+                storage,
+                beads_dir,
+                cli,
+                jsonl_path,
+                db_path,
+                show_progress,
+            )?;
+        }
     }
-
-    // Update content hash
-    let content_hash = compute_jsonl_hash(jsonl_path)?;
-    storage.set_metadata(METADATA_JSONL_CONTENT_HASH, &content_hash)?;
 
     // Output result
     let result = ImportResultOutput {

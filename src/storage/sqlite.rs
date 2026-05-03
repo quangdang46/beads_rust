@@ -1481,6 +1481,30 @@ impl SqliteStorage {
         Ok(())
     }
 
+    /// Run SQLite's native integrity probe and return its diagnostic rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pragma cannot be executed.
+    pub(crate) fn integrity_check_messages(&self) -> Result<Vec<String>> {
+        let rows = self.conn.query("PRAGMA integrity_check")?;
+        let mut messages = Vec::new();
+        for row in rows {
+            for value in row.values() {
+                if let Some(text) = value.as_text() {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        messages.push(trimmed.to_string());
+                    }
+                }
+            }
+        }
+        if messages.is_empty() {
+            messages.push("integrity_check returned no diagnostic rows".to_string());
+        }
+        Ok(messages)
+    }
+
     /// Get audit events for a specific issue.
     ///
     /// # Errors
