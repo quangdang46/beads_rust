@@ -3962,6 +3962,45 @@ fn cleanup_import_orphans_in_tx(storage: &SqliteStorage) -> Result<usize> {
     Ok(orphans_cleaned)
 }
 
+fn skipped_import_matches_stored_issue(
+    storage: &SqliteStorage,
+    target_id: &str,
+    incoming: &Issue,
+) -> Result<bool> {
+    let Some(mut stored) = storage.get_issue_for_export(target_id)? else {
+        return Ok(false);
+    };
+    let mut expected = incoming.clone();
+    if expected.id != target_id {
+        expected.id = target_id.to_string();
+    }
+
+    normalize_issue_for_export(&mut stored);
+    normalize_issue_for_export(&mut expected);
+    Ok(stored.sync_equals(&expected))
+}
+
+fn export_hash_entry_for_import_action(
+    storage: &SqliteStorage,
+    action: &CollisionAction,
+    target_id: &str,
+    issue: &Issue,
+    computed_hash: &str,
+) -> Result<Option<(String, String)>> {
+    match action {
+        CollisionAction::Insert | CollisionAction::Update { .. } => {
+            Ok(Some((target_id.to_string(), computed_hash.to_string())))
+        }
+        CollisionAction::Skip { .. } => {
+            if skipped_import_matches_stored_issue(storage, target_id, issue)? {
+                Ok(Some((target_id.to_string(), computed_hash.to_string())))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn stream_import_actions_in_tx(
     storage: &SqliteStorage,
@@ -3977,6 +4016,7 @@ fn stream_import_actions_in_tx(
     let mut seen_external_refs = HashSet::new();
     let mut export_hash_batch = Vec::with_capacity(IMPORT_EXPORT_HASH_BATCH_SIZE);
     let mut export_hash_ids = HashSet::new();
+    let mut uncertified_local_wins = 0usize;
 
     progress.set_position(0);
     storage.clear_all_export_hashes_in_tx()?;
@@ -4013,11 +4053,21 @@ fn stream_import_actions_in_tx(
         apply_collision_renames(&mut issue, collision_renames);
         process_import_action(storage, &action, &issue, &mut tx_result)?;
 
-        export_hash_ids.insert(target_id.clone());
-        export_hash_batch.push((target_id, computed_hash));
-        if export_hash_batch.len() >= IMPORT_EXPORT_HASH_BATCH_SIZE {
-            storage.set_export_hashes_in_tx(&export_hash_batch)?;
-            export_hash_batch.clear();
+        if let Some((export_id, export_hash)) = export_hash_entry_for_import_action(
+            storage,
+            &action,
+            &target_id,
+            &issue,
+            &computed_hash,
+        )? {
+            export_hash_ids.insert(export_id.clone());
+            export_hash_batch.push((export_id, export_hash));
+            if export_hash_batch.len() >= IMPORT_EXPORT_HASH_BATCH_SIZE {
+                storage.set_export_hashes_in_tx(&export_hash_batch)?;
+                export_hash_batch.clear();
+            }
+        } else {
+            uncertified_local_wins += 1;
         }
 
         progress.inc(1);
@@ -4028,6 +4078,13 @@ fn stream_import_actions_in_tx(
         storage.set_export_hashes_in_tx(&export_hash_batch)?;
     }
     tx_result.export_hashes_recorded = export_hash_ids.len();
+    if uncertified_local_wins > 0 {
+        tracing::debug!(
+            count = uncertified_local_wins,
+            "Import preserved local records that differ from JSONL; marking database for flush"
+        );
+        storage.set_metadata_in_tx("needs_flush", "true")?;
+    }
 
     let orphans_cleaned = cleanup_import_orphans_in_tx(storage)?;
     if orphans_cleaned > 0 {
@@ -6291,6 +6348,68 @@ mod tests {
 
         let unchanged = storage.get_issue("test-001").unwrap().unwrap();
         assert_eq!(unchanged.title, "Newer title");
+    }
+
+    #[test]
+    fn test_import_tombstone_skip_marks_flush_pending() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("issues.jsonl");
+
+        let mut tombstone = make_issue_at("bd-tomb", "Deleted locally", fixed_time(100));
+        tombstone.status = Status::Tombstone;
+        tombstone.deleted_at = Some(fixed_time(100));
+        storage.create_issue(&tombstone, "test").unwrap();
+        storage
+            .clear_dirty_issues_legacy(&["bd-tomb".to_string()])
+            .unwrap();
+        storage.set_metadata("needs_flush", "false").unwrap();
+
+        let mut incoming = make_issue_at("bd-tomb", "Remote resurrection", fixed_time(200));
+        incoming.status = Status::Open;
+        let json = serde_json::to_string(&incoming).unwrap();
+        fs::write(&path, format!("{json}\n")).unwrap();
+
+        let result =
+            import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd")).unwrap();
+        assert_eq!(result.tombstone_skipped, 1);
+        assert_eq!(
+            storage.get_metadata("needs_flush").unwrap().as_deref(),
+            Some("true")
+        );
+        assert!(storage.get_export_hash("bd-tomb").unwrap().is_none());
+
+        let still_tombstone = storage.get_issue("bd-tomb").unwrap().unwrap();
+        assert_eq!(still_tombstone.status, Status::Tombstone);
+    }
+
+    #[test]
+    fn test_import_relation_only_local_win_marks_flush_pending() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("issues.jsonl");
+
+        let existing = make_issue_at("bd-rel", "Same content", fixed_time(200));
+        storage.create_issue(&existing, "test").unwrap();
+        storage.add_label("bd-rel", "local-only", "test").unwrap();
+        storage
+            .clear_dirty_issues_legacy(&["bd-rel".to_string()])
+            .unwrap();
+        storage.set_metadata("needs_flush", "false").unwrap();
+
+        let incoming = make_issue_at("bd-rel", "Same content", fixed_time(100));
+        let json = serde_json::to_string(&incoming).unwrap();
+        fs::write(&path, format!("{json}\n")).unwrap();
+
+        let result =
+            import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd")).unwrap();
+        assert_eq!(result.skipped_count, 1);
+        assert_eq!(
+            storage.get_metadata("needs_flush").unwrap().as_deref(),
+            Some("true")
+        );
+        assert!(storage.get_export_hash("bd-rel").unwrap().is_none());
+        assert_eq!(storage.get_labels("bd-rel").unwrap(), vec!["local-only"]);
     }
 
     #[test]
