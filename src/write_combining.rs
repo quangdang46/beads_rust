@@ -11,6 +11,7 @@ use crate::cli::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 
 /// Schema version for write-combining request and result envelopes.
@@ -198,6 +199,28 @@ pub struct MutationResult {
     pub flush: CombinedFlushOutcome,
 }
 
+impl MutationResult {
+    /// Build a per-caller mutation result.
+    #[must_use]
+    pub fn new(
+        idempotency_key: impl Into<String>,
+        family: CompatibleMutation,
+        exit_code: i32,
+        stdout: impl Into<String>,
+        stderr: impl Into<String>,
+        flush: CombinedFlushOutcome,
+    ) -> Self {
+        Self {
+            idempotency_key: idempotency_key.into(),
+            family,
+            exit_code,
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+            flush,
+        }
+    }
+}
+
 /// Resource caps for planning one future combined batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BatchLimits {
@@ -314,6 +337,124 @@ pub struct BatchPlan {
     pub skipped: Vec<SkippedMutation>,
     /// Sum of accepted compact argument JSON bytes.
     pub used_argument_bytes: usize,
+}
+
+/// Per-envelope response emitted by a combined batch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchResponse {
+    /// Original zero-based queue position.
+    pub index: usize,
+    /// The envelope's idempotency key.
+    pub idempotency_key: String,
+    /// The envelope's compatible family.
+    pub family: CompatibleMutation,
+    /// Output mode requested by the caller.
+    pub output_mode: CombinedOutputMode,
+    /// Applied result or pre-execution skip reason.
+    pub outcome: BatchResponseOutcome,
+}
+
+/// Applied or skipped response for one queued envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "status", content = "detail")]
+pub enum BatchResponseOutcome {
+    /// The mutation ran and produced the caller-visible output.
+    Applied(MutationResult),
+    /// The mutation did not run.
+    Skipped(BatchSkipReason),
+}
+
+/// Deterministic report for one future combined batch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchReport {
+    /// Report schema version.
+    pub schema_version: String,
+    /// Homogeneous family accepted by the batch, if any.
+    pub family: Option<CompatibleMutation>,
+    /// One response per input envelope, sorted by original queue position.
+    pub responses: Vec<BatchResponse>,
+}
+
+impl BatchReport {
+    /// Count applied responses.
+    #[must_use]
+    pub fn applied_count(&self) -> usize {
+        self.responses
+            .iter()
+            .filter(|response| matches!(response.outcome, BatchResponseOutcome::Applied(_)))
+            .count()
+    }
+
+    /// Count skipped responses.
+    #[must_use]
+    pub fn skipped_count(&self) -> usize {
+        self.responses.len() - self.applied_count()
+    }
+}
+
+/// Invalid executor output while building a batch report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "error", content = "detail")]
+pub enum BatchReportError {
+    /// A planned accepted or skipped index does not exist in the input queue.
+    PlannedIndexOutOfBounds {
+        /// Planned index.
+        index: usize,
+        /// Number of input envelopes.
+        envelope_count: usize,
+    },
+    /// The plan names the same queue index more than once.
+    DuplicatePlannedIndex {
+        /// Duplicated queue index.
+        index: usize,
+    },
+    /// The plan did not account for every input envelope.
+    IncompletePlan {
+        /// Number of input envelopes.
+        expected: usize,
+        /// Number of responses assembled from the plan.
+        planned: usize,
+    },
+    /// The accepted plan family does not match the original envelope.
+    PlannedFamilyMismatch {
+        /// Original queue index.
+        index: usize,
+        /// Envelope mutation family.
+        expected: CompatibleMutation,
+        /// Planned mutation family.
+        found: CompatibleMutation,
+    },
+    /// The executor returned the same idempotency key more than once.
+    DuplicateResult {
+        /// Duplicated result idempotency key.
+        idempotency_key: String,
+    },
+    /// The accepted plan contains duplicate idempotency keys.
+    DuplicateAcceptedIdempotencyKey {
+        /// Duplicated accepted idempotency key.
+        idempotency_key: String,
+    },
+    /// An accepted envelope has no executor result.
+    MissingResult {
+        /// Original queue index.
+        index: usize,
+        /// Missing result idempotency key.
+        idempotency_key: String,
+    },
+    /// The executor produced a result for an envelope that was not accepted.
+    UnexpectedResult {
+        /// Unexpected result idempotency key.
+        idempotency_key: String,
+    },
+    /// The executor result does not match the accepted envelope family.
+    ResultFamilyMismatch {
+        /// Result idempotency key.
+        idempotency_key: String,
+        /// Expected mutation family.
+        expected: CompatibleMutation,
+        /// Reported mutation family.
+        found: CompatibleMutation,
+    },
 }
 
 impl BatchPlan {
@@ -437,6 +578,135 @@ pub fn plan_batch(
     }
 
     Ok(plan)
+}
+
+/// Assemble deterministic per-envelope responses for a planned batch.
+///
+/// The future executor can apply only `plan.accepted`; this function then
+/// merges those applied results with the pre-execution skips from `plan.skipped`
+/// and validates that every input envelope receives exactly one response.
+///
+/// # Errors
+///
+/// Returns an error if the plan is inconsistent with the input envelopes or if
+/// the applied results do not exactly match the accepted envelopes.
+pub fn assemble_batch_report(
+    envelopes: &[MutationEnvelope],
+    plan: &BatchPlan,
+    applied_results: &[MutationResult],
+) -> std::result::Result<BatchReport, BatchReportError> {
+    let mut results_by_key = BTreeMap::new();
+    for result in applied_results {
+        if results_by_key
+            .insert(result.idempotency_key.as_str(), result)
+            .is_some()
+        {
+            return Err(BatchReportError::DuplicateResult {
+                idempotency_key: result.idempotency_key.clone(),
+            });
+        }
+    }
+
+    let mut accepted_keys = BTreeSet::new();
+    let mut responses_by_index = BTreeMap::new();
+
+    for skipped_mutation in &plan.skipped {
+        let envelope = envelope_at(envelopes, skipped_mutation.index)?;
+        insert_response(
+            &mut responses_by_index,
+            BatchResponse {
+                index: skipped_mutation.index,
+                idempotency_key: envelope.idempotency_key.clone(),
+                family: envelope.family,
+                output_mode: envelope.output_mode,
+                outcome: BatchResponseOutcome::Skipped(skipped_mutation.reason.clone()),
+            },
+        )?;
+    }
+
+    for planned_mutation in &plan.accepted {
+        let envelope = envelope_at(envelopes, planned_mutation.index)?;
+        if planned_mutation.family != envelope.family {
+            return Err(BatchReportError::PlannedFamilyMismatch {
+                index: planned_mutation.index,
+                expected: envelope.family,
+                found: planned_mutation.family,
+            });
+        }
+        if !accepted_keys.insert(envelope.idempotency_key.as_str()) {
+            return Err(BatchReportError::DuplicateAcceptedIdempotencyKey {
+                idempotency_key: envelope.idempotency_key.clone(),
+            });
+        }
+        let Some(result) = results_by_key.get(envelope.idempotency_key.as_str()) else {
+            return Err(BatchReportError::MissingResult {
+                index: planned_mutation.index,
+                idempotency_key: envelope.idempotency_key.clone(),
+            });
+        };
+        if result.family != envelope.family {
+            return Err(BatchReportError::ResultFamilyMismatch {
+                idempotency_key: envelope.idempotency_key.clone(),
+                expected: envelope.family,
+                found: result.family,
+            });
+        }
+
+        insert_response(
+            &mut responses_by_index,
+            BatchResponse {
+                index: planned_mutation.index,
+                idempotency_key: envelope.idempotency_key.clone(),
+                family: envelope.family,
+                output_mode: envelope.output_mode,
+                outcome: BatchResponseOutcome::Applied((*result).clone()),
+            },
+        )?;
+    }
+
+    for result in applied_results {
+        if !accepted_keys.contains(result.idempotency_key.as_str()) {
+            return Err(BatchReportError::UnexpectedResult {
+                idempotency_key: result.idempotency_key.clone(),
+            });
+        }
+    }
+
+    if responses_by_index.len() != envelopes.len() {
+        return Err(BatchReportError::IncompletePlan {
+            expected: envelopes.len(),
+            planned: responses_by_index.len(),
+        });
+    }
+
+    Ok(BatchReport {
+        schema_version: WRITE_COMBINING_SCHEMA_VERSION.to_string(),
+        family: plan.family,
+        responses: responses_by_index.into_values().collect(),
+    })
+}
+
+fn envelope_at(
+    envelopes: &[MutationEnvelope],
+    index: usize,
+) -> std::result::Result<&MutationEnvelope, BatchReportError> {
+    envelopes
+        .get(index)
+        .ok_or(BatchReportError::PlannedIndexOutOfBounds {
+            index,
+            envelope_count: envelopes.len(),
+        })
+}
+
+fn insert_response(
+    responses_by_index: &mut BTreeMap<usize, BatchResponse>,
+    response: BatchResponse,
+) -> std::result::Result<(), BatchReportError> {
+    let index = response.index;
+    if responses_by_index.insert(index, response).is_some() {
+        return Err(BatchReportError::DuplicatePlannedIndex { index });
+    }
+    Ok(())
 }
 
 fn skipped(index: usize, reason: BatchSkipReason) -> SkippedMutation {
@@ -647,6 +917,25 @@ mod tests {
             Err(err) => {
                 assert_eq!(Some(err), None);
                 BatchPlan::default()
+            }
+        }
+    }
+
+    fn mutation_result(key: &str, family: CompatibleMutation) -> MutationResult {
+        MutationResult::new(key, family, 0, "ok", "", CombinedFlushOutcome::Succeeded)
+    }
+
+    fn reported(result: std::result::Result<BatchReport, BatchReportError>) -> BatchReport {
+        assert!(result.is_ok(), "unexpected batch-report error: {result:?}");
+        match result {
+            Ok(report) => report,
+            Err(err) => {
+                assert_eq!(Some(err), None);
+                BatchReport {
+                    schema_version: String::new(),
+                    family: None,
+                    responses: Vec::new(),
+                }
             }
         }
     }
@@ -1183,6 +1472,216 @@ mod tests {
         assert_eq!(
             plan_batch(&[], BatchLimits::new(1, 0), NOW_UNIX_MS),
             Err(BatchLimitError::ZeroMaxArgumentBytes)
+        );
+    }
+
+    #[test]
+    fn batch_report_preserves_original_queue_order() {
+        let mut invalid = envelope(
+            "invalid",
+            CompatibleMutation::CreateIssue,
+            FUTURE_UNIX_MS,
+            json!({"title": "invalid"}),
+        );
+        invalid.schema_version = "br.write-combining.v0".to_string();
+        let envelopes = vec![
+            envelope(
+                "request-1",
+                CompatibleMutation::CreateIssue,
+                FUTURE_UNIX_MS,
+                json!({"title": "first"}),
+            ),
+            invalid,
+            envelope(
+                "request-2",
+                CompatibleMutation::CreateIssue,
+                FUTURE_UNIX_MS,
+                json!({"title": "second"}),
+            ),
+        ];
+        let plan = planned(plan_batch(&envelopes, BatchLimits::default(), NOW_UNIX_MS));
+        let results = vec![
+            mutation_result("request-1", CompatibleMutation::CreateIssue),
+            mutation_result("request-2", CompatibleMutation::CreateIssue),
+        ];
+
+        let report = reported(assemble_batch_report(&envelopes, &plan, &results));
+
+        assert_eq!(report.schema_version, WRITE_COMBINING_SCHEMA_VERSION);
+        assert_eq!(report.family, Some(CompatibleMutation::CreateIssue));
+        assert_eq!(report.applied_count(), 2);
+        assert_eq!(report.skipped_count(), 1);
+        assert_eq!(
+            report
+                .responses
+                .iter()
+                .map(|response| response.index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            report.responses[1].outcome,
+            BatchResponseOutcome::Skipped(BatchSkipReason::InvalidEnvelope(
+                EnvelopeValidationError::UnsupportedSchemaVersion
+            ))
+        );
+    }
+
+    #[test]
+    fn batch_report_rejects_missing_unexpected_and_duplicate_results() {
+        let envelopes = vec![envelope(
+            "request-1",
+            CompatibleMutation::CreateIssue,
+            FUTURE_UNIX_MS,
+            json!({"title": "first"}),
+        )];
+        let plan = planned(plan_batch(&envelopes, BatchLimits::default(), NOW_UNIX_MS));
+
+        assert_eq!(
+            assemble_batch_report(&envelopes, &plan, &[]),
+            Err(BatchReportError::MissingResult {
+                index: 0,
+                idempotency_key: "request-1".to_string(),
+            })
+        );
+        assert_eq!(
+            assemble_batch_report(
+                &envelopes,
+                &plan,
+                &[
+                    mutation_result("request-1", CompatibleMutation::CreateIssue),
+                    mutation_result("extra", CompatibleMutation::CreateIssue),
+                ],
+            ),
+            Err(BatchReportError::UnexpectedResult {
+                idempotency_key: "extra".to_string(),
+            })
+        );
+        assert_eq!(
+            assemble_batch_report(
+                &envelopes,
+                &plan,
+                &[
+                    mutation_result("request-1", CompatibleMutation::CreateIssue),
+                    mutation_result("request-1", CompatibleMutation::CreateIssue),
+                ],
+            ),
+            Err(BatchReportError::DuplicateResult {
+                idempotency_key: "request-1".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn batch_report_rejects_family_mismatches() {
+        let envelopes = vec![envelope(
+            "request-1",
+            CompatibleMutation::CreateIssue,
+            FUTURE_UNIX_MS,
+            json!({"title": "first"}),
+        )];
+        let mut plan = planned(plan_batch(&envelopes, BatchLimits::default(), NOW_UNIX_MS));
+
+        assert_eq!(
+            assemble_batch_report(
+                &envelopes,
+                &plan,
+                &[mutation_result("request-1", CompatibleMutation::AddComment)],
+            ),
+            Err(BatchReportError::ResultFamilyMismatch {
+                idempotency_key: "request-1".to_string(),
+                expected: CompatibleMutation::CreateIssue,
+                found: CompatibleMutation::AddComment,
+            })
+        );
+
+        if let Some(first_accepted) = plan.accepted.first_mut() {
+            first_accepted.family = CompatibleMutation::AddComment;
+        } else {
+            assert_eq!(plan.accepted_count(), 1);
+        }
+        assert_eq!(
+            assemble_batch_report(
+                &envelopes,
+                &plan,
+                &[mutation_result(
+                    "request-1",
+                    CompatibleMutation::CreateIssue
+                )],
+            ),
+            Err(BatchReportError::PlannedFamilyMismatch {
+                index: 0,
+                expected: CompatibleMutation::CreateIssue,
+                found: CompatibleMutation::AddComment,
+            })
+        );
+    }
+
+    #[test]
+    fn batch_report_rejects_inconsistent_plan_shape() {
+        let envelopes = vec![envelope(
+            "request-1",
+            CompatibleMutation::CreateIssue,
+            FUTURE_UNIX_MS,
+            json!({"title": "first"}),
+        )];
+
+        assert_eq!(
+            assemble_batch_report(&envelopes, &BatchPlan::default(), &[]),
+            Err(BatchReportError::IncompletePlan {
+                expected: 1,
+                planned: 0,
+            })
+        );
+
+        let out_of_bounds = BatchPlan {
+            family: Some(CompatibleMutation::CreateIssue),
+            accepted: vec![PlannedMutation {
+                index: 1,
+                family: CompatibleMutation::CreateIssue,
+                argument_bytes: 1,
+            }],
+            skipped: Vec::new(),
+            used_argument_bytes: 1,
+        };
+        assert_eq!(
+            assemble_batch_report(
+                &envelopes,
+                &out_of_bounds,
+                &[mutation_result(
+                    "request-1",
+                    CompatibleMutation::CreateIssue
+                )],
+            ),
+            Err(BatchReportError::PlannedIndexOutOfBounds {
+                index: 1,
+                envelope_count: 1,
+            })
+        );
+
+        let duplicate_index = BatchPlan {
+            family: Some(CompatibleMutation::CreateIssue),
+            accepted: vec![PlannedMutation {
+                index: 0,
+                family: CompatibleMutation::CreateIssue,
+                argument_bytes: 1,
+            }],
+            skipped: vec![SkippedMutation {
+                index: 0,
+                reason: BatchSkipReason::Expired,
+            }],
+            used_argument_bytes: 1,
+        };
+        assert_eq!(
+            assemble_batch_report(
+                &envelopes,
+                &duplicate_index,
+                &[mutation_result(
+                    "request-1",
+                    CompatibleMutation::CreateIssue
+                )],
+            ),
+            Err(BatchReportError::DuplicatePlannedIndex { index: 0 })
         );
     }
 }
