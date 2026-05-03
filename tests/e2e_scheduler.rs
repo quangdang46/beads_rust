@@ -24,6 +24,33 @@ fn create_issue(workspace: &BrWorkspace, title: &str, priority: &str) -> String 
     parse_created_id(&result.stdout)
 }
 
+fn create_labeled_issue(
+    workspace: &BrWorkspace,
+    title: &str,
+    priority: &str,
+    label: &str,
+) -> String {
+    let issue_id = create_issue(workspace, title, priority);
+    let result = run_br(
+        workspace,
+        ["update", &issue_id, "--add-label", label],
+        "label_issue",
+    );
+    assert!(result.status.success(), "label failed: {}", result.stderr);
+    issue_id
+}
+
+fn scheduler_json(workspace: &BrWorkspace, args: &[&str], label: &str) -> Value {
+    let result = run_br(workspace, args, label);
+    assert!(
+        result.status.success(),
+        "scheduler failed: {}",
+        result.stderr
+    );
+    let payload = extract_json_payload(&result.stdout);
+    serde_json::from_str(&payload).expect("scheduler json")
+}
+
 #[test]
 fn scheduler_json_ranks_ready_bottlenecks_with_evidence() {
     let _log = common::test_log("scheduler_json_ranks_ready_bottlenecks_with_evidence");
@@ -60,18 +87,11 @@ fn scheduler_json_ranks_ready_bottlenecks_with_evidence() {
     );
     assert!(dep.status.success(), "dep add failed: {}", dep.stderr);
 
-    let result = run_br(
+    let json = scheduler_json(
         &workspace,
-        ["scheduler", "--json", "--limit", "2"],
+        &["scheduler", "--json", "--limit", "2"],
         "scheduler_json",
     );
-    assert!(
-        result.status.success(),
-        "scheduler failed: {}",
-        result.stderr
-    );
-    let payload = extract_json_payload(&result.stdout);
-    let json: Value = serde_json::from_str(&payload).expect("scheduler json");
     let recommendations = json["recommendations"].as_array().expect("recommendations");
 
     assert_eq!(json["schema"], "br.scheduler.v1");
@@ -119,9 +139,9 @@ fn scheduler_candidate_limit_refills_after_external_blockers() {
         );
     }
 
-    let result = run_br(
+    let json = scheduler_json(
         &workspace,
-        [
+        &[
             "scheduler",
             "--json",
             "--candidate-limit",
@@ -131,13 +151,6 @@ fn scheduler_candidate_limit_refills_after_external_blockers() {
         ],
         "scheduler_external_candidate_limit",
     );
-    assert!(
-        result.status.success(),
-        "scheduler failed: {}",
-        result.stderr
-    );
-    let payload = extract_json_payload(&result.stdout);
-    let json: Value = serde_json::from_str(&payload).expect("scheduler json");
     let recommendations = json["recommendations"].as_array().expect("recommendations");
 
     assert_eq!(json["candidate_count"], 2);
@@ -150,6 +163,211 @@ fn scheduler_candidate_limit_refills_after_external_blockers() {
     assert!(recommended_ids.contains(&free_two.as_str()));
     assert!(!recommended_ids.contains(&blocked_one.as_str()));
     assert!(!recommended_ids.contains(&blocked_two.as_str()));
+}
+
+#[test]
+fn scheduler_stale_claim_and_fairness_evidence_are_parseable() {
+    let _log = common::test_log("scheduler_stale_claim_and_fairness_evidence_are_parseable");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let assigned = create_issue(&workspace, "Assigned open task", "1");
+    let unassigned = create_issue(&workspace, "Unassigned open task", "1");
+
+    let assign = run_br(
+        &workspace,
+        ["update", &assigned, "--assignee", "agent-a"],
+        "assign_issue",
+    );
+    assert!(assign.status.success(), "assign failed: {}", assign.stderr);
+
+    let fresh_json = scheduler_json(
+        &workspace,
+        &[
+            "scheduler",
+            "--json",
+            "--stale-claim-hours",
+            "999999",
+            "--limit",
+            "2",
+        ],
+        "scheduler_fresh_claim",
+    );
+    let fresh = fresh_json["recommendations"]
+        .as_array()
+        .expect("fresh recommendations");
+    assert_eq!(fresh[0]["issue"]["id"], unassigned);
+    assert_eq!(fresh[0]["evidence"]["fairness"]["unassigned"], true);
+    assert_eq!(fresh[1]["issue"]["id"], assigned);
+    assert_eq!(fresh[1]["evidence"]["fairness"]["contribution"], -2);
+    assert_eq!(fresh[1]["evidence"]["stale_claim"]["is_stale"], false);
+
+    let stale_json = scheduler_json(
+        &workspace,
+        &[
+            "scheduler",
+            "--json",
+            "--stale-claim-hours",
+            "0",
+            "--limit",
+            "2",
+        ],
+        "scheduler_stale_claim",
+    );
+    let stale = stale_json["recommendations"]
+        .as_array()
+        .expect("stale recommendations");
+    let assigned_row = stale
+        .iter()
+        .find(|row| row["issue"]["id"] == assigned)
+        .expect("assigned row");
+    assert_eq!(
+        assigned_row["evidence"]["stale_claim"]["assignee"],
+        "agent-a"
+    );
+    assert_eq!(assigned_row["evidence"]["stale_claim"]["is_stale"], true);
+    assert_eq!(assigned_row["evidence"]["stale_claim"]["contribution"], 4);
+    assert_eq!(
+        assigned_row["evidence"]["stale_claim"]["stale_threshold_minutes"],
+        0
+    );
+}
+
+#[test]
+fn scheduler_wide_queue_diversifies_contention_domains() {
+    let _log = common::test_log("scheduler_wide_queue_diversifies_contention_domains");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    for index in 0..5 {
+        let _id = create_labeled_issue(
+            &workspace,
+            &format!("Backend queue task {index}"),
+            "1",
+            "backend",
+        );
+    }
+    let docs = create_labeled_issue(&workspace, "Docs isolated task", "1", "docs");
+
+    let json = scheduler_json(
+        &workspace,
+        &["scheduler", "--json", "--limit", "3"],
+        "scheduler_wide_queue",
+    );
+    let recommendations = json["recommendations"].as_array().expect("recommendations");
+
+    assert_eq!(json["candidate_count"], 6);
+    assert_eq!(recommendations[0]["issue"]["id"], docs);
+    assert_eq!(
+        recommendations[0]["evidence"]["domain_contention"]["domain"],
+        "docs"
+    );
+    assert_eq!(
+        recommendations[0]["evidence"]["domain_contention"]["candidate_count_in_domain"],
+        1
+    );
+    assert_eq!(
+        recommendations[1]["evidence"]["domain_contention"]["domain"],
+        "backend"
+    );
+    assert_eq!(
+        recommendations[1]["evidence"]["domain_contention"]["candidate_count_in_domain"],
+        5
+    );
+}
+
+#[test]
+fn scheduler_cycle_fixture_stays_parseable_after_cycle_rejection() {
+    let _log = common::test_log("scheduler_cycle_fixture_stays_parseable_after_cycle_rejection");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let root = create_issue(&workspace, "Cycle root", "1");
+    let dependent = create_issue(&workspace, "Cycle dependent", "1");
+
+    let dep = run_br(
+        &workspace,
+        ["dep", "add", &dependent, &root],
+        "add_cycle_base_dep",
+    );
+    assert!(dep.status.success(), "dep add failed: {}", dep.stderr);
+
+    let cycle = run_br(
+        &workspace,
+        ["dep", "add", &root, &dependent],
+        "reject_cycle_dep",
+    );
+    assert!(
+        !cycle.status.success(),
+        "cycle should be rejected: {}",
+        cycle.stdout
+    );
+
+    let json = scheduler_json(
+        &workspace,
+        &["scheduler", "--json", "--limit", "1"],
+        "scheduler_after_cycle_rejection",
+    );
+    let recommendations = json["recommendations"].as_array().expect("recommendations");
+
+    assert_eq!(json["schema"], "br.scheduler.v1");
+    assert_eq!(recommendations.len(), 1);
+    assert_eq!(recommendations[0]["issue"]["id"], root);
+    assert_eq!(
+        recommendations[0]["evidence"]["dependency_impact"]["dependent_count"],
+        1
+    );
+}
+
+#[test]
+fn scheduler_robot_output_has_stable_dry_run_shape() {
+    let _log = common::test_log("scheduler_robot_output_has_stable_dry_run_shape");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    let _id = create_labeled_issue(&workspace, "Robot parseable task", "2", "agents");
+
+    let json = scheduler_json(
+        &workspace,
+        &["scheduler", "--robot", "--limit", "1"],
+        "scheduler_robot_shape",
+    );
+    let recommendation = json["recommendations"]
+        .as_array()
+        .expect("recommendations")
+        .first()
+        .expect("recommendation");
+
+    assert_eq!(json["schema"], "br.scheduler.v1");
+    assert_eq!(json["returned_count"], 1);
+    assert!(json["generated_at"].is_string());
+    assert_eq!(
+        json["fallback_policy"]["exhaustion_behavior"],
+        "if scoring evidence is tied or incomplete, preserve fallback rank"
+    );
+    assert!(recommendation["rank"].is_u64());
+    assert!(recommendation["fallback_rank"].is_u64());
+    assert!(recommendation["score"].is_i64());
+    assert!(recommendation["issue"]["id"].is_string());
+    assert!(recommendation["evidence"]["priority"]["contribution"].is_i64());
+    assert!(recommendation["evidence"]["dependency_impact"]["contribution"].is_i64());
+    assert!(recommendation["evidence"]["stale_claim"]["is_stale"].is_boolean());
+    assert!(recommendation["evidence"]["fairness"]["reason"].is_string());
+    assert!(recommendation["evidence"]["domain_contention"]["domain"].is_string());
+    assert!(
+        recommendation["rationale"]
+            .as_array()
+            .expect("rationale")
+            .len()
+            >= 3
+    );
 }
 
 #[test]
