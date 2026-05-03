@@ -418,11 +418,7 @@ fn query_list(storage: &crate::storage::SqliteStorage, ctx: &OutputContext) -> R
     }
 
     if ctx.is_json() {
-        let output = QueryListOutput {
-            count: queries.len(),
-            queries,
-        };
-        ctx.json_pretty(&output);
+        ctx.json_array_count("queries", queries.iter(), "count", queries.len());
     } else if ctx.is_toon() {
         let output = QueryListOutput {
             count: queries.len(),

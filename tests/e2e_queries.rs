@@ -852,6 +852,14 @@ fn e2e_saved_queries_lifecycle() {
         list_json.stderr
     );
     let list_payload = extract_json_payload(&list_json.stdout);
+    assert!(
+        list_payload.starts_with("{\"queries\":["),
+        "query list JSON should preserve queries-first object shape: {list_payload}"
+    );
+    assert!(
+        list_payload.ends_with(",\"count\":2}"),
+        "query list JSON should preserve count trailer: {list_payload}"
+    );
     let list_parsed: Value = serde_json::from_str(&list_payload).expect("list json");
     assert_eq!(list_parsed["count"], 2);
     let queries = list_parsed["queries"].as_array().expect("queries array");

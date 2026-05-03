@@ -124,6 +124,29 @@ where
     writer.write_all(b"}").map_err(serde_json::Error::io)
 }
 
+fn write_json_array_count_to_writer<I, T, W>(
+    writer: &mut W,
+    array_field: &str,
+    values: I,
+    count_field: &str,
+    count: usize,
+) -> serde_json::Result<()>
+where
+    I: IntoIterator<Item = T>,
+    T: Serialize,
+    W: Write,
+{
+    writer.write_all(b"{").map_err(serde_json::Error::io)?;
+    serde_json::to_writer(&mut *writer, array_field)?;
+    writer.write_all(b":").map_err(serde_json::Error::io)?;
+    write_json_array_to_writer(writer, values)?;
+    writer.write_all(b",").map_err(serde_json::Error::io)?;
+    serde_json::to_writer(&mut *writer, count_field)?;
+    writer.write_all(b":").map_err(serde_json::Error::io)?;
+    serde_json::to_writer(&mut *writer, &count)?;
+    writer.write_all(b"}").map_err(serde_json::Error::io)
+}
+
 fn write_json_trailer_to_writer<W: Write>(writer: &mut W) -> serde_json::Result<()> {
     writer.write_all(b"\n").map_err(serde_json::Error::io)?;
     writer.flush().map_err(serde_json::Error::io)
@@ -478,6 +501,31 @@ impl OutputContext {
             let stdout = io::stdout();
             let mut out = io::BufWriter::with_capacity(JSON_OUTPUT_BUFFER_CAPACITY, stdout.lock());
             if let Err(err) = write_json_array_page_to_writer(&mut out, array_field, values, meta) {
+                self.report_serialization_error("JSON", &err);
+                return;
+            }
+            if let Err(err) = write_json_trailer_to_writer(&mut out) {
+                self.report_serialization_error("JSON", &err);
+            }
+        }
+    }
+
+    pub(crate) fn json_array_count<I, T>(
+        &self,
+        array_field: &str,
+        values: I,
+        count_field: &str,
+        count: usize,
+    ) where
+        I: IntoIterator<Item = T>,
+        T: serde::Serialize,
+    {
+        if self.is_json() {
+            let stdout = io::stdout();
+            let mut out = io::BufWriter::with_capacity(JSON_OUTPUT_BUFFER_CAPACITY, stdout.lock());
+            if let Err(err) =
+                write_json_array_count_to_writer(&mut out, array_field, values, count_field, count)
+            {
                 self.report_serialization_error("JSON", &err);
                 return;
             }
@@ -924,6 +972,37 @@ mod tests {
         assert_eq!(
             streamed,
             serde_json::to_vec(&materialized).expect("materialized JSON page serialization failed")
+        );
+    }
+
+    #[test]
+    fn write_json_array_count_to_writer_matches_materialized_struct_output() {
+        #[derive(Serialize)]
+        struct QueryList<'a> {
+            queries: &'a [serde_json::Value],
+            count: usize,
+        }
+
+        let rows = vec![json!({"name": "triage"}), json!({"name": "release"})];
+        let materialized = QueryList {
+            queries: &rows,
+            count: rows.len(),
+        };
+        let mut streamed = Vec::new();
+
+        write_json_array_count_to_writer(
+            &mut streamed,
+            "queries",
+            rows.iter(),
+            "count",
+            rows.len(),
+        )
+        .expect("streaming JSON query list serialization failed");
+
+        assert_eq!(
+            streamed,
+            serde_json::to_vec(&materialized)
+                .expect("materialized JSON query list serialization failed")
         );
     }
 
