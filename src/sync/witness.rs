@@ -68,6 +68,35 @@ pub struct JsonlWitnessComparison {
     pub first_changed_chunk_index: Option<usize>,
 }
 
+/// Candidate-ordered reuse plan for a future parallel JSONL sync pipeline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[must_use = "reuse plans identify which chunks can be copied or rebuilt"]
+pub struct JsonlWitnessReusePlan {
+    pub comparison: JsonlWitnessComparison,
+    pub actions: Vec<JsonlChunkReuseStep>,
+}
+
+/// One chunk action in a JSONL witness reuse plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JsonlChunkReuseStep {
+    pub action: JsonlChunkReuseAction,
+    pub base_index: Option<usize>,
+    pub candidate_index: Option<usize>,
+    pub start_line: usize,
+    pub line_count: usize,
+    pub byte_count: u64,
+}
+
+/// Conservative work class for one witness chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JsonlChunkReuseAction {
+    ReuseUnchanged,
+    RebuildCandidate,
+    ReadAdded,
+    DropRemoved,
+}
+
 /// Build a deterministic witness over exact JSONL bytes read from `reader`.
 ///
 /// Lines are counted by `BufRead::read_until(b'\n')`, so newline bytes are part
@@ -123,6 +152,83 @@ pub fn build_jsonl_merkle_witness<R: BufRead>(
         root_hash,
         chunks,
     })
+}
+
+/// Build a conservative, candidate-ordered chunk reuse plan.
+///
+/// Emitting actions appear in candidate JSONL order, so workers may process
+/// reusable and rebuild chunks independently while the coordinator emits by
+/// `candidate_index`. `DropRemoved` actions are appended after emitting actions
+/// because they have no candidate output position.
+pub fn plan_jsonl_witness_reuse(
+    base: &JsonlMerkleWitness,
+    candidate: &JsonlMerkleWitness,
+) -> JsonlWitnessReusePlan {
+    let comparison = compare_jsonl_merkle_witnesses(base, candidate);
+    let witnesses_are_comparable =
+        comparison.schema_versions_match && comparison.chunk_size_lines_match;
+    let comparable_chunk_count = if witnesses_are_comparable {
+        base.chunks.len().min(candidate.chunks.len())
+    } else {
+        0
+    };
+    let mut actions = Vec::with_capacity(base.chunks.len().max(candidate.chunks.len()));
+
+    if witnesses_are_comparable {
+        for (index, (base_chunk, candidate_chunk)) in
+            base.chunks.iter().zip(&candidate.chunks).enumerate()
+        {
+            let action = if chunks_match_for_reuse(base_chunk, candidate_chunk) {
+                JsonlChunkReuseAction::ReuseUnchanged
+            } else {
+                JsonlChunkReuseAction::RebuildCandidate
+            };
+            actions.push(candidate_chunk_step(
+                action,
+                Some(index),
+                index,
+                candidate_chunk,
+            ));
+        }
+    }
+
+    for (offset, chunk) in candidate
+        .chunks
+        .get(comparable_chunk_count..)
+        .unwrap_or(&[])
+        .iter()
+        .enumerate()
+    {
+        actions.push(candidate_chunk_step(
+            if witnesses_are_comparable {
+                JsonlChunkReuseAction::ReadAdded
+            } else {
+                JsonlChunkReuseAction::RebuildCandidate
+            },
+            None,
+            comparable_chunk_count + offset,
+            chunk,
+        ));
+    }
+
+    for (offset, chunk) in base
+        .chunks
+        .get(comparable_chunk_count..)
+        .unwrap_or(&[])
+        .iter()
+        .enumerate()
+    {
+        actions.push(base_chunk_step(
+            JsonlChunkReuseAction::DropRemoved,
+            comparable_chunk_count + offset,
+            chunk,
+        ));
+    }
+
+    JsonlWitnessReusePlan {
+        comparison,
+        actions,
+    }
 }
 
 /// Compare two JSONL witnesses and conservatively identify reusable chunks.
@@ -235,6 +341,37 @@ fn chunks_match_for_reuse(base: &JsonlChunkWitness, candidate: &JsonlChunkWitnes
         && base.line_count == candidate.line_count
         && base.byte_count == candidate.byte_count
         && base.hash == candidate.hash
+}
+
+fn candidate_chunk_step(
+    action: JsonlChunkReuseAction,
+    base_index: Option<usize>,
+    candidate_index: usize,
+    chunk: &JsonlChunkWitness,
+) -> JsonlChunkReuseStep {
+    JsonlChunkReuseStep {
+        action,
+        base_index,
+        candidate_index: Some(candidate_index),
+        start_line: chunk.start_line,
+        line_count: chunk.line_count,
+        byte_count: chunk.byte_count,
+    }
+}
+
+fn base_chunk_step(
+    action: JsonlChunkReuseAction,
+    base_index: usize,
+    chunk: &JsonlChunkWitness,
+) -> JsonlChunkReuseStep {
+    JsonlChunkReuseStep {
+        action,
+        base_index: Some(base_index),
+        candidate_index: None,
+        start_line: chunk.start_line,
+        line_count: chunk.line_count,
+        byte_count: chunk.byte_count,
+    }
 }
 
 fn sum_chunk_bytes(chunks: &[JsonlChunkWitness]) -> u64 {
@@ -551,5 +688,98 @@ mod tests {
         assert_eq!(comparison.removed_chunks, base.chunks.len());
         assert_eq!(comparison.safe_reuse_prefix_chunks, 0);
         assert_eq!(comparison.first_changed_chunk_index, Some(0));
+    }
+
+    #[test]
+    fn reuse_plan_reuses_identical_candidate_chunks_in_order() {
+        let base = witness(b"a\nb\nc\n", 1);
+        let candidate = witness(b"a\nb\nc\n", 1);
+
+        let plan = plan_jsonl_witness_reuse(&base, &candidate);
+
+        let actions: Vec<_> = plan.actions.iter().map(|step| step.action).collect();
+        assert_eq!(
+            actions,
+            vec![
+                JsonlChunkReuseAction::ReuseUnchanged,
+                JsonlChunkReuseAction::ReuseUnchanged,
+                JsonlChunkReuseAction::ReuseUnchanged,
+            ]
+        );
+        assert!(
+            plan.actions
+                .iter()
+                .enumerate()
+                .all(|(index, step)| step.candidate_index == Some(index))
+        );
+        assert_eq!(plan.comparison.safe_reuse_prefix_chunks, 3);
+    }
+
+    #[test]
+    fn reuse_plan_separates_changed_and_added_candidate_chunks() {
+        let base = witness(b"a\nb\n", 1);
+        let candidate = witness(b"a\nB\nc\n", 1);
+
+        let plan = plan_jsonl_witness_reuse(&base, &candidate);
+
+        let actions: Vec<_> = plan.actions.iter().map(|step| step.action).collect();
+        assert_eq!(
+            actions,
+            vec![
+                JsonlChunkReuseAction::ReuseUnchanged,
+                JsonlChunkReuseAction::RebuildCandidate,
+                JsonlChunkReuseAction::ReadAdded,
+            ]
+        );
+        assert_eq!(plan.actions[1].base_index, Some(1));
+        assert_eq!(plan.actions[1].candidate_index, Some(1));
+        assert_eq!(plan.actions[2].base_index, None);
+        assert_eq!(plan.actions[2].candidate_index, Some(2));
+    }
+
+    #[test]
+    fn reuse_plan_appends_removed_base_chunks_after_candidate_actions() {
+        let base = witness(b"a\nb\nc\n", 1);
+        let candidate = witness(b"a\n", 1);
+
+        let plan = plan_jsonl_witness_reuse(&base, &candidate);
+
+        let actions: Vec<_> = plan.actions.iter().map(|step| step.action).collect();
+        assert_eq!(
+            actions,
+            vec![
+                JsonlChunkReuseAction::ReuseUnchanged,
+                JsonlChunkReuseAction::DropRemoved,
+                JsonlChunkReuseAction::DropRemoved,
+            ]
+        );
+        assert_eq!(plan.actions[0].candidate_index, Some(0));
+        assert_eq!(plan.actions[1].base_index, Some(1));
+        assert_eq!(plan.actions[1].candidate_index, None);
+        assert_eq!(plan.actions[2].base_index, Some(2));
+    }
+
+    #[test]
+    fn reuse_plan_rebuilds_all_candidate_chunks_when_chunk_sizes_differ() {
+        let base = witness(b"a\nb\nc\n", 1);
+        let candidate = witness(b"a\nb\nc\n", 2);
+
+        let plan = plan_jsonl_witness_reuse(&base, &candidate);
+
+        let actions: Vec<_> = plan.actions.iter().map(|step| step.action).collect();
+        assert_eq!(
+            actions,
+            vec![
+                JsonlChunkReuseAction::RebuildCandidate,
+                JsonlChunkReuseAction::RebuildCandidate,
+                JsonlChunkReuseAction::DropRemoved,
+                JsonlChunkReuseAction::DropRemoved,
+                JsonlChunkReuseAction::DropRemoved,
+            ]
+        );
+        assert!(plan.actions[0].base_index.is_none());
+        assert_eq!(plan.actions[0].candidate_index, Some(0));
+        assert_eq!(plan.actions[2].base_index, Some(0));
+        assert_eq!(plan.comparison.comparable_chunk_count, 0);
     }
 }
