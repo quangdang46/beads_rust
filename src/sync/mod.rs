@@ -2472,6 +2472,9 @@ pub fn finalize_export(
 ) -> Result<()> {
     use chrono::Utc;
     let observed_jsonl = observed_jsonl_witness(jsonl_path)?;
+    let prior_content_hash = storage.get_metadata(METADATA_JSONL_CONTENT_HASH)?;
+    let export_hashes_current =
+        export_hashes_certified_current(result, prior_content_hash.as_deref());
 
     storage.with_write_transaction(|storage| -> Result<()> {
         // Clear dirty flags for exported issues (safe version with timestamp validation)
@@ -2481,7 +2484,7 @@ pub fn finalize_export(
 
         // Record export hashes for each exported issue. Keep unchanged rows
         // stable so full flushes do not rewrite the export_hashes table.
-        if let Some(hashes) = issue_hashes {
+        if !export_hashes_current && let Some(hashes) = issue_hashes {
             storage.set_changed_export_hashes_in_tx(hashes)?;
         }
 
@@ -2498,6 +2501,13 @@ pub fn finalize_export(
     })?;
 
     Ok(())
+}
+
+fn export_hashes_certified_current(
+    result: &ExportResult,
+    prior_content_hash: Option<&str>,
+) -> bool {
+    result.exported_marked_at.is_empty() && prior_content_hash == Some(result.content_hash.as_str())
 }
 
 fn normalize_issue_for_export(issue: &mut Issue) {
@@ -7098,6 +7108,37 @@ mod tests {
                 .is_some()
         );
         assert!(storage.get_metadata(METADATA_JSONL_SIZE).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_export_hashes_certified_current_requires_no_dirty_and_matching_hash() {
+        let mut result = ExportResult {
+            exported_count: 1,
+            exported_ids: vec!["bd-1".to_string()],
+            exported_marked_at: Vec::new(),
+            skipped_tombstone_ids: Vec::new(),
+            content_hash: "content-hash".to_string(),
+            output_path: None,
+            issue_hashes: vec![("bd-1".to_string(), "issue-hash".to_string())],
+        };
+
+        assert!(export_hashes_certified_current(
+            &result,
+            Some("content-hash")
+        ));
+        assert!(!export_hashes_certified_current(
+            &result,
+            Some("different-hash")
+        ));
+        assert!(!export_hashes_certified_current(&result, None));
+
+        result
+            .exported_marked_at
+            .push(("bd-1".to_string(), "dirty-marker".to_string()));
+        assert!(!export_hashes_certified_current(
+            &result,
+            Some("content-hash")
+        ));
     }
 
     #[test]
