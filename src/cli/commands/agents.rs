@@ -831,8 +831,7 @@ fn execute_check(
     ctx: &OutputContext,
 ) -> Result<()> {
     if matches!(ctx.mode(), OutputMode::Rich) {
-        render_check_rich(detection, work_dir, ctx);
-        return Ok(());
+        return render_check_rich(detection, work_dir, ctx);
     }
 
     if !detection.found() {
@@ -1233,7 +1232,11 @@ fn execute_update(
 // --- Rich output render functions ---
 
 /// Render check result as a rich panel.
-fn render_check_rich(detection: &AgentFileDetection, work_dir: &Path, ctx: &OutputContext) {
+fn render_check_rich(
+    detection: &AgentFileDetection,
+    work_dir: &Path,
+    ctx: &OutputContext,
+) -> Result<()> {
     let console = Console::default();
     let theme = ctx.theme();
     let width = ctx.width();
@@ -1241,11 +1244,8 @@ fn render_check_rich(detection: &AgentFileDetection, work_dir: &Path, ctx: &Outp
     let mut content = Text::new("");
 
     if detection.found() {
-        let file_path = detection
-            .file_path
-            .as_deref()
-            .unwrap_or_else(|| Path::new("<unknown>"));
-        let file_type = detection.file_type.as_deref().unwrap_or("agent file");
+        let file_path = detection.file_path_ref("agents check rich")?;
+        let file_type = detection.file_type_ref("agents check rich")?;
 
         content.append_styled("File        ", theme.dimmed.clone());
         content.append_styled(file_type, theme.emphasis.clone());
@@ -1303,6 +1303,7 @@ fn render_check_rich(detection: &AgentFileDetection, work_dir: &Path, ctx: &Outp
         .box_style(theme.box_style);
 
     console.print_renderable(&panel);
+    Ok(())
 }
 
 fn render_unreadable_rich(
@@ -1657,6 +1658,43 @@ mod tests {
         };
 
         assert_eq!(inferred_dry_run_action(&detection), "none");
+    }
+
+    #[test]
+    fn test_execute_check_reports_inconsistent_detection_metadata() {
+        let detection = AgentFileDetection {
+            file_path: Some(PathBuf::from("AGENTS.md")),
+            ..Default::default()
+        };
+        let ctx = OutputContext::from_flags(false, false, true);
+
+        let err = execute_check(&detection, Path::new("."), &ctx)
+            .expect_err("missing file_type should be an internal error");
+
+        assert!(matches!(
+            err,
+            BeadsError::Internal { message } if message.contains("missing file_type")
+        ));
+    }
+
+    #[test]
+    fn test_execute_update_reports_missing_detection_content() {
+        let detection = AgentFileDetection {
+            file_path: Some(PathBuf::from("AGENTS.md")),
+            file_type: Some("AGENTS.md".to_string()),
+            has_blurb: true,
+            blurb_version: 0,
+            ..Default::default()
+        };
+        let ctx = OutputContext::from_flags(false, false, true);
+
+        let err = execute_update(&detection, Path::new("."), true, true, &ctx)
+            .expect_err("missing content should be an internal error");
+
+        assert!(matches!(
+            err,
+            BeadsError::Internal { message } if message.contains("missing content")
+        ));
     }
 
     #[test]
