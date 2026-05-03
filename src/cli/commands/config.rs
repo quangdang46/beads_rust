@@ -317,6 +317,25 @@ fn canonical_config_key(key: &str) -> String {
     key.trim().to_lowercase().replace('-', "_")
 }
 
+fn push_unique_config_alias(aliases: &mut Vec<String>, alias: String) {
+    if !alias.is_empty() && !aliases.contains(&alias) {
+        aliases.push(alias);
+    }
+}
+
+fn config_key_aliases(key: &str) -> Vec<String> {
+    let trimmed = key.trim();
+    let mut aliases = Vec::new();
+    push_unique_config_alias(&mut aliases, trimmed.to_string());
+
+    let lower = trimmed.to_lowercase();
+    push_unique_config_alias(&mut aliases, lower.clone());
+    push_unique_config_alias(&mut aliases, lower.replace('-', "_"));
+    push_unique_config_alias(&mut aliases, lower.replace('_', "-"));
+
+    aliases
+}
+
 fn resolve_source(key: &str, layers: &[LayerWithSource]) -> ConfigSource {
     let canonical = canonical_config_key(key);
     for layer in layers.iter().rev() {
@@ -922,7 +941,9 @@ fn delete_config_value(
         && !matches!(overrides.no_db, Some(true))
     {
         let mut storage_ctx = config::open_storage_with_cli(dir, overrides)?;
-        db_deleted = storage_ctx.storage.delete_config(key)?;
+        for alias in config_key_aliases(key) {
+            db_deleted |= storage_ctx.storage.delete_config(&alias)?;
+        }
         storage_ctx.flush_no_db_if_dirty()?;
     }
 
@@ -1033,15 +1054,23 @@ fn delete_nested(value: &mut serde_yml::Value, path: &[&str]) -> bool {
     };
 
     if let serde_yml::Value::Mapping(map) = value {
-        let key = serde_yml::Value::String((*part).to_string());
-
         if remaining_path.is_empty() {
-            return map.remove(&key).is_some();
+            let mut deleted = false;
+            for alias in config_key_aliases(part) {
+                let key = serde_yml::Value::String(alias);
+                deleted |= map.remove(&key).is_some();
+            }
+            return deleted;
         }
 
-        if let Some(child) = map.get_mut(&key) {
-            return delete_nested(child, remaining_path);
+        let mut deleted = false;
+        for alias in config_key_aliases(part) {
+            let key = serde_yml::Value::String(alias);
+            if let Some(child) = map.get_mut(&key) {
+                deleted |= delete_nested(child, remaining_path);
+            }
         }
+        return deleted;
     }
     false
 }
@@ -1375,6 +1404,32 @@ mod tests {
 
         let contents = fs::read_to_string(&config_path).unwrap();
         assert!(!contents.contains("color"));
+    }
+
+    #[test]
+    fn test_delete_config_key_removes_hyphen_underscore_aliases() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        fs::write(
+            &config_path,
+            "issue-prefix: bd\nsync:\n  auto-flush: false\n",
+        )
+        .unwrap();
+
+        let deleted_prefix =
+            apply_prepared_yaml_delete(prepare_yaml_delete(&config_path, "issue_prefix").unwrap())
+                .unwrap();
+        assert!(deleted_prefix);
+
+        let deleted_sync = apply_prepared_yaml_delete(
+            prepare_yaml_delete(&config_path, "sync.auto_flush").unwrap(),
+        )
+        .unwrap();
+        assert!(deleted_sync);
+
+        let contents = fs::read_to_string(&config_path).unwrap();
+        assert!(!contents.contains("issue-prefix"));
+        assert!(!contents.contains("auto-flush"));
     }
 
     #[test]
