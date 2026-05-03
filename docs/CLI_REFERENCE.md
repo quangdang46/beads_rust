@@ -486,6 +486,42 @@ br ready --json --limit 10
 
 ---
 
+### scheduler
+
+Rank ready work for agent swarms with explainable evidence.
+
+```bash
+br scheduler [OPTIONS]
+br schedule [OPTIONS]   # alias
+```
+
+`scheduler` starts from the same ready-work definition as `ready`, then scores a
+bounded candidate set with deterministic evidence terms for priority,
+dependency impact, stale claims, fairness, and domain contention. JSON and TOON
+output include `schema: "br.scheduler.v1"` plus a fallback policy so agents can
+parse the result safely and preserve conservative ordering when evidence ties.
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--limit <N>` | Maximum recommendations (default: 20, 0=unlimited) |
+| `--candidate-limit <N>` | Maximum ready candidates to score (default: 512, 0=unlimited) |
+| `--stale-claim-hours <N>` | Non-negative claim age threshold for stale-claim evidence (default: 2) |
+| `--format <FMT>` | Output format: text, json, toon |
+| `--stats` | Show token savings stats when using TOON output |
+| `--robot` | Machine-readable output |
+
+**Examples:**
+```bash
+# Top swarm recommendations with evidence
+br scheduler --json --limit 10
+
+# Token-efficient parseable output
+br scheduler --format toon --stats
+```
+
+---
+
 ### blocked
 
 List blocked issues.

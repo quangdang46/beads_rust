@@ -370,6 +370,20 @@ fn main() {
                 commands::ready::execute(&args, cli.json, &overrides, &output_ctx)
             }
         }
+        Commands::Scheduler(args) => {
+            if let (Some(res), Some(beads_dir)) = (storage_result.as_ref(), ctx.beads_dir.as_ref())
+            {
+                commands::scheduler::execute_with_storage_ctx(
+                    &args,
+                    &overrides,
+                    &output_ctx,
+                    beads_dir,
+                    res,
+                )
+            } else {
+                commands::scheduler::execute(&args, cli.json, &overrides, &output_ctx)
+            }
+        }
         Commands::Blocked(args) => {
             if let (Some(res), Some(beads_dir)) = (storage_result.as_ref(), ctx.beads_dir.as_ref())
             {
@@ -750,6 +764,7 @@ const fn needs_write_lock(cmd: &Commands) -> bool {
         | Commands::Show(_)
         | Commands::Search(_)
         | Commands::Ready(_)
+        | Commands::Scheduler(_)
         | Commands::Blocked(_)
         | Commands::Count(_)
         | Commands::Stale(_)
@@ -791,6 +806,7 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Show(_)
         | Commands::Search(_)
         | Commands::Ready(_)
+        | Commands::Scheduler(_)
         | Commands::Blocked(_)
         | Commands::Count(_)
         | Commands::Stale(_)
@@ -844,6 +860,7 @@ const fn supports_read_only_fast_open(cmd: &Commands) -> bool {
         | Commands::Show(_)
         | Commands::Search(_)
         | Commands::Ready(_)
+        | Commands::Scheduler(_)
         | Commands::Blocked(_)
         | Commands::Count(_)
         | Commands::Stale(_)
@@ -871,6 +888,7 @@ const fn supports_auto_import_read_only_probe(cmd: &Commands) -> bool {
         | Commands::Show(_)
         | Commands::Search(_)
         | Commands::Ready(_)
+        | Commands::Scheduler(_)
         | Commands::Blocked(_)
         | Commands::Count(_)
         | Commands::Stale(_)
@@ -927,6 +945,7 @@ fn command_requested_output_format(cmd: &Commands) -> Option<OutputFormat> {
         Commands::Search(args) => args.filters.format,
         Commands::Show(args) => args.format.map(Into::into),
         Commands::Ready(args) => args.format.map(Into::into),
+        Commands::Scheduler(args) => args.format.map(Into::into),
         Commands::Blocked(args) => args.format.map(Into::into),
         Commands::Stats(args) | Commands::Status(args) => args.format.map(Into::into),
         Commands::Schema(args) => args.format.map(Into::into),

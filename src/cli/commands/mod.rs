@@ -36,6 +36,7 @@ pub mod q;
 pub mod query;
 pub mod ready;
 pub mod reopen;
+pub mod scheduler;
 pub mod schema;
 pub mod search;
 pub mod show;

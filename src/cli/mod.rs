@@ -843,6 +843,10 @@ pub enum Commands {
     /// Reopen an issue
     Reopen(ReopenArgs),
 
+    /// Rank ready work for agent swarms with explainable evidence
+    #[command(alias = "schedule")]
+    Scheduler(SchedulerArgs),
+
     /// Emit JSON Schemas and per-command output envelope shapes (for agent/tooling integration)
     ///
     /// IMPORTANT: br schema is not a stable API and is subject to change.
@@ -1357,6 +1361,7 @@ pub const fn command_requests_robot_json(cmd: &Commands) -> bool {
         Commands::Close(args) => args.robot,
         Commands::Reopen(args) => args.robot,
         Commands::Ready(args) => args.robot,
+        Commands::Scheduler(args) => args.robot,
         Commands::Blocked(args) => args.robot,
         Commands::Stats(args) | Commands::Status(args) => args.robot,
         Commands::Defer(args) => args.robot,
@@ -2076,6 +2081,34 @@ pub struct ReadyArgs {
     /// Wrap long lines instead of truncating in text output
     #[arg(long)]
     pub wrap: bool,
+
+    /// Output format (text, json, toon). Env: BR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT.
+    #[arg(long, value_enum)]
+    pub format: Option<OutputFormatBasic>,
+
+    /// Show token savings stats when using TOON output
+    #[arg(long)]
+    pub stats: bool,
+
+    /// Machine-readable output (alias for --json)
+    #[arg(long)]
+    pub robot: bool,
+}
+
+/// Arguments for the scheduler command.
+#[derive(Args, Debug, Clone, Default)]
+pub struct SchedulerArgs {
+    /// Maximum recommendations to return (default: 20, 0 = unlimited)
+    #[arg(long, default_value_t = 20)]
+    pub limit: usize,
+
+    /// Maximum ready candidates to score before truncating (default: 512, 0 = unlimited)
+    #[arg(long, default_value_t = 512)]
+    pub candidate_limit: usize,
+
+    /// Non-negative claim age threshold, in hours, for stale-claim evidence
+    #[arg(long, default_value_t = 2)]
+    pub stale_claim_hours: i64,
 
     /// Output format (text, json, toon). Env: BR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT.
     #[arg(long, value_enum)]
