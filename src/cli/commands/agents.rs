@@ -1666,15 +1666,17 @@ mod tests {
             file_path: Some(PathBuf::from("AGENTS.md")),
             ..Default::default()
         };
-        let ctx = OutputContext::from_flags(false, false, true);
 
-        let err = execute_check(&detection, Path::new("."), &ctx)
-            .expect_err("missing file_type should be an internal error");
+        for mode in [OutputMode::Plain, OutputMode::Rich] {
+            let ctx = OutputContext::with_mode(mode);
+            let err = execute_check(&detection, Path::new("."), &ctx)
+                .expect_err("missing file_type should be an internal error");
 
-        assert!(matches!(
-            err,
-            BeadsError::Internal { message } if message.contains("missing file_type")
-        ));
+            assert!(matches!(
+                err,
+                BeadsError::Internal { message } if message.contains("missing file_type")
+            ));
+        }
     }
 
     #[test]
