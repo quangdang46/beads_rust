@@ -2770,6 +2770,10 @@ impl SqliteStorage {
     /// Returns an error if the database query fails.
     #[allow(clippy::too_many_lines)]
     pub fn list_issues(&self, filters: &ListFilters) -> Result<Vec<Issue>> {
+        if let Some(limit) = default_visible_priority_page_limit(filters) {
+            return self.list_default_visible_priority_page(limit);
+        }
+
         let sort_default_in_rust = should_sort_list_default_in_rust(filters);
         let mut sql = String::from(
             r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
@@ -2945,6 +2949,47 @@ impl SqliteStorage {
         }
         if sort_default_in_rust {
             sort_list_default(&mut issues);
+        }
+
+        Ok(issues)
+    }
+
+    fn list_default_visible_priority_page(&self, limit: usize) -> Result<Vec<Issue>> {
+        let mut issues = Vec::with_capacity(limit);
+
+        for priority in [
+            Priority::CRITICAL,
+            Priority::HIGH,
+            Priority::MEDIUM,
+            Priority::LOW,
+            Priority::BACKLOG,
+        ] {
+            let remaining = limit.saturating_sub(issues.len());
+            if remaining == 0 {
+                break;
+            }
+
+            let sql = format!(
+                r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
+                         status, priority, issue_type, assignee, owner, estimated_minutes,
+                         created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
+                         due_at, defer_until, external_ref, source_system, source_repo,
+                         deleted_at, deleted_by, delete_reason, original_type,
+                         compaction_level, compacted_at, compacted_at_commit, original_size,
+                         sender, ephemeral, pinned, is_template
+                  FROM issues
+                  WHERE priority = ?
+                    AND status NOT IN ('closed', 'tombstone', 'deferred')
+                    AND (is_template = 0 OR is_template IS NULL)
+                  ORDER BY created_at DESC, id ASC
+                  LIMIT {remaining}"
+            );
+            let rows = self
+                .conn
+                .query_with_params(&sql, &[SqliteValue::from(i64::from(priority.0))])?;
+            for row in &rows {
+                issues.push(Self::issue_from_row(row)?);
+            }
         }
 
         Ok(issues)
@@ -8942,6 +8987,31 @@ fn should_sort_list_default_in_rust(filters: &ListFilters) -> bool {
         && !filters.reverse
         && filters.offset.is_none_or(|offset| offset == 0)
         && filters.limit.is_none_or(|limit| limit == 0)
+}
+
+fn default_visible_priority_page_limit(filters: &ListFilters) -> Option<usize> {
+    let limit = filters.limit?;
+    if limit == 0 || filters.offset.is_some_and(|offset| offset > 0) {
+        return None;
+    }
+
+    let is_default_visible = filters.statuses.as_ref().is_none_or(Vec::is_empty)
+        && filters.types.as_ref().is_none_or(Vec::is_empty)
+        && filters.priorities.as_ref().is_none_or(Vec::is_empty)
+        && filters.assignee.is_none()
+        && !filters.unassigned
+        && !filters.include_closed
+        && !filters.include_deferred
+        && !filters.include_templates
+        && filters.title_contains.is_none()
+        && filters.sort.is_none()
+        && !filters.reverse
+        && filters.labels.as_ref().is_none_or(Vec::is_empty)
+        && filters.labels_or.as_ref().is_none_or(Vec::is_empty)
+        && filters.updated_before.is_none()
+        && filters.updated_after.is_none();
+
+    is_default_visible.then_some(limit)
 }
 
 fn sort_list_default(issues: &mut [Issue]) {
@@ -15510,6 +15580,72 @@ mod tests {
         let ids: Vec<_> = issues.iter().map(|issue| issue.id.as_str()).collect();
 
         assert_eq!(ids, vec!["bd-list-a", "bd-list-b"]);
+    }
+
+    #[test]
+    fn test_list_issues_default_visible_limited_page_matches_full_sort() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let day_1 = Utc.with_ymd_and_hms(2025, 8, 1, 0, 0, 0).unwrap();
+        let day_2 = Utc.with_ymd_and_hms(2025, 8, 2, 0, 0, 0).unwrap();
+
+        for issue in [
+            make_issue("bd-p1-old", "P1 old", Status::Open, 1, None, day_1, None),
+            make_issue("bd-p0-old", "P0 old", Status::Open, 0, None, day_1, None),
+            make_issue("bd-p0-new", "P0 new", Status::Open, 0, None, day_2, None),
+            make_issue("bd-p0-a", "P0 tie A", Status::Open, 0, None, day_2, None),
+            make_issue("bd-p0-b", "P0 tie B", Status::Open, 0, None, day_2, None),
+            make_issue(
+                "bd-deferred",
+                "Deferred",
+                Status::Deferred,
+                0,
+                None,
+                day_2,
+                None,
+            ),
+        ] {
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        let mut closed = make_issue("bd-closed", "Closed", Status::Closed, 0, None, day_2, None);
+        closed.closed_at = Some(day_2);
+        storage.create_issue(&closed, "tester").unwrap();
+
+        let mut template = make_issue(
+            "bd-template",
+            "Template",
+            Status::Open,
+            0,
+            None,
+            day_2,
+            None,
+        );
+        template.is_template = true;
+        storage.create_issue(&template, "tester").unwrap();
+
+        let full = storage.list_issues(&ListFilters::default()).unwrap();
+        let limited = storage
+            .list_issues(&ListFilters {
+                limit: Some(4),
+                ..ListFilters::default()
+            })
+            .unwrap();
+
+        let full_ids = full
+            .iter()
+            .take(4)
+            .map(|issue| issue.id.as_str())
+            .collect::<Vec<_>>();
+        let limited_ids = limited
+            .iter()
+            .map(|issue| issue.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(limited_ids, full_ids);
+        assert_eq!(
+            limited_ids,
+            vec!["bd-p0-a", "bd-p0-b", "bd-p0-new", "bd-p0-old"]
+        );
     }
 
     #[test]
