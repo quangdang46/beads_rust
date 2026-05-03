@@ -8,7 +8,7 @@ use std::borrow::Cow;
 use std::io::{self, IsTerminal, Write};
 use std::sync::OnceLock;
 use toon_rust::options::KeyFoldingMode;
-use toon_rust::{EncodeOptions, JsonValue, StringOrNumberOrBoolOrNull, encode};
+use toon_rust::{EncodeOptions, JsonValue, StringOrNumberOrBoolOrNull, encode_lines};
 
 /// Central output coordinator that respects robot/json/quiet modes.
 ///
@@ -150,6 +150,28 @@ where
 fn write_json_trailer_to_writer<W: Write>(writer: &mut W) -> serde_json::Result<()> {
     writer.write_all(b"\n").map_err(serde_json::Error::io)?;
     writer.flush().map_err(serde_json::Error::io)
+}
+
+fn write_toon_lines_to_writer<W: Write>(
+    writer: &mut W,
+    lines: &[String],
+) -> serde_json::Result<()> {
+    let mut first = true;
+    for line in lines {
+        if first {
+            first = false;
+        } else {
+            writer.write_all(b"\n").map_err(serde_json::Error::io)?;
+        }
+        writer
+            .write_all(line.as_bytes())
+            .map_err(serde_json::Error::io)?;
+    }
+    Ok(())
+}
+
+fn toon_lines_len(lines: &[String]) -> usize {
+    lines.iter().map(String::len).sum::<usize>() + lines.len().saturating_sub(1)
 }
 
 fn is_broken_pipe_serialization_error(err: &serde_json::Error) -> bool {
@@ -556,8 +578,16 @@ impl OutputContext {
             let mut toon_value: JsonValue = json_value.into();
             sanitize_toon_value(&mut toon_value);
             let options = Some(toon_encode_options());
-            let toon_output = encode(toon_value, options);
-            println!("{toon_output}");
+            let toon_lines = encode_lines(toon_value, options);
+            let stdout = io::stdout();
+            let mut out = io::BufWriter::with_capacity(JSON_OUTPUT_BUFFER_CAPACITY, stdout.lock());
+            if let Err(err) = write_toon_lines_to_writer(&mut out, &toon_lines) {
+                self.report_serialization_error("TOON", &err);
+                return;
+            }
+            if let Err(err) = write_json_trailer_to_writer(&mut out) {
+                self.report_serialization_error("TOON", &err);
+            }
         }
     }
 
@@ -589,10 +619,10 @@ impl OutputContext {
                 None
             };
             let options = Some(toon_encode_options());
-            let toon_output = encode(toon_value, options);
+            let toon_lines = encode_lines(toon_value, options);
+            let toon_chars = toon_lines_len(&toon_lines);
 
             if let Some(json_chars) = json_chars {
-                let toon_chars = toon_output.len();
                 let savings = if json_chars > 0 {
                     let diff = json_chars.saturating_sub(toon_chars);
                     diff * 100 / json_chars
@@ -605,7 +635,15 @@ impl OutputContext {
                 );
             }
 
-            println!("{toon_output}");
+            let stdout = io::stdout();
+            let mut out = io::BufWriter::with_capacity(JSON_OUTPUT_BUFFER_CAPACITY, stdout.lock());
+            if let Err(err) = write_toon_lines_to_writer(&mut out, &toon_lines) {
+                self.report_serialization_error("TOON", &err);
+                return;
+            }
+            if let Err(err) = write_json_trailer_to_writer(&mut out) {
+                self.report_serialization_error("TOON", &err);
+            }
         }
     }
 
@@ -1006,6 +1044,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn write_toon_lines_to_writer_matches_materialized_encode_output() {
+        let value = json!({
+            "issues": [
+                { "id": "beads_rust-alpha", "priority": 0 },
+                { "id": "beads_rust-beta", "priority": 1 }
+            ],
+            "count": 2
+        });
+        let mut toon_value = JsonValue::from(value);
+        sanitize_toon_value(&mut toon_value);
+        let options = Some(toon_encode_options());
+        let materialized = toon_rust::encode(toon_value.clone(), options.clone()).into_bytes();
+        let lines = encode_lines(toon_value, options);
+        let mut streamed = Vec::new();
+
+        write_toon_lines_to_writer(&mut streamed, &lines)
+            .expect("streaming TOON line output failed");
+
+        assert_eq!(streamed, materialized);
+        assert_eq!(toon_lines_len(&lines), streamed.len());
+    }
+
     struct WriteZero;
 
     impl Write for WriteZero {
@@ -1043,6 +1104,16 @@ mod tests {
     }
 
     #[test]
+    fn write_toon_lines_to_writer_propagates_partial_writer_failure() {
+        let lines = vec!["items[1]:".to_string(), "  - beads_rust-alpha".to_string()];
+        let err =
+            write_toon_lines_to_writer(&mut WriteZero, &lines).expect_err("partial writer failed");
+
+        assert_eq!(err.io_error_kind(), Some(io::ErrorKind::WriteZero));
+        assert!(!is_broken_pipe_serialization_error(&err));
+    }
+
+    #[test]
     fn write_json_trailer_flushes_and_classifies_broken_pipe() {
         let mut writer = BrokenPipeOnFlush { bytes: Vec::new() };
         let err =
@@ -1070,7 +1141,7 @@ mod tests {
 
         let mut toon_value = JsonValue::from(value);
         sanitize_toon_value(&mut toon_value);
-        let toon_output = encode(toon_value, Some(toon_encode_options()));
+        let toon_output = toon_rust::encode(toon_value, Some(toon_encode_options()));
 
         for forbidden in ['\u{1b}', '\u{7}', '\u{8}', '\u{9b}', '\r'] {
             assert!(
