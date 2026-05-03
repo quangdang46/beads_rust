@@ -36,6 +36,7 @@ use std::fs;
 use std::io::{BufRead, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::UNIX_EPOCH;
 use tempfile::tempdir;
 use tracing::warn;
 
@@ -155,7 +156,7 @@ pub fn is_excluded_jsonl(filename: &str) -> bool {
 }
 
 /// Resolved paths for this workspace.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConfigPaths {
     pub beads_dir: PathBuf,
     pub db_path: PathBuf,
@@ -2934,7 +2935,7 @@ fn resolve_jsonl_path(
 }
 
 /// A configuration layer split into startup-only and runtime (DB) keys.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConfigLayer {
     pub startup: HashMap<String, String>,
     pub runtime: HashMap<String, String>,
@@ -3257,6 +3258,148 @@ pub struct StartupConfig {
     pub merged_config: ConfigLayer,
 }
 
+const STARTUP_CACHE_VERSION: u32 = 1;
+const STARTUP_CACHE_ENABLE_ENV: &str = "BR_STARTUP_CACHE";
+const STARTUP_CACHE_DIR_ENV: &str = "BR_STARTUP_CACHE_DIR";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StartupCacheRecord {
+    version: u32,
+    key: String,
+    witness: StartupCacheWitness,
+    paths: ConfigPaths,
+    layers: Vec<ConfigLayer>,
+    merged_config: ConfigLayer,
+}
+
+impl StartupCacheRecord {
+    fn into_startup(self) -> StartupConfig {
+        StartupConfig {
+            paths: self.paths,
+            layers: self.layers,
+            merged_config: self.merged_config,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct StartupCacheWitness {
+    db_override: Option<PathBuf>,
+    env: Vec<(String, Option<String>)>,
+    files: Vec<StartupFileWitness>,
+}
+
+impl StartupCacheWitness {
+    fn capture(beads_dir: &Path, db_override: Option<&PathBuf>) -> Self {
+        let env = startup_cache_env_witness();
+        let mut files = startup_cache_watch_paths(beads_dir)
+            .into_iter()
+            .map(StartupFileWitness::capture)
+            .collect::<Vec<_>>();
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+
+        Self {
+            db_override: db_override.cloned(),
+            env,
+            files,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct StartupFileWitness {
+    path: PathBuf,
+    state: StartupPathState,
+}
+
+impl StartupFileWitness {
+    fn capture(path: PathBuf) -> Self {
+        let state = match fs::symlink_metadata(&path) {
+            Ok(metadata) => StartupPathState::present(&metadata),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => StartupPathState::Missing,
+            Err(err) => StartupPathState::Unreadable {
+                kind: err.kind().to_string(),
+            },
+        };
+        Self { path, state }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+enum StartupPathState {
+    Missing,
+    Unreadable {
+        kind: String,
+    },
+    Present {
+        kind: StartupFileKind,
+        len: u64,
+        modified_nanos: Option<u128>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        unix: Option<StartupUnixFileWitness>,
+    },
+}
+
+impl StartupPathState {
+    fn present(metadata: &fs::Metadata) -> Self {
+        let file_type = metadata.file_type();
+        Self::Present {
+            kind: if file_type.is_symlink() {
+                StartupFileKind::Symlink
+            } else if file_type.is_file() {
+                StartupFileKind::File
+            } else if file_type.is_dir() {
+                StartupFileKind::Directory
+            } else {
+                StartupFileKind::Other
+            },
+            len: metadata.len(),
+            modified_nanos: metadata.modified().ok().and_then(|modified| {
+                modified.duration_since(UNIX_EPOCH).ok().map(|duration| {
+                    u128::from(duration.as_secs()) * 1_000_000_000
+                        + u128::from(duration.subsec_nanos())
+                })
+            }),
+            unix: startup_unix_file_witness(metadata),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+enum StartupFileKind {
+    File,
+    Directory,
+    Symlink,
+    Other,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct StartupUnixFileWitness {
+    dev: u64,
+    ino: u64,
+    mode: u32,
+    mtime_nsec: i64,
+    ctime_nsec: i64,
+}
+
+#[cfg(unix)]
+fn startup_unix_file_witness(metadata: &fs::Metadata) -> Option<StartupUnixFileWitness> {
+    use std::os::unix::fs::MetadataExt;
+
+    Some(StartupUnixFileWitness {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        mode: metadata.mode(),
+        mtime_nsec: metadata.mtime_nsec(),
+        ctime_nsec: metadata.ctime_nsec(),
+    })
+}
+
+#[cfg(not(unix))]
+const fn startup_unix_file_witness(_metadata: &fs::Metadata) -> Option<StartupUnixFileWitness> {
+    None
+}
+
 /// Load startup-only config layers and resolve the effective storage paths once.
 ///
 /// # Errors
@@ -3264,6 +3407,18 @@ pub struct StartupConfig {
 /// Returns an error if any startup config layer cannot be read or parsed, or if
 /// path resolution fails.
 pub fn load_startup_config_with_paths(
+    beads_dir: &Path,
+    db_override: Option<&PathBuf>,
+) -> Result<StartupConfig> {
+    if startup_cache_enabled() {
+        let cache_dir = startup_cache_dir_from_env();
+        return load_startup_config_with_paths_cached_at(beads_dir, db_override, &cache_dir);
+    }
+
+    load_startup_config_with_paths_uncached(beads_dir, db_override)
+}
+
+fn load_startup_config_with_paths_uncached(
     beads_dir: &Path,
     db_override: Option<&PathBuf>,
 ) -> Result<StartupConfig> {
@@ -3294,6 +3449,179 @@ pub fn load_startup_config_with_paths(
         layers,
         merged_config: merged_startup,
     })
+}
+
+fn load_startup_config_with_paths_cached_at(
+    beads_dir: &Path,
+    db_override: Option<&PathBuf>,
+    cache_dir: &Path,
+) -> Result<StartupConfig> {
+    let before = StartupCacheWitness::capture(beads_dir, db_override);
+    let key = startup_cache_key(beads_dir, &before);
+    let cache_path = startup_cache_path(cache_dir, &key);
+
+    if let Some(startup) =
+        try_read_startup_cache(&cache_path, &key, &before, beads_dir, db_override)
+    {
+        return Ok(startup);
+    }
+
+    let direct = load_startup_config_with_paths_uncached(beads_dir, db_override)?;
+    let after = StartupCacheWitness::capture(beads_dir, db_override);
+    if before == after {
+        let record = StartupCacheRecord {
+            version: STARTUP_CACHE_VERSION,
+            key,
+            witness: after,
+            paths: direct.paths.clone(),
+            layers: direct.layers.clone(),
+            merged_config: direct.merged_config.clone(),
+        };
+        let _ = write_startup_cache_record(&cache_path, &record);
+    }
+    Ok(direct)
+}
+
+fn try_read_startup_cache(
+    cache_path: &Path,
+    key: &str,
+    before: &StartupCacheWitness,
+    beads_dir: &Path,
+    db_override: Option<&PathBuf>,
+) -> Option<StartupConfig> {
+    let contents = fs::read_to_string(cache_path).ok()?;
+    let record: StartupCacheRecord = serde_json::from_str(&contents).ok()?;
+    if record.version != STARTUP_CACHE_VERSION || record.key != key || record.witness != *before {
+        return None;
+    }
+
+    let after = StartupCacheWitness::capture(beads_dir, db_override);
+    if after == *before {
+        Some(record.into_startup())
+    } else {
+        None
+    }
+}
+
+fn write_startup_cache_record(cache_path: &Path, record: &StartupCacheRecord) -> Result<()> {
+    let Some(parent) = cache_path.parent() else {
+        return Ok(());
+    };
+    fs::create_dir_all(parent)?;
+    let bytes = serde_json::to_vec(record)?;
+    let tmp_path = cache_path.with_extension(format!("tmp.{}", std::process::id()));
+    fs::write(&tmp_path, bytes)?;
+    fs::rename(tmp_path, cache_path)?;
+    Ok(())
+}
+
+#[must_use]
+fn startup_cache_enabled() -> bool {
+    env::var(STARTUP_CACHE_ENABLE_ENV)
+        .ok()
+        .and_then(|value| parse_bool(&value))
+        .unwrap_or(false)
+}
+
+fn startup_cache_dir_from_env() -> PathBuf {
+    if let Some(path) = env::var_os(STARTUP_CACHE_DIR_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    {
+        return path;
+    }
+    if let Some(path) = env::var_os("XDG_CACHE_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    {
+        return path.join("beads").join("startup");
+    }
+    if let Some(home) = env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    {
+        return home.join(".cache").join("beads").join("startup");
+    }
+    env::temp_dir().join("beads-startup-cache")
+}
+
+fn startup_cache_key(beads_dir: &Path, witness: &StartupCacheWitness) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"br-startup-cache-v1");
+    hasher.update(beads_dir.to_string_lossy().as_bytes());
+    hasher.update(b"\0");
+    if let Some(db_override) = &witness.db_override {
+        hasher.update(db_override.to_string_lossy().as_bytes());
+    }
+    hasher.update(b"\0");
+    for (key, value) in &witness.env {
+        hasher.update(key.as_bytes());
+        hasher.update(b"=");
+        if let Some(value) = value {
+            hasher.update(value.as_bytes());
+        }
+        hasher.update(b"\0");
+    }
+    hex_encode(&hasher.finalize())
+}
+
+fn startup_cache_path(cache_dir: &Path, key: &str) -> PathBuf {
+    cache_dir.join(format!("startup-{key}.json"))
+}
+
+fn startup_cache_env_witness() -> Vec<(String, Option<String>)> {
+    let mut keys = vec![
+        "BEADS_AUTO_START_DAEMON".to_string(),
+        "BEADS_CACHE_DIR".to_string(),
+        "BEADS_DIR".to_string(),
+        "BEADS_FLUSH_DEBOUNCE".to_string(),
+        "BEADS_IDENTITY".to_string(),
+        "BEADS_JSONL".to_string(),
+        "BEADS_REMOTE_SYNC_INTERVAL".to_string(),
+        "HOME".to_string(),
+    ];
+    keys.extend(env::vars().filter_map(|(key, _)| key.starts_with("BD_").then_some(key)));
+    keys.sort();
+    keys.dedup();
+
+    keys.into_iter()
+        .map(|key| {
+            let value = env::var(&key).ok();
+            (key, value)
+        })
+        .collect()
+}
+
+fn startup_cache_watch_paths(beads_dir: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![
+        beads_dir.join("metadata.json"),
+        beads_dir.join("config.yaml"),
+        beads_dir.join("routes.jsonl"),
+        beads_dir.join("redirect"),
+    ];
+
+    if let Ok(home) = env::var("HOME")
+        && !home.trim().is_empty()
+    {
+        let home_path = PathBuf::from(home);
+        let config_root = home_path.join(".config");
+        paths.push(config_root.join("beads").join("config.yaml"));
+        paths.push(config_root.join("bd").join("config.yaml"));
+        paths.push(home_path.join(".beads").join("config.yaml"));
+    }
+
+    if let Some(project_root) = beads_dir.parent() {
+        for ancestor in project_root.ancestors() {
+            paths.push(ancestor.join("mayor").join("town.json"));
+        }
+        if let Some(town_root) = routing::find_town_root(project_root) {
+            paths.push(town_root.join(".beads").join("routes.jsonl"));
+        }
+    }
+
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 #[must_use]
@@ -5832,6 +6160,175 @@ routing:
                 .expect("query mutated jsonl issue")
                 .is_none(),
             "mutating metadata after startup load must not change the opened storage paths"
+        );
+    }
+
+    fn startup_cache_files(cache_dir: &Path) -> Vec<PathBuf> {
+        let mut files = fs::read_dir(cache_dir)
+            .expect("read cache dir")
+            .map(|entry| entry.expect("cache entry").path())
+            .collect::<Vec<_>>();
+        files.sort();
+        files
+    }
+
+    #[test]
+    fn startup_config_cache_invalidates_metadata_changes() {
+        let temp = TempDir::new().expect("tempdir");
+        let cache = TempDir::new().expect("cache");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let first_jsonl = beads_dir.join("first.jsonl");
+        let second_jsonl = beads_dir.join("second-longer-name.jsonl");
+        write_single_issue_jsonl(&first_jsonl, "bd-first", "First startup snapshot");
+        write_single_issue_jsonl(&second_jsonl, "bd-second", "Second startup snapshot");
+
+        fs::write(
+            beads_dir.join("metadata.json"),
+            r#"{"database":"beads.db","jsonl_export":"first.jsonl"}"#,
+        )
+        .expect("write first metadata");
+
+        let first = load_startup_config_with_paths_cached_at(&beads_dir, None, cache.path())
+            .expect("first");
+        assert_eq!(first.paths.jsonl_path, first_jsonl);
+        assert_eq!(startup_cache_files(cache.path()).len(), 1);
+
+        fs::write(
+            beads_dir.join("metadata.json"),
+            r#"{"database":"beads.db","jsonl_export":"second-longer-name.jsonl"}"#,
+        )
+        .expect("write second metadata");
+
+        let second = load_startup_config_with_paths_cached_at(&beads_dir, None, cache.path())
+            .expect("second");
+        assert_eq!(second.paths.jsonl_path, second_jsonl);
+    }
+
+    #[test]
+    fn startup_config_cache_invalidates_project_config_changes() {
+        let temp = TempDir::new().expect("tempdir");
+        let cache = TempDir::new().expect("cache");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        fs::write(beads_dir.join("config.yaml"), "no-db: true\n").expect("write config");
+
+        let first = load_startup_config_with_paths_cached_at(&beads_dir, None, cache.path())
+            .expect("first");
+        assert_eq!(no_db_from_layer(&first.merged_config), Some(true));
+
+        fs::write(beads_dir.join("config.yaml"), "no-db: false\n").expect("rewrite config");
+        let second = load_startup_config_with_paths_cached_at(&beads_dir, None, cache.path())
+            .expect("second");
+        assert_eq!(no_db_from_layer(&second.merged_config), Some(false));
+    }
+
+    #[test]
+    fn startup_config_cache_rejects_hit_if_witness_changes_during_optimistic_read() {
+        let temp = TempDir::new().expect("tempdir");
+        let cache = TempDir::new().expect("cache");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        fs::write(
+            beads_dir.join("metadata.json"),
+            r#"{"database":"beads.db","jsonl_export":"issues.jsonl"}"#,
+        )
+        .expect("write metadata");
+        let before = StartupCacheWitness::capture(&beads_dir, None);
+        let key = startup_cache_key(&beads_dir, &before);
+        let cache_path = startup_cache_path(cache.path(), &key);
+
+        load_startup_config_with_paths_cached_at(&beads_dir, None, cache.path())
+            .expect("prime cache");
+        assert!(cache_path.is_file(), "priming should write startup cache");
+
+        fs::write(
+            beads_dir.join("metadata.json"),
+            r#"{"database":"beads.db","jsonl_export":"mutated-after-first-witness.jsonl"}"#,
+        )
+        .expect("mutate metadata");
+
+        let stale = try_read_startup_cache(&cache_path, &key, &before, &beads_dir, None);
+        assert!(
+            stale.is_none(),
+            "second witness check must reject a torn optimistic cache read"
+        );
+    }
+
+    #[test]
+    fn startup_config_cache_falls_back_from_corrupt_cache() {
+        let temp = TempDir::new().expect("tempdir");
+        let cache = TempDir::new().expect("cache");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let startup = load_startup_config_with_paths_cached_at(&beads_dir, None, cache.path())
+            .expect("prime");
+        assert_eq!(startup.paths.metadata, Metadata::default());
+
+        let cache_file = startup_cache_files(cache.path())
+            .into_iter()
+            .next()
+            .expect("cache file");
+        fs::write(cache_file, "{ definitely not valid json").expect("corrupt cache");
+
+        let fallback =
+            load_startup_config_with_paths_cached_at(&beads_dir, None, cache.path()).expect("load");
+        assert_eq!(fallback.paths.metadata, Metadata::default());
+    }
+
+    #[test]
+    fn startup_config_cache_witness_tracks_routes_redirects_and_db_override() {
+        let temp = TempDir::new().expect("tempdir");
+        let town_root = temp.path().join("town");
+        let project_root = town_root.join("project");
+        let beads_dir = project_root.join(".beads");
+        let town_beads = town_root.join(".beads");
+        fs::create_dir_all(town_root.join("mayor")).expect("create mayor");
+        fs::create_dir_all(&beads_dir).expect("create project beads");
+        fs::create_dir_all(&town_beads).expect("create town beads");
+        fs::write(town_root.join("mayor").join("town.json"), "{}\n").expect("write town marker");
+
+        let initial = StartupCacheWitness::capture(&beads_dir, None);
+        fs::write(
+            beads_dir.join("routes.jsonl"),
+            r#"{"prefix":"other-","path":"../other"}"#,
+        )
+        .expect("write local routes");
+        assert_ne!(
+            initial,
+            StartupCacheWitness::capture(&beads_dir, None),
+            "local routes.jsonl must invalidate cached startup metadata"
+        );
+
+        let before_redirect = StartupCacheWitness::capture(&beads_dir, None);
+        fs::write(beads_dir.join("redirect"), ".\n").expect("write redirect");
+        assert_ne!(
+            before_redirect,
+            StartupCacheWitness::capture(&beads_dir, None),
+            "redirect changes must invalidate cached startup metadata"
+        );
+
+        let before_town_routes = StartupCacheWitness::capture(&beads_dir, None);
+        fs::write(
+            town_beads.join("routes.jsonl"),
+            r#"{"prefix":"town-","path":"."}"#,
+        )
+        .expect("write town routes");
+        assert_ne!(
+            before_town_routes,
+            StartupCacheWitness::capture(&beads_dir, None),
+            "town routes.jsonl must invalidate cached startup metadata"
+        );
+
+        let db_a = beads_dir.join("a.db");
+        let db_b = beads_dir.join("b.db");
+        assert_ne!(
+            StartupCacheWitness::capture(&beads_dir, Some(&db_a)),
+            StartupCacheWitness::capture(&beads_dir, Some(&db_b)),
+            "CLI database override changes must not reuse a stale cache entry"
         );
     }
 
