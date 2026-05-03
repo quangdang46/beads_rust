@@ -116,8 +116,17 @@ fn execute_inner(
     // Validate sort key before query
     validate_sort_key(args.sort.as_deref())?;
 
+    let use_projected_text_rows = matches!(output_format, OutputFormat::Text)
+        && !args.long
+        && !args.pretty
+        && !client_filters;
+
     // Query issues
-    let mut issues = storage.list_issues(&filters)?;
+    let mut issues = if use_projected_text_rows {
+        storage.list_text_issues_for_command_output(&filters)?
+    } else {
+        storage.list_issues(&filters)?
+    };
     if client_filters {
         issues = apply_client_filters(issues, args)?;
     }
