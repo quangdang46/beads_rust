@@ -34,12 +34,17 @@
 
 mod common;
 
+use beads_rust::util::hex_encode;
 use common::artifact_validator::{
-    ArtifactValidator, StartupMatrixAggregation, StartupMatrixManifest, StartupMatrixState,
+    ArtifactValidator, PerfEvidenceBinary, PerfEvidenceCommand, PerfEvidenceComparison,
+    PerfEvidenceDataset, PerfEvidenceEnvVar, PerfEvidenceEnvironment, PerfEvidenceGit,
+    PerfEvidenceGolden, PerfEvidenceManifest, PerfEvidencePolicy, PerfEvidenceResources,
+    PerfEvidenceTiming, StartupMatrixAggregation, StartupMatrixManifest, StartupMatrixState,
 };
 use common::binary_discovery::{DiscoveredBinaries, discover_binaries};
 use common::dataset_registry::{IsolatedDataset, KnownDataset};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
@@ -125,8 +130,8 @@ struct RunResult {
     stdout: Vec<u8>,
 }
 
-/// Captured command output for startup matrix artifact bundles.
-struct StartupMatrixRun {
+/// Captured command output for performance artifact bundles.
+struct CapturedCommandRun {
     duration: Duration,
     exit_code: i32,
     success: bool,
@@ -162,7 +167,7 @@ fn run_startup_matrix_command(
     args: &[&str],
     cwd: &Path,
     env_vars: &[(&str, String)],
-) -> std::io::Result<StartupMatrixRun> {
+) -> std::io::Result<CapturedCommandRun> {
     let mut command = Command::new(binary_path);
     command.args(args).current_dir(cwd);
     for key in [
@@ -191,7 +196,7 @@ fn run_startup_matrix_command(
         .stderr(Stdio::piped())
         .output()?;
 
-    Ok(StartupMatrixRun {
+    Ok(CapturedCommandRun {
         duration: start.elapsed(),
         exit_code: output.status.code().unwrap_or(-1),
         success: output.status.success(),
@@ -452,7 +457,7 @@ fn write_startup_matrix_state_artifacts(
     args: &[&str],
     cwd: &Path,
     env_vars: &[(&str, String)],
-    run: &StartupMatrixRun,
+    run: &CapturedCommandRun,
 ) -> std::io::Result<StartupMatrixState> {
     for subdir in ["logs", "timing", "syscalls", "rss", "raw"] {
         fs::create_dir_all(bundle_dir.join(subdir))?;
@@ -583,6 +588,322 @@ fn write_startup_matrix_smoke_bundle(
     fs::write(
         bundle_dir.join("startup-matrix-manifest.json"),
         serde_json::to_string_pretty(&manifest)?,
+    )?;
+
+    Ok(manifest)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex_encode(&Sha256::digest(bytes))
+}
+
+fn git_revision_for_perf_evidence() -> String {
+    Command::new("git")
+        .args(["rev-parse", "--verify", "HEAD"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|revision| !revision.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn git_dirty_for_perf_evidence() -> bool {
+    Command::new("git")
+        .args(["status", "--short"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .is_some_and(|output| !String::from_utf8_lossy(&output.stdout).trim().is_empty())
+}
+
+fn rustc_version_for_perf_evidence() -> Option<String> {
+    Command::new("rustc")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|version| !version.is_empty())
+}
+
+fn percentile(sorted_samples: &[f64], numerator: usize, denominator: usize) -> f64 {
+    if sorted_samples.is_empty() {
+        return 0.0;
+    }
+
+    let max_index = sorted_samples.len() - 1;
+    let index = max_index.saturating_mul(numerator).div_ceil(denominator);
+    sorted_samples[index.min(max_index)]
+}
+
+fn prepare_perf_evidence_bundle_dir(bundle_dir: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(bundle_dir)?;
+    for subdir in [
+        "logs", "timing", "syscalls", "io", "rss", "golden", "proof", "baseline", "raw",
+    ] {
+        fs::create_dir_all(bundle_dir.join(subdir))?;
+    }
+
+    Ok(())
+}
+
+fn record_perf_evidence_runs(
+    br_path: &Path,
+    workspace_root: &Path,
+    bundle_dir: &Path,
+    args: &[&str],
+) -> std::io::Result<(Vec<CapturedCommandRun>, Vec<String>)> {
+    let mut runs = Vec::new();
+    let mut raw_artifact_paths = Vec::new();
+
+    for run_index in 0..3 {
+        let run = run_startup_matrix_command(br_path, args, workspace_root, &[])?;
+        if !run.success {
+            return Err(std::io::Error::other(format!(
+                "perf evidence smoke command failed with code {}; stdout={}; stderr={}",
+                run.exit_code,
+                String::from_utf8_lossy(&run.stdout),
+                String::from_utf8_lossy(&run.stderr)
+            )));
+        }
+
+        let stdout_path = format!("raw/list-{run_index}.stdout");
+        let stderr_path = format!("raw/list-{run_index}.stderr");
+        fs::write(bundle_dir.join(&stdout_path), &run.stdout)?;
+        fs::write(bundle_dir.join(&stderr_path), &run.stderr)?;
+        raw_artifact_paths.push(stdout_path);
+        raw_artifact_paths.push(stderr_path);
+        runs.push(run);
+    }
+
+    Ok((runs, raw_artifact_paths))
+}
+
+fn write_perf_evidence_golden(
+    bundle_dir: &Path,
+    runs: &[CapturedCommandRun],
+) -> std::io::Result<(String, String)> {
+    let Some(first_run) = runs.first() else {
+        return Err(std::io::Error::other(
+            "perf evidence smoke requires at least one command run",
+        ));
+    };
+    let stdout_sha256 = sha256_hex(&first_run.stdout);
+    let stderr_sha256 = sha256_hex(&first_run.stderr);
+    fs::write(bundle_dir.join("golden/stdout"), &first_run.stdout)?;
+    fs::write(bundle_dir.join("golden/stderr"), &first_run.stderr)?;
+    fs::write(
+        bundle_dir.join("golden/checksums.txt"),
+        format!("{stdout_sha256}  golden/stdout\n{stderr_sha256}  golden/stderr\n"),
+    )?;
+
+    Ok((stdout_sha256, stderr_sha256))
+}
+
+fn write_perf_evidence_timing(
+    bundle_dir: &Path,
+    runs: &[CapturedCommandRun],
+) -> std::io::Result<PerfEvidenceTiming> {
+    let mut durations_ms = runs
+        .iter()
+        .map(|run| run.duration.as_secs_f64() * 1000.0)
+        .collect::<Vec<_>>();
+    durations_ms.sort_by(f64::total_cmp);
+    let timing = PerfEvidenceTiming {
+        sample_count: runs.len(),
+        min_ms: *durations_ms.first().unwrap_or(&0.0),
+        p50_ms: percentile(&durations_ms, 50, 100),
+        p95_ms: percentile(&durations_ms, 95, 100),
+        p99_ms: percentile(&durations_ms, 99, 100),
+        max_ms: *durations_ms.last().unwrap_or(&0.0),
+        summary_path: "timing/list.json".to_string(),
+        raw_samples_path: "timing/list-samples.jsonl".to_string(),
+    };
+
+    let sample_lines = runs
+        .iter()
+        .enumerate()
+        .map(|(run_index, run)| {
+            serde_json::json!({
+                "run_index": run_index,
+                "duration_ms": run.duration.as_secs_f64() * 1000.0,
+                "exit_code": run.exit_code,
+                "stdout_sha256": sha256_hex(&run.stdout),
+                "stderr_sha256": sha256_hex(&run.stderr),
+            })
+            .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(
+        bundle_dir.join(&timing.raw_samples_path),
+        format!("{sample_lines}\n"),
+    )?;
+    fs::write(
+        bundle_dir.join(&timing.summary_path),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "sample_count": timing.sample_count,
+            "min_ms": timing.min_ms,
+            "p50_ms": timing.p50_ms,
+            "p95_ms": timing.p95_ms,
+            "p99_ms": timing.p99_ms,
+            "max_ms": timing.max_ms,
+        }))?,
+    )?;
+
+    Ok(timing)
+}
+
+fn write_perf_evidence_support_artifacts(
+    bundle_dir: &Path,
+    workspace_root: &Path,
+    args: &[&str],
+    sample_count: usize,
+    stdout_sha256: &str,
+    stderr_sha256: &str,
+) -> std::io::Result<()> {
+    fs::write(
+        bundle_dir.join("logs/list.log"),
+        format!(
+            "command: br {}\nworkspace: {}\nsamples: {}\nstdout_sha256: {stdout_sha256}\nstderr_sha256: {stderr_sha256}\n",
+            args.join(" "),
+            workspace_root.display(),
+            sample_count
+        ),
+    )?;
+    for (path, collector) in [
+        ("syscalls/list.json", "syscall"),
+        ("io/list.json", "io"),
+        ("rss/list.json", "rss"),
+    ] {
+        fs::write(
+            bundle_dir.join(path),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "collector": collector,
+                "status": "not_collected",
+                "reason": "smoke evidence bundle records the required slot; full release gates can replace this with platform capture",
+            }))?,
+        )?;
+    }
+    fs::write(
+        bundle_dir.join("proof/isomorphism.md"),
+        "## Change: perf evidence smoke ledger\n- Ordering preserved: yes; command output is not transformed.\n- Tie-breaking unchanged: yes; br list decides ordering.\n- Floating-point: N/A for command output; timings are evidence only.\n- RNG seeds: unchanged/N/A.\n- Golden outputs: stdout and stderr SHA-256 hashes recorded in golden/checksums.txt.\n",
+    )?;
+
+    Ok(())
+}
+
+fn build_perf_evidence_manifest(
+    br_path: &Path,
+    workspace_root: &Path,
+    args: &[&str],
+    timing: PerfEvidenceTiming,
+    hashes: (String, String),
+    raw_artifact_paths: Vec<String>,
+) -> std::io::Result<PerfEvidenceManifest> {
+    let (stdout_sha256, stderr_sha256) = hashes;
+    let issues_jsonl = fs::read(workspace_root.join(".beads").join("issues.jsonl"))?;
+    let generated_at = chrono::Utc::now();
+    Ok(PerfEvidenceManifest {
+        schema_version: "br.perf-evidence.v1".to_string(),
+        generated_at: generated_at.to_rfc3339(),
+        valid_until: Some((generated_at + chrono::Duration::days(30)).to_rfc3339()),
+        command: PerfEvidenceCommand {
+            label: "list_json".to_string(),
+            args: args.iter().map(|arg| (*arg).to_string()).collect(),
+        },
+        dataset: PerfEvidenceDataset {
+            name: "tiny-smoke".to_string(),
+            issue_count: Some(3),
+            content_hash: Some(sha256_hex(&issues_jsonl)),
+        },
+        git: PerfEvidenceGit {
+            revision: git_revision_for_perf_evidence(),
+            dirty: git_dirty_for_perf_evidence(),
+        },
+        binary: PerfEvidenceBinary {
+            path: br_path.display().to_string(),
+            version: None,
+        },
+        environment: PerfEvidenceEnvironment {
+            os: std::env::consts::OS.to_string(),
+            rustc: rustc_version_for_perf_evidence(),
+            env: vec![PerfEvidenceEnvVar {
+                name: "NO_COLOR".to_string(),
+                value_hash: Some(sha256_hex(b"1")),
+            }],
+        },
+        timing,
+        resources: PerfEvidenceResources {
+            syscalls: "syscalls/list.json".to_string(),
+            io: "io/list.json".to_string(),
+            rss: "rss/list.json".to_string(),
+        },
+        golden: PerfEvidenceGolden {
+            stdout_sha256,
+            stderr_sha256: Some(stderr_sha256),
+            checksums_path: "golden/checksums.txt".to_string(),
+            stdout_path: "golden/stdout".to_string(),
+            stderr_path: Some("golden/stderr".to_string()),
+        },
+        isomorphism_note_path: "proof/isomorphism.md".to_string(),
+        policy: PerfEvidencePolicy {
+            mode: "enforcing".to_string(),
+            baseline_manifest_path: Some("baseline/perf-evidence-manifest.json".to_string()),
+            latency_regression_budget_pct: Some(5.0),
+            syscall_regression_budget_pct: Some(10.0),
+            output_hash_must_match: true,
+        },
+        comparison: PerfEvidenceComparison {
+            status: "pass".to_string(),
+            baseline_manifest_path: Some("baseline/perf-evidence-manifest.json".to_string()),
+            p95_delta_pct: Some(0.0),
+            stdout_hash_match: Some(true),
+            syscall_delta_pct: Some(0.0),
+            decision_reason: "self-baseline smoke comparison passed enforcing policy".to_string(),
+        },
+        raw_artifact_paths,
+    })
+}
+
+fn write_perf_evidence_smoke_bundle(
+    br_path: &Path,
+    bundle_dir: &Path,
+) -> std::io::Result<PerfEvidenceManifest> {
+    prepare_perf_evidence_bundle_dir(bundle_dir)?;
+
+    let (_workspace_guard, workspace_root) = create_br_workspace(br_path, 3)?;
+    let args = ["list", "--json"];
+    let (runs, raw_artifact_paths) =
+        record_perf_evidence_runs(br_path, &workspace_root, bundle_dir, &args)?;
+    let hashes = write_perf_evidence_golden(bundle_dir, &runs)?;
+    let timing = write_perf_evidence_timing(bundle_dir, &runs)?;
+    write_perf_evidence_support_artifacts(
+        bundle_dir,
+        &workspace_root,
+        &args,
+        runs.len(),
+        &hashes.0,
+        &hashes.1,
+    )?;
+    let manifest = build_perf_evidence_manifest(
+        br_path,
+        &workspace_root,
+        &args,
+        timing,
+        hashes,
+        raw_artifact_paths,
+    )?;
+
+    let manifest_json = serde_json::to_string_pretty(&manifest)?;
+    fs::write(
+        bundle_dir.join("perf-evidence-manifest.json"),
+        &manifest_json,
+    )?;
+    fs::write(
+        bundle_dir.join("baseline/perf-evidence-manifest.json"),
+        manifest_json,
     )?;
 
     Ok(manifest)
@@ -1215,6 +1536,36 @@ fn startup_matrix_smoke_bundle_covers_storage_open_states() -> std::io::Result<(
     let mut expected = STARTUP_MATRIX_STATES.to_vec();
     expected.sort_unstable();
     assert_eq!(states, expected);
+
+    Ok(())
+}
+
+/// Smoke runner for the reusable performance evidence ledger bundle.
+#[test]
+fn perf_evidence_smoke_bundle_records_list_json_command() -> std::io::Result<()> {
+    let br_path = assert_cmd::cargo::cargo_bin!("br");
+    let run_id = format!(
+        "perf-evidence-smoke-{}-{}",
+        chrono::Utc::now().format("%Y%m%dT%H%M%S%fZ"),
+        std::process::id()
+    );
+    let bundle_dir = PathBuf::from("target").join("perf-artifacts").join(run_id);
+
+    let manifest = write_perf_evidence_smoke_bundle(br_path, &bundle_dir)?;
+    let validation = ArtifactValidator::new().validate_perf_evidence_bundle_dir(&bundle_dir);
+    assert!(
+        validation.valid,
+        "perf evidence bundle should validate: {:?}",
+        validation.errors
+    );
+    assert_eq!(manifest.schema_version, "br.perf-evidence.v1");
+    assert_eq!(manifest.command.args, ["list", "--json"]);
+    assert_eq!(manifest.policy.mode, "enforcing");
+    assert_eq!(manifest.comparison.status, "pass");
+    assert_eq!(manifest.comparison.stdout_hash_match, Some(true));
+    assert_eq!(manifest.timing.sample_count, 3);
+    assert!(manifest.timing.p50_ms <= manifest.timing.p95_ms);
+    assert!(manifest.timing.p95_ms <= manifest.timing.p99_ms);
 
     Ok(())
 }

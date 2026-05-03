@@ -164,13 +164,18 @@ use isolated workspaces so source datasets are never mutated.
 cargo test --test bench_cold_warm_start -- --nocapture --ignored
 HARNESS_ARTIFACTS=1 cargo test --test bench_cold_warm_start -- --nocapture --ignored
 cargo test --test bench_cold_warm_start startup_matrix_smoke_bundle -- --nocapture
+cargo test --test bench_cold_warm_start perf_evidence_smoke_bundle -- --nocapture
 ```
 Outputs: `target/benchmark-results/cold_warm_*_latest.json`,
 `target/benchmark-results/cold_warm_all_<timestamp>.json`. The startup matrix
 smoke test also writes a validated bundle under
 `target/perf-artifacts/startup-matrix-smoke-*/` with command logs, timing,
 syscall, RSS, and raw stdout/stderr slots for clean, stale, routed, no-db,
-read-only-fast-open, sync-status, and recovery-anomaly startup states.
+read-only-fast-open, sync-status, and recovery-anomaly startup states. The perf
+evidence smoke test writes `target/perf-artifacts/perf-evidence-smoke-*/` with
+the `perf-evidence-manifest.json`, timing samples, placeholder syscall/IO/RSS
+slots, golden stdout/stderr checksums, an isomorphism note, and an enforcing
+self-baseline comparison.
 
 **Synthetic scale (10k–250k issues)**
 ```bash

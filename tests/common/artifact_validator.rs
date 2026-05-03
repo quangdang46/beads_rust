@@ -5,13 +5,14 @@
 //!
 //! Task: beads_rust-r23m
 
-use chrono::DateTime;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
 const STARTUP_MATRIX_MANIFEST: &str = "startup-matrix-manifest.json";
+const PERF_EVIDENCE_MANIFEST: &str = "perf-evidence-manifest.json";
 const REQUIRED_STARTUP_STATES: &[&str] = &[
     "clean",
     "stale",
@@ -156,6 +157,142 @@ pub struct StartupMatrixAggregation {
     pub raw_evidence_preserved: bool,
     #[serde(default)]
     pub error: Option<String>,
+}
+
+/// Manifest for reusable performance evidence and tail-latency gate bundles.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerfEvidenceManifest {
+    pub schema_version: String,
+    pub generated_at: String,
+    #[serde(default)]
+    pub valid_until: Option<String>,
+    pub command: PerfEvidenceCommand,
+    pub dataset: PerfEvidenceDataset,
+    pub git: PerfEvidenceGit,
+    pub binary: PerfEvidenceBinary,
+    pub environment: PerfEvidenceEnvironment,
+    pub timing: PerfEvidenceTiming,
+    pub resources: PerfEvidenceResources,
+    pub golden: PerfEvidenceGolden,
+    pub isomorphism_note_path: String,
+    pub policy: PerfEvidencePolicy,
+    pub comparison: PerfEvidenceComparison,
+    #[serde(default)]
+    pub raw_artifact_paths: Vec<String>,
+}
+
+/// Command covered by a performance evidence bundle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerfEvidenceCommand {
+    pub label: String,
+    pub args: Vec<String>,
+}
+
+/// Dataset fingerprint used by the measured command.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerfEvidenceDataset {
+    pub name: String,
+    #[serde(default)]
+    pub issue_count: Option<usize>,
+    #[serde(default)]
+    pub content_hash: Option<String>,
+}
+
+/// Git revision metadata for reproducibility.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerfEvidenceGit {
+    pub revision: String,
+    pub dirty: bool,
+}
+
+/// Binary metadata for the measured executable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerfEvidenceBinary {
+    pub path: String,
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
+/// Environment fingerprint for a performance evidence run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerfEvidenceEnvironment {
+    pub os: String,
+    #[serde(default)]
+    pub rustc: Option<String>,
+    #[serde(default)]
+    pub env: Vec<PerfEvidenceEnvVar>,
+}
+
+/// Environment variable recorded without leaking raw values by default.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerfEvidenceEnvVar {
+    pub name: String,
+    #[serde(default)]
+    pub value_hash: Option<String>,
+}
+
+/// Timing summary and raw sample references for tail-latency gates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerfEvidenceTiming {
+    pub sample_count: usize,
+    pub min_ms: f64,
+    pub p50_ms: f64,
+    pub p95_ms: f64,
+    pub p99_ms: f64,
+    pub max_ms: f64,
+    pub summary_path: String,
+    pub raw_samples_path: String,
+}
+
+/// Resource evidence references.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerfEvidenceResources {
+    #[serde(rename = "syscall_summary_path")]
+    pub syscalls: String,
+    #[serde(rename = "io_summary_path")]
+    pub io: String,
+    #[serde(rename = "rss_summary_path")]
+    pub rss: String,
+}
+
+/// Golden output references and hashes for behavior-preservation checks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerfEvidenceGolden {
+    pub stdout_sha256: String,
+    #[serde(default)]
+    pub stderr_sha256: Option<String>,
+    pub checksums_path: String,
+    pub stdout_path: String,
+    #[serde(default)]
+    pub stderr_path: Option<String>,
+}
+
+/// Advisory or enforcing gate policy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerfEvidencePolicy {
+    pub mode: String,
+    #[serde(default)]
+    pub baseline_manifest_path: Option<String>,
+    #[serde(default)]
+    pub latency_regression_budget_pct: Option<f64>,
+    #[serde(default)]
+    pub syscall_regression_budget_pct: Option<f64>,
+    pub output_hash_must_match: bool,
+}
+
+/// Baseline-vs-candidate comparison result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerfEvidenceComparison {
+    pub status: String,
+    #[serde(default)]
+    pub baseline_manifest_path: Option<String>,
+    #[serde(default)]
+    pub p95_delta_pct: Option<f64>,
+    #[serde(default)]
+    pub stdout_hash_match: Option<bool>,
+    #[serde(default)]
+    pub syscall_delta_pct: Option<f64>,
+    pub decision_reason: String,
 }
 
 /// Artifact validator
@@ -663,6 +800,358 @@ impl ArtifactValidator {
         result
     }
 
+    /// Validate a performance evidence manifest file.
+    pub fn validate_perf_evidence_manifest_file(&self, path: &Path) -> ValidationResult {
+        let content = match fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) => {
+                return ValidationResult::ok().with_error(ValidationError {
+                    line: None,
+                    field: None,
+                    message: format!("Failed to read performance evidence manifest: {e}"),
+                });
+            }
+        };
+
+        self.validate_perf_evidence_manifest_content(&content)
+    }
+
+    /// Validate performance evidence manifest JSON content.
+    #[allow(clippy::unused_self)]
+    pub fn validate_perf_evidence_manifest_content(&self, content: &str) -> ValidationResult {
+        let manifest = match Self::parse_perf_evidence_manifest(content) {
+            Ok(manifest) => manifest,
+            Err(error) => return ValidationResult::ok().with_error(error),
+        };
+
+        Self::validate_perf_evidence_manifest(&manifest)
+    }
+
+    fn parse_perf_evidence_manifest(
+        content: &str,
+    ) -> Result<PerfEvidenceManifest, ValidationError> {
+        serde_json::from_str(content).map_err(|e| ValidationError {
+            line: None,
+            field: None,
+            message: format!("Invalid performance evidence manifest JSON: {e}"),
+        })
+    }
+
+    fn validate_perf_evidence_manifest(manifest: &PerfEvidenceManifest) -> ValidationResult {
+        let mut result = ValidationResult::ok();
+
+        if manifest.schema_version != "br.perf-evidence.v1" {
+            result = result.with_error(ValidationError {
+                line: None,
+                field: Some("schema_version".to_string()),
+                message: format!(
+                    "Expected br.perf-evidence.v1, got {}",
+                    manifest.schema_version
+                ),
+            });
+        }
+
+        result = result.merge(Self::validate_rfc3339_field(
+            "generated_at",
+            &manifest.generated_at,
+        ));
+        if let Some(valid_until) = manifest.valid_until.as_deref() {
+            result = result.merge(Self::validate_rfc3339_field("valid_until", valid_until));
+            if let Ok(expires_at) = DateTime::parse_from_rfc3339(valid_until)
+                && expires_at.with_timezone(&Utc) < Utc::now()
+            {
+                result = result.with_error(ValidationError {
+                    line: None,
+                    field: Some("valid_until".to_string()),
+                    message: format!("Performance evidence artifact is stale: {valid_until}"),
+                });
+            }
+        }
+
+        result = result.merge(Self::validate_non_empty_field(
+            "command.label",
+            &manifest.command.label,
+        ));
+        result = result.merge(Self::validate_non_empty_field(
+            "dataset.name",
+            &manifest.dataset.name,
+        ));
+        result = result.merge(Self::validate_non_empty_field(
+            "git.revision",
+            &manifest.git.revision,
+        ));
+        result = result.merge(Self::validate_non_empty_field(
+            "binary.path",
+            &manifest.binary.path,
+        ));
+        result = result.merge(Self::validate_non_empty_field(
+            "environment.os",
+            &manifest.environment.os,
+        ));
+
+        for env in &manifest.environment.env {
+            result = result.merge(Self::validate_non_empty_field(
+                "environment.env.name",
+                &env.name,
+            ));
+        }
+
+        result = result.merge(Self::validate_perf_timing(&manifest.timing));
+        result = result.merge(Self::validate_perf_resources(&manifest.resources));
+        result = result.merge(Self::validate_perf_golden(&manifest.golden));
+        result = result.merge(Self::validate_relative_artifact_path(
+            "isomorphism_note_path",
+            &manifest.isomorphism_note_path,
+        ));
+        result = result.merge(Self::validate_perf_policy(manifest));
+
+        for path in &manifest.raw_artifact_paths {
+            result = result.merge(Self::validate_relative_artifact_path(
+                "raw_artifact_paths",
+                path,
+            ));
+        }
+
+        result
+    }
+
+    fn validate_perf_timing(timing: &PerfEvidenceTiming) -> ValidationResult {
+        let mut result = ValidationResult::ok();
+
+        if timing.sample_count == 0 {
+            result = result.with_error(ValidationError {
+                line: None,
+                field: Some("timing.sample_count".to_string()),
+                message: "Timing sample count must be greater than zero".to_string(),
+            });
+        }
+
+        for (field, value) in [
+            ("timing.min_ms", timing.min_ms),
+            ("timing.p50_ms", timing.p50_ms),
+            ("timing.p95_ms", timing.p95_ms),
+            ("timing.p99_ms", timing.p99_ms),
+            ("timing.max_ms", timing.max_ms),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                result = result.with_error(ValidationError {
+                    line: None,
+                    field: Some(field.to_string()),
+                    message: format!("Timing value must be finite and non-negative: {value}"),
+                });
+            }
+        }
+
+        if !(timing.min_ms <= timing.p50_ms
+            && timing.p50_ms <= timing.p95_ms
+            && timing.p95_ms <= timing.p99_ms
+            && timing.p99_ms <= timing.max_ms)
+        {
+            result = result.with_error(ValidationError {
+                line: None,
+                field: Some("timing".to_string()),
+                message: "Timing quantiles must satisfy min <= p50 <= p95 <= p99 <= max"
+                    .to_string(),
+            });
+        }
+
+        result = result.merge(Self::validate_relative_artifact_path(
+            "timing.summary_path",
+            &timing.summary_path,
+        ));
+        result = result.merge(Self::validate_relative_artifact_path(
+            "timing.raw_samples_path",
+            &timing.raw_samples_path,
+        ));
+
+        result
+    }
+
+    fn validate_perf_resources(resources: &PerfEvidenceResources) -> ValidationResult {
+        let mut result = ValidationResult::ok();
+        for (field, path) in [
+            ("resources.syscall_summary_path", &resources.syscalls),
+            ("resources.io_summary_path", &resources.io),
+            ("resources.rss_summary_path", &resources.rss),
+        ] {
+            result = result.merge(Self::validate_relative_artifact_path(field, path));
+        }
+        result
+    }
+
+    fn validate_perf_golden(golden: &PerfEvidenceGolden) -> ValidationResult {
+        let mut result = ValidationResult::ok();
+
+        result = result.merge(Self::validate_sha256_field(
+            "golden.stdout_sha256",
+            &golden.stdout_sha256,
+        ));
+        if let Some(stderr_sha256) = golden.stderr_sha256.as_deref() {
+            result = result.merge(Self::validate_sha256_field(
+                "golden.stderr_sha256",
+                stderr_sha256,
+            ));
+        }
+
+        result = result.merge(Self::validate_relative_artifact_path(
+            "golden.checksums_path",
+            &golden.checksums_path,
+        ));
+        result = result.merge(Self::validate_relative_artifact_path(
+            "golden.stdout_path",
+            &golden.stdout_path,
+        ));
+        if let Some(stderr_path) = golden.stderr_path.as_deref() {
+            result = result.merge(Self::validate_relative_artifact_path(
+                "golden.stderr_path",
+                stderr_path,
+            ));
+        }
+
+        result
+    }
+
+    fn validate_perf_policy(manifest: &PerfEvidenceManifest) -> ValidationResult {
+        let mut result = ValidationResult::ok();
+        let mode = manifest.policy.mode.as_str();
+        let status = manifest.comparison.status.as_str();
+
+        if !matches!(mode, "advisory" | "enforcing") {
+            result = result.with_error(ValidationError {
+                line: None,
+                field: Some("policy.mode".to_string()),
+                message: format!("Must be 'advisory' or 'enforcing', got: {mode}"),
+            });
+        }
+
+        if !matches!(status, "pass" | "advisory" | "failed" | "not_compared") {
+            result = result.with_error(ValidationError {
+                line: None,
+                field: Some("comparison.status".to_string()),
+                message: format!(
+                    "Must be 'pass', 'advisory', 'failed', or 'not_compared', got: {status}"
+                ),
+            });
+        }
+
+        result = result.merge(Self::validate_non_empty_field(
+            "comparison.decision_reason",
+            &manifest.comparison.decision_reason,
+        ));
+
+        if mode == "enforcing" {
+            if manifest.policy.baseline_manifest_path.is_none() {
+                result = result.with_error(ValidationError {
+                    line: None,
+                    field: Some("policy.baseline_manifest_path".to_string()),
+                    message: "Enforcing mode requires a baseline manifest path".to_string(),
+                });
+            }
+
+            if manifest.comparison.baseline_manifest_path.is_none() {
+                result = result.with_error(ValidationError {
+                    line: None,
+                    field: Some("comparison.baseline_manifest_path".to_string()),
+                    message: "Enforcing mode requires a compared baseline manifest path"
+                        .to_string(),
+                });
+            }
+
+            if status != "pass" {
+                result = result.with_error(ValidationError {
+                    line: None,
+                    field: Some("comparison.status".to_string()),
+                    message: format!("Enforcing mode requires comparison pass, got: {status}"),
+                });
+            }
+        } else if status == "failed" {
+            result = result.with_warning(
+                "Advisory performance evidence comparison failed without blocking".to_string(),
+            );
+        }
+
+        if manifest.policy.output_hash_must_match
+            && manifest.comparison.stdout_hash_match == Some(false)
+        {
+            if mode == "enforcing" {
+                result = result.with_error(ValidationError {
+                    line: None,
+                    field: Some("comparison.stdout_hash_match".to_string()),
+                    message: "Output hash mismatch under enforcing policy".to_string(),
+                });
+            } else {
+                result = result.with_warning(
+                    "Output hash mismatch recorded under advisory policy".to_string(),
+                );
+            }
+        }
+
+        for (field, path) in [
+            (
+                "policy.baseline_manifest_path",
+                manifest.policy.baseline_manifest_path.as_deref(),
+            ),
+            (
+                "comparison.baseline_manifest_path",
+                manifest.comparison.baseline_manifest_path.as_deref(),
+            ),
+        ] {
+            if let Some(path) = path {
+                result = result.merge(Self::validate_relative_artifact_path(field, path));
+            }
+        }
+
+        result
+    }
+
+    /// Validate a performance evidence bundle directory, including referenced files.
+    pub fn validate_perf_evidence_bundle_dir(&self, dir: &Path) -> ValidationResult {
+        let manifest_path = dir.join(PERF_EVIDENCE_MANIFEST);
+        let content = match fs::read_to_string(&manifest_path) {
+            Ok(c) => c,
+            Err(e) => {
+                return ValidationResult::ok().with_error(ValidationError {
+                    line: None,
+                    field: Some(PERF_EVIDENCE_MANIFEST.to_string()),
+                    message: format!("Failed to read performance evidence manifest: {e}"),
+                });
+            }
+        };
+
+        let manifest = match Self::parse_perf_evidence_manifest(&content) {
+            Ok(manifest) => manifest,
+            Err(error) => return ValidationResult::ok().with_error(error),
+        };
+
+        let mut result = self.validate_perf_evidence_manifest_content(&content);
+        for path in [
+            &manifest.timing.summary_path,
+            &manifest.timing.raw_samples_path,
+            &manifest.resources.syscalls,
+            &manifest.resources.io,
+            &manifest.resources.rss,
+            &manifest.golden.checksums_path,
+            &manifest.golden.stdout_path,
+            &manifest.isomorphism_note_path,
+        ] {
+            result = result.merge(Self::validate_perf_bundle_file_exists(dir, path));
+        }
+
+        if let Some(stderr_path) = manifest.golden.stderr_path.as_deref() {
+            result = result.merge(Self::validate_perf_bundle_file_exists(dir, stderr_path));
+        }
+
+        for path in &manifest.raw_artifact_paths {
+            result = result.merge(Self::validate_perf_bundle_file_exists(dir, path));
+        }
+
+        if let Some(baseline_path) = manifest.policy.baseline_manifest_path.as_deref() {
+            result = result.merge(Self::validate_perf_bundle_file_exists(dir, baseline_path));
+        }
+
+        result
+    }
+
     fn validate_bundle_file_exists(dir: &Path, relative_path: &str) -> ValidationResult {
         let path_result = Self::validate_relative_artifact_path("artifact_path", relative_path);
         if !path_result.valid {
@@ -674,6 +1163,63 @@ impl ArtifactValidator {
                 line: None,
                 field: Some(relative_path.to_string()),
                 message: "Referenced startup matrix artifact is missing".to_string(),
+            });
+        }
+
+        ValidationResult::ok()
+    }
+
+    fn validate_perf_bundle_file_exists(dir: &Path, relative_path: &str) -> ValidationResult {
+        let path_result = Self::validate_relative_artifact_path("artifact_path", relative_path);
+        if !path_result.valid {
+            return path_result;
+        }
+
+        if !dir.join(relative_path).is_file() {
+            return ValidationResult::ok().with_error(ValidationError {
+                line: None,
+                field: Some(relative_path.to_string()),
+                message: "Referenced performance evidence artifact is missing".to_string(),
+            });
+        }
+
+        ValidationResult::ok()
+    }
+
+    fn validate_rfc3339_field(field: &str, value: &str) -> ValidationResult {
+        if DateTime::parse_from_rfc3339(value).is_err() {
+            return ValidationResult::ok().with_error(ValidationError {
+                line: None,
+                field: Some(field.to_string()),
+                message: format!("Invalid RFC3339 timestamp: {value}"),
+            });
+        }
+
+        ValidationResult::ok()
+    }
+
+    fn validate_non_empty_field(field: &str, value: &str) -> ValidationResult {
+        if value.trim().is_empty() {
+            return ValidationResult::ok().with_error(ValidationError {
+                line: None,
+                field: Some(field.to_string()),
+                message: "Field cannot be empty".to_string(),
+            });
+        }
+
+        ValidationResult::ok()
+    }
+
+    fn validate_sha256_field(field: &str, value: &str) -> ValidationResult {
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return ValidationResult::ok().with_error(ValidationError {
+                line: None,
+                field: Some(field.to_string()),
+                message: format!("Expected lowercase SHA-256 hex digest, got: {value}"),
             });
         }
 
@@ -711,6 +1257,10 @@ impl ArtifactValidator {
 
         if dir.join(STARTUP_MATRIX_MANIFEST).exists() {
             result = result.merge(self.validate_startup_matrix_bundle_dir(dir));
+        }
+
+        if dir.join(PERF_EVIDENCE_MANIFEST).exists() {
+            result = result.merge(self.validate_perf_evidence_bundle_dir(dir));
         }
 
         result
@@ -902,6 +1452,124 @@ mod tests {
             error
                 .message
                 .contains("Referenced startup matrix artifact is missing")
+        }));
+    }
+
+    fn perf_manifest_json(
+        mode: &str,
+        comparison_status: &str,
+        stdout_hash_match: bool,
+        valid_until: &str,
+    ) -> String {
+        format!(
+            r#"{{
+                "schema_version":"br.perf-evidence.v1",
+                "generated_at":"2026-05-03T02:00:00Z",
+                "valid_until":"{valid_until}",
+                "command":{{"label":"list_json","args":["list","--json"]}},
+                "dataset":{{"name":"tiny-smoke","issue_count":3,"content_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},
+                "git":{{"revision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","dirty":false}},
+                "binary":{{"path":"target/debug/br","version":"br 0.2.5"}},
+                "environment":{{"os":"linux","rustc":"rustc 1.91.0-nightly","env":[{{"name":"NO_COLOR","value_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}}]}},
+                "timing":{{"sample_count":3,"min_ms":1.0,"p50_ms":2.0,"p95_ms":3.0,"p99_ms":3.0,"max_ms":3.0,"summary_path":"timing/list.json","raw_samples_path":"timing/list-samples.jsonl"}},
+                "resources":{{"syscall_summary_path":"syscalls/list.json","io_summary_path":"io/list.json","rss_summary_path":"rss/list.json"}},
+                "golden":{{"stdout_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","stderr_sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","checksums_path":"golden/checksums.txt","stdout_path":"golden/stdout","stderr_path":"golden/stderr"}},
+                "isomorphism_note_path":"proof/isomorphism.md",
+                "policy":{{"mode":"{mode}","baseline_manifest_path":"baseline/perf-evidence-manifest.json","latency_regression_budget_pct":5.0,"syscall_regression_budget_pct":10.0,"output_hash_must_match":true}},
+                "comparison":{{"status":"{comparison_status}","baseline_manifest_path":"baseline/perf-evidence-manifest.json","p95_delta_pct":0.0,"stdout_hash_match":{stdout_hash_match},"syscall_delta_pct":0.0,"decision_reason":"self-baseline smoke comparison"}},
+                "raw_artifact_paths":["raw/list-0.stdout","raw/list-0.stderr"]
+            }}"#
+        )
+    }
+
+    fn write_perf_bundle_files(dir: &Path) {
+        for subdir in [
+            "timing", "syscalls", "io", "rss", "golden", "proof", "baseline", "raw",
+        ] {
+            fs::create_dir_all(dir.join(subdir)).expect("create perf evidence subdir");
+        }
+
+        for path in [
+            "timing/list.json",
+            "timing/list-samples.jsonl",
+            "syscalls/list.json",
+            "io/list.json",
+            "rss/list.json",
+            "golden/checksums.txt",
+            "golden/stdout",
+            "golden/stderr",
+            "proof/isomorphism.md",
+            "baseline/perf-evidence-manifest.json",
+            "raw/list-0.stdout",
+            "raw/list-0.stderr",
+        ] {
+            fs::write(dir.join(path), "perf evidence smoke artifact")
+                .expect("write perf evidence artifact");
+        }
+    }
+
+    #[test]
+    fn valid_perf_evidence_manifest_passes() {
+        let validator = ArtifactValidator::new();
+        let content = perf_manifest_json("enforcing", "pass", true, "2099-01-01T00:00:00Z");
+        let result = validator.validate_perf_evidence_manifest_content(&content);
+        assert!(result.valid, "Errors: {:?}", result.errors);
+    }
+
+    #[test]
+    fn perf_evidence_manifest_rejects_stale_artifacts() {
+        let validator = ArtifactValidator::new();
+        let content = perf_manifest_json("enforcing", "pass", true, "2000-01-01T00:00:00Z");
+        let result = validator.validate_perf_evidence_manifest_content(&content);
+        assert!(!result.valid);
+        assert!(result.errors.iter().any(|error| {
+            error.field.as_deref() == Some("valid_until") && error.message.contains("stale")
+        }));
+    }
+
+    #[test]
+    fn perf_evidence_enforcing_policy_requires_passing_comparison() {
+        let validator = ArtifactValidator::new();
+        let content = perf_manifest_json("enforcing", "advisory", true, "2099-01-01T00:00:00Z");
+        let result = validator.validate_perf_evidence_manifest_content(&content);
+        assert!(!result.valid);
+        assert!(result.errors.iter().any(|error| {
+            error.field.as_deref() == Some("comparison.status")
+                && error.message.contains("requires comparison pass")
+        }));
+    }
+
+    #[test]
+    fn perf_evidence_advisory_policy_warns_without_failing() {
+        let validator = ArtifactValidator::new();
+        let content = perf_manifest_json("advisory", "failed", false, "2099-01-01T00:00:00Z");
+        let result = validator.validate_perf_evidence_manifest_content(&content);
+        assert!(result.valid, "Errors: {:?}", result.errors);
+        assert!(!result.warnings.is_empty());
+    }
+
+    #[test]
+    fn perf_evidence_bundle_validates_referenced_files() {
+        let validator = ArtifactValidator::new();
+        let dir = tempdir().expect("create tempdir");
+        let manifest = perf_manifest_json("enforcing", "pass", true, "2099-01-01T00:00:00Z");
+        fs::write(dir.path().join(PERF_EVIDENCE_MANIFEST), manifest)
+            .expect("write perf evidence manifest");
+        write_perf_bundle_files(dir.path());
+
+        let result = validator.validate_perf_evidence_bundle_dir(dir.path());
+        assert!(result.valid, "Errors: {:?}", result.errors);
+
+        let incomplete_dir = tempdir().expect("create incomplete tempdir");
+        let manifest = perf_manifest_json("enforcing", "pass", true, "2099-01-01T00:00:00Z");
+        fs::write(incomplete_dir.path().join(PERF_EVIDENCE_MANIFEST), manifest)
+            .expect("write incomplete perf evidence manifest");
+        let incomplete = validator.validate_perf_evidence_bundle_dir(incomplete_dir.path());
+        assert!(!incomplete.valid);
+        assert!(incomplete.errors.iter().any(|error| {
+            error
+                .message
+                .contains("Referenced performance evidence artifact is missing")
         }));
     }
 }

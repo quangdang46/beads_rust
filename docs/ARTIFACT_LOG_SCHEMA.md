@@ -142,6 +142,88 @@ summary using relative paths inside the bundle. Raw artifact references are
 optional for successful aggregation, but partial or failed aggregation must set
 `raw_evidence_preserved` to `true` and keep at least one raw artifact reference.
 
+### 5. Performance Evidence Manifest (perf-evidence-manifest.json)
+
+Reusable performance proof bundles include a manifest that ties command output
+goldens to timing/resource evidence and an advisory or enforcing gate policy.
+The schema is designed for optimization passes where a later change must prove
+behavior preservation and bounded tail-latency/resource drift.
+
+```json
+{
+  "schema_version": "br.perf-evidence.v1",
+  "generated_at": "2026-05-03T02:00:00Z",
+  "valid_until": "2026-06-02T02:00:00Z",
+  "command": {
+    "label": "list_json",
+    "args": ["list", "--json"]
+  },
+  "dataset": {
+    "name": "tiny-smoke",
+    "issue_count": 3,
+    "content_hash": "64-char-sha256"
+  },
+  "git": {
+    "revision": "git-revision",
+    "dirty": false
+  },
+  "binary": {
+    "path": "target/debug/br",
+    "version": "br 0.2.5"
+  },
+  "environment": {
+    "os": "linux",
+    "rustc": "rustc 1.91.0-nightly",
+    "env": [{"name": "NO_COLOR", "value_hash": "64-char-sha256"}]
+  },
+  "timing": {
+    "sample_count": 3,
+    "min_ms": 1.0,
+    "p50_ms": 2.0,
+    "p95_ms": 3.0,
+    "p99_ms": 3.0,
+    "max_ms": 3.0,
+    "summary_path": "timing/list.json",
+    "raw_samples_path": "timing/list-samples.jsonl"
+  },
+  "resources": {
+    "syscall_summary_path": "syscalls/list.json",
+    "io_summary_path": "io/list.json",
+    "rss_summary_path": "rss/list.json"
+  },
+  "golden": {
+    "stdout_sha256": "64-char-sha256",
+    "stderr_sha256": "64-char-sha256",
+    "checksums_path": "golden/checksums.txt",
+    "stdout_path": "golden/stdout",
+    "stderr_path": "golden/stderr"
+  },
+  "isomorphism_note_path": "proof/isomorphism.md",
+  "policy": {
+    "mode": "enforcing",
+    "baseline_manifest_path": "baseline/perf-evidence-manifest.json",
+    "latency_regression_budget_pct": 5.0,
+    "syscall_regression_budget_pct": 10.0,
+    "output_hash_must_match": true
+  },
+  "comparison": {
+    "status": "pass",
+    "baseline_manifest_path": "baseline/perf-evidence-manifest.json",
+    "p95_delta_pct": 0.0,
+    "stdout_hash_match": true,
+    "syscall_delta_pct": 0.0,
+    "decision_reason": "candidate stayed within enforcing policy"
+  },
+  "raw_artifact_paths": ["raw/list-0.stdout", "raw/list-0.stderr"]
+}
+```
+
+Policy modes:
+
+- `advisory`: comparison failures produce warnings and do not block unrelated
+  commands.
+- `enforcing`: a baseline manifest path and passing comparison are required.
+
 ## Directory Structure
 
 ```
@@ -163,6 +245,18 @@ target/perf-artifacts/
     ├── syscalls/
     ├── rss/
     └── raw/
+
+target/perf-artifacts/
+└── <perf-evidence-run>/
+    ├── perf-evidence-manifest.json
+    ├── baseline/
+    ├── golden/
+    ├── proof/
+    ├── timing/
+    ├── syscalls/
+    ├── io/
+    ├── rss/
+    └── raw/
 ```
 
 ## Validation Rules
@@ -179,6 +273,14 @@ target/perf-artifacts/
    required startup state exactly once
 8. **Aggregation evidence**: Partial or failed startup matrix aggregation must
    preserve raw evidence references
+9. **Performance evidence freshness**: `valid_until`, when present, must be in
+   the future
+10. **Performance gate policy**: Enforcing mode requires a baseline manifest and
+    a passing comparison; advisory mode may warn without blocking
+11. **Golden hashes**: Performance evidence stdout/stderr hashes must be
+    lowercase SHA-256 hex digests
+12. **Timing order**: Performance evidence timing must satisfy
+    `min <= p50 <= p95 <= p99 <= max`
 
 ### Cross-Platform Normalization
 
@@ -197,6 +299,8 @@ let validator = ArtifactValidator::new();
 validator.validate_events_file("target/test-artifacts/e2e/test/events.jsonl")?;
 validator.validate_snapshot_file("target/test-artifacts/e2e/test/before.snapshot.json")?;
 validator.validate_summary_file("target/test-artifacts/e2e/test/summary.json")?;
+validator.validate_startup_matrix_bundle_dir("target/perf-artifacts/startup-matrix-smoke-...")?;
+validator.validate_perf_evidence_bundle_dir("target/perf-artifacts/perf-evidence-smoke-...")?;
 ```
 
 ## Environment Variables
