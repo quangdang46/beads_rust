@@ -1499,7 +1499,7 @@ mod tests {
 
     use tempfile::TempDir;
 
-    fn assert_unexpected_error(other: BeadsError) {
+    fn assert_unexpected_error(other: &BeadsError) {
         let message = format!("{other:?}");
         assert!(message.is_empty(), "unexpected error: {message}");
     }
@@ -1876,7 +1876,7 @@ mod tests {
                 assert_eq!(field, "force");
                 assert!(reason.contains("--force"));
             }
-            other => assert_unexpected_error(other),
+            other => assert_unexpected_error(&other),
         }
     }
 
@@ -1925,7 +1925,7 @@ mod tests {
                 assert_eq!(field, "AGENTS.md");
                 assert!(reason.contains("current directory"));
             }
-            other => assert_unexpected_error(other),
+            other => assert_unexpected_error(&other),
         }
     }
 
@@ -1951,7 +1951,7 @@ mod tests {
                 assert_eq!(field, "AGENTS.md");
                 assert!(reason.contains("current directory"));
             }
-            other => assert_unexpected_error(other),
+            other => assert_unexpected_error(&other),
         }
     }
 
@@ -2028,7 +2028,7 @@ mod tests {
                 assert!(reason.contains("--add"));
                 assert!(reason.contains("--check"));
             }
-            other => assert_unexpected_error(other),
+            other => assert_unexpected_error(&other),
         }
     }
 }
