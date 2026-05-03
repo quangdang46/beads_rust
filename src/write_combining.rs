@@ -11,9 +11,14 @@ use crate::cli::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::io::{self, Write};
 
 /// Schema version for write-combining request and result envelopes.
 pub const WRITE_COMBINING_SCHEMA_VERSION: &str = "br.write-combining.v1";
+/// Conservative default request count for one future combined batch.
+pub const DEFAULT_MAX_COMBINED_ENVELOPES: usize = 64;
+/// Conservative default serialized argument budget for one future combined batch.
+pub const DEFAULT_MAX_COMBINED_ARGUMENT_BYTES: usize = 1024 * 1024;
 
 /// Whether a CLI command can enter the future write-combining queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -193,6 +198,276 @@ pub struct MutationResult {
     pub flush: CombinedFlushOutcome,
 }
 
+/// Resource caps for planning one future combined batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchLimits {
+    /// Maximum number of envelopes accepted into one batch.
+    pub max_envelopes: usize,
+    /// Maximum compact JSON bytes for accepted envelope arguments.
+    pub max_argument_bytes: usize,
+}
+
+impl BatchLimits {
+    /// Build explicit batch limits.
+    #[must_use]
+    pub const fn new(max_envelopes: usize, max_argument_bytes: usize) -> Self {
+        Self {
+            max_envelopes,
+            max_argument_bytes,
+        }
+    }
+
+    /// Validate that both limits are usable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either bound is zero.
+    pub const fn validate(self) -> std::result::Result<(), BatchLimitError> {
+        if self.max_envelopes == 0 {
+            return Err(BatchLimitError::ZeroMaxEnvelopes);
+        }
+        if self.max_argument_bytes == 0 {
+            return Err(BatchLimitError::ZeroMaxArgumentBytes);
+        }
+        Ok(())
+    }
+}
+
+impl Default for BatchLimits {
+    fn default() -> Self {
+        Self {
+            max_envelopes: DEFAULT_MAX_COMBINED_ENVELOPES,
+            max_argument_bytes: DEFAULT_MAX_COMBINED_ARGUMENT_BYTES,
+        }
+    }
+}
+
+/// Invalid batch-limit configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BatchLimitError {
+    /// A batch must be able to accept at least one envelope.
+    ZeroMaxEnvelopes,
+    /// A batch must have a positive argument-byte budget.
+    ZeroMaxArgumentBytes,
+}
+
+/// One accepted envelope in a planned homogeneous batch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlannedMutation {
+    /// Original zero-based queue position.
+    pub index: usize,
+    /// Compatible family for the accepted mutation.
+    pub family: CompatibleMutation,
+    /// Compact JSON byte size of the serialized argument payload.
+    pub argument_bytes: usize,
+}
+
+/// One envelope not accepted into the planned batch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedMutation {
+    /// Original zero-based queue position.
+    pub index: usize,
+    /// Why the envelope was not accepted.
+    pub reason: BatchSkipReason,
+}
+
+/// Why a queued envelope is not in the planned batch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "reason", content = "detail")]
+pub enum BatchSkipReason {
+    /// Envelope-level validation failed before any side effects.
+    InvalidEnvelope(EnvelopeValidationError),
+    /// The caller deadline has already elapsed.
+    Expired,
+    /// The batch accepted the maximum number of envelopes.
+    QueueFull,
+    /// Accepting this envelope would exceed the argument-byte budget.
+    ArgumentBytesExceeded {
+        /// Bytes already accepted before this envelope.
+        used: usize,
+        /// Bytes required by this envelope.
+        needed: usize,
+        /// Configured maximum bytes for the batch.
+        limit: usize,
+    },
+    /// The planner hit a different compatible family after accepting a prefix.
+    FamilyBoundary {
+        /// Family accepted by the current batch.
+        expected: CompatibleMutation,
+        /// Family found at the boundary.
+        found: CompatibleMutation,
+    },
+    /// The envelope was behind a capacity or family boundary and is left for a
+    /// later direct path or later batch.
+    BlockedByBatchBoundary,
+}
+
+/// Plan for one homogeneous write-combining batch.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchPlan {
+    /// Homogeneous family accepted by this batch.
+    pub family: Option<CompatibleMutation>,
+    /// Accepted envelopes in original queue order.
+    pub accepted: Vec<PlannedMutation>,
+    /// Envelopes rejected or deferred by the planner.
+    pub skipped: Vec<SkippedMutation>,
+    /// Sum of accepted compact argument JSON bytes.
+    pub used_argument_bytes: usize,
+}
+
+impl BatchPlan {
+    /// Number of accepted envelopes.
+    #[must_use]
+    pub fn accepted_count(&self) -> usize {
+        self.accepted.len()
+    }
+
+    /// Whether this batch would apply no mutations.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.accepted.is_empty()
+    }
+}
+
+/// Build a conservative homogeneous-prefix batch plan.
+///
+/// Invalid and expired envelopes are rejected before side effects and do not
+/// block later valid entries. Once a valid envelope cannot enter the current
+/// batch because of capacity or family boundaries, all later entries are left
+/// for a later direct path or later batch. That preserves queue-prefix ordering
+/// for every accepted mutation.
+///
+/// # Errors
+///
+/// Returns an error when `limits` has a zero request or byte bound.
+pub fn plan_batch(
+    envelopes: &[MutationEnvelope],
+    limits: BatchLimits,
+    now_unix_ms: u64,
+) -> std::result::Result<BatchPlan, BatchLimitError> {
+    limits.validate()?;
+
+    let mut plan = BatchPlan::default();
+    let mut boundary_seen = false;
+
+    for (index, envelope) in envelopes.iter().enumerate() {
+        if boundary_seen {
+            plan.skipped
+                .push(skipped(index, BatchSkipReason::BlockedByBatchBoundary));
+            continue;
+        }
+
+        if let Err(err) = envelope.validate() {
+            plan.skipped
+                .push(skipped(index, BatchSkipReason::InvalidEnvelope(err)));
+            continue;
+        }
+
+        if envelope.deadline_unix_ms <= now_unix_ms {
+            plan.skipped.push(skipped(index, BatchSkipReason::Expired));
+            continue;
+        }
+
+        if let Some(expected) = plan.family
+            && envelope.family != expected
+        {
+            plan.skipped.push(skipped(
+                index,
+                BatchSkipReason::FamilyBoundary {
+                    expected,
+                    found: envelope.family,
+                },
+            ));
+            boundary_seen = true;
+            continue;
+        }
+
+        if plan.accepted.len() >= limits.max_envelopes {
+            plan.skipped
+                .push(skipped(index, BatchSkipReason::QueueFull));
+            boundary_seen = true;
+            continue;
+        }
+
+        let Some(argument_bytes) = compact_json_len(&envelope.arguments) else {
+            plan.skipped.push(skipped(
+                index,
+                BatchSkipReason::ArgumentBytesExceeded {
+                    used: plan.used_argument_bytes,
+                    needed: usize::MAX,
+                    limit: limits.max_argument_bytes,
+                },
+            ));
+            boundary_seen = true;
+            continue;
+        };
+        let Some(next_bytes) = plan.used_argument_bytes.checked_add(argument_bytes) else {
+            plan.skipped.push(skipped(
+                index,
+                BatchSkipReason::ArgumentBytesExceeded {
+                    used: plan.used_argument_bytes,
+                    needed: argument_bytes,
+                    limit: limits.max_argument_bytes,
+                },
+            ));
+            boundary_seen = true;
+            continue;
+        };
+        if next_bytes > limits.max_argument_bytes {
+            plan.skipped.push(skipped(
+                index,
+                BatchSkipReason::ArgumentBytesExceeded {
+                    used: plan.used_argument_bytes,
+                    needed: argument_bytes,
+                    limit: limits.max_argument_bytes,
+                },
+            ));
+            boundary_seen = true;
+            continue;
+        }
+
+        plan.family.get_or_insert(envelope.family);
+        plan.used_argument_bytes = next_bytes;
+        plan.accepted.push(PlannedMutation {
+            index,
+            family: envelope.family,
+            argument_bytes,
+        });
+    }
+
+    Ok(plan)
+}
+
+fn skipped(index: usize, reason: BatchSkipReason) -> SkippedMutation {
+    SkippedMutation { index, reason }
+}
+
+fn compact_json_len(value: &Value) -> Option<usize> {
+    let mut writer = CountingWriter::default();
+    serde_json::to_writer(&mut writer, value).ok()?;
+    Some(writer.len)
+}
+
+#[derive(Default)]
+struct CountingWriter {
+    len: usize,
+}
+
+impl Write for CountingWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.len = self
+            .len
+            .checked_add(buf.len())
+            .ok_or_else(|| io::Error::other("compact JSON length overflow"))?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Classify a parsed CLI command for future write-combining eligibility.
 #[must_use]
 pub fn classify_command(command: &Commands) -> CommandCompatibility {
@@ -345,6 +620,36 @@ mod tests {
     use crate::cli::{CommentListArgs, CommentsArgs, DepListArgs, DepRemoveArgs, DepTreeArgs};
     use serde_json::json;
     use std::path::PathBuf;
+
+    const NOW_UNIX_MS: u64 = 1_000;
+    const FUTURE_UNIX_MS: u64 = 2_000;
+
+    fn envelope(
+        key: &str,
+        family: CompatibleMutation,
+        deadline_unix_ms: u64,
+        arguments: Value,
+    ) -> MutationEnvelope {
+        MutationEnvelope::new(
+            key,
+            "DustyPuma",
+            family,
+            CombinedOutputMode::Json,
+            deadline_unix_ms,
+            arguments,
+        )
+    }
+
+    fn planned(result: std::result::Result<BatchPlan, BatchLimitError>) -> BatchPlan {
+        assert!(result.is_ok(), "unexpected batch-limit error: {result:?}");
+        match result {
+            Ok(plan) => plan,
+            Err(err) => {
+                assert_eq!(Some(err), None);
+                BatchPlan::default()
+            }
+        }
+    }
 
     #[test]
     fn classifies_simple_create_as_candidate() {
@@ -654,6 +959,230 @@ mod tests {
         assert_eq!(
             envelope.validate(),
             Err(EnvelopeValidationError::MissingDeadline)
+        );
+    }
+
+    #[test]
+    fn batch_accepts_homogeneous_prefix_in_order() {
+        let envelopes = vec![
+            envelope(
+                "request-1",
+                CompatibleMutation::CreateIssue,
+                FUTURE_UNIX_MS,
+                json!({"title": "first"}),
+            ),
+            envelope(
+                "request-2",
+                CompatibleMutation::CreateIssue,
+                FUTURE_UNIX_MS,
+                json!({"title": "second"}),
+            ),
+        ];
+
+        let plan = planned(plan_batch(&envelopes, BatchLimits::default(), NOW_UNIX_MS));
+
+        assert_eq!(plan.family, Some(CompatibleMutation::CreateIssue));
+        assert_eq!(plan.accepted_count(), 2);
+        assert_eq!(
+            plan.accepted
+                .iter()
+                .map(|mutation| mutation.index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert!(plan.skipped.is_empty());
+        assert!(plan.used_argument_bytes > 0);
+    }
+
+    #[test]
+    fn batch_rejects_invalid_and_expired_without_blocking_later_valid() {
+        let mut invalid = envelope(
+            "invalid",
+            CompatibleMutation::CreateIssue,
+            FUTURE_UNIX_MS,
+            json!({"title": "invalid"}),
+        );
+        invalid.schema_version = "br.write-combining.v0".to_string();
+        let envelopes = vec![
+            invalid,
+            envelope(
+                "expired",
+                CompatibleMutation::CreateIssue,
+                NOW_UNIX_MS,
+                json!({"title": "expired"}),
+            ),
+            envelope(
+                "valid",
+                CompatibleMutation::CreateIssue,
+                FUTURE_UNIX_MS,
+                json!({"title": "valid"}),
+            ),
+        ];
+
+        let plan = planned(plan_batch(&envelopes, BatchLimits::default(), NOW_UNIX_MS));
+
+        assert_eq!(plan.accepted_count(), 1);
+        assert_eq!(plan.accepted[0].index, 2);
+        assert_eq!(
+            plan.skipped
+                .iter()
+                .map(|skipped| &skipped.reason)
+                .collect::<Vec<_>>(),
+            vec![
+                &BatchSkipReason::InvalidEnvelope(
+                    EnvelopeValidationError::UnsupportedSchemaVersion
+                ),
+                &BatchSkipReason::Expired
+            ]
+        );
+    }
+
+    #[test]
+    fn batch_stops_at_family_boundary() {
+        let envelopes = vec![
+            envelope(
+                "create-1",
+                CompatibleMutation::CreateIssue,
+                FUTURE_UNIX_MS,
+                json!({"title": "first"}),
+            ),
+            envelope(
+                "comment-1",
+                CompatibleMutation::AddComment,
+                FUTURE_UNIX_MS,
+                json!({"id": "br-1", "message": "done"}),
+            ),
+            envelope(
+                "create-2",
+                CompatibleMutation::CreateIssue,
+                FUTURE_UNIX_MS,
+                json!({"title": "third"}),
+            ),
+        ];
+
+        let plan = planned(plan_batch(&envelopes, BatchLimits::default(), NOW_UNIX_MS));
+
+        assert_eq!(plan.accepted_count(), 1);
+        assert_eq!(
+            plan.skipped
+                .iter()
+                .map(|skipped| &skipped.reason)
+                .collect::<Vec<_>>(),
+            vec![
+                &BatchSkipReason::FamilyBoundary {
+                    expected: CompatibleMutation::CreateIssue,
+                    found: CompatibleMutation::AddComment,
+                },
+                &BatchSkipReason::BlockedByBatchBoundary,
+            ]
+        );
+    }
+
+    #[test]
+    fn batch_limits_envelope_count_and_blocks_remainder() {
+        let envelopes = vec![
+            envelope(
+                "create-1",
+                CompatibleMutation::CreateIssue,
+                FUTURE_UNIX_MS,
+                json!({"title": "first"}),
+            ),
+            envelope(
+                "create-2",
+                CompatibleMutation::CreateIssue,
+                FUTURE_UNIX_MS,
+                json!({"title": "second"}),
+            ),
+            envelope(
+                "create-3",
+                CompatibleMutation::CreateIssue,
+                FUTURE_UNIX_MS,
+                json!({"title": "third"}),
+            ),
+            envelope(
+                "create-4",
+                CompatibleMutation::CreateIssue,
+                FUTURE_UNIX_MS,
+                json!({"title": "fourth"}),
+            ),
+        ];
+
+        let plan = planned(plan_batch(
+            &envelopes,
+            BatchLimits::new(2, DEFAULT_MAX_COMBINED_ARGUMENT_BYTES),
+            NOW_UNIX_MS,
+        ));
+
+        assert_eq!(plan.accepted_count(), 2);
+        assert_eq!(
+            plan.skipped
+                .iter()
+                .map(|skipped| &skipped.reason)
+                .collect::<Vec<_>>(),
+            vec![
+                &BatchSkipReason::QueueFull,
+                &BatchSkipReason::BlockedByBatchBoundary,
+            ]
+        );
+    }
+
+    #[test]
+    fn batch_argument_byte_limit_blocks_remainder() {
+        let first = envelope(
+            "create-1",
+            CompatibleMutation::CreateIssue,
+            FUTURE_UNIX_MS,
+            json!({"title": "a"}),
+        );
+        let second = envelope(
+            "create-2",
+            CompatibleMutation::CreateIssue,
+            FUTURE_UNIX_MS,
+            json!({"title": "this payload does not fit"}),
+        );
+        let third = envelope(
+            "create-3",
+            CompatibleMutation::CreateIssue,
+            FUTURE_UNIX_MS,
+            json!({"title": "c"}),
+        );
+        let first_bytes = compact_json_len(&first.arguments).unwrap_or(usize::MAX);
+        let second_bytes = compact_json_len(&second.arguments).unwrap_or(usize::MAX);
+        let envelopes = vec![first, second, third];
+
+        let plan = planned(plan_batch(
+            &envelopes,
+            BatchLimits::new(8, first_bytes),
+            NOW_UNIX_MS,
+        ));
+
+        assert_eq!(plan.accepted_count(), 1);
+        assert_eq!(plan.used_argument_bytes, first_bytes);
+        assert_eq!(
+            plan.skipped
+                .iter()
+                .map(|skipped| &skipped.reason)
+                .collect::<Vec<_>>(),
+            vec![
+                &BatchSkipReason::ArgumentBytesExceeded {
+                    used: first_bytes,
+                    needed: second_bytes,
+                    limit: first_bytes,
+                },
+                &BatchSkipReason::BlockedByBatchBoundary,
+            ]
+        );
+    }
+
+    #[test]
+    fn batch_rejects_zero_limits() {
+        assert_eq!(
+            plan_batch(&[], BatchLimits::new(0, 1), NOW_UNIX_MS),
+            Err(BatchLimitError::ZeroMaxEnvelopes)
+        );
+        assert_eq!(
+            plan_batch(&[], BatchLimits::new(1, 0), NOW_UNIX_MS),
+            Err(BatchLimitError::ZeroMaxArgumentBytes)
         );
     }
 }
