@@ -12,6 +12,7 @@
 //! - [`storage`] - `SQLite` database layer
 //! - [`sync`] - JSONL import/export operations
 //! - [`config`] - Configuration management
+//! - [`cache`] - Pure cache policies for high-RAM acceleration
 //! - [`error`] - Error types and handling
 //! - [`format`] - Output formatting (text, JSON)
 //! - [`util`] - Utility functions (hashing, time, paths)
@@ -21,6 +22,7 @@
 // Lint configuration is in Cargo.toml [lints.clippy] section
 #![allow(clippy::module_name_repetitions)]
 
+pub mod cache;
 pub mod cli;
 pub mod config;
 pub mod error;
