@@ -124,6 +124,15 @@ where
     writer.write_all(b"}").map_err(serde_json::Error::io)
 }
 
+fn write_json_trailer_to_writer<W: Write>(writer: &mut W) -> serde_json::Result<()> {
+    writer.write_all(b"\n").map_err(serde_json::Error::io)?;
+    writer.flush().map_err(serde_json::Error::io)
+}
+
+fn is_broken_pipe_serialization_error(err: &serde_json::Error) -> bool {
+    err.io_error_kind() == Some(io::ErrorKind::BrokenPipe)
+}
+
 #[must_use]
 fn toon_encode_options() -> EncodeOptions {
     EncodeOptions {
@@ -404,7 +413,7 @@ impl OutputContext {
     }
 
     fn report_serialization_error(&self, format: &str, err: &serde_json::Error) {
-        if !self.is_quiet() {
+        if !self.is_quiet() && !is_broken_pipe_serialization_error(err) {
             eprintln!("Error: failed to serialize {format} output: {err}");
         }
     }
@@ -432,7 +441,9 @@ impl OutputContext {
                 self.report_serialization_error("JSON", &err);
                 return;
             }
-            let _ = out.write_all(b"\n");
+            if let Err(err) = write_json_trailer_to_writer(&mut out) {
+                self.report_serialization_error("JSON", &err);
+            }
         }
     }
 
@@ -448,7 +459,9 @@ impl OutputContext {
                 self.report_serialization_error("JSON", &err);
                 return;
             }
-            let _ = out.write_all(b"\n");
+            if let Err(err) = write_json_trailer_to_writer(&mut out) {
+                self.report_serialization_error("JSON", &err);
+            }
         }
     }
 
@@ -468,7 +481,9 @@ impl OutputContext {
                 self.report_serialization_error("JSON", &err);
                 return;
             }
-            let _ = out.write_all(b"\n");
+            if let Err(err) = write_json_trailer_to_writer(&mut out) {
+                self.report_serialization_error("JSON", &err);
+            }
         }
     }
 
@@ -910,6 +925,53 @@ mod tests {
             streamed,
             serde_json::to_vec(&materialized).expect("materialized JSON page serialization failed")
         );
+    }
+
+    struct WriteZero;
+
+    impl Write for WriteZero {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct BrokenPipeOnFlush {
+        bytes: Vec<u8>,
+    }
+
+    impl Write for BrokenPipeOnFlush {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+    }
+
+    #[test]
+    fn write_json_array_to_writer_propagates_partial_writer_failure() {
+        let err = write_json_array_to_writer(&mut WriteZero, [json!({"id": "bd-a"})].iter())
+            .expect_err("partial writer should fail");
+
+        assert_eq!(err.io_error_kind(), Some(io::ErrorKind::WriteZero));
+        assert!(!is_broken_pipe_serialization_error(&err));
+    }
+
+    #[test]
+    fn write_json_trailer_flushes_and_classifies_broken_pipe() {
+        let mut writer = BrokenPipeOnFlush { bytes: Vec::new() };
+        let err =
+            write_json_trailer_to_writer(&mut writer).expect_err("flush should report broken pipe");
+
+        assert_eq!(writer.bytes, b"\n");
+        assert_eq!(err.io_error_kind(), Some(io::ErrorKind::BrokenPipe));
+        assert!(is_broken_pipe_serialization_error(&err));
     }
 
     #[test]
