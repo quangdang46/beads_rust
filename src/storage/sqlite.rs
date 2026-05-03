@@ -1362,13 +1362,18 @@ impl SqliteStorage {
             return Ok(0);
         }
 
+        let issue_ids = unique_exports
+            .iter()
+            .map(|(issue_id, _hash)| issue_id.clone())
+            .collect::<Vec<_>>();
+        let existing_hashes = self.get_export_hashes_for_ids_in_tx(&issue_ids)?;
         let now = Utc::now().to_rfc3339();
         let mut count = 0;
 
         for (issue_id, content_hash) in &unique_exports {
-            if self
-                .get_export_hash(issue_id)?
-                .is_some_and(|(existing_hash, _)| existing_hash == *content_hash)
+            if existing_hashes
+                .get(issue_id)
+                .is_some_and(|existing_hash| existing_hash == content_hash)
             {
                 continue;
             }
@@ -1389,6 +1394,41 @@ impl SqliteStorage {
         }
 
         Ok(count)
+    }
+
+    fn get_export_hashes_for_ids_in_tx(
+        &self,
+        issue_ids: &[String],
+    ) -> Result<HashMap<String, String>> {
+        if issue_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut hashes = HashMap::with_capacity(issue_ids.len());
+        for chunk in issue_ids.chunks(DIRTY_ISSUE_CHUNK_SIZE) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "SELECT issue_id, content_hash FROM export_hashes WHERE issue_id IN ({})",
+                placeholders
+            );
+            let params = chunk
+                .iter()
+                .map(|issue_id| SqliteValue::from(issue_id.as_str()))
+                .collect::<Vec<_>>();
+            let rows = self.conn.query_with_params(&sql, &params)?;
+
+            for row in &rows {
+                let Some(issue_id) = row.get(0).and_then(SqliteValue::as_text) else {
+                    continue;
+                };
+                let Some(content_hash) = row.get(1).and_then(SqliteValue::as_text) else {
+                    continue;
+                };
+                hashes.insert(issue_id.to_string(), content_hash.to_string());
+            }
+        }
+
+        Ok(hashes)
     }
 
     fn dedupe_export_hash_batch(exports: &[(String, String)]) -> Vec<(String, String)> {

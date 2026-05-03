@@ -2479,9 +2479,10 @@ pub fn finalize_export(
             storage.clear_dirty_issues(&result.exported_marked_at)?;
         }
 
-        // Record export hashes for each exported issue (for incremental export detection)
+        // Record export hashes for each exported issue. Keep unchanged rows
+        // stable so full flushes do not rewrite the export_hashes table.
         if let Some(hashes) = issue_hashes {
-            storage.set_export_hashes_in_tx(hashes)?;
+            storage.set_changed_export_hashes_in_tx(hashes)?;
         }
 
         // Update metadata
