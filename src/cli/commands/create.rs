@@ -34,7 +34,9 @@ pub struct CreateConfig {
 /// default take over.
 pub(crate) fn canonical_source_repo(beads_dir: &Path) -> Option<String> {
     let parent = beads_dir.parent()?;
-    let canonical = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
+    let canonical = parent
+        .canonicalize()
+        .unwrap_or_else(|_| parent.to_path_buf());
     let name = canonical.file_name()?.to_string_lossy().into_owned();
     if name.is_empty() || name == "." || name == "/" {
         None
