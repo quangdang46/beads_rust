@@ -251,11 +251,25 @@ pub fn execute(
 ) -> Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
-    ensure_query_storage_available(&storage_ctx)?;
+    execute_with_storage_ctx(command, cli, ctx, &mut storage_ctx)
+}
+
+/// Execute the query command using storage already opened by the caller.
+///
+/// # Errors
+///
+/// Returns an error if database operations fail or if inputs are invalid.
+pub fn execute_with_storage_ctx(
+    command: &QueryCommands,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    storage_ctx: &mut config::OpenStorageResult,
+) -> Result<()> {
+    ensure_query_storage_available(storage_ctx)?;
 
     match command {
         QueryCommands::Save(args) => query_save(args, &mut storage_ctx.storage, ctx),
-        QueryCommands::Run(args) => query_run(args, &storage_ctx.storage, cli, ctx),
+        QueryCommands::Run(args) => query_run(args, storage_ctx, cli, ctx),
         QueryCommands::List => query_list(&storage_ctx.storage, ctx),
         QueryCommands::Delete(args) => query_delete(args, &mut storage_ctx.storage, ctx),
     }
@@ -346,14 +360,15 @@ fn query_save(
 
 fn query_run(
     args: &QueryRunArgs,
-    storage: &crate::storage::SqliteStorage,
+    storage_ctx: &config::OpenStorageResult,
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
     let name = args.name.trim();
     let key = format!("{QUERY_KEY_PREFIX}{name}");
 
-    let value = storage
+    let value = storage_ctx
+        .storage
         .get_config(&key)?
         .ok_or_else(|| BeadsError::validation("query", format_query_not_found_message(name)))?;
 
@@ -369,8 +384,7 @@ fn query_run(
     debug!(?merged_args, "Merged filters");
 
     // Execute list command with merged args
-    // We call the list execute function directly
-    super::list::execute(&merged_args, ctx.is_json(), cli, ctx)
+    super::list::execute_with_storage(&merged_args, cli, ctx, storage_ctx)
 }
 
 fn query_list(storage: &crate::storage::SqliteStorage, ctx: &OutputContext) -> Result<()> {

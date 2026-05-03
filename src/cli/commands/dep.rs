@@ -45,6 +45,36 @@ pub fn execute(
     }
 }
 
+/// Execute a read-only dep command using storage that was already opened by the caller.
+///
+/// Returns `Ok(false)` when the command needs the normal routed or mutating path.
+///
+/// # Errors
+///
+/// Returns an error if database operations fail or if inputs are invalid.
+pub fn execute_with_storage_ctx(
+    command: &DepCommands,
+    json: bool,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    local_beads_dir: &Path,
+    storage_ctx: &config::OpenStorageResult,
+) -> Result<bool> {
+    match command {
+        DepCommands::List(args) => {
+            execute_local_dep_list_with_storage_ctx(args, cli, ctx, local_beads_dir, storage_ctx)
+        }
+        DepCommands::Tree(args) => {
+            execute_local_dep_tree_with_storage_ctx(args, cli, ctx, local_beads_dir, storage_ctx)
+        }
+        DepCommands::Cycles(args) => {
+            dep_cycles(args, &storage_ctx.storage, json, ctx)?;
+            Ok(true)
+        }
+        DepCommands::Add(_) | DepCommands::Remove(_) => Ok(false),
+    }
+}
+
 fn execute_dep_add(
     args: &DepAddArgs,
     _json: bool,
@@ -122,6 +152,37 @@ fn execute_dep_list(
     )
 }
 
+fn execute_local_dep_list_with_storage_ctx(
+    args: &DepListArgs,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    local_beads_dir: &Path,
+    storage_ctx: &config::OpenStorageResult,
+) -> Result<bool> {
+    if config::routing::resolve_route(&args.issue, local_beads_dir)?.is_external {
+        return Ok(false);
+    }
+
+    let config_layer = storage_ctx.load_config(cli)?;
+    let use_color = config::should_use_color(&config_layer);
+    let quiet = cli.quiet.unwrap_or(false);
+    let id_config = config::id_config_from_layer(&config_layer);
+    let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+    let external_db_paths =
+        config::external_project_db_paths(&config_layer, &storage_ctx.paths.beads_dir);
+
+    dep_list(
+        args,
+        &storage_ctx.storage,
+        &resolver,
+        &external_db_paths,
+        ctx,
+        quiet,
+        !use_color,
+    )?;
+    Ok(true)
+}
+
 fn execute_dep_tree(
     args: &DepTreeArgs,
     _json: bool,
@@ -145,6 +206,34 @@ fn execute_dep_tree(
         false,
         ctx,
     )
+}
+
+fn execute_local_dep_tree_with_storage_ctx(
+    args: &DepTreeArgs,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    local_beads_dir: &Path,
+    storage_ctx: &config::OpenStorageResult,
+) -> Result<bool> {
+    if config::routing::resolve_route(&args.issue, local_beads_dir)?.is_external {
+        return Ok(false);
+    }
+
+    let config_layer = storage_ctx.load_config(cli)?;
+    let id_config = config::id_config_from_layer(&config_layer);
+    let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+    let external_db_paths =
+        config::external_project_db_paths(&config_layer, &storage_ctx.paths.beads_dir);
+
+    dep_tree(
+        args,
+        &storage_ctx.storage,
+        &resolver,
+        &external_db_paths,
+        false,
+        ctx,
+    )?;
+    Ok(true)
 }
 
 fn open_routed_storage_for_input(

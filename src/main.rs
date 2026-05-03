@@ -229,7 +229,25 @@ fn main() {
             }
         }
         Commands::Comments(args) => {
-            commands::comments::execute(&args, cli.json, &overrides, &output_ctx)
+            if let (Some(res), Some(beads_dir)) = (storage_result.as_ref(), ctx.beads_dir.as_ref())
+            {
+                match commands::comments::execute_with_storage_ctx(
+                    &args,
+                    cli.json,
+                    &overrides,
+                    &output_ctx,
+                    beads_dir,
+                    res,
+                ) {
+                    Ok(true) => Ok(()),
+                    Ok(false) => {
+                        commands::comments::execute(&args, cli.json, &overrides, &output_ctx)
+                    }
+                    Err(err) => Err(err),
+                }
+            } else {
+                commands::comments::execute(&args, cli.json, &overrides, &output_ctx)
+            }
         }
         Commands::Search(args) => {
             if let Some(res) = storage_result.as_ref() {
@@ -260,10 +278,43 @@ fn main() {
         }
         Commands::Q(args) => commands::q::execute(args, &overrides, &output_ctx),
         Commands::Dep { command } => {
-            commands::dep::execute(&command, cli.json, &overrides, &output_ctx)
+            if let (Some(res), Some(beads_dir)) = (storage_result.as_ref(), ctx.beads_dir.as_ref())
+            {
+                match commands::dep::execute_with_storage_ctx(
+                    &command,
+                    cli.json,
+                    &overrides,
+                    &output_ctx,
+                    beads_dir,
+                    res,
+                ) {
+                    Ok(true) => Ok(()),
+                    Ok(false) => {
+                        commands::dep::execute(&command, cli.json, &overrides, &output_ctx)
+                    }
+                    Err(err) => Err(err),
+                }
+            } else {
+                commands::dep::execute(&command, cli.json, &overrides, &output_ctx)
+            }
         }
         Commands::Epic { command } => {
-            commands::epic::execute(&command, cli.json, &overrides, &output_ctx)
+            if let Some(res) = storage_result.as_ref() {
+                match commands::epic::execute_with_storage_ctx(
+                    &command,
+                    &overrides,
+                    &output_ctx,
+                    res,
+                ) {
+                    Ok(true) => Ok(()),
+                    Ok(false) => {
+                        commands::epic::execute(&command, cli.json, &overrides, &output_ctx)
+                    }
+                    Err(err) => Err(err),
+                }
+            } else {
+                commands::epic::execute(&command, cli.json, &overrides, &output_ctx)
+            }
         }
         Commands::Label { command } => {
             if let Some(res) = storage_result.as_ref() {
@@ -294,7 +345,17 @@ fn main() {
             || commands::stale::execute(&args, &overrides, &output_ctx),
             |res| commands::stale::execute_with_storage(&args, &output_ctx, &res.storage),
         ),
-        Commands::Lint(args) => commands::lint::execute(&args, cli.json, &overrides, &output_ctx),
+        Commands::Lint(args) => {
+            if let Some(res) = storage_result.as_ref() {
+                match commands::lint::execute_with_storage_ctx(&args, &output_ctx, res) {
+                    Ok(true) => Ok(()),
+                    Ok(false) => commands::lint::execute(&args, cli.json, &overrides, &output_ctx),
+                    Err(err) => Err(err),
+                }
+            } else {
+                commands::lint::execute(&args, cli.json, &overrides, &output_ctx)
+            }
+        }
         Commands::Ready(args) => {
             if let (Some(res), Some(beads_dir)) = (storage_result.as_ref(), ctx.beads_dir.as_ref())
             {
@@ -401,7 +462,22 @@ fn main() {
                 commands::changelog::execute(&args, cli.json || args.robot, &overrides, &output_ctx)
             }
         }
-        Commands::Query { command } => commands::query::execute(&command, &overrides, &output_ctx),
+        Commands::Query { command } => {
+            if is_read_only_query_command(&command) {
+                if let Some(res) = storage_result.as_mut() {
+                    commands::query::execute_with_storage_ctx(
+                        &command,
+                        &overrides,
+                        &output_ctx,
+                        res,
+                    )
+                } else {
+                    commands::query::execute(&command, &overrides, &output_ctx)
+                }
+            } else {
+                commands::query::execute(&command, &overrides, &output_ctx)
+            }
+        }
         Commands::Graph(args) => {
             if let (Some(res), Some(beads_dir)) = (storage_result.as_ref(), ctx.beads_dir.as_ref())
             {
@@ -784,14 +860,30 @@ const fn supports_read_only_fast_open(cmd: &Commands) -> bool {
         } => true,
         Commands::Dep { command } => is_read_only_dep_command(command),
         Commands::Label { command } => is_read_only_label_listing(command),
+        Commands::Query { command } => is_read_only_query_command(command),
         _ => false,
     }
 }
 
 const fn supports_auto_import_read_only_probe(cmd: &Commands) -> bool {
     match cmd {
-        Commands::List(_) | Commands::Count(_) => true,
+        Commands::List(_)
+        | Commands::Show(_)
+        | Commands::Search(_)
+        | Commands::Ready(_)
+        | Commands::Blocked(_)
+        | Commands::Count(_)
+        | Commands::Stale(_)
+        | Commands::Changelog(_)
+        | Commands::Graph(_)
+        | Commands::Orphans(beads_rust::cli::OrphansArgs { fix: false, .. })
+        | Commands::Epic {
+            command: beads_rust::cli::EpicCommands::Status(_),
+        } => true,
+        Commands::Lint(args) => args.ids.is_empty(),
         Commands::Label { command } => is_read_only_label_listing(command),
+        Commands::Dep { command } => is_read_only_dep_command(command),
+        Commands::Query { command } => is_read_only_query_command(command),
         Commands::Sync(args) => args.status,
         Commands::Stats(args) | Commands::Status(args) => args.no_activity,
         _ => false,
@@ -817,6 +909,15 @@ const fn is_read_only_label_listing(command: &beads_rust::cli::LabelCommands) ->
         | beads_rust::cli::LabelCommands::Remove(_)
         | beads_rust::cli::LabelCommands::List(_)
         | beads_rust::cli::LabelCommands::Rename(_) => false,
+    }
+}
+
+const fn is_read_only_query_command(command: &beads_rust::cli::QueryCommands) -> bool {
+    match command {
+        beads_rust::cli::QueryCommands::Run(_) | beads_rust::cli::QueryCommands::List => true,
+        beads_rust::cli::QueryCommands::Save(_) | beads_rust::cli::QueryCommands::Delete(_) => {
+            false
+        }
     }
 }
 
@@ -1114,7 +1215,8 @@ mod tests {
         ]);
         assert!(!build_cli_overrides(&label_list_issue).read_only_fast_open);
 
-        let missing_auto_flush = Cli::parse_from(["br", "--no-auto-import", "ready"]);
+        let missing_auto_flush =
+            Cli::parse_from(["br", "--no-auto-import", "comments", "list", "bd-abc"]);
         assert!(!build_cli_overrides(&missing_auto_flush).read_only_fast_open);
 
         let mutating = Cli::parse_from([
@@ -1148,6 +1250,102 @@ mod tests {
             "write path",
         ]);
         assert!(!build_cli_overrides(&comments_add).read_only_fast_open);
+    }
+
+    #[test]
+    fn read_only_fast_open_auto_probe_covers_preopened_commands() {
+        let ready = Cli::parse_from(["br", "ready"]);
+        assert!(build_cli_overrides(&ready).read_only_fast_open);
+
+        let blocked = Cli::parse_from(["br", "blocked"]);
+        assert!(build_cli_overrides(&blocked).read_only_fast_open);
+
+        let show = Cli::parse_from(["br", "show", "br-123"]);
+        assert!(build_cli_overrides(&show).read_only_fast_open);
+
+        let search = Cli::parse_from(["br", "search", "needle"]);
+        assert!(build_cli_overrides(&search).read_only_fast_open);
+
+        let stale = Cli::parse_from(["br", "stale"]);
+        assert!(build_cli_overrides(&stale).read_only_fast_open);
+
+        let lint = Cli::parse_from(["br", "lint"]);
+        assert!(build_cli_overrides(&lint).read_only_fast_open);
+
+        let lint_issue = Cli::parse_from(["br", "lint", "br-123"]);
+        assert!(!build_cli_overrides(&lint_issue).read_only_fast_open);
+
+        let changelog = Cli::parse_from(["br", "changelog"]);
+        assert!(build_cli_overrides(&changelog).read_only_fast_open);
+
+        let graph = Cli::parse_from(["br", "graph", "--all"]);
+        assert!(build_cli_overrides(&graph).read_only_fast_open);
+
+        let orphans = Cli::parse_from(["br", "orphans"]);
+        assert!(build_cli_overrides(&orphans).read_only_fast_open);
+
+        let epic_status = Cli::parse_from(["br", "epic", "status"]);
+        assert!(build_cli_overrides(&epic_status).read_only_fast_open);
+
+        let dep_tree = Cli::parse_from(["br", "dep", "tree", "br-123"]);
+        assert!(build_cli_overrides(&dep_tree).read_only_fast_open);
+
+        let dep_list = Cli::parse_from(["br", "dep", "list", "br-123"]);
+        assert!(build_cli_overrides(&dep_list).read_only_fast_open);
+
+        let dep_cycles = Cli::parse_from(["br", "dep", "cycles"]);
+        assert!(build_cli_overrides(&dep_cycles).read_only_fast_open);
+
+        let query_run = Cli::parse_from(["br", "query", "run", "mine", "--format", "json"]);
+        assert!(build_cli_overrides(&query_run).read_only_fast_open);
+
+        let query_list = Cli::parse_from(["br", "query", "list"]);
+        assert!(build_cli_overrides(&query_list).read_only_fast_open);
+    }
+
+    #[test]
+    fn read_only_fast_open_covers_read_only_query_commands() {
+        let query_run = Cli::parse_from([
+            "br",
+            "--no-auto-import",
+            "--no-auto-flush",
+            "query",
+            "run",
+            "mine",
+            "--format",
+            "json",
+        ]);
+        assert!(build_cli_overrides(&query_run).read_only_fast_open);
+
+        let query_list =
+            Cli::parse_from(["br", "--no-auto-import", "--no-auto-flush", "query", "list"]);
+        assert!(build_cli_overrides(&query_list).read_only_fast_open);
+
+        let no_auto_import_only =
+            Cli::parse_from(["br", "--no-auto-import", "query", "run", "mine"]);
+        assert!(build_cli_overrides(&no_auto_import_only).read_only_fast_open);
+
+        let query_save = Cli::parse_from([
+            "br",
+            "--no-auto-import",
+            "--no-auto-flush",
+            "query",
+            "save",
+            "mine",
+            "--status",
+            "open",
+        ]);
+        assert!(!build_cli_overrides(&query_save).read_only_fast_open);
+
+        let query_delete = Cli::parse_from([
+            "br",
+            "--no-auto-import",
+            "--no-auto-flush",
+            "query",
+            "delete",
+            "mine",
+        ]);
+        assert!(!build_cli_overrides(&query_delete).read_only_fast_open);
     }
 
     #[test]

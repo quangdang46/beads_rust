@@ -48,6 +48,50 @@ pub fn execute(
     }
 }
 
+/// Execute local read-only comments commands using storage already opened by the caller.
+///
+/// Returns `Ok(false)` when the command must use the normal routed or mutating path.
+///
+/// # Errors
+///
+/// Returns an error if route resolution, config loading, ID resolution, or comment lookup fails.
+pub fn execute_with_storage_ctx(
+    args: &CommentsArgs,
+    json: bool,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    local_beads_dir: &Path,
+    storage_ctx: &config::OpenStorageResult,
+) -> Result<bool> {
+    match &args.command {
+        Some(CommentCommands::Add(_)) => Ok(false),
+        Some(CommentCommands::List(list_args)) => execute_list_with_storage_ctx(
+            &list_args.id,
+            json,
+            cli,
+            ctx,
+            local_beads_dir,
+            list_args.wrap,
+            storage_ctx,
+        ),
+        None => {
+            let id = args
+                .id
+                .as_deref()
+                .ok_or_else(|| BeadsError::validation("id", "missing issue id"))?;
+            execute_list_with_storage_ctx(
+                id,
+                json,
+                cli,
+                ctx,
+                local_beads_dir,
+                args.wrap,
+                storage_ctx,
+            )
+        }
+    }
+}
+
 fn execute_add(
     args: &CommentAddArgs,
     cli: &config::CliOverrides,
@@ -120,6 +164,28 @@ fn execute_list(
         ctx,
         wrap,
     )
+}
+
+fn execute_list_with_storage_ctx(
+    issue_input: &str,
+    json: bool,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    local_beads_dir: &Path,
+    wrap: bool,
+    storage_ctx: &config::OpenStorageResult,
+) -> Result<bool> {
+    let route = config::routing::resolve_route(issue_input, local_beads_dir)?;
+    if route.is_external {
+        return Ok(false);
+    }
+
+    let config_layer = storage_ctx.load_config(cli)?;
+    let id_config = config::id_config_from_layer(&config_layer);
+    let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+
+    list_comments_by_id(issue_input, &storage_ctx.storage, &resolver, json, ctx, wrap)?;
+    Ok(true)
 }
 
 fn open_routed_storage_for_input(
@@ -350,7 +416,7 @@ fn read_limited_string<R: Read>(reader: &mut R, byte_limit: usize, field: &str) 
     if buffer.len() > byte_limit {
         return Err(BeadsError::validation(
             field,
-            format!("stdin input exceeds maximum size of {byte_limit} bytes"),
+            format!("{field} input exceeds maximum size of {byte_limit} bytes"),
         ));
     }
     Ok(buffer)
@@ -362,17 +428,8 @@ fn read_comment_text(args: &CommentAddArgs) -> Result<String> {
             let mut stdin = std::io::stdin();
             return read_limited_string(&mut stdin, MAX_STDIN_COMMENT_BYTES, "text");
         }
-        let metadata = fs::metadata(path)?;
-        if metadata.len() > MAX_STDIN_COMMENT_BYTES as u64 {
-            return Err(BeadsError::validation(
-                "file",
-                format!(
-                    "file exceeds maximum comment size of {} bytes",
-                    MAX_STDIN_COMMENT_BYTES
-                ),
-            ));
-        }
-        return Ok(fs::read_to_string(path)?);
+        let mut file = fs::File::open(path)?;
+        return read_limited_string(&mut file, MAX_STDIN_COMMENT_BYTES, "file");
     }
     if let Some(message) = &args.message {
         return Ok(message.clone());
@@ -535,6 +592,27 @@ mod tests {
         let result = read_comment_text(&args).unwrap();
         assert!(result.contains("Comment from file"));
         info!("test_read_comment_text_from_file: assertions passed");
+    }
+
+    #[test]
+    fn test_read_comment_text_rejects_oversized_file() {
+        init_test_logging();
+        info!("test_read_comment_text_rejects_oversized_file: starting");
+        let mut file = NamedTempFile::new().unwrap();
+        let payload = vec![b'a'; MAX_STDIN_COMMENT_BYTES + 1];
+        file.write_all(&payload).unwrap();
+        file.flush().unwrap();
+
+        let args = CommentAddArgs {
+            id: "test-id".to_string(),
+            text: vec![],
+            file: Some(file.path().to_path_buf()),
+            author: None,
+            message: None,
+        };
+        let err = read_comment_text(&args).expect_err("oversized file");
+        assert!(matches!(err, BeadsError::Validation { field, .. } if field == "file"));
+        info!("test_read_comment_text_rejects_oversized_file: assertions passed");
     }
 
     #[test]

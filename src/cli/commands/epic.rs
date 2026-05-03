@@ -30,6 +30,28 @@ pub fn execute(
     }
 }
 
+/// Execute a read-only epic command using storage that was already opened by the caller.
+///
+/// Returns `Ok(false)` when the command needs the normal mutating path.
+///
+/// # Errors
+///
+/// Returns an error if database operations fail.
+pub fn execute_with_storage_ctx(
+    command: &EpicCommands,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    storage_ctx: &config::OpenStorageResult,
+) -> Result<bool> {
+    match command {
+        EpicCommands::Status(args) => {
+            execute_status_with_storage_ctx(args, cli, ctx, storage_ctx)?;
+            Ok(true)
+        }
+        EpicCommands::CloseEligible(_) => Ok(false),
+    }
+}
+
 fn execute_status(
     args: &EpicStatusArgs,
     _json: bool,
@@ -38,11 +60,19 @@ fn execute_status(
 ) -> Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
-    let storage = &storage_ctx.storage;
+    execute_status_with_storage_ctx(args, cli, ctx, &storage_ctx)
+}
+
+fn execute_status_with_storage_ctx(
+    args: &EpicStatusArgs,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    storage_ctx: &config::OpenStorageResult,
+) -> Result<()> {
     let config_layer = storage_ctx.load_config(cli)?;
     let use_color = config::should_use_color(&config_layer);
 
-    let mut epics = load_epic_statuses(storage)?;
+    let mut epics = load_epic_statuses(&storage_ctx.storage)?;
     if args.eligible_only {
         epics.retain(|e| e.eligible_for_close);
     }

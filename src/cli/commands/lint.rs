@@ -103,15 +103,42 @@ pub fn execute(
 
     let issues = if args.ids.is_empty() {
         let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
-        let storage = &storage_ctx.storage;
-        let filters = build_filters(args)?;
-        storage.list_issues(&filters)?
+        lint_issues_with_storage(args, &storage_ctx.storage)?
     } else {
         resolve_issues(&beads_dir, args, cli)?
     };
 
-    let summary = lint_issues(&issues);
+    render_lint_output(lint_issues(&issues), ctx);
+    Ok(())
+}
 
+/// Execute the all-issues lint scan using storage already opened by the caller.
+///
+/// Returns `Ok(false)` when explicit issue IDs require the normal routed path.
+///
+/// # Errors
+///
+/// Returns an error if database access fails or filters are invalid.
+pub fn execute_with_storage_ctx(
+    args: &LintArgs,
+    ctx: &OutputContext,
+    storage_ctx: &config::OpenStorageResult,
+) -> Result<bool> {
+    if !args.ids.is_empty() {
+        return Ok(false);
+    }
+
+    let issues = lint_issues_with_storage(args, &storage_ctx.storage)?;
+    render_lint_output(lint_issues(&issues), ctx);
+    Ok(true)
+}
+
+fn lint_issues_with_storage(args: &LintArgs, storage: &SqliteStorage) -> Result<Vec<Issue>> {
+    let filters = build_filters(args)?;
+    storage.list_issues(&filters)
+}
+
+fn render_lint_output(summary: LintSummary, ctx: &OutputContext) {
     if ctx.is_toon() {
         let output = LintOutput {
             total: summary.warnings,
@@ -119,7 +146,7 @@ pub fn execute(
             results: summary.results,
         };
         ctx.toon(&output);
-        return Ok(());
+        return;
     }
 
     if ctx.is_json() {
@@ -129,12 +156,12 @@ pub fn execute(
             results: summary.results,
         };
         ctx.json_pretty(&output);
-        return Ok(());
+        return;
     }
 
     if ctx.is_quiet() {
         if summary.results.is_empty() {
-            return Ok(());
+            return;
         }
         std::process::exit(summary.exit_code(false));
     }
@@ -147,7 +174,7 @@ pub fn execute(
                 "✓ No template warnings found ({} issues checked)",
                 summary.checked
             );
-            return Ok(());
+            return;
         }
 
         println!(
