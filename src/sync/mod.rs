@@ -1544,7 +1544,7 @@ fn hydrate_export_issue_batch(
         labels_map.as_ref(),
         comments_map.as_ref(),
         ctx,
-    )?;
+    );
 
     Ok(issues)
 }
@@ -1596,7 +1596,7 @@ fn hydrate_export_issues_full_scan(
         labels_map.as_ref(),
         comments_map.as_ref(),
         ctx,
-    )?;
+    );
 
     Ok(issues)
 }
@@ -1607,8 +1607,8 @@ fn populate_export_issue_relations(
     deps_map: Option<&HashMap<String, Vec<Dependency>>>,
     labels_map: Option<&HashMap<String, Vec<String>>>,
     comments_map: Option<&HashMap<String, Vec<Comment>>>,
-    ctx: &mut ExportContext,
-) -> Result<()> {
+    ctx: &ExportContext,
+) {
     for issue in issues {
         if let Some(map) = deps_map {
             if let Some(deps) = map.get(&issue.id) {
@@ -1642,8 +1642,6 @@ fn populate_export_issue_relations(
 
         normalize_issue_for_export(issue);
     }
-
-    Ok(())
 }
 
 fn write_export_issue_jsonl<W: Write>(
