@@ -194,6 +194,19 @@ agent count, claim density, skewed-DAG factor, JSONL hash, file-size report, and
 health results. The manual million profile targets 1,000,000 issues and 10,000
 simulated agents when the host has enough memory and CPU.
 
+**Contention replay lab (CI smoke and manual 64-worker profile)**
+```bash
+cargo test --test bench_contention_replay -- --nocapture
+BR_CONTENTION_64=1 cargo test --test bench_contention_replay \
+  manual_64_worker_contention_profile_records_replayable_trace -- --ignored --nocapture
+```
+Outputs: `target/test-artifacts/contention-replay/<profile>-seed-*/`.
+The trace schema records worker id, command, start/end timing, estimated write
+lock wait, auto-import/auto-flush classification, exit code, stdout/stderr
+hashes, and replay seed. Replay creates a fresh workspace from only the trace
+plan and reports the first divergent worker/event if exit codes or created
+issue effects differ.
+
 **Real datasets**
 ```bash
 cargo test --test bench_real_datasets -- --nocapture --ignored
