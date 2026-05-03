@@ -3343,6 +3343,11 @@ enum StartupPathState {
 impl StartupPathState {
     fn present(metadata: &fs::Metadata) -> Self {
         let file_type = metadata.file_type();
+        #[cfg(unix)]
+        let unix = Some(startup_unix_file_witness(metadata));
+        #[cfg(not(unix))]
+        let unix = None;
+
         Self::Present {
             kind: if file_type.is_symlink() {
                 StartupFileKind::Symlink
@@ -3360,7 +3365,7 @@ impl StartupPathState {
                         + u128::from(duration.subsec_nanos())
                 })
             }),
-            unix: startup_unix_file_witness(metadata),
+            unix,
         }
     }
 }
@@ -3383,21 +3388,16 @@ struct StartupUnixFileWitness {
 }
 
 #[cfg(unix)]
-fn startup_unix_file_witness(metadata: &fs::Metadata) -> Option<StartupUnixFileWitness> {
+fn startup_unix_file_witness(metadata: &fs::Metadata) -> StartupUnixFileWitness {
     use std::os::unix::fs::MetadataExt;
 
-    Some(StartupUnixFileWitness {
+    StartupUnixFileWitness {
         dev: metadata.dev(),
         ino: metadata.ino(),
         mode: metadata.mode(),
         mtime_nsec: metadata.mtime_nsec(),
         ctime_nsec: metadata.ctime_nsec(),
-    })
-}
-
-#[cfg(not(unix))]
-const fn startup_unix_file_witness(_metadata: &fs::Metadata) -> Option<StartupUnixFileWitness> {
-    None
+    }
 }
 
 /// Load startup-only config layers and resolve the effective storage paths once.
