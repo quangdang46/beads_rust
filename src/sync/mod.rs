@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_WRITE_LOCK_TIMEOUT_MS: u64 = 30_000;
 const WRITE_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(25);
-const EXPORT_ISSUE_BATCH_SIZE: usize = 256;
+const EXPORT_ISSUE_BATCH_SIZE: usize = 1024;
 const IMPORT_EXPORT_HASH_BATCH_SIZE: usize = 512;
 
 /// Acquire a blocking exclusive lock on `.beads/.write.lock`.
