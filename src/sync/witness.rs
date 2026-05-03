@@ -77,6 +77,38 @@ pub struct JsonlWitnessReusePlan {
     pub actions: Vec<JsonlChunkReuseStep>,
 }
 
+/// Bounded work plan for executing a witness reuse plan with parallel workers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JsonlWitnessParallelWorkPlan {
+    pub max_parallelism: usize,
+    pub total_batches: usize,
+    pub candidate_output_batches: usize,
+    pub metadata_only_drop_batches: usize,
+    pub deterministic_batch_order: bool,
+    pub batches: Vec<JsonlWitnessWorkBatch>,
+}
+
+/// One bounded batch of independent JSONL witness work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JsonlWitnessWorkBatch {
+    pub index: usize,
+    pub kind: JsonlWitnessWorkBatchKind,
+    pub action_count: usize,
+    pub candidate_start_index: Option<usize>,
+    pub candidate_end_index: Option<usize>,
+    pub line_count: usize,
+    pub byte_count: u64,
+    pub actions: Vec<JsonlChunkReuseStep>,
+}
+
+/// Batch class for a parallel witness work plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JsonlWitnessWorkBatchKind {
+    CandidateOutput,
+    MetadataOnlyDrop,
+}
+
 /// Scheduling summary derived from a candidate-ordered JSONL reuse plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JsonlWitnessReuseSchedule {
@@ -251,6 +283,68 @@ pub fn plan_jsonl_witness_reuse(
         schedule,
         actions,
     }
+}
+
+/// Split a candidate-ordered reuse plan into bounded parallel work batches.
+///
+/// Candidate-output batches always appear in candidate index order. Metadata-only
+/// drops are emitted after candidate-output batches because they have no output
+/// position in the candidate JSONL stream.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidInput`] when `max_parallelism` is zero.
+pub fn plan_jsonl_witness_parallel_work(
+    plan: &JsonlWitnessReusePlan,
+    max_parallelism: usize,
+) -> io::Result<JsonlWitnessParallelWorkPlan> {
+    if max_parallelism == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "max_parallelism must be greater than zero",
+        ));
+    }
+
+    let mut batches = Vec::new();
+    let mut current_kind = None;
+    let mut current_actions = Vec::new();
+
+    for step in &plan.actions {
+        let step_kind = work_batch_kind(step);
+        if let Some(kind) = current_kind {
+            if kind != step_kind || current_actions.len() == max_parallelism {
+                push_work_batch(&mut batches, kind, std::mem::take(&mut current_actions));
+                current_kind = Some(step_kind);
+            }
+        } else {
+            current_kind = Some(step_kind);
+        }
+
+        current_actions.push(step.clone());
+    }
+
+    if let Some(kind) = current_kind {
+        push_work_batch(&mut batches, kind, current_actions);
+    }
+
+    let candidate_output_batches = batches
+        .iter()
+        .filter(|batch| matches!(batch.kind, JsonlWitnessWorkBatchKind::CandidateOutput))
+        .count();
+    let metadata_only_drop_batches = batches
+        .iter()
+        .filter(|batch| matches!(batch.kind, JsonlWitnessWorkBatchKind::MetadataOnlyDrop))
+        .count();
+
+    Ok(JsonlWitnessParallelWorkPlan {
+        max_parallelism,
+        total_batches: batches.len(),
+        candidate_output_batches,
+        metadata_only_drop_batches,
+        deterministic_batch_order: plan.schedule.deterministic_candidate_order
+            && work_batches_are_deterministically_ordered(&batches),
+        batches,
+    })
 }
 
 /// Compare two JSONL witnesses and conservatively identify reusable chunks.
@@ -470,6 +564,81 @@ fn candidate_actions_are_deterministically_ordered(actions: &[JsonlChunkReuseSte
             }
             Some(_) => return false,
             None => drops_started = true,
+        }
+    }
+
+    true
+}
+
+fn work_batch_kind(step: &JsonlChunkReuseStep) -> JsonlWitnessWorkBatchKind {
+    if step.candidate_index.is_some() {
+        JsonlWitnessWorkBatchKind::CandidateOutput
+    } else {
+        JsonlWitnessWorkBatchKind::MetadataOnlyDrop
+    }
+}
+
+fn push_work_batch(
+    batches: &mut Vec<JsonlWitnessWorkBatch>,
+    kind: JsonlWitnessWorkBatchKind,
+    actions: Vec<JsonlChunkReuseStep>,
+) {
+    let index = batches.len();
+    batches.push(build_work_batch(index, kind, actions));
+}
+
+fn build_work_batch(
+    index: usize,
+    kind: JsonlWitnessWorkBatchKind,
+    actions: Vec<JsonlChunkReuseStep>,
+) -> JsonlWitnessWorkBatch {
+    let action_count = actions.len();
+    let candidate_start_index = actions.iter().filter_map(|step| step.candidate_index).min();
+    let candidate_end_index = actions
+        .iter()
+        .filter_map(|step| step.candidate_index)
+        .max()
+        .map(|index| index.saturating_add(1));
+    let line_count = actions
+        .iter()
+        .fold(0_usize, |total, step| total.saturating_add(step.line_count));
+    let byte_count = actions
+        .iter()
+        .fold(0_u64, |total, step| total.saturating_add(step.byte_count));
+
+    JsonlWitnessWorkBatch {
+        index,
+        kind,
+        action_count,
+        candidate_start_index,
+        candidate_end_index,
+        line_count,
+        byte_count,
+        actions,
+    }
+}
+
+fn work_batches_are_deterministically_ordered(batches: &[JsonlWitnessWorkBatch]) -> bool {
+    let mut expected_candidate_index = 0;
+    let mut drops_started = false;
+
+    for (expected_batch_index, batch) in batches.iter().enumerate() {
+        if batch.index != expected_batch_index {
+            return false;
+        }
+
+        match batch.kind {
+            JsonlWitnessWorkBatchKind::CandidateOutput if !drops_started => {
+                if batch.candidate_start_index != Some(expected_candidate_index) {
+                    return false;
+                }
+                expected_candidate_index += batch.action_count;
+                if batch.candidate_end_index != Some(expected_candidate_index) {
+                    return false;
+                }
+            }
+            JsonlWitnessWorkBatchKind::CandidateOutput => return false,
+            JsonlWitnessWorkBatchKind::MetadataOnlyDrop => drops_started = true,
         }
     }
 
@@ -919,5 +1088,106 @@ mod tests {
         assert_eq!(plan.actions[0].candidate_index, Some(0));
         assert_eq!(plan.actions[2].base_index, Some(0));
         assert_eq!(plan.comparison.comparable_chunk_count, 0);
+    }
+
+    #[test]
+    fn parallel_work_plan_batches_candidate_actions_before_metadata_drops() {
+        let base = witness(b"a\nb\nc\nd\n", 1);
+        let candidate = witness(b"a\nB\nc\n", 1);
+        let reuse_plan = plan_jsonl_witness_reuse(&base, &candidate);
+
+        let work_plan = plan_jsonl_witness_parallel_work(&reuse_plan, 2).unwrap();
+
+        assert_eq!(work_plan.max_parallelism, 2);
+        assert_eq!(work_plan.total_batches, 3);
+        assert_eq!(work_plan.candidate_output_batches, 2);
+        assert_eq!(work_plan.metadata_only_drop_batches, 1);
+        assert!(work_plan.deterministic_batch_order);
+
+        assert_eq!(
+            work_plan.batches[0].kind,
+            JsonlWitnessWorkBatchKind::CandidateOutput
+        );
+        assert_eq!(work_plan.batches[0].action_count, 2);
+        assert_eq!(work_plan.batches[0].candidate_start_index, Some(0));
+        assert_eq!(work_plan.batches[0].candidate_end_index, Some(2));
+        assert_eq!(
+            work_plan.batches[0]
+                .actions
+                .iter()
+                .map(|step| step.action)
+                .collect::<Vec<_>>(),
+            vec![
+                JsonlChunkReuseAction::ReuseUnchanged,
+                JsonlChunkReuseAction::RebuildCandidate,
+            ]
+        );
+
+        assert_eq!(
+            work_plan.batches[1].kind,
+            JsonlWitnessWorkBatchKind::CandidateOutput
+        );
+        assert_eq!(work_plan.batches[1].action_count, 1);
+        assert_eq!(work_plan.batches[1].candidate_start_index, Some(2));
+        assert_eq!(work_plan.batches[1].candidate_end_index, Some(3));
+        assert_eq!(
+            work_plan.batches[1].line_count,
+            candidate.chunks[2].line_count
+        );
+        assert_eq!(
+            work_plan.batches[1].byte_count,
+            candidate.chunks[2].byte_count
+        );
+
+        assert_eq!(
+            work_plan.batches[2].kind,
+            JsonlWitnessWorkBatchKind::MetadataOnlyDrop
+        );
+        assert_eq!(work_plan.batches[2].action_count, 1);
+        assert_eq!(work_plan.batches[2].candidate_start_index, None);
+        assert_eq!(work_plan.batches[2].candidate_end_index, None);
+        assert_eq!(work_plan.batches[2].line_count, base.chunks[3].line_count);
+        assert_eq!(work_plan.batches[2].byte_count, base.chunks[3].byte_count);
+    }
+
+    #[test]
+    fn parallel_work_plan_rejects_zero_parallelism() {
+        let base = witness(b"a\n", 1);
+        let candidate = witness(b"a\n", 1);
+        let reuse_plan = plan_jsonl_witness_reuse(&base, &candidate);
+
+        let err = plan_jsonl_witness_parallel_work(&reuse_plan, 0).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn parallel_work_plan_rebuilds_incompatible_candidate_chunks_in_waves() {
+        let base = witness(b"a\nb\nc\n", 1);
+        let candidate = witness(b"a\nb\nc\n", 2);
+        let reuse_plan = plan_jsonl_witness_reuse(&base, &candidate);
+
+        let work_plan = plan_jsonl_witness_parallel_work(&reuse_plan, 1).unwrap();
+
+        assert_eq!(work_plan.total_batches, 5);
+        assert_eq!(work_plan.candidate_output_batches, 2);
+        assert_eq!(work_plan.metadata_only_drop_batches, 3);
+        assert!(work_plan.deterministic_batch_order);
+        assert_eq!(
+            work_plan
+                .batches
+                .iter()
+                .map(|batch| batch.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                JsonlWitnessWorkBatchKind::CandidateOutput,
+                JsonlWitnessWorkBatchKind::CandidateOutput,
+                JsonlWitnessWorkBatchKind::MetadataOnlyDrop,
+                JsonlWitnessWorkBatchKind::MetadataOnlyDrop,
+                JsonlWitnessWorkBatchKind::MetadataOnlyDrop,
+            ]
+        );
+        assert_eq!(work_plan.batches[0].candidate_start_index, Some(0));
+        assert_eq!(work_plan.batches[1].candidate_start_index, Some(1));
     }
 }
