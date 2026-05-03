@@ -16,7 +16,11 @@
 mod common;
 
 use beads_rust::util::hex_encode;
+use beads_rust::write_combining::{
+    BatchLimits, CombinedOutputMode, CompatibleMutation, MutationEnvelope, plan_batch,
+};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
@@ -30,6 +34,7 @@ use tempfile::TempDir;
 
 const TRACE_SCHEMA_VERSION: &str = "br.contention-trace.v1";
 const REPLAY_REPORT_SCHEMA_VERSION: &str = "br.contention-replay-report.v1";
+const WRITE_COMBINING_PROJECTION_SCHEMA_VERSION: &str = "br.write-combining-projection.v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ContentionProfile {
@@ -149,6 +154,24 @@ struct ReplayDivergence {
     expected: String,
     actual: String,
     command: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct WriteCombiningProjectionReport {
+    schema_version: String,
+    trace_schema_version: String,
+    replay_seed: u64,
+    plan_hash: String,
+    batch_limit: BatchLimits,
+    direct_lock_acquisitions: usize,
+    projected_lock_acquisitions: usize,
+    saved_lock_acquisitions: usize,
+    accepted_envelopes: usize,
+    skipped_envelopes: usize,
+    direct_total_lock_wait_ms: u64,
+    direct_max_lock_wait_ms: u64,
+    projected_single_batch_wait_ms: u64,
+    used_argument_bytes: usize,
 }
 
 struct CommandRun {
@@ -397,6 +420,62 @@ fn replay_contention_trace(trace: &ContentionTrace) -> io::Result<ReplayReport> 
     })
 }
 
+fn project_write_combining_from_trace(
+    trace: &ContentionTrace,
+    batch_limit: BatchLimits,
+) -> io::Result<WriteCombiningProjectionReport> {
+    let envelopes = trace
+        .events
+        .iter()
+        .filter_map(mutation_envelope_from_event)
+        .collect::<Vec<_>>();
+    let plan = plan_batch(&envelopes, batch_limit, trace.lock_released_at_ms)
+        .map_err(|err| io::Error::other(format!("invalid batch limits: {err:?}")))?;
+    let projected_lock_acquisitions = usize::from(plan.accepted_count() > 0);
+    let direct_lock_acquisitions = envelopes.len();
+    let direct_total_lock_wait_ms = trace
+        .events
+        .iter()
+        .map(|event| event.lock_wait_ms)
+        .sum::<u64>();
+
+    Ok(WriteCombiningProjectionReport {
+        schema_version: WRITE_COMBINING_PROJECTION_SCHEMA_VERSION.to_string(),
+        trace_schema_version: trace.schema_version.clone(),
+        replay_seed: trace.replay_seed,
+        plan_hash: trace.plan_hash.clone(),
+        batch_limit,
+        direct_lock_acquisitions,
+        projected_lock_acquisitions,
+        saved_lock_acquisitions: direct_lock_acquisitions
+            .saturating_sub(projected_lock_acquisitions),
+        accepted_envelopes: plan.accepted_count(),
+        skipped_envelopes: plan.skipped.len(),
+        direct_total_lock_wait_ms,
+        direct_max_lock_wait_ms: trace.summary.max_lock_wait_ms,
+        projected_single_batch_wait_ms: trace.summary.max_lock_wait_ms,
+        used_argument_bytes: plan.used_argument_bytes,
+    })
+}
+
+fn mutation_envelope_from_event(event: &ContentionEvent) -> Option<MutationEnvelope> {
+    if event.command_kind != CommandKind::CreateIssue || event.exit_code != 0 {
+        return None;
+    }
+    let title = create_title_from_command(&event.command)?;
+    Some(MutationEnvelope::new(
+        format!("{}:{}", event.worker_id, event.event_index),
+        event.worker_id.clone(),
+        CompatibleMutation::CreateIssue,
+        CombinedOutputMode::Json,
+        event
+            .started_at_ms
+            .saturating_add(event.lock_wait_ms)
+            .saturating_add(1),
+        json!({ "title": title }),
+    ))
+}
+
 fn replay_report_with_divergence(
     trace: &ContentionTrace,
     events_replayed: usize,
@@ -564,6 +643,17 @@ fn write_replay_report_artifact(
     Ok(report_path)
 }
 
+fn write_write_combining_projection_artifact(
+    profile: &ContentionProfile,
+    report: &WriteCombiningProjectionReport,
+) -> io::Result<PathBuf> {
+    let artifact_dir = contention_artifact_dir(profile);
+    fs::create_dir_all(&artifact_dir)?;
+    let report_path = artifact_dir.join("write-combining-projection-report.json");
+    write_json_pretty(&report_path, report)?;
+    Ok(report_path)
+}
+
 fn contention_artifact_dir(profile: &ContentionProfile) -> PathBuf {
     let target_dir = std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
@@ -640,6 +730,29 @@ fn contention_ci_profile_records_and_replays_trace() {
     let report_path = write_replay_report_artifact(&run.trace.profile, &replay)
         .expect("replay report artifact should write");
     assert!(report_path.is_file(), "replay report artifact should exist");
+
+    let projection = project_write_combining_from_trace(&run.trace, BatchLimits::default())
+        .expect("write-combining projection should build from contention trace");
+    assert_eq!(
+        projection.schema_version,
+        WRITE_COMBINING_PROJECTION_SCHEMA_VERSION
+    );
+    assert_eq!(projection.direct_lock_acquisitions, 4);
+    assert_eq!(projection.projected_lock_acquisitions, 1);
+    assert_eq!(projection.saved_lock_acquisitions, 3);
+    assert_eq!(projection.accepted_envelopes, 4);
+    assert_eq!(projection.skipped_envelopes, 0);
+    assert!(
+        projection.direct_total_lock_wait_ms > projection.projected_single_batch_wait_ms,
+        "projection should show lower lock-wait exposure than one lock per worker"
+    );
+    let projection_path =
+        write_write_combining_projection_artifact(&run.trace.profile, &projection)
+            .expect("write-combining projection artifact should write");
+    assert!(
+        projection_path.is_file(),
+        "write-combining projection artifact should exist"
+    );
 }
 
 #[test]
@@ -650,18 +763,25 @@ fn replay_report_identifies_first_divergent_worker_event() {
     let run = run_contention_lab(ContentionProfile::ci_profile(83_001))
         .expect("contention lab should record a CI trace");
     let mut divergent_trace = run.trace.clone();
-    divergent_trace.events[0].exit_code = 99;
+    assert!(
+        !divergent_trace.events.is_empty(),
+        "contention trace should include at least one event"
+    );
+    let (expected_worker_id, expected_event_index) =
+        if let Some(first_event) = divergent_trace.events.first_mut() {
+            first_event.exit_code = 99;
+            (first_event.worker_id.clone(), first_event.event_index)
+        } else {
+            return;
+        };
 
     let replay = replay_contention_trace(&divergent_trace).expect("divergent trace should replay");
     let divergence = replay
         .divergence
         .expect("replay should report a divergence");
 
-    assert_eq!(divergence.worker_id, divergent_trace.events[0].worker_id);
-    assert_eq!(
-        divergence.event_index,
-        divergent_trace.events[0].event_index
-    );
+    assert_eq!(divergence.worker_id, expected_worker_id);
+    assert_eq!(divergence.event_index, expected_event_index);
     assert_eq!(divergence.field, "exit_code");
     assert_eq!(divergence.expected, "99");
     assert_eq!(divergence.actual, "0");
