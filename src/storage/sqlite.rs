@@ -66,6 +66,15 @@ pub(crate) struct BlockedCacheProjectionHealth {
     pub(crate) cached_mismatched_rows: Option<usize>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReadyProjectionHealth {
+    pub(crate) parity_status: String,
+    pub(crate) cached_ready_rows: Option<usize>,
+    pub(crate) direct_ready_rows: Option<usize>,
+    pub(crate) cached_ready_missing_rows: Option<usize>,
+    pub(crate) cached_ready_extra_rows: Option<usize>,
+}
+
 impl BlockedCacheProjectionHealth {
     fn unavailable(direct_blocked_rows: Option<usize>) -> Self {
         Self {
@@ -86,6 +95,25 @@ impl BlockedCacheProjectionHealth {
         .into_iter()
         .flatten()
         .any(|count| count > 0)
+    }
+}
+
+impl ReadyProjectionHealth {
+    fn unavailable(cached_ready_rows: Option<usize>, direct_ready_rows: Option<usize>) -> Self {
+        Self {
+            parity_status: "unavailable".to_string(),
+            cached_ready_rows,
+            direct_ready_rows,
+            cached_ready_missing_rows: None,
+            cached_ready_extra_rows: None,
+        }
+    }
+
+    pub(crate) fn has_mismatch(&self) -> bool {
+        [self.cached_ready_missing_rows, self.cached_ready_extra_rows]
+            .into_iter()
+            .flatten()
+            .any(|count| count > 0)
     }
 }
 
@@ -4099,6 +4127,17 @@ impl SqliteStorage {
         Self::compare_blocked_cache_projection(cached_map.as_ref(), direct_map.as_ref())
     }
 
+    pub(crate) fn ready_projection_health(conn: &Connection) -> ReadyProjectionHealth {
+        let cached_ready_ids = Self::query_ready_projection_ids(conn, None, true).ok();
+        let direct_blocked_ids = Self::compute_blocked_issues_map_impl(conn)
+            .ok()
+            .map(|map| map.into_keys().collect::<HashSet<_>>());
+        let direct_ready_ids = direct_blocked_ids.as_ref().and_then(|blocked_ids| {
+            Self::query_ready_projection_ids(conn, Some(blocked_ids), false).ok()
+        });
+        Self::compare_ready_projection(cached_ready_ids.as_ref(), direct_ready_ids.as_ref())
+    }
+
     fn compare_blocked_cache_projection(
         cached: Option<&HashMap<String, Vec<String>>>,
         direct: Option<&HashMap<String, Vec<String>>>,
@@ -4149,6 +4188,60 @@ impl SqliteStorage {
             cached_map.insert(issue_id.to_string(), blockers);
         }
         Ok(cached_map)
+    }
+
+    fn compare_ready_projection(
+        cached: Option<&HashSet<String>>,
+        direct: Option<&HashSet<String>>,
+    ) -> ReadyProjectionHealth {
+        let cached_ready_rows = cached.map(HashSet::len);
+        let direct_ready_rows = direct.map(HashSet::len);
+        let (Some(cached), Some(direct)) = (cached, direct) else {
+            return ReadyProjectionHealth::unavailable(cached_ready_rows, direct_ready_rows);
+        };
+
+        let missing_rows = direct.difference(cached).count();
+        let extra_rows = cached.difference(direct).count();
+        let parity_status = if missing_rows == 0 && extra_rows == 0 {
+            "matches"
+        } else {
+            "mismatch"
+        };
+
+        ReadyProjectionHealth {
+            parity_status: parity_status.to_string(),
+            cached_ready_rows,
+            direct_ready_rows,
+            cached_ready_missing_rows: Some(missing_rows),
+            cached_ready_extra_rows: Some(extra_rows),
+        }
+    }
+
+    fn query_ready_projection_ids(
+        conn: &Connection,
+        direct_blocked_ids: Option<&HashSet<String>>,
+        exclude_blocked_in_sql: bool,
+    ) -> Result<HashSet<String>> {
+        let (sql, params) = Self::build_ready_issue_candidates_query(
+            &ReadyFilters::default(),
+            ReadySortPolicy::Priority,
+            exclude_blocked_in_sql,
+            false,
+            ReadyIssueProjection::Command,
+            false,
+        );
+        let rows = conn.query_with_params(&sql, &params)?;
+        let mut ready_ids = HashSet::with_capacity(rows.len());
+        for row in &rows {
+            let Some(issue_id) = row.get(0).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            if direct_blocked_ids.is_some_and(|blocked_ids| blocked_ids.contains(issue_id)) {
+                continue;
+            }
+            ready_ids.insert(issue_id.to_string());
+        }
+        Ok(ready_ids)
     }
 
     fn blocker_refs_to_issue_ids(blockers: &[String]) -> Vec<String> {
