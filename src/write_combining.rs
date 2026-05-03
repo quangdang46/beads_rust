@@ -380,6 +380,27 @@ pub struct BatchReport {
     pub responses: Vec<BatchResponse>,
 }
 
+/// Aggregated caller-visible outcomes for one combined batch report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchOutcomeSummary {
+    /// Total responses emitted by the report.
+    pub response_count: usize,
+    /// Responses for envelopes that reached the executor.
+    pub applied_count: usize,
+    /// Responses for envelopes rejected before execution.
+    pub skipped_count: usize,
+    /// Applied mutations with process-style success exit codes.
+    pub successful_mutations: usize,
+    /// Applied mutations with non-zero process-style exit codes.
+    pub failed_mutations: usize,
+    /// Applied mutations whose SQLite commit succeeded but JSONL flush failed.
+    pub flush_failures: usize,
+    /// Original queue index for the first non-zero result, if any.
+    pub first_failed_index: Option<usize>,
+    /// Original queue index for the first post-commit flush failure, if any.
+    pub first_flush_failure_index: Option<usize>,
+}
+
 impl BatchReport {
     /// Count applied responses.
     #[must_use]
@@ -394,6 +415,48 @@ impl BatchReport {
     #[must_use]
     pub fn skipped_count(&self) -> usize {
         self.responses.len() - self.applied_count()
+    }
+
+    /// Summarize caller-visible failures without hiding per-envelope results.
+    #[must_use]
+    pub fn outcome_summary(&self) -> BatchOutcomeSummary {
+        let mut summary = BatchOutcomeSummary {
+            response_count: self.responses.len(),
+            applied_count: 0,
+            skipped_count: 0,
+            successful_mutations: 0,
+            failed_mutations: 0,
+            flush_failures: 0,
+            first_failed_index: None,
+            first_flush_failure_index: None,
+        };
+
+        for response in &self.responses {
+            match &response.outcome {
+                BatchResponseOutcome::Applied(result) => {
+                    summary.applied_count += 1;
+                    if result.exit_code == 0 {
+                        summary.successful_mutations += 1;
+                    } else {
+                        summary.failed_mutations += 1;
+                        if summary.first_failed_index.is_none() {
+                            summary.first_failed_index = Some(response.index);
+                        }
+                    }
+                    if result.flush == CombinedFlushOutcome::FailedAfterCommit {
+                        summary.flush_failures += 1;
+                        if summary.first_flush_failure_index.is_none() {
+                            summary.first_flush_failure_index = Some(response.index);
+                        }
+                    }
+                }
+                BatchResponseOutcome::Skipped(_) => {
+                    summary.skipped_count += 1;
+                }
+            }
+        }
+
+        summary
     }
 }
 
@@ -1585,6 +1648,112 @@ mod tests {
             BatchResponseOutcome::Skipped(BatchSkipReason::InvalidEnvelope(
                 EnvelopeValidationError::UnsupportedSchemaVersion
             ))
+        );
+    }
+
+    #[test]
+    fn batch_outcome_summary_preserves_failures_and_flush_failures() {
+        let mut invalid = envelope(
+            "invalid",
+            CompatibleMutation::CreateIssue,
+            FUTURE_UNIX_MS,
+            json!({"title": "invalid"}),
+        );
+        invalid.schema_version = "br.write-combining.v0".to_string();
+        let envelopes = vec![
+            envelope(
+                "request-1",
+                CompatibleMutation::CreateIssue,
+                FUTURE_UNIX_MS,
+                json!({"title": "first"}),
+            ),
+            envelope(
+                "request-2",
+                CompatibleMutation::CreateIssue,
+                FUTURE_UNIX_MS,
+                json!({"title": "second"}),
+            ),
+            envelope(
+                "request-3",
+                CompatibleMutation::CreateIssue,
+                FUTURE_UNIX_MS,
+                json!({"title": "third"}),
+            ),
+            invalid,
+        ];
+        let plan = planned(plan_batch(&envelopes, BatchLimits::default(), NOW_UNIX_MS));
+        let results = vec![
+            MutationResult::new(
+                "request-1",
+                CompatibleMutation::CreateIssue,
+                0,
+                r#"{"id":"one"}"#,
+                "",
+                CombinedFlushOutcome::Succeeded,
+            ),
+            MutationResult::new(
+                "request-2",
+                CompatibleMutation::CreateIssue,
+                2,
+                "",
+                "validation failed",
+                CombinedFlushOutcome::Succeeded,
+            ),
+            MutationResult::new(
+                "request-3",
+                CompatibleMutation::CreateIssue,
+                0,
+                r#"{"id":"three"}"#,
+                "flush failed",
+                CombinedFlushOutcome::FailedAfterCommit,
+            ),
+        ];
+
+        let report = reported(assemble_batch_report(&envelopes, &plan, &results));
+        let summary = report.outcome_summary();
+
+        assert_eq!(
+            summary,
+            BatchOutcomeSummary {
+                response_count: 4,
+                applied_count: 3,
+                skipped_count: 1,
+                successful_mutations: 2,
+                failed_mutations: 1,
+                flush_failures: 1,
+                first_failed_index: Some(1),
+                first_flush_failure_index: Some(2),
+            }
+        );
+        assert_eq!(
+            report
+                .responses
+                .iter()
+                .find(|response| response.index == 1)
+                .map(|response| &response.outcome),
+            Some(&BatchResponseOutcome::Applied(MutationResult::new(
+                "request-2",
+                CompatibleMutation::CreateIssue,
+                2,
+                "",
+                "validation failed",
+                CombinedFlushOutcome::Succeeded,
+            )))
+        );
+        assert_eq!(
+            report
+                .responses
+                .iter()
+                .find(|response| response.index == 2)
+                .map(|response| &response.outcome),
+            Some(&BatchResponseOutcome::Applied(MutationResult::new(
+                "request-3",
+                CompatibleMutation::CreateIssue,
+                0,
+                r#"{"id":"three"}"#,
+                "flush failed",
+                CombinedFlushOutcome::FailedAfterCommit,
+            )))
         );
     }
 
