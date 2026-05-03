@@ -138,6 +138,30 @@ impl AgentFileDetection {
         }
         self.has_blurb && self.blurb_version < BLURB_VERSION
     }
+
+    fn file_path_ref(&self, context: &str) -> Result<&Path> {
+        self.file_path.as_deref().ok_or_else(|| {
+            BeadsError::internal(format!(
+                "agent file detection is missing file_path while handling {context}"
+            ))
+        })
+    }
+
+    fn file_type_ref(&self, context: &str) -> Result<&str> {
+        self.file_type.as_deref().ok_or_else(|| {
+            BeadsError::internal(format!(
+                "agent file detection is missing file_type while handling {context}"
+            ))
+        })
+    }
+
+    fn content_ref(&self, context: &str) -> Result<&str> {
+        self.content.as_deref().ok_or_else(|| {
+            BeadsError::internal(format!(
+                "agent file detection is missing content while handling {context}"
+            ))
+        })
+    }
 }
 
 #[must_use]
@@ -688,7 +712,7 @@ fn execute_dry_run_inferred(
     }
 
     if let Some(err) = detection.read_error.as_deref() {
-        let file_path = detection.file_path.as_ref().unwrap();
+        let file_path = detection.file_path_ref("agents dry-run unreadable file")?;
         let file_type = detection.file_type.as_deref().unwrap_or("agent file");
         if is_rich {
             render_unreadable_rich(file_path, file_type, err, "Dry Run", ctx);
@@ -705,7 +729,7 @@ fn execute_dry_run_inferred(
 
     if detection.needs_upgrade() {
         // Would update existing blurb
-        let file_path = detection.file_path.as_ref().unwrap();
+        let file_path = detection.file_path_ref("agents dry-run update")?;
         let from_version = if detection.has_legacy_blurb {
             "bv (legacy)".to_string()
         } else {
@@ -724,7 +748,7 @@ fn execute_dry_run_inferred(
 
     if detection.needs_blurb() {
         // File exists but has no blurb -- would add
-        let file_path = detection.file_path.as_ref().unwrap();
+        let file_path = detection.file_path_ref("agents dry-run add")?;
         if is_rich {
             render_dry_run_add_rich(file_path, ctx);
         } else {
@@ -821,8 +845,8 @@ fn execute_check(
         return Ok(());
     }
 
-    let file_path = detection.file_path.as_ref().unwrap();
-    let file_type = detection.file_type.as_ref().unwrap();
+    let file_path = detection.file_path_ref("agents check")?;
+    let file_type = detection.file_type_ref("agents check")?;
 
     println!("Found: {} at {}", file_type, file_path.display());
 
@@ -888,11 +912,13 @@ fn execute_add(
         if let Some(ref err) = detection.read_error {
             return Err(BeadsError::Config(format!(
                 "Cannot add instructions: {} exists but is unreadable: {}",
-                detection.file_type.as_ref().unwrap(),
+                detection.file_type_ref("agents add unreadable file")?,
                 err
             )));
         }
-        let path = detection.file_path.clone().unwrap();
+        let path = detection
+            .file_path_ref("agents add existing file")?
+            .to_path_buf();
         let content = detection.content.clone().unwrap_or_default();
         (path, content)
     } else {
@@ -989,7 +1015,7 @@ fn execute_remove(
     if let Some(ref err) = detection.read_error {
         return Err(BeadsError::Config(format!(
             "Cannot remove instructions: {} exists but is unreadable: {}",
-            detection.file_type.as_ref().unwrap(),
+            detection.file_type_ref("agents remove unreadable file")?,
             err
         )));
     }
@@ -1012,8 +1038,8 @@ fn execute_remove(
         return Ok(());
     }
 
-    let file_path = detection.file_path.as_ref().unwrap();
-    let content = detection.content.as_ref().unwrap();
+    let file_path = detection.file_path_ref("agents remove")?;
+    let content = detection.content_ref("agents remove")?;
 
     let new_content = if detection.has_legacy_blurb {
         remove_legacy_blurb(content)
@@ -1103,7 +1129,7 @@ fn execute_update(
     if let Some(ref err) = detection.read_error {
         return Err(BeadsError::Config(format!(
             "Cannot update instructions: {} exists but is unreadable: {}",
-            detection.file_type.as_ref().unwrap(),
+            detection.file_type_ref("agents update unreadable file")?,
             err
         )));
     }
@@ -1126,8 +1152,8 @@ fn execute_update(
         return Ok(());
     }
 
-    let file_path = detection.file_path.as_ref().unwrap();
-    let content = detection.content.as_ref().unwrap();
+    let file_path = detection.file_path_ref("agents update")?;
+    let content = detection.content_ref("agents update")?;
     let new_content = update_blurb(content);
 
     let from_version = if detection.has_legacy_blurb {
@@ -1215,8 +1241,11 @@ fn render_check_rich(detection: &AgentFileDetection, work_dir: &Path, ctx: &Outp
     let mut content = Text::new("");
 
     if detection.found() {
-        let file_path = detection.file_path.as_ref().unwrap();
-        let file_type = detection.file_type.as_ref().unwrap();
+        let file_path = detection
+            .file_path
+            .as_deref()
+            .unwrap_or_else(|| Path::new("<unknown>"));
+        let file_type = detection.file_type.as_deref().unwrap_or("agent file");
 
         content.append_styled("File        ", theme.dimmed.clone());
         content.append_styled(file_type, theme.emphasis.clone());
@@ -1468,6 +1497,11 @@ mod tests {
     use std::env;
 
     use tempfile::TempDir;
+
+    fn assert_unexpected_error(other: BeadsError) {
+        let message = format!("{other:?}");
+        assert!(message.is_empty(), "unexpected error: {message}");
+    }
 
     struct DirGuard {
         previous: PathBuf,
@@ -1802,7 +1836,7 @@ mod tests {
                 assert_eq!(field, "force");
                 assert!(reason.contains("--force"));
             }
-            other => panic!("unexpected error: {other:?}"),
+            other => assert_unexpected_error(other),
         }
     }
 
@@ -1851,7 +1885,7 @@ mod tests {
                 assert_eq!(field, "AGENTS.md");
                 assert!(reason.contains("current directory"));
             }
-            other => panic!("unexpected error: {other:?}"),
+            other => assert_unexpected_error(other),
         }
     }
 
@@ -1877,7 +1911,7 @@ mod tests {
                 assert_eq!(field, "AGENTS.md");
                 assert!(reason.contains("current directory"));
             }
-            other => panic!("unexpected error: {other:?}"),
+            other => assert_unexpected_error(other),
         }
     }
 
@@ -1954,7 +1988,7 @@ mod tests {
                 assert!(reason.contains("--add"));
                 assert!(reason.contains("--check"));
             }
-            other => panic!("unexpected error: {other:?}"),
+            other => assert_unexpected_error(other),
         }
     }
 }
