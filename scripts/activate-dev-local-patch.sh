@@ -28,15 +28,29 @@ if ! git ls-files --error-unmatch Cargo.lock >/dev/null 2>&1; then
   exit 1
 fi
 
+case "${1:-}" in
+  "")
+    ENABLE_FASTMCP=false
+    ;;
+  "--fastmcp")
+    ENABLE_FASTMCP=true
+    ;;
+  *)
+    echo "error: unknown flag '${1}'" >&2
+    echo "       supported: (none) | --fastmcp" >&2
+    exit 1
+    ;;
+esac
+
 if [[ ! -d ../frankensqlite/crates/fsqlite ]]; then
   echo "error: sibling frankensqlite checkout not found at ../frankensqlite" >&2
   echo "       run \`git clone https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite\` first" >&2
   exit 1
 fi
 
-if [[ "${1:-}" != "" && "${1:-}" != "--fastmcp" ]]; then
-  echo "error: unknown flag '${1}'" >&2
-  echo "       supported: (none) | --fastmcp" >&2
+if [[ "$ENABLE_FASTMCP" == true && ! -d ../fastmcp_rust/crates/fastmcp ]]; then
+  echo "error: sibling fastmcp_rust checkout not found at ../fastmcp_rust" >&2
+  echo "       run \`git clone https://github.com/Dicklesworthstone/fastmcp_rust ../fastmcp_rust\` first" >&2
   exit 1
 fi
 
@@ -55,7 +69,7 @@ if [[ -f .cargo/config.toml ]] \
   exit 1
 fi
 
-if [[ "${1:-}" == "--fastmcp" ]]; then
+if [[ "$ENABLE_FASTMCP" == true ]]; then
   # Strip the leading `# ` from the fastmcp_rust block so those entries activate too.
   sed -E 's/^# (fastmcp-[a-z]+ +=)/\1/' scripts/dev-local-frankensqlite.toml > .cargo/config.toml
   echo "activated dev-local patch (frankensqlite + fastmcp_rust)"
