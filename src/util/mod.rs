@@ -23,11 +23,12 @@ pub use id::{
 
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 const LAST_TOUCHED_FILE: &str = "last-touched";
-const MAX_LAST_TOUCHED_BYTES: u64 = 4096;
+const MAX_LAST_TOUCHED_BYTES: usize = 4096;
+const MAX_LAST_TOUCHED_BYTES_U64: u64 = 4096;
 
 /// Environment variable for overriding the cache directory location.
 ///
@@ -110,18 +111,34 @@ pub fn set_last_touched_id(beads_dir: &Path, id: &str) {
 #[must_use]
 pub fn get_last_touched_id(beads_dir: &Path) -> String {
     let path = last_touched_path(beads_dir);
-    if fs::metadata(&path).map_or(true, |metadata| metadata.len() > MAX_LAST_TOUCHED_BYTES) {
+    let Ok(metadata) = fs::metadata(&path) else {
         return String::new();
+    };
+
+    read_last_touched_file_limited(&path, &metadata).unwrap_or_default()
+}
+
+fn read_last_touched_file_limited(path: &Path, metadata: &fs::Metadata) -> io::Result<String> {
+    if metadata.len() > MAX_LAST_TOUCHED_BYTES_U64 {
+        return Ok(String::new());
     }
 
-    let mut line = String::new();
-    if let Ok(file) = fs::File::open(path)
-        && BufReader::new(file).read_line(&mut line).is_ok()
-    {
-        return line.trim().to_string();
+    let file = fs::File::open(path)?;
+    let mut reader = file.take(MAX_LAST_TOUCHED_BYTES_U64.saturating_add(1));
+    let mut content = Vec::new();
+    reader.read_to_end(&mut content)?;
+    if content.len() > MAX_LAST_TOUCHED_BYTES {
+        return Ok(String::new());
     }
 
-    String::new()
+    let content =
+        String::from_utf8(content).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    Ok(content
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string())
 }
 
 /// Best-effort delete of the last-touched file.
@@ -261,10 +278,36 @@ mod tests {
             .append(true)
             .open(&path)
             .expect("open last touched");
-        file.set_len(MAX_LAST_TOUCHED_BYTES + 1)
+        file.set_len(MAX_LAST_TOUCHED_BYTES_U64 + 1)
             .expect("extend last touched");
 
         assert_eq!(get_last_touched_id(&beads_dir), "");
+    }
+
+    #[test]
+    fn test_read_last_touched_file_limited_checks_size_after_open() {
+        let temp = TempDir::new().expect("temp dir");
+        let path = temp.path().join(LAST_TOUCHED_FILE);
+        fs::write(&path, "bd-abc123\n").expect("write last touched");
+        let metadata = fs::metadata(&path).expect("metadata");
+        fs::write(&path, vec![b'a'; MAX_LAST_TOUCHED_BYTES + 1]).expect("grow last touched");
+
+        let value = read_last_touched_file_limited(&path, &metadata).expect("read last touched");
+
+        assert_eq!(value, "");
+    }
+
+    #[test]
+    fn test_read_last_touched_file_limited_rejects_invalid_utf8() {
+        let temp = TempDir::new().expect("temp dir");
+        let path = temp.path().join(LAST_TOUCHED_FILE);
+        fs::write(&path, [0xff]).expect("write invalid last touched");
+        let metadata = fs::metadata(&path).expect("metadata");
+
+        let err = read_last_touched_file_limited(&path, &metadata)
+            .expect_err("invalid UTF-8 should fail");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
