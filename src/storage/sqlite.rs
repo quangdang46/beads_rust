@@ -4015,25 +4015,18 @@ impl SqliteStorage {
         let mut sql = String::from(projection.select_clause());
         let mut params: Vec<SqliteValue> = Vec::new();
 
-        if let Some(ref labels) = filters.labels {
-            for label in labels {
-                sql.push_str(" AND EXISTS (SELECT 1 FROM labels WHERE labels.issue_id = issues.id AND labels.label = ?)");
-                params.push(SqliteValue::from(label.as_str()));
-            }
+        let labels_and = filters.labels.as_deref().unwrap_or(&[]);
+        let labels_or = filters.labels_or.as_deref().unwrap_or(&[]);
+        let label_candidate_ids = if labels_and.is_empty() && labels_or.is_empty() {
+            None
+        } else {
+            self.label_filter_candidate_ids(labels_and, labels_or)?
+        };
+        if label_candidate_ids.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(Vec::new());
         }
-
-        if let Some(ref labels_or) = filters.labels_or
-            && !labels_or.is_empty()
-        {
-            let placeholders: Vec<String> = labels_or.iter().map(|_| "?".to_string()).collect();
-            let _ = write!(
-                sql,
-                " AND EXISTS (SELECT 1 FROM labels WHERE labels.issue_id = issues.id AND labels.label IN ({}))",
-                placeholders.join(",")
-            );
-            for label in labels_or {
-                params.push(SqliteValue::from(label.as_str()));
-            }
+        if let Some(ref issue_ids) = label_candidate_ids {
+            append_issue_id_membership_filter(&mut sql, &mut params, issue_ids);
         }
 
         if let Some(ref statuses) = filters.statuses
@@ -16850,6 +16843,96 @@ mod tests {
         let case_results = storage.search_issues("authentication", &filters).unwrap();
         let case_ids: Vec<_> = case_results.iter().map(|issue| issue.id.as_str()).collect();
         assert_eq!(case_ids, vec!["bd-s-description"]);
+    }
+
+    #[test]
+    fn test_search_issues_materialized_label_candidates_preserve_semantics() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 9, 1, 0, 0, 0).unwrap();
+
+        let mut export_swarm = make_issue(
+            "bd-s-label-a",
+            "needle export swarm",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        export_swarm.labels = vec!["export".to_string(), "swarm".to_string()];
+        let mut export_only = make_issue(
+            "bd-s-label-b",
+            "needle export only",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        export_only.labels = vec!["export".to_string()];
+        let mut swarm_only = make_issue(
+            "bd-s-label-c",
+            "needle swarm only",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        swarm_only.labels = vec!["swarm".to_string()];
+        let mut unrelated = make_issue(
+            "bd-s-label-d",
+            "needle unrelated",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        unrelated.labels = vec!["other".to_string()];
+
+        for issue in [export_swarm, export_only, swarm_only, unrelated] {
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        let ids_for = |filters: ListFilters| {
+            storage
+                .search_issues("needle", &filters)
+                .unwrap()
+                .into_iter()
+                .map(|issue| issue.id)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            ids_for(ListFilters {
+                labels: Some(vec!["export".to_string(), "swarm".to_string()]),
+                ..ListFilters::default()
+            }),
+            vec!["bd-s-label-a"]
+        );
+        assert_eq!(
+            ids_for(ListFilters {
+                labels_or: Some(vec!["export".to_string(), "swarm".to_string()]),
+                ..ListFilters::default()
+            }),
+            vec!["bd-s-label-a", "bd-s-label-b", "bd-s-label-c"]
+        );
+        assert_eq!(
+            ids_for(ListFilters {
+                labels: Some(vec!["export".to_string()]),
+                labels_or: Some(vec!["swarm".to_string()]),
+                ..ListFilters::default()
+            }),
+            vec!["bd-s-label-a"]
+        );
+        assert!(
+            ids_for(ListFilters {
+                labels: Some(vec!["missing".to_string()]),
+                ..ListFilters::default()
+            })
+            .is_empty()
+        );
     }
 
     #[test]
