@@ -183,7 +183,8 @@ pub fn read_redirect(beads_dir: &Path) -> Result<Option<PathBuf>> {
         return Ok(None);
     }
 
-    let content = read_redirect_file_limited(&redirect_path)?;
+    let metadata = fs::metadata(&redirect_path)?;
+    let content = read_redirect_file_limited(&redirect_path, &metadata)?;
     let target = content.trim();
 
     if target.is_empty() {
@@ -209,8 +210,8 @@ pub fn read_redirect(beads_dir: &Path) -> Result<Option<PathBuf>> {
     Ok(Some(resolved))
 }
 
-fn read_redirect_file_limited(redirect_path: &Path) -> Result<String> {
-    if fs::metadata(redirect_path)?.len() > MAX_REDIRECT_BYTES_U64 {
+fn read_redirect_file_limited(redirect_path: &Path, metadata: &fs::Metadata) -> Result<String> {
+    if metadata.len() > MAX_REDIRECT_BYTES_U64 {
         return Err(BeadsError::Config(format!(
             "Redirect file exceeds maximum size of {MAX_REDIRECT_BYTES} bytes: {}",
             redirect_path.display()
@@ -219,8 +220,8 @@ fn read_redirect_file_limited(redirect_path: &Path) -> Result<String> {
 
     let file = File::open(redirect_path)?;
     let mut reader = file.take(MAX_REDIRECT_BYTES_U64.saturating_add(1));
-    let mut content = String::new();
-    reader.read_to_string(&mut content)?;
+    let mut content = Vec::new();
+    reader.read_to_end(&mut content)?;
     if content.len() > MAX_REDIRECT_BYTES {
         return Err(BeadsError::Config(format!(
             "Redirect file exceeds maximum size of {MAX_REDIRECT_BYTES} bytes: {}",
@@ -228,7 +229,12 @@ fn read_redirect_file_limited(redirect_path: &Path) -> Result<String> {
         )));
     }
 
-    Ok(content)
+    String::from_utf8(content).map_err(|e| {
+        BeadsError::Config(format!(
+            "Redirect file must be valid UTF-8: {}: {e}",
+            redirect_path.display()
+        ))
+    })
 }
 
 /// Follow redirects until we reach a terminal beads directory.
@@ -560,6 +566,37 @@ mod tests {
         let err = read_redirect(&beads_dir).unwrap_err();
         assert!(
             matches!(&err, BeadsError::Config(msg) if msg.contains("maximum size")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn read_redirect_file_limited_checks_size_before_utf8_decode() {
+        let dir = TempDir::new().unwrap();
+        let redirect_path = dir.path().join("redirect");
+        fs::write(&redirect_path, ".").unwrap();
+        let metadata = fs::metadata(&redirect_path).unwrap();
+        let mut payload = vec![b'a'; MAX_REDIRECT_BYTES];
+        payload.push(0xc3);
+        fs::write(&redirect_path, payload).unwrap();
+
+        let err = read_redirect_file_limited(&redirect_path, &metadata).unwrap_err();
+        assert!(
+            matches!(&err, BeadsError::Config(msg) if msg.contains("maximum size")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn read_redirect_rejects_invalid_utf8() {
+        let dir = TempDir::new().unwrap();
+        let beads_dir = dir.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::write(beads_dir.join("redirect"), [0xff]).unwrap();
+
+        let err = read_redirect(&beads_dir).unwrap_err();
+        assert!(
+            matches!(&err, BeadsError::Config(msg) if msg.contains("valid UTF-8")),
             "unexpected error: {err:?}"
         );
     }
