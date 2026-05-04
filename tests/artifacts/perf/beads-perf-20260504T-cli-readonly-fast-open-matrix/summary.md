@@ -6,9 +6,9 @@ Bead: `beads_rust-72yf.3`
 
 ## Objective
 
-Extend the hot read-path proof surface from one CLI command to a representative
-matrix of read-heavy commands. The slice also adds an explicit conservative
-fallback knob:
+Extend the hot read-path proof surface from one CLI command to the full default
+CLI command family currently allowed to use read-only fast-open. The slice also
+adds an explicit conservative fallback knob:
 
 ```bash
 BR_DISABLE_READ_ONLY_FAST_OPEN=1 br list --json --limit 1
@@ -23,6 +23,7 @@ fast-open and force the locked/direct storage path.
 |---|---:|---:|---:|---:|
 | Add conservative fast-open kill switch plus CLI read matrix proof | 4 | 4 | 2 | 8.0 |
 | Promote `comments list` to safe auto-import read-only probe coverage | 3 | 4 | 1 | 12.0 |
+| Expand proof to every default fast-open CLI read family | 4 | 5 | 1 | 20.0 |
 
 Alien-graveyard mapping: this follows the fallback-safe fast-path pattern. The
 optimized path has a direct conservative escape hatch, and the matrix proves the
@@ -37,11 +38,30 @@ the locked path.
 
 - `list --json --limit 5`
 - `show <id> --format json`
+- `search Fast-open --format json --limit 5`
 - `ready --json --limit 5`
+- `scheduler --json --limit 5 --candidate-limit 10`
 - `blocked --json --limit 5`
+- `count --json`
+- `count --by label --json`
+- `stale --days 0 --json`
+- `lint --json`
+- `sync --status --json`
+- `stats --no-activity --json`
+- `status --no-activity --json`
+- `changelog --since 2100-01-01 --robot`
+- `graph --all --compact`
+- `orphans --robot`
 - `comments list <id> --json`
+- `comments <id> --json`
+- `epic status --json`
+- `label list`
+- `label list-all --json`
 - `dep list <id> --format json`
+- `dep tree <id> --json`
+- `dep cycles --json`
 - `query run fast-open-p1 --format json`
+- `query list --json`
 
 ## Proofs
 
@@ -56,7 +76,9 @@ This asserts:
 
 - Every matrix command succeeds with `BR_DISABLE_READ_ONLY_FAST_OPEN=1`.
 - Every matrix command succeeds through default read-only fast-open.
-- Fast-open stdout is byte-identical to conservative-path stdout.
+- Fast-open stdout is byte-identical to conservative-path stdout, except for
+  explicitly normalized volatile JSON clock fields (`scheduler.generated_at`,
+  `changelog.until`).
 - With `.beads/.write.lock` held, every default fast-open matrix command still
   succeeds.
 - With `.beads/.write.lock` held, the conservative path times out and reports
@@ -77,16 +99,35 @@ Result:
   "commands": [
     "list_json",
     "show_json",
+    "search_json",
     "ready_json",
+    "scheduler_json",
     "blocked_json",
+    "count_json",
+    "count_by_label_json",
+    "stale_json",
+    "lint_json",
+    "sync_status_json",
+    "stats_no_activity_json",
+    "status_no_activity_json",
+    "changelog_robot",
+    "graph_all_compact",
+    "orphans_robot",
     "comments_json",
+    "comments_shorthand_json",
+    "epic_status_json",
+    "label_list_unique",
+    "label_list_all_json",
     "dep_list_json",
-    "query_run_json"
+    "dep_tree_json",
+    "dep_cycles_json",
+    "query_run_json",
+    "query_list_json"
   ],
   "rounds": 5,
-  "conservative_total_ns": 792360585,
-  "fast_open_total_ns": 611925502,
-  "speedup_milli": 1294,
+  "conservative_total_ns": 2806575002,
+  "fast_open_total_ns": 2170888046,
+  "speedup_milli": 1292,
   "equality": "routine matrix test asserts byte-identical stdout per command"
 }
 ```
@@ -99,7 +140,8 @@ Result:
   handle and are shared by both paths.
 - Floating-point: N/A.
 - RNG seeds: N/A.
-- Golden outputs: the matrix asserts byte-identical stdout per command.
+- Golden outputs: the matrix asserts byte-identical stdout per command, with
+  explicit normalization only for volatile JSON clock fields.
 - Fallback: `BR_DISABLE_READ_ONLY_FAST_OPEN=1` forces the direct locked path.
 
 ## Verification
