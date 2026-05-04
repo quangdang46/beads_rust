@@ -7,7 +7,7 @@
 mod common;
 
 use common::cli::{BrRun, BrWorkspace, parse_created_id, run_br, run_br_with_env};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::fs::OpenOptions;
 use std::time::{Duration, Instant};
 
@@ -15,13 +15,21 @@ const DISABLE_FAST_OPEN_ENV: (&str, &str) = ("BR_DISABLE_READ_ONLY_FAST_OPEN", "
 
 struct SeededWorkspace {
     workspace: BrWorkspace,
+    epic_id: String,
     blocker_id: String,
     blocked_id: String,
+}
+
+#[derive(Clone, Copy)]
+enum CompareMode {
+    Exact,
+    JsonWithoutKeys(&'static [&'static str]),
 }
 
 struct MatrixCommand {
     label: &'static str,
     args: Vec<String>,
+    compare_mode: CompareMode,
 }
 
 fn assert_success(run: &BrRun, label: &str) {
@@ -39,6 +47,23 @@ fn seed_workspace() -> SeededWorkspace {
     let init = run_br(&workspace, ["init"], "init");
     assert_success(&init, "init");
 
+    let epic = run_br(
+        &workspace,
+        [
+            "create",
+            "Fast-open roadmap epic",
+            "-p",
+            "0",
+            "--type",
+            "epic",
+            "-l",
+            "roadmap,fast-open",
+        ],
+        "create_epic",
+    );
+    assert_success(&epic, "create_epic");
+    let epic_id = parse_created_id(&epic.stdout);
+
     let blocker = run_br(
         &workspace,
         [
@@ -48,6 +73,8 @@ fn seed_workspace() -> SeededWorkspace {
             "1",
             "--type",
             "bug",
+            "-l",
+            "backend,fast-open",
         ],
         "create_blocker",
     );
@@ -63,6 +90,10 @@ fn seed_workspace() -> SeededWorkspace {
             "2",
             "--type",
             "task",
+            "-l",
+            "backend",
+            "--parent",
+            &epic_id,
         ],
         "create_blocked",
     );
@@ -78,6 +109,10 @@ fn seed_workspace() -> SeededWorkspace {
             "0",
             "--type",
             "feature",
+            "-l",
+            "ready,fast-open",
+            "--parent",
+            &epic_id,
         ],
         "create_ready",
     );
@@ -116,6 +151,7 @@ fn seed_workspace() -> SeededWorkspace {
 
     SeededWorkspace {
         workspace,
+        epic_id,
         blocker_id,
         blocked_id,
     }
@@ -123,13 +159,13 @@ fn seed_workspace() -> SeededWorkspace {
 
 fn matrix_commands(seed: &SeededWorkspace) -> Vec<MatrixCommand> {
     vec![
-        MatrixCommand {
-            label: "list_json",
-            args: strings(["--lock-timeout", "50", "list", "--json", "--limit", "5"]),
-        },
-        MatrixCommand {
-            label: "show_json",
-            args: vec![
+        exact_command(
+            "list_json",
+            strings(["--lock-timeout", "50", "list", "--json", "--limit", "5"]),
+        ),
+        exact_command(
+            "show_json",
+            vec![
                 "--lock-timeout".into(),
                 "50".into(),
                 "show".into(),
@@ -137,18 +173,93 @@ fn matrix_commands(seed: &SeededWorkspace) -> Vec<MatrixCommand> {
                 "--format".into(),
                 "json".into(),
             ],
-        },
-        MatrixCommand {
-            label: "ready_json",
-            args: strings(["--lock-timeout", "50", "ready", "--json", "--limit", "5"]),
-        },
-        MatrixCommand {
-            label: "blocked_json",
-            args: strings(["--lock-timeout", "50", "blocked", "--json", "--limit", "5"]),
-        },
-        MatrixCommand {
-            label: "comments_json",
-            args: vec![
+        ),
+        exact_command(
+            "search_json",
+            strings([
+                "--lock-timeout",
+                "50",
+                "search",
+                "Fast-open",
+                "--format",
+                "json",
+                "--limit",
+                "5",
+            ]),
+        ),
+        exact_command(
+            "ready_json",
+            strings(["--lock-timeout", "50", "ready", "--json", "--limit", "5"]),
+        ),
+        normalized_json_command(
+            "scheduler_json",
+            strings([
+                "--lock-timeout",
+                "50",
+                "scheduler",
+                "--json",
+                "--limit",
+                "5",
+                "--candidate-limit",
+                "10",
+            ]),
+            &["generated_at"],
+        ),
+        exact_command(
+            "blocked_json",
+            strings(["--lock-timeout", "50", "blocked", "--json", "--limit", "5"]),
+        ),
+        exact_command(
+            "count_json",
+            strings(["--lock-timeout", "50", "count", "--json"]),
+        ),
+        exact_command(
+            "count_by_label_json",
+            strings(["--lock-timeout", "50", "count", "--by", "label", "--json"]),
+        ),
+        exact_command(
+            "stale_json",
+            strings(["--lock-timeout", "50", "stale", "--days", "0", "--json"]),
+        ),
+        exact_command(
+            "lint_json",
+            strings(["--lock-timeout", "50", "lint", "--json"]),
+        ),
+        exact_command(
+            "sync_status_json",
+            strings(["--lock-timeout", "50", "sync", "--status", "--json"]),
+        ),
+        exact_command(
+            "stats_no_activity_json",
+            strings(["--lock-timeout", "50", "stats", "--no-activity", "--json"]),
+        ),
+        exact_command(
+            "status_no_activity_json",
+            strings(["--lock-timeout", "50", "status", "--no-activity", "--json"]),
+        ),
+        normalized_json_command(
+            "changelog_robot",
+            strings([
+                "--lock-timeout",
+                "50",
+                "changelog",
+                "--since",
+                "2100-01-01",
+                "--robot",
+            ]),
+            &["until"],
+        ),
+        exact_command(
+            "graph_all_compact",
+            strings(["--lock-timeout", "50", "graph", "--all", "--compact"]),
+        ),
+        exact_command(
+            "orphans_robot",
+            strings(["--lock-timeout", "50", "orphans", "--robot"]),
+        ),
+        exact_command(
+            "comments_json",
+            vec![
                 "--lock-timeout".into(),
                 "50".into(),
                 "comments".into(),
@@ -156,10 +267,32 @@ fn matrix_commands(seed: &SeededWorkspace) -> Vec<MatrixCommand> {
                 seed.blocker_id.clone(),
                 "--json".into(),
             ],
-        },
-        MatrixCommand {
-            label: "dep_list_json",
-            args: vec![
+        ),
+        exact_command(
+            "comments_shorthand_json",
+            vec![
+                "--lock-timeout".into(),
+                "50".into(),
+                "comments".into(),
+                seed.blocker_id.clone(),
+                "--json".into(),
+            ],
+        ),
+        exact_command(
+            "epic_status_json",
+            strings(["--lock-timeout", "50", "epic", "status", "--json"]),
+        ),
+        exact_command(
+            "label_list_unique",
+            strings(["--lock-timeout", "50", "label", "list"]),
+        ),
+        exact_command(
+            "label_list_all_json",
+            strings(["--lock-timeout", "50", "label", "list-all", "--json"]),
+        ),
+        exact_command(
+            "dep_list_json",
+            vec![
                 "--lock-timeout".into(),
                 "50".into(),
                 "dep".into(),
@@ -168,10 +301,25 @@ fn matrix_commands(seed: &SeededWorkspace) -> Vec<MatrixCommand> {
                 "--format".into(),
                 "json".into(),
             ],
-        },
-        MatrixCommand {
-            label: "query_run_json",
-            args: strings([
+        ),
+        exact_command(
+            "dep_tree_json",
+            vec![
+                "--lock-timeout".into(),
+                "50".into(),
+                "dep".into(),
+                "tree".into(),
+                seed.blocked_id.clone(),
+                "--json".into(),
+            ],
+        ),
+        exact_command(
+            "dep_cycles_json",
+            strings(["--lock-timeout", "50", "dep", "cycles", "--json"]),
+        ),
+        exact_command(
+            "query_run_json",
+            strings([
                 "--lock-timeout",
                 "50",
                 "query",
@@ -180,8 +328,32 @@ fn matrix_commands(seed: &SeededWorkspace) -> Vec<MatrixCommand> {
                 "--format",
                 "json",
             ]),
-        },
+        ),
+        exact_command(
+            "query_list_json",
+            strings(["--lock-timeout", "50", "query", "list", "--json"]),
+        ),
     ]
+}
+
+fn exact_command(label: &'static str, args: Vec<String>) -> MatrixCommand {
+    MatrixCommand {
+        label,
+        args,
+        compare_mode: CompareMode::Exact,
+    }
+}
+
+fn normalized_json_command(
+    label: &'static str,
+    args: Vec<String>,
+    ignored_keys: &'static [&'static str],
+) -> MatrixCommand {
+    MatrixCommand {
+        label,
+        args,
+        compare_mode: CompareMode::JsonWithoutKeys(ignored_keys),
+    }
 }
 
 fn strings<const N: usize>(values: [&str; N]) -> Vec<String> {
@@ -202,6 +374,53 @@ fn run_command(workspace: &BrWorkspace, command: &MatrixCommand, disable_fast_op
     }
 }
 
+fn assert_outputs_match(command: &MatrixCommand, fast: &BrRun, conservative: &BrRun) {
+    match command.compare_mode {
+        CompareMode::Exact => assert_eq!(
+            fast.stdout, conservative.stdout,
+            "{} stdout changed between read-only fast-open and conservative locked path",
+            command.label
+        ),
+        CompareMode::JsonWithoutKeys(keys) => {
+            let mut fast_json: Value = serde_json::from_str(&fast.stdout).unwrap_or_else(|err| {
+                panic!("{} fast-open stdout is not JSON: {err}", command.label)
+            });
+            let mut conservative_json: Value = serde_json::from_str(&conservative.stdout)
+                .unwrap_or_else(|err| {
+                    panic!("{} conservative stdout is not JSON: {err}", command.label)
+                });
+
+            remove_json_keys(&mut fast_json, keys);
+            remove_json_keys(&mut conservative_json, keys);
+
+            assert_eq!(
+                fast_json, conservative_json,
+                "{} normalized JSON changed between read-only fast-open and conservative locked path",
+                command.label
+            );
+        }
+    }
+}
+
+fn remove_json_keys(value: &mut Value, ignored_keys: &[&str]) {
+    match value {
+        Value::Object(object) => {
+            for key in ignored_keys {
+                object.remove(*key);
+            }
+            for nested in object.values_mut() {
+                remove_json_keys(nested, ignored_keys);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                remove_json_keys(item, ignored_keys);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+}
+
 #[test]
 fn cli_read_only_fast_open_matrix_matches_conservative_outputs() {
     let _log = common::test_log("cli_read_only_fast_open_matrix_matches_conservative_outputs");
@@ -214,11 +433,7 @@ fn cli_read_only_fast_open_matrix_matches_conservative_outputs() {
         let fast = run_command(&seed.workspace, &command, false);
         assert_success(&fast, command.label);
 
-        assert_eq!(
-            fast.stdout, conservative.stdout,
-            "{} stdout changed between read-only fast-open and conservative locked path",
-            command.label
-        );
+        assert_outputs_match(&command, &fast, &conservative);
     }
 }
 
