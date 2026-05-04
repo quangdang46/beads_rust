@@ -67,25 +67,27 @@ fn main() {
     // Issue #243: frankensqlite deadlocks when multiple processes attempt
     // concurrent writes to the same database file. Serialize all mutating
     // operations through a blocking flock on `.beads/.write.lock`. Normal
-    // storage open is not guaranteed read-only in recovery/schema paths, and
-    // fsqlite can still return SQLITE_BUSY for read-only SELECTs during
-    // concurrent writers, so every DB-family command acquires the advisory lock
-    // before Phase 2.
-    let write_lock =
-        if should_acquire_startup_write_lock(command_needs_write_lock, should_preopen_storage)
-            && ctx.is_initialized()
-        {
-            let lock_timeout = ctx.write_lock_timeout();
-            match ctx.beads_dir.as_deref().map(|beads_dir| {
-                beads_rust::sync::blocking_write_lock_with_timeout(beads_dir, lock_timeout)
-            }) {
-                Some(Ok(lock)) => Some(lock),
-                Some(Err(e)) => handle_error(&e, json_error_mode, color_error_mode),
-                None => None,
-            }
-        } else {
-            None
-        };
+    // storage open is not guaranteed read-only in recovery/schema paths, so
+    // DB-family commands keep the advisory lock unless they can first use the
+    // current-schema read-only fast-open path. Fast-open misses reacquire the
+    // same write lock inside config before any recovery or writable fallback.
+    let write_lock = if should_acquire_startup_write_lock(
+        command_needs_write_lock,
+        should_preopen_storage,
+        ctx.overrides.read_only_fast_open,
+    ) && ctx.is_initialized()
+    {
+        let lock_timeout = ctx.write_lock_timeout();
+        match ctx.beads_dir.as_deref().map(|beads_dir| {
+            beads_rust::sync::blocking_write_lock_with_timeout(beads_dir, lock_timeout)
+        }) {
+            Some(Ok(lock)) => Some(lock),
+            Some(Err(e)) => handle_error(&e, json_error_mode, color_error_mode),
+            None => None,
+        }
+    } else {
+        None
+    };
     if write_lock.is_some() {
         overrides
             .held_write_lock_beads_dir
@@ -697,8 +699,9 @@ const fn should_preopen_storage(
 const fn should_acquire_startup_write_lock(
     command_needs_write_lock: bool,
     should_preopen_storage: bool,
+    read_only_fast_open: bool,
 ) -> bool {
-    command_needs_write_lock || should_preopen_storage
+    !read_only_fast_open && (command_needs_write_lock || should_preopen_storage)
 }
 
 /// Determine if a command potentially mutates data and triggers auto-flush.
@@ -1463,17 +1466,17 @@ mod tests {
     }
 
     #[test]
-    fn read_only_fast_open_does_not_bypass_required_startup_write_lock() {
+    fn read_only_fast_open_defers_startup_write_lock_until_fallback() {
         assert!(
-            should_acquire_startup_write_lock(true, false),
-            "read-only fast-open commands still touch storage and must serialize at startup"
+            !should_acquire_startup_write_lock(true, false, true),
+            "read-only fast-open commands should try the current-schema read-only DB before joining the writer lock path"
         );
         assert!(
-            should_acquire_startup_write_lock(true, true),
-            "auto-import or auto-flush preopen still requires the startup lock"
+            !should_acquire_startup_write_lock(true, true, true),
+            "auto-import probes can use read-only fast-open first; stale probes reacquire the lock before writable fallback"
         );
         assert!(
-            should_acquire_startup_write_lock(false, true),
+            should_acquire_startup_write_lock(false, true, false),
             "non-fast-open DB-family commands must keep the startup lock"
         );
     }
@@ -1834,9 +1837,12 @@ mod tests {
 
     #[test]
     fn preopen_storage_requires_write_lock_before_open() {
-        assert!(should_acquire_startup_write_lock(false, true));
-        assert!(should_acquire_startup_write_lock(true, false));
-        assert!(should_acquire_startup_write_lock(true, true));
-        assert!(!should_acquire_startup_write_lock(false, false));
+        assert!(should_acquire_startup_write_lock(false, true, false));
+        assert!(should_acquire_startup_write_lock(true, false, false));
+        assert!(should_acquire_startup_write_lock(true, true, false));
+        assert!(!should_acquire_startup_write_lock(false, false, false));
+        assert!(!should_acquire_startup_write_lock(false, true, true));
+        assert!(!should_acquire_startup_write_lock(true, false, true));
+        assert!(!should_acquire_startup_write_lock(true, true, true));
     }
 }
