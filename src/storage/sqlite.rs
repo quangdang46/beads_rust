@@ -6771,9 +6771,9 @@ impl SqliteStorage {
         &self,
         issue_ids: &[String],
     ) -> Result<HashMap<String, Vec<String>>> {
-        // Keep chunks small to avoid fsqlite MemDatabase root-page collisions
-        // when ephemeral tables from earlier chunks conflict with real pager pages.
-        const SQLITE_VAR_LIMIT: usize = 200;
+        // Stay below SQLite's common 999-variable ceiling while keeping the
+        // default scheduler candidate window to one evidence-loading round trip.
+        const SQLITE_VAR_LIMIT: usize = 900;
 
         if issue_ids.is_empty() {
             return Ok(HashMap::new());
@@ -7609,10 +7609,11 @@ impl SqliteStorage {
         &self,
         issue_ids: &[String],
     ) -> Result<(HashMap<String, usize>, HashMap<String, usize>)> {
-        // Keep chunks small to avoid fsqlite MemDatabase root-page collisions
-        // when ephemeral tables from earlier chunks conflict with real pager pages.
-        // Also avoid CTE VALUES materialization which is the primary collision trigger.
-        const SQLITE_VAR_LIMIT: usize = 200;
+        // Stay below SQLite's common 999-variable ceiling while keeping the
+        // default scheduler candidate window to one evidence-loading round trip.
+        // Avoid CTE VALUES materialization, which is the primary root-page
+        // collision trigger for fsqlite's MemDatabase.
+        const SQLITE_VAR_LIMIT: usize = 900;
 
         if issue_ids.is_empty() {
             return Ok((HashMap::new(), HashMap::new()));
@@ -12125,6 +12126,37 @@ mod tests {
         let all_counts = storage.count_all_relation_counts().unwrap();
 
         assert_eq!(all_counts, chunked_counts);
+    }
+
+    #[test]
+    fn test_scheduler_evidence_helpers_handle_default_candidate_window() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 4, 1, 0, 0, 0).unwrap();
+        let ids = (0..512)
+            .map(|index| format!("bd-window-{index:03}"))
+            .collect::<Vec<_>>();
+
+        for id in &ids {
+            let issue = make_issue(id, id, Status::Open, 1, None, t1, None);
+            storage.create_issue(&issue, "tester").unwrap();
+            storage.add_label(id, "scheduler", "tester").unwrap();
+        }
+        for issue_id in ids.iter().skip(1) {
+            storage
+                .add_dependency(issue_id, &ids[0], "blocks", "tester")
+                .unwrap();
+        }
+
+        let labels = storage.get_labels_for_issues(&ids).unwrap();
+        let (dependency_counts, dependent_counts) =
+            storage.count_relation_counts_for_issues(&ids).unwrap();
+
+        assert_eq!(labels.len(), ids.len());
+        assert!(ids.iter().all(|id| labels[id] == ["scheduler"]));
+        assert_eq!(*dependent_counts.get(&ids[0]).unwrap_or(&0), ids.len() - 1);
+        for issue_id in ids.iter().skip(1) {
+            assert_eq!(*dependency_counts.get(issue_id).unwrap_or(&0), 1);
+        }
     }
 
     #[test]
