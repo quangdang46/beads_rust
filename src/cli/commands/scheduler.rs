@@ -8,6 +8,7 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::{ReadyIssue, sanitize_terminal_inline};
 use crate::output::{OutputContext, OutputMode};
+use crate::storage::sqlite::ListRelationMetadata;
 use crate::storage::{ReadyFilters, ReadySortPolicy, SqliteStorage};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -18,6 +19,13 @@ const SCHEDULER_SCHEMA: &str = "br.scheduler.v1";
 const PRIORITY_WEIGHT: i64 = 10;
 const DEPENDENT_WEIGHT: i64 = 3;
 const MAX_DEPENDENT_CONTRIBUTION: i64 = 30;
+const SCHEDULER_FULL_METADATA_THRESHOLD: usize = 256;
+
+type SchedulerRelationMetadata = (
+    HashMap<String, Vec<String>>,
+    HashMap<String, usize>,
+    HashMap<String, usize>,
+);
 
 #[derive(Debug, Serialize)]
 struct SchedulerOutput {
@@ -225,9 +233,8 @@ fn build_scheduler_output(
         .iter()
         .map(|issue| issue.id.clone())
         .collect::<Vec<_>>();
-    let (dependency_counts, dependent_counts) =
-        storage.count_relation_counts_for_issues(&issue_ids)?;
-    let labels_by_issue = storage.get_labels_for_issues(&issue_ids)?;
+    let (labels_by_issue, dependency_counts, dependent_counts) =
+        load_scheduler_relation_metadata(storage, &issue_ids)?;
     let domain_counts = count_candidate_domains(&issues, &labels_by_issue);
     let stale_threshold_minutes = stale_threshold_minutes(args.stale_claim_hours)?;
     let scoring_inputs = ScoringInputs {
@@ -296,6 +303,49 @@ fn load_scheduler_config(
     } else {
         config::load_config(beads_dir, Some(storage), cli)
     }
+}
+
+fn load_scheduler_relation_metadata(
+    storage: &SqliteStorage,
+    issue_ids: &[String],
+) -> Result<SchedulerRelationMetadata> {
+    if issue_ids.len() >= SCHEDULER_FULL_METADATA_THRESHOLD {
+        let relation_metadata = storage.get_all_list_relation_metadata()?;
+        return Ok(project_scheduler_relation_metadata(
+            issue_ids,
+            &relation_metadata,
+        ));
+    }
+
+    let labels_by_issue = storage.get_labels_for_issues(issue_ids)?;
+    let (dependency_counts, dependent_counts) =
+        storage.count_relation_counts_for_issues(issue_ids)?;
+    Ok((labels_by_issue, dependency_counts, dependent_counts))
+}
+
+fn project_scheduler_relation_metadata(
+    issue_ids: &[String],
+    relation_metadata: &HashMap<String, ListRelationMetadata>,
+) -> SchedulerRelationMetadata {
+    let mut labels_by_issue = HashMap::with_capacity(issue_ids.len());
+    let mut dependency_counts = HashMap::with_capacity(issue_ids.len());
+    let mut dependent_counts = HashMap::with_capacity(issue_ids.len());
+
+    for issue_id in issue_ids {
+        if let Some(metadata) = relation_metadata.get(issue_id) {
+            if !metadata.labels.is_empty() {
+                labels_by_issue.insert(issue_id.clone(), metadata.labels.clone());
+            }
+            if metadata.dependency_count > 0 {
+                dependency_counts.insert(issue_id.clone(), metadata.dependency_count);
+            }
+            if metadata.dependent_count > 0 {
+                dependent_counts.insert(issue_id.clone(), metadata.dependent_count);
+            }
+        }
+    }
+
+    (labels_by_issue, dependency_counts, dependent_counts)
 }
 
 fn score_candidate(
@@ -456,8 +506,12 @@ fn print_scheduler_text(output: &SchedulerOutput) {
 
 #[cfg(test)]
 mod tests {
-    use super::{primary_domain, stale_threshold_minutes, usize_to_i64};
+    use super::{
+        primary_domain, project_scheduler_relation_metadata, stale_threshold_minutes, usize_to_i64,
+    };
     use crate::model::{Issue, IssueType};
+    use crate::storage::sqlite::ListRelationMetadata;
+    use std::collections::HashMap;
 
     #[test]
     fn primary_domain_prefers_first_sorted_label() {
@@ -485,6 +539,38 @@ mod tests {
     #[test]
     fn usize_to_i64_saturates_on_overflow() {
         assert_eq!(usize_to_i64(42), 42);
+    }
+
+    #[test]
+    fn scheduler_relation_projection_keeps_candidate_metadata() {
+        let issue_ids = vec!["bd-a".to_string(), "bd-b".to_string()];
+        let mut relation_metadata = HashMap::new();
+        relation_metadata.insert(
+            "bd-a".to_string(),
+            ListRelationMetadata {
+                labels: vec!["scheduler".to_string()],
+                dependency_count: 2,
+                dependent_count: 3,
+            },
+        );
+        relation_metadata.insert(
+            "bd-other".to_string(),
+            ListRelationMetadata {
+                labels: vec!["ignored".to_string()],
+                dependency_count: 1,
+                dependent_count: 1,
+            },
+        );
+
+        let (labels, dependency_counts, dependent_counts) =
+            project_scheduler_relation_metadata(&issue_ids, &relation_metadata);
+
+        assert_eq!(labels["bd-a"], ["scheduler"]);
+        assert!(!labels.contains_key("bd-b"));
+        assert_eq!(dependency_counts.get("bd-a"), Some(&2));
+        assert_eq!(dependent_counts.get("bd-a"), Some(&3));
+        assert!(!dependency_counts.contains_key("bd-other"));
+        assert!(!dependent_counts.contains_key("bd-other"));
     }
 
     #[test]
