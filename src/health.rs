@@ -453,8 +453,8 @@ fn jsonl_has_conflict_markers(path: &Path) -> bool {
             consumed += 1;
 
             if reading_prefix && byte != b'\n' {
-                if prefix_len < CONFLICT_MARKER_PREFIX_LEN {
-                    prefix[prefix_len] = byte;
+                if let Some(slot) = prefix.get_mut(prefix_len) {
+                    *slot = byte;
                     prefix_len += 1;
                 }
                 if prefix_len == CONFLICT_MARKER_PREFIX_LEN {
