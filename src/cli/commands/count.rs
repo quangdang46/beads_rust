@@ -377,27 +377,22 @@ fn default_visible_group_counts(
         return Ok(None);
     }
 
-    let rows = match by {
-        CountBy::Status => storage.count_default_visible_statuses()?,
-        CountBy::Priority => storage.count_default_visible_priorities()?,
-        CountBy::Type => storage.count_default_visible_types()?,
-        CountBy::Assignee => storage.count_default_visible_assignees()?,
-        CountBy::Label => {
-            let (total, rows) = storage.count_default_visible_labels()?;
-            let groups = rows
-                .into_iter()
-                .map(|(group, count)| CountGroup { group, count })
-                .collect();
-            return Ok(Some((total, groups)));
-        }
-    };
-    let total = rows.iter().map(|(_, count)| *count).sum();
-    let groups = rows
-        .into_iter()
-        .map(|(group, count)| CountGroup { group, count })
-        .collect();
+    if by == CountBy::Label {
+        let (total, rows) = storage.count_default_visible_labels()?;
+        let groups = rows
+            .into_iter()
+            .map(|(group, count)| CountGroup { group, count })
+            .collect();
+        return Ok(Some((total, groups)));
+    }
 
-    Ok(Some((total, groups)))
+    let rows = storage.list_stats_issues()?;
+    let rows = rows
+        .into_iter()
+        .filter(|issue| stats_row_matches_count_filters(issue, filters))
+        .collect::<Vec<_>>();
+    let groups = group_stats_counts(storage, &rows, by)?;
+    Ok(Some((rows.len(), groups)))
 }
 
 fn is_default_visible_group_count(filters: &ListFilters) -> bool {
