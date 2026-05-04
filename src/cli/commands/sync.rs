@@ -268,6 +268,12 @@ fn validate_sync_mode_args(args: &SyncArgs) -> Result<()> {
             reason: "--witness-parallelism must be greater than zero".to_string(),
         });
     }
+    if args.export_parallelism == Some(0) {
+        return Err(BeadsError::Validation {
+            field: "export_parallelism".to_string(),
+            reason: "--export-parallelism must be greater than zero".to_string(),
+        });
+    }
 
     // --rebuild only makes sense with import (the default or --import-only)
     if args.rebuild && (args.flush_only || args.merge) {
@@ -1219,6 +1225,7 @@ fn execute_flush(
         allow_external_jsonl: path_policy.allow_external_jsonl,
         show_progress,
         history: HistoryConfig::default(),
+        max_parallel_workers: args.export_parallelism.unwrap_or(0),
     };
 
     // Execute export
@@ -2402,6 +2409,7 @@ fn execute_merge(
         allow_external_jsonl: path_policy.allow_external_jsonl,
         show_progress,
         history: HistoryConfig::default(),
+        max_parallel_workers: args.export_parallelism.unwrap_or(0),
     };
 
     let (export_result, _) = export_to_jsonl_with_policy(storage, jsonl_path, &export_config)?;
@@ -2683,6 +2691,18 @@ mod tests {
         };
 
         let err = validate_sync_mode_args(&args).expect_err("zero witness parallelism should fail");
+        assert!(matches!(err, BeadsError::Validation { .. }));
+    }
+
+    #[test]
+    fn test_validate_sync_mode_args_rejects_zero_export_parallelism() {
+        let args = SyncArgs {
+            flush_only: true,
+            export_parallelism: Some(0),
+            ..SyncArgs::default()
+        };
+
+        let err = validate_sync_mode_args(&args).expect_err("zero export parallelism should fail");
         assert!(matches!(err, BeadsError::Validation { .. }));
     }
 

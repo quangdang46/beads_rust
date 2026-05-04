@@ -2286,6 +2286,14 @@ pub struct SyncArgs {
     )]
     pub witness_parallelism: Option<usize>,
 
+    /// Parallel worker cap for JSONL export line preparation
+    ///
+    /// Used by --flush-only and merge export writeback. When omitted, br uses
+    /// up to 64 workers capped by host parallelism. Use 1 for the serial
+    /// fallback.
+    #[arg(long = "export-parallelism", value_name = "WORKERS")]
+    pub export_parallelism: Option<usize>,
+
     /// Override safety guards (use with caution!)
     ///
     /// Bypasses Empty DB Guard and Stale DB Guard for export.

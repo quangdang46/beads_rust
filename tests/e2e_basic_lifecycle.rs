@@ -1,6 +1,6 @@
 mod common;
 
-use beads_rust::model::{Dependency, DependencyType, Issue, IssueType, Priority, Status};
+use beads_rust::model::{Comment, Dependency, DependencyType, Issue, IssueType, Priority, Status};
 use beads_rust::storage::SqliteStorage;
 use chrono::Utc;
 use common::cli::{
@@ -1503,6 +1503,101 @@ fn assert_base_witness_reuse_plan(witness_json: &Value) {
         materialization["read_added_byte_count"].as_u64(),
         reuse_plan["schedule"]["read_added_byte_count"].as_u64()
     );
+}
+
+#[test]
+fn e2e_sync_flush_export_parallelism_preserves_jsonl_bytes() {
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_parallel_export");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let now = Utc::now();
+    let records = (0..300)
+        .map(|index| {
+            let id = format!("bd-pex{index:04}");
+            let mut issue = make_issue(&id, &format!("Parallel export issue {index:04}"), now);
+            issue.description = Some(format!(
+                "Synthetic JSONL export payload {index:04} with enough stable text to exercise ordered line preparation."
+            ));
+            issue.assignee = Some(format!("agent-{:03}", index % 64));
+            issue.labels = vec![
+                "parallel-export".to_string(),
+                "jsonl".to_string(),
+                format!("lane-{:02}", index % 16),
+            ];
+            issue.comments.push(Comment {
+                id: i64::from(index) + 1,
+                issue_id: id,
+                author: format!("agent-{:03}", index % 64),
+                body: format!(
+                    "Deterministic comment payload {index:04} for serde_json export parity."
+                ),
+                created_at: now,
+            });
+            serde_json::to_string(&issue).expect("serialize parallel export fixture issue")
+        })
+        .collect::<Vec<_>>();
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    fs::write(&jsonl_path, records.join("\n") + "\n").expect("write parallel export fixture");
+
+    let import = run_br(
+        &workspace,
+        ["sync", "--import-only", "--force", "--json"],
+        "import_parallel_export_fixture",
+    );
+    assert!(
+        import.status.success(),
+        "import fixture failed: {}",
+        import.stderr
+    );
+
+    let serial = run_br(
+        &workspace,
+        [
+            "sync",
+            "--flush-only",
+            "--force",
+            "--export-parallelism",
+            "1",
+            "--json",
+        ],
+        "flush_parallel_export_serial",
+    );
+    assert!(
+        serial.status.success(),
+        "serial export failed: {}",
+        serial.stderr
+    );
+    let serial_json: Value =
+        serde_json::from_str(&extract_json_payload(&serial.stdout)).expect("serial flush json");
+    let serial_bytes = fs::read(&jsonl_path).expect("read serial jsonl");
+
+    let parallel = run_br(
+        &workspace,
+        [
+            "sync",
+            "--flush-only",
+            "--force",
+            "--export-parallelism",
+            "4",
+            "--json",
+        ],
+        "flush_parallel_export_parallel",
+    );
+    assert!(
+        parallel.status.success(),
+        "parallel export failed: {}",
+        parallel.stderr
+    );
+    let parallel_json: Value =
+        serde_json::from_str(&extract_json_payload(&parallel.stdout)).expect("parallel flush json");
+    let parallel_bytes = fs::read(&jsonl_path).expect("read parallel jsonl");
+
+    assert_eq!(parallel_bytes, serial_bytes);
+    assert_eq!(serial_json["exported_issues"].as_u64(), Some(300));
+    assert_eq!(parallel_json["exported_issues"].as_u64(), Some(300));
+    assert_eq!(parallel_json["content_hash"], serial_json["content_hash"]);
 }
 
 #[test]

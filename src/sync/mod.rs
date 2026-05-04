@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::util::hex_encode;
+use indicatif::ProgressBar;
 use std::collections::{BTreeMap, HashMap, HashSet, hash_map::RandomState};
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -42,6 +43,8 @@ const DEFAULT_WRITE_LOCK_TIMEOUT_MS: u64 = 30_000;
 const WRITE_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const EXPORT_ISSUE_BATCH_SIZE: usize = 1024;
 const EXPORT_FULL_SCAN_ISSUE_THRESHOLD: usize = 20_000;
+const EXPORT_PARALLEL_PREPARE_MIN_ISSUES: usize = 256;
+const DEFAULT_JSONL_EXPORT_PARALLELISM: usize = 64;
 const IMPORT_EXPORT_HASH_BATCH_SIZE: usize = 512;
 
 /// Acquire a blocking exclusive lock on `.beads/.write.lock`.
@@ -234,6 +237,11 @@ pub struct ExportConfig {
     pub show_progress: bool,
     /// Configuration for history backups.
     pub history: HistoryConfig,
+    /// Worker cap for parallel JSONL line preparation during file exports.
+    ///
+    /// `0` means "auto": use up to 64 workers, capped by host parallelism.
+    /// `1` is the deterministic serial fallback.
+    pub max_parallel_workers: usize,
 }
 
 /// Export error handling policy.
@@ -1679,6 +1687,181 @@ fn write_export_issue_jsonl<W: Write>(
     Ok(true)
 }
 
+struct PreparedExportIssue {
+    id: String,
+    jsonl_line: Vec<u8>,
+    content_hash: String,
+    dependency_count: usize,
+    label_count: usize,
+    comment_count: usize,
+}
+
+enum PreparedExportEntry {
+    Issue(PreparedExportIssue),
+    SkippedTombstone(String),
+    Error(ExportError),
+}
+
+fn effective_export_parallelism(config: &ExportConfig) -> usize {
+    if config.max_parallel_workers == 1 || export_parallelism_disabled_by_env() {
+        return 1;
+    }
+
+    let host_parallelism = thread::available_parallelism()
+        .map_or(DEFAULT_JSONL_EXPORT_PARALLELISM, std::num::NonZero::get);
+    let cap = if config.max_parallel_workers == 0 {
+        DEFAULT_JSONL_EXPORT_PARALLELISM
+    } else {
+        config.max_parallel_workers
+    };
+
+    cap.min(host_parallelism).max(1)
+}
+
+fn export_parallelism_disabled_by_env() -> bool {
+    std::env::var_os("BR_DISABLE_PARALLEL_JSONL_EXPORT").is_some_and(|value| {
+        let value = value.to_string_lossy();
+        value != "0" && !value.eq_ignore_ascii_case("false")
+    })
+}
+
+const fn should_prepare_export_issues_parallel(issue_count: usize, max_parallelism: usize) -> bool {
+    max_parallelism > 1 && issue_count >= EXPORT_PARALLEL_PREPARE_MIN_ISSUES
+}
+
+fn prepare_export_issue_jsonl(issue: &Issue, retention_days: Option<u64>) -> PreparedExportEntry {
+    if issue.is_expired_tombstone(retention_days) {
+        return PreparedExportEntry::SkippedTombstone(issue.id.clone());
+    }
+
+    let mut jsonl_line = Vec::with_capacity(1024);
+    if let Err(err) = serde_json::to_writer(&mut jsonl_line, issue) {
+        return PreparedExportEntry::Error(ExportError::new(
+            ExportEntityType::Issue,
+            issue.id.clone(),
+            err.to_string(),
+        ));
+    }
+    jsonl_line.push(b'\n');
+
+    PreparedExportEntry::Issue(PreparedExportIssue {
+        id: issue.id.clone(),
+        jsonl_line,
+        content_hash: issue
+            .content_hash
+            .clone()
+            .unwrap_or_else(|| crate::util::content_hash(issue)),
+        dependency_count: issue.dependencies.len(),
+        label_count: issue.labels.len(),
+        comment_count: issue.comments.len(),
+    })
+}
+
+fn prepare_export_issue_chunk(
+    issues: &[Issue],
+    retention_days: Option<u64>,
+) -> Vec<PreparedExportEntry> {
+    issues
+        .iter()
+        .map(|issue| prepare_export_issue_jsonl(issue, retention_days))
+        .collect()
+}
+
+fn prepare_export_issues_jsonl_parallel(
+    issues: &[Issue],
+    retention_days: Option<u64>,
+    max_parallelism: usize,
+) -> Result<Vec<PreparedExportEntry>> {
+    if !should_prepare_export_issues_parallel(issues.len(), max_parallelism) {
+        return Ok(prepare_export_issue_chunk(issues, retention_days));
+    }
+
+    let worker_count = max_parallelism.min(issues.len());
+    let chunk_size = issues.len().div_ceil(worker_count);
+
+    thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(worker_count);
+        for (chunk_index, chunk) in issues.chunks(chunk_size).enumerate() {
+            let start_index = chunk_index * chunk_size;
+            handles.push(scope.spawn(move || {
+                (
+                    start_index,
+                    prepare_export_issue_chunk(chunk, retention_days),
+                )
+            }));
+        }
+
+        let mut chunks = Vec::with_capacity(handles.len());
+        for handle in handles {
+            let chunk = handle.join().map_err(|_| {
+                BeadsError::Config("Parallel JSONL export worker panicked".to_string())
+            })?;
+            chunks.push(chunk);
+        }
+
+        chunks.sort_unstable_by_key(|(start_index, _)| *start_index);
+        let total_entries = chunks.iter().map(|(_, entries)| entries.len()).sum();
+        let mut entries = Vec::with_capacity(total_entries);
+        for (_, chunk_entries) in chunks {
+            entries.extend(chunk_entries);
+        }
+
+        Ok(entries)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_prepared_export_entries<W: Write>(
+    writer: &mut W,
+    prepared_entries: Vec<PreparedExportEntry>,
+    hasher: &mut Sha256,
+    ctx: &mut ExportContext,
+    report: &mut ExportReport,
+    exported_ids: &mut Vec<String>,
+    skipped_tombstone_ids: &mut Vec<String>,
+    issue_hashes: &mut Vec<(String, String)>,
+    progress: Option<&ProgressBar>,
+) -> Result<()> {
+    for entry in prepared_entries {
+        match entry {
+            PreparedExportEntry::Issue(prepared) => {
+                if let Err(err) = writer.write_all(&prepared.jsonl_line) {
+                    ctx.handle_error(ExportError::new(
+                        ExportEntityType::Issue,
+                        prepared.id,
+                        err.to_string(),
+                    ))?;
+                    increment_progress(progress);
+                    continue;
+                }
+
+                hasher.update(&prepared.jsonl_line);
+                exported_ids.push(prepared.id.clone());
+                issue_hashes.push((prepared.id, prepared.content_hash));
+                report.issues_exported += 1;
+                report.dependencies_exported += prepared.dependency_count;
+                report.labels_exported += prepared.label_count;
+                report.comments_exported += prepared.comment_count;
+            }
+            PreparedExportEntry::SkippedTombstone(id) => {
+                skipped_tombstone_ids.push(id);
+            }
+            PreparedExportEntry::Error(err) => {
+                ctx.handle_error(err)?;
+            }
+        }
+        increment_progress(progress);
+    }
+
+    Ok(())
+}
+
+fn increment_progress(progress: Option<&ProgressBar>) {
+    if let Some(progress) = progress {
+        progress.inc(1);
+    }
+}
+
 /// Export issues from `SQLite` to JSONL format.
 ///
 /// This implements the classic beads export semantics:
@@ -1857,39 +2040,28 @@ pub fn export_to_jsonl_with_policy(
     let mut skipped_tombstone_ids = Vec::new(); // Usually small
     let mut issue_hashes = Vec::with_capacity(export_ids.len());
     let mut buffer = Vec::with_capacity(1024);
+    let max_parallelism = effective_export_parallelism(config);
 
     if export_ids.len() <= EXPORT_FULL_SCAN_ISSUE_THRESHOLD {
         let issues = hydrate_export_issues_full_scan(storage, &mut ctx)?;
-        for issue in &issues {
-            // Skip expired tombstones
-            if issue.is_expired_tombstone(config.retention_days) {
-                skipped_tombstone_ids.push(issue.id.clone());
-                progress.inc(1);
-                continue;
-            }
-
-            if !write_export_issue_jsonl(&mut writer, issue, &mut hasher, &mut buffer, &mut ctx)? {
-                progress.inc(1);
-                continue;
-            }
-
-            exported_ids.push(issue.id.clone());
-            issue_hashes.push((
-                issue.id.clone(),
-                issue
-                    .content_hash
-                    .clone()
-                    .unwrap_or_else(|| crate::util::content_hash(issue)),
-            ));
-            report.issues_exported += 1;
-            report.dependencies_exported += issue.dependencies.len();
-            report.labels_exported += issue.labels.len();
-            report.comments_exported += issue.comments.len();
-            progress.inc(1);
-        }
-    } else {
-        for id_batch in export_ids.chunks(EXPORT_ISSUE_BATCH_SIZE) {
-            let issues = hydrate_export_issue_batch(storage, id_batch, &mut ctx)?;
+        if should_prepare_export_issues_parallel(issues.len(), max_parallelism) {
+            let prepared = prepare_export_issues_jsonl_parallel(
+                &issues,
+                config.retention_days,
+                max_parallelism,
+            )?;
+            write_prepared_export_entries(
+                &mut writer,
+                prepared,
+                &mut hasher,
+                &mut ctx,
+                &mut report,
+                &mut exported_ids,
+                &mut skipped_tombstone_ids,
+                &mut issue_hashes,
+                Some(&progress),
+            )?;
+        } else {
             for issue in &issues {
                 // Skip expired tombstones
                 if issue.is_expired_tombstone(config.retention_days) {
@@ -1922,6 +2094,62 @@ pub fn export_to_jsonl_with_policy(
                 report.labels_exported += issue.labels.len();
                 report.comments_exported += issue.comments.len();
                 progress.inc(1);
+            }
+        }
+    } else {
+        for id_batch in export_ids.chunks(EXPORT_ISSUE_BATCH_SIZE) {
+            let issues = hydrate_export_issue_batch(storage, id_batch, &mut ctx)?;
+            if should_prepare_export_issues_parallel(issues.len(), max_parallelism) {
+                let prepared = prepare_export_issues_jsonl_parallel(
+                    &issues,
+                    config.retention_days,
+                    max_parallelism,
+                )?;
+                write_prepared_export_entries(
+                    &mut writer,
+                    prepared,
+                    &mut hasher,
+                    &mut ctx,
+                    &mut report,
+                    &mut exported_ids,
+                    &mut skipped_tombstone_ids,
+                    &mut issue_hashes,
+                    Some(&progress),
+                )?;
+            } else {
+                for issue in &issues {
+                    // Skip expired tombstones
+                    if issue.is_expired_tombstone(config.retention_days) {
+                        skipped_tombstone_ids.push(issue.id.clone());
+                        progress.inc(1);
+                        continue;
+                    }
+
+                    if !write_export_issue_jsonl(
+                        &mut writer,
+                        issue,
+                        &mut hasher,
+                        &mut buffer,
+                        &mut ctx,
+                    )? {
+                        progress.inc(1);
+                        continue;
+                    }
+
+                    exported_ids.push(issue.id.clone());
+                    issue_hashes.push((
+                        issue.id.clone(),
+                        issue
+                            .content_hash
+                            .clone()
+                            .unwrap_or_else(|| crate::util::content_hash(issue)),
+                    ));
+                    report.issues_exported += 1;
+                    report.dependencies_exported += issue.dependencies.len();
+                    report.labels_exported += issue.labels.len();
+                    report.comments_exported += issue.comments.len();
+                    progress.inc(1);
+                }
             }
         }
     }
