@@ -1485,6 +1485,24 @@ fn assert_base_witness_reuse_plan(witness_json: &Value) {
     assert_eq!(batches[1]["candidate_start_index"].as_u64(), Some(1));
     assert_eq!(batches[1]["candidate_end_index"].as_u64(), Some(2));
     assert_eq!(batches[1]["action_count"].as_u64(), Some(1));
+
+    let materialization = &witness_json["base_reuse_materialization"];
+    assert_eq!(materialization["reused_chunks"].as_u64(), Some(1));
+    assert_eq!(materialization["rebuilt_chunks"].as_u64(), Some(0));
+    assert_eq!(materialization["read_added_chunks"].as_u64(), Some(1));
+    assert_eq!(materialization["dropped_chunks"].as_u64(), Some(0));
+    assert_eq!(
+        materialization["output_byte_count"].as_u64(),
+        witness_json["witness"]["byte_count"].as_u64()
+    );
+    assert_eq!(
+        materialization["reused_byte_count"].as_u64(),
+        reuse_plan["schedule"]["reusable_byte_count"].as_u64()
+    );
+    assert_eq!(
+        materialization["read_added_byte_count"].as_u64(),
+        reuse_plan["schedule"]["read_added_byte_count"].as_u64()
+    );
 }
 
 #[test]

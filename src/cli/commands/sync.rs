@@ -10,7 +10,8 @@ use crate::output::OutputContext;
 use crate::sync::history::HistoryConfig;
 use crate::sync::witness::{
     JsonlMerkleWitness, JsonlWitnessComparison, JsonlWitnessParallelWorkPlan,
-    JsonlWitnessReusePlan, build_jsonl_merkle_witness_parallel, compare_jsonl_merkle_witnesses,
+    JsonlWitnessReuseMaterialization, JsonlWitnessReusePlan, build_jsonl_merkle_witness_parallel,
+    compare_jsonl_merkle_witnesses, materialize_jsonl_witness_reuse_plan,
     plan_jsonl_witness_parallel_work, plan_jsonl_witness_reuse,
 };
 use crate::sync::{
@@ -88,6 +89,8 @@ pub struct SyncWitnessResult {
     pub base_reuse_plan: Option<JsonlWitnessReusePlan>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_parallel_work_plan: Option<JsonlWitnessParallelWorkPlan>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_reuse_materialization: Option<JsonlWitnessReuseMaterialization>,
 }
 
 struct BaseWitnessArtifacts {
@@ -95,6 +98,7 @@ struct BaseWitnessArtifacts {
     comparison: Option<JsonlWitnessComparison>,
     reuse_plan: Option<JsonlWitnessReusePlan>,
     parallel_work_plan: Option<JsonlWitnessParallelWorkPlan>,
+    reuse_materialization: Option<JsonlWitnessReuseMaterialization>,
 }
 
 #[derive(Debug)]
@@ -926,6 +930,7 @@ fn execute_witness(
         base_comparison: base_artifacts.comparison,
         base_reuse_plan: base_artifacts.reuse_plan,
         base_parallel_work_plan: base_artifacts.parallel_work_plan,
+        base_reuse_materialization: base_artifacts.reuse_materialization,
     };
 
     if !should_render_human_sync_output(ctx, use_json) {
@@ -980,6 +985,7 @@ fn build_base_witness_artifacts(
             comparison: None,
             reuse_plan: None,
             parallel_work_plan: None,
+            reuse_materialization: None,
         });
     }
 
@@ -988,13 +994,53 @@ fn build_base_witness_artifacts(
     let reuse_plan = plan_jsonl_witness_reuse(&base_witness, current_witness);
     let parallel_work_plan = plan_jsonl_witness_parallel_work(&reuse_plan, max_parallelism)
         .map_err(|err| BeadsError::Config(format!("Failed to plan JSONL witness work: {err}")))?;
+    let reuse_materialization = materialize_base_reuse_plan(
+        &base_jsonl_path,
+        &path_policy.jsonl_path,
+        &base_witness,
+        current_witness,
+        &reuse_plan,
+    )?;
 
     Ok(BaseWitnessArtifacts {
         jsonl_path: Some(base_jsonl_path.display().to_string()),
         comparison: Some(comparison),
         reuse_plan: Some(reuse_plan),
         parallel_work_plan: Some(parallel_work_plan),
+        reuse_materialization: Some(reuse_materialization),
     })
+}
+
+fn materialize_base_reuse_plan(
+    base_jsonl_path: &Path,
+    current_jsonl_path: &Path,
+    base_witness: &JsonlMerkleWitness,
+    current_witness: &JsonlMerkleWitness,
+    reuse_plan: &JsonlWitnessReusePlan,
+) -> Result<JsonlWitnessReuseMaterialization> {
+    let mut base_file = File::open(base_jsonl_path).map_err(|err| {
+        BeadsError::Config(format!(
+            "Failed to open base JSONL file for reuse materialization {}: {err}",
+            base_jsonl_path.display()
+        ))
+    })?;
+    let mut current_file = File::open(current_jsonl_path).map_err(|err| {
+        BeadsError::Config(format!(
+            "Failed to open current JSONL file for reuse materialization {}: {err}",
+            current_jsonl_path.display()
+        ))
+    })?;
+    let mut sink = std::io::sink();
+
+    materialize_jsonl_witness_reuse_plan(
+        &mut base_file,
+        &mut current_file,
+        &mut sink,
+        base_witness,
+        current_witness,
+        reuse_plan,
+    )
+    .map_err(|err| BeadsError::Config(format!("Failed to materialize JSONL reuse plan: {err}")))
 }
 
 fn render_witness_text(result: &SyncWitnessResult) {
@@ -1033,6 +1079,16 @@ fn render_witness_text(result: &SyncWitnessResult) {
         println!(
             "  Parallel work batches: {} (max_parallelism={})",
             plan.total_batches, plan.max_parallelism
+        );
+    }
+    if let Some(materialization) = &result.base_reuse_materialization {
+        println!(
+            "  Reuse materialization: output_bytes={}, reused_chunks={}, rebuilt_chunks={}, read_added_chunks={}, dropped_chunks={}",
+            materialization.output_byte_count,
+            materialization.reused_chunks,
+            materialization.rebuilt_chunks,
+            materialization.read_added_chunks,
+            materialization.dropped_chunks
         );
     }
 }
