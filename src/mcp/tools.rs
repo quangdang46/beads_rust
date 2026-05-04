@@ -85,6 +85,7 @@ const PLACEHOLDER_EXACT: &[&str] = &[
 ];
 
 const SHOW_ISSUE_BATCH_MAX: usize = 100;
+const CREATE_ISSUE_BATCH_MAX: usize = 100;
 const UPDATE_ISSUE_BATCH_MAX: usize = 100;
 const CLOSE_ISSUE_BATCH_MAX: usize = 100;
 const MANAGE_DEPENDENCIES_BATCH_MAX: usize = 100;
@@ -1414,18 +1415,233 @@ impl CreateIssueTool {
     }
 }
 
+fn create_issue_result_json(
+    id: String,
+    title: String,
+    priority: Priority,
+    issue_type: IssueType,
+    parent_id: Option<String>,
+    coercions: Vec<String>,
+) -> Value {
+    let mut result = json!({
+        "id": id,
+        "title": title,
+        "status": "open",
+        "priority": priority.0,
+        "type": issue_type.as_str(),
+        "next_actions": [
+            "Use update_issue to add details or change fields",
+            "Use manage_dependencies to link to other issues"
+        ]
+    });
+
+    if let Some(pid) = parent_id {
+        result["parent"] = json!(pid);
+    }
+
+    if !coercions.is_empty() {
+        result["coercions"] = json!(coercions);
+        result["warnings"] = result["coercions"].clone();
+    }
+
+    result
+}
+
+fn create_issue_json(
+    storage: &mut SqliteStorage,
+    state: &BeadsState,
+    args: &Value,
+) -> McpResult<Value> {
+    let title = required_str_arg(args, "title")?;
+    validate_mcp_title(&title)?;
+
+    let mut coercions: Vec<String> = Vec::new();
+
+    let (issue_type, type_warning) = optional_str_arg(args, "type")?
+        .as_deref()
+        .map_or((IssueType::Task, None), parse_issue_type);
+    if let Some(w) = type_warning {
+        coercions.push(w);
+    }
+
+    let (priority, prio_warning) = optional_str_arg(args, "priority")?
+        .as_deref()
+        .map(parse_priority)
+        .transpose()?
+        .unwrap_or((Priority::MEDIUM, None));
+    if let Some(w) = prio_warning {
+        coercions.push(w);
+    }
+
+    let parent_id = optional_str_arg(args, "parent")?;
+    let description = optional_str_arg(args, "description")?;
+    let assignee = optional_str_arg(args, "assignee")?;
+    let labels_to_add = optional_label_array_arg(args, "labels")?;
+
+    let now = chrono::Utc::now();
+    let prefix = state.issue_prefix.as_deref().unwrap_or("br");
+
+    if let Some(ref pid) = parent_id {
+        require_valid_issue(storage, pid)?;
+    }
+
+    let id = if let Some(ref pid) = parent_id {
+        let next_num = storage.next_child_number(pid).map_err(beads_to_mcp)?;
+        next_available_child_id(pid, next_num, |candidate| storage.id_exists(candidate))?
+    } else {
+        generate_issue_id_with_checked_lookup(&title, &state.actor, now, prefix, |candidate| {
+            storage.id_exists(candidate)
+        })?
+    };
+
+    let issue = Issue {
+        id: id.clone(),
+        title: title.clone(),
+        description: description.clone(),
+        status: Status::Open,
+        priority,
+        issue_type: issue_type.clone(),
+        assignee: assignee.clone(),
+        created_by: Some(state.actor.clone()),
+        created_at: now,
+        updated_at: now,
+        ..Issue::default()
+    };
+
+    IssueValidator::validate(&issue)
+        .map_err(BeadsError::from_validation_errors)
+        .map_err(beads_to_mcp)?;
+
+    storage
+        .create_issue(&issue, &state.actor)
+        .map_err(beads_to_mcp)?;
+
+    for label in &labels_to_add {
+        storage
+            .add_label(&id, label, &state.actor)
+            .map_err(beads_to_mcp)?;
+    }
+
+    if let Some(ref pid) = parent_id {
+        storage
+            .add_dependency(&id, pid, "parent-child", &state.actor)
+            .map_err(beads_to_mcp)?;
+    }
+
+    Ok(create_issue_result_json(
+        id, title, priority, issue_type, parent_id, coercions,
+    ))
+}
+
+fn create_issue_batch_items(args: &Value) -> McpResult<Option<Vec<Value>>> {
+    let Some(value) = args.get("issues") else {
+        return Ok(None);
+    };
+
+    if [
+        "title",
+        "description",
+        "type",
+        "priority",
+        "assignee",
+        "labels",
+        "parent",
+    ]
+    .iter()
+    .any(|key| args.get(*key).is_some())
+    {
+        return Err(McpError::invalid_params(
+            "Provide either title for a single issue or issues[] for a batch, not both",
+        ));
+    }
+
+    let items = value.as_array().ok_or_else(|| {
+        McpError::invalid_params(format!("'issues' must be an array of objects, got {value}"))
+    })?;
+    if items.is_empty() {
+        return Err(McpError::invalid_params(
+            "'issues' must include at least one issue object",
+        ));
+    }
+    if items.len() > CREATE_ISSUE_BATCH_MAX {
+        return Err(McpError::invalid_params(format!(
+            "'issues' supports at most {CREATE_ISSUE_BATCH_MAX} issue objects per call, got {}",
+            items.len()
+        )));
+    }
+    for (idx, item) in items.iter().enumerate() {
+        if !item.is_object() {
+            return Err(McpError::invalid_params(format!(
+                "'issues[{idx}]' must be an object, got {item}"
+            )));
+        }
+    }
+
+    Ok(Some(items.clone()))
+}
+
+fn create_issue_batch_error_item(index: usize, args: &Value, err: McpError) -> Value {
+    let title = args
+        .get("title")
+        .and_then(Value::as_str)
+        .map_or(Value::Null, |title| json!(title));
+    json!({
+        "index": index,
+        "title": title,
+        "ok": false,
+        "error": mcp_error_json(err),
+    })
+}
+
+fn create_issue_batch_json(
+    storage: &mut SqliteStorage,
+    state: &BeadsState,
+    items: &[Value],
+) -> Value {
+    let mut ok_count = 0_u64;
+    let results = items
+        .iter()
+        .enumerate()
+        .map(
+            |(index, item)| match create_issue_json(storage, state, item) {
+                Ok(result) => {
+                    ok_count += 1;
+                    json!({
+                        "index": index,
+                        "title": item.get("title").and_then(Value::as_str),
+                        "id": result.get("id").and_then(Value::as_str),
+                        "ok": true,
+                        "result": result,
+                    })
+                }
+                Err(err) => create_issue_batch_error_item(index, item, err),
+            },
+        )
+        .collect::<Vec<_>>();
+    let count = u64::try_from(items.len()).unwrap_or(u64::MAX);
+
+    json!({
+        "items": results,
+        "count": count,
+        "ok_count": ok_count,
+        "error_count": count.saturating_sub(ok_count),
+    })
+}
+
 impl ToolHandler for CreateIssueTool {
+    #[allow(clippy::too_many_lines)]
     fn definition(&self) -> Tool {
         Tool {
             name: "create_issue".into(),
             description: Some(
-                "Create a new issue. Returns the created issue with its ID.\n\n\
+                "Create one issue, or create multiple issues in one batch. Returns created issue IDs.\n\n\
                  Discovery: See beads://schema for valid types/priorities, beads://labels for labels.\n\
                  When to use: Recording a new bug, feature, task, or work item.\n\
                  NOT for: Updating existing issues — use update_issue instead.\n\
-                 Do: Provide a clear title (1-500 chars). Search with list_issues first to avoid dupes.\n\
+                 Do: Provide a clear title (1-500 chars), or pass issues[] for a per-item batch envelope. Search with list_issues first to avoid dupes.\n\
                  Don't: Create duplicate issues — search first.\n\
                  Inputs auto-corrected: 'urgent' → critical, 'feat' → feature, etc.\n\
+                 Batch semantics: issues[] uses one write lock/storage open/auto-flush and returns {items,count,ok_count,error_count}; each item has ok:true with the legacy result or ok:false with a structured error.\n\
                  Idempotency: NOT idempotent — each call creates a new issue."
                     .into(),
             ),
@@ -1460,9 +1676,23 @@ impl ToolHandler for CreateIssueTool {
                     "parent": {
                         "type": "string",
                         "description": "Parent issue ID to create as sub-issue. Creates a parent-child dependency automatically."
+                    },
+                    "issues": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": CREATE_ISSUE_BATCH_MAX,
+                        "description": "Batch of issue objects using the same fields as a single create item: title, description, type, priority, assignee, labels, and parent. Returns {items,count,ok_count,error_count}; each item is either {index,title,id,ok:true,result} using the legacy single-create result shape, or {index,title,ok:false,error}. Partial failures do not fail the whole batch.",
+                        "items": {
+                            "type": "object",
+                            "required": ["title"],
+                            "additionalProperties": true
+                        }
                     }
                 },
-                "required": ["title"],
+                "oneOf": [
+                    {"required": ["title"]},
+                    {"required": ["issues"]}
+                ],
                 "additionalProperties": false
             }),
             output_schema: None,
@@ -1478,128 +1708,17 @@ impl ToolHandler for CreateIssueTool {
         }
     }
 
-    // The trait signature dictates a single entry point; the body branches
-    // through every mutable-issue field + label/comment side channel, each
-    // of which has its own coercion/warning surface. Extracting would
-    // scatter the argument-parse-to-apply flow across six helpers whose
-    // only caller is this one, hurting readability more than the line
-    // count helps.
-    #[allow(clippy::too_many_lines)]
     fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
-        let title = required_str_arg(&args, "title")?;
-
-        validate_mcp_title(&title)?;
-
-        let mut coercions: Vec<String> = Vec::new();
-
-        let (issue_type, type_warning) = optional_str_arg(&args, "type")?
-            .as_deref()
-            .map_or((IssueType::Task, None), parse_issue_type);
-        if let Some(w) = type_warning {
-            coercions.push(w);
+        if let Some(items) = create_issue_batch_items(&args)? {
+            let result = self
+                .0
+                .with_mutation(|storage| Ok(create_issue_batch_json(storage, &self.0, &items)))?;
+            return Ok(vec![Content::text(result.to_string())]);
         }
 
-        let (priority, prio_warning) = optional_str_arg(&args, "priority")?
-            .as_deref()
-            .map(parse_priority)
-            .transpose()?
-            .unwrap_or((Priority::MEDIUM, None));
-        if let Some(w) = prio_warning {
-            coercions.push(w);
-        }
-
-        let parent_id = optional_str_arg(&args, "parent")?;
-        let description = optional_str_arg(&args, "description")?;
-        let assignee = optional_str_arg(&args, "assignee")?;
-
-        let labels_to_add = optional_label_array_arg(&args, "labels")?;
-
-        let id = self.0.with_mutation(|storage| {
-            let now = chrono::Utc::now();
-            let prefix = self.0.issue_prefix.as_deref().unwrap_or("br");
-
-            // Validate parent exists BEFORE creating the issue
-            if let Some(ref pid) = parent_id {
-                require_valid_issue(storage, pid)?;
-            }
-
-            let id = if let Some(ref pid) = parent_id {
-                let next_num = storage.next_child_number(pid).map_err(beads_to_mcp)?;
-                next_available_child_id(pid, next_num, |candidate| storage.id_exists(candidate))?
-            } else {
-                generate_issue_id_with_checked_lookup(
-                    &title,
-                    &self.0.actor,
-                    now,
-                    prefix,
-                    |candidate| storage.id_exists(candidate),
-                )?
-            };
-
-            let issue = Issue {
-                id: id.clone(),
-                title: title.clone(),
-                description: description.clone(),
-                status: Status::Open,
-                priority,
-                issue_type: issue_type.clone(),
-                assignee: assignee.clone(),
-                created_by: Some(self.0.actor.clone()),
-                created_at: now,
-                updated_at: now,
-                ..Issue::default()
-            };
-
-            IssueValidator::validate(&issue)
-                .map_err(BeadsError::from_validation_errors)
-                .map_err(beads_to_mcp)?;
-
-            storage
-                .create_issue(&issue, &self.0.actor)
-                .map_err(beads_to_mcp)?;
-
-            for label in &labels_to_add {
-                storage
-                    .add_label(&id, label, &self.0.actor)
-                    .map_err(beads_to_mcp)?;
-            }
-
-            if let Some(ref pid) = parent_id {
-                storage
-                    .add_dependency(&id, pid, "parent-child", &self.0.actor)
-                    .map_err(beads_to_mcp)?;
-            }
-
-            Ok(id)
-        })?;
-
-        let mut warnings: Vec<String> = Vec::new();
-        // Warn if coercions happened
-        warnings.extend(coercions.clone());
-
-        let mut result = json!({
-            "id": id,
-            "title": title,
-            "status": "open",
-            "priority": priority.0,
-            "type": issue_type.as_str(),
-            "next_actions": [
-                "Use update_issue to add details or change fields",
-                "Use manage_dependencies to link to other issues"
-            ]
-        });
-
-        if let Some(ref pid) = parent_id {
-            result["parent"] = json!(pid);
-        }
-
-        if !coercions.is_empty() {
-            result["coercions"] = json!(coercions);
-        }
-
-        if !warnings.is_empty() {
-            result["warnings"] = json!(warnings);
-        }
+        let result = self
+            .0
+            .with_mutation(|storage| create_issue_json(storage, &self.0, &args))?;
 
         Ok(vec![Content::text(result.to_string())])
     }
@@ -2982,6 +3101,208 @@ mod tests {
         assert_eq!(
             second["items"][1]["issue"]["title"].as_str(),
             Some("cached batch updated title")
+        );
+    }
+
+    #[test]
+    fn create_issue_legacy_single_result_shape_is_unchanged() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let tool = CreateIssueTool::new(Arc::clone(&state));
+
+        let content = tool
+            .call(
+                &ctx,
+                json!({
+                    "title": "single create issue",
+                    "type": "feat",
+                    "priority": "urgent",
+                    "labels": ["team:create"]
+                }),
+            )
+            .expect("single create");
+        let result = content_json(&content);
+
+        assert_eq!(result["title"].as_str(), Some("single create issue"));
+        assert_eq!(result["status"].as_str(), Some("open"));
+        assert_eq!(result["type"].as_str(), Some("feature"));
+        assert!(result["id"].as_str().is_some());
+        assert!(result.get("items").is_none());
+        assert!(result.get("count").is_none());
+
+        let storage = SqliteStorage::open(&state.db_path).expect("open storage");
+        let id = result["id"].as_str().expect("created id");
+        assert_eq!(
+            storage.get_labels(id).expect("labels"),
+            vec!["team:create".to_string()]
+        );
+    }
+
+    #[test]
+    fn create_issue_batch_returns_ordered_items_partial_errors_and_flushes() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        insert_test_issue(&state, "br-mcp-create-parent", "batch parent issue");
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let tool = CreateIssueTool::new(Arc::clone(&state));
+
+        let content = tool
+            .call(
+                &ctx,
+                json!({
+                    "issues": [
+                        {
+                            "title": "batch create first",
+                            "type": "feat",
+                            "priority": "urgent",
+                            "labels": ["team:create"]
+                        },
+                        {"title": ""},
+                        {
+                            "title": "batch create child",
+                            "parent": "br-mcp-create-parent",
+                            "labels": ["team:child"]
+                        },
+                        {
+                            "title": "batch create missing parent",
+                            "parent": "missing-parent"
+                        }
+                    ]
+                }),
+            )
+            .expect("batch create");
+        let batch = content_json(&content);
+
+        assert_batch_counts(&batch, 4, 2, 2);
+        assert_eq!(batch["items"][0]["index"].as_u64(), Some(0));
+        assert_eq!(batch["items"][0]["ok"].as_bool(), Some(true));
+        assert_eq!(
+            batch["items"][0]["result"]["type"].as_str(),
+            Some("feature")
+        );
+        assert_eq!(batch["items"][1]["ok"].as_bool(), Some(false));
+        assert!(
+            batch["items"][1]["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("Title"))
+        );
+        assert_eq!(
+            batch["items"][2]["result"]["parent"].as_str(),
+            Some("br-mcp-create-parent")
+        );
+        assert_eq!(
+            batch["items"][3]["error"]["data"]["error_type"].as_str(),
+            Some("ISSUE_NOT_FOUND")
+        );
+
+        let storage = SqliteStorage::open(&state.db_path).expect("open storage");
+        let first_id = batch["items"][0]["id"].as_str().expect("first id");
+        let child_id = batch["items"][2]["id"].as_str().expect("child id");
+        assert_eq!(
+            storage.get_labels(first_id).expect("first labels"),
+            vec!["team:create".to_string()]
+        );
+        assert_eq!(
+            storage.get_labels(child_id).expect("child labels"),
+            vec!["team:child".to_string()]
+        );
+        let child_deps = storage
+            .get_dependencies_full(child_id)
+            .expect("child dependencies");
+        assert!(child_deps.iter().any(|dep| {
+            dep.depends_on_id == "br-mcp-create-parent"
+                && dep.dep_type == DependencyType::ParentChild
+        }));
+
+        let jsonl = fs::read_to_string(&state.jsonl_path).expect("read auto-flushed jsonl");
+        assert!(jsonl.contains("batch create first"));
+        assert!(jsonl.contains("batch create child"));
+        assert!(!jsonl.contains("batch create missing parent"));
+    }
+
+    #[test]
+    fn create_issue_batch_rejects_ambiguous_single_and_batch_args() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let tool = CreateIssueTool::new(state);
+
+        let err = tool
+            .call(
+                &ctx,
+                json!({
+                    "title": "single title",
+                    "issues": [{"title": "batch title"}]
+                }),
+            )
+            .expect_err("title and issues together should fail");
+
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
+        assert!(err.message.contains("either title"));
+    }
+
+    #[test]
+    #[ignore = "perf probe for MCP create_issue batch evidence"]
+    fn mcp_create_issue_batch_perf_probe() {
+        let issue_count = 25_usize;
+        let iterations = 5_usize;
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+
+        let single_temp = TempDir::new().expect("single tempdir");
+        let single_state = mcp_test_state(&single_temp);
+        let single_tool = CreateIssueTool::new(Arc::clone(&single_state));
+        let repeated_started = Instant::now();
+        for round in 0..iterations {
+            for index in 0..issue_count {
+                single_tool
+                    .call(
+                        &ctx,
+                        json!({"title": format!("single create round {round} issue {index:04}")}),
+                    )
+                    .expect("single create");
+            }
+        }
+        let repeated = repeated_started.elapsed();
+
+        let batch_temp = TempDir::new().expect("batch tempdir");
+        let batch_state = mcp_test_state(&batch_temp);
+        let batch_tool = CreateIssueTool::new(Arc::clone(&batch_state));
+        let batch_started = Instant::now();
+        let mut last_batch = serde_json::Value::Null;
+        for round in 0..iterations {
+            let issues = (0..issue_count)
+                .map(|index| json!({"title": format!("batch create round {round} issue {index:04}")}))
+                .collect::<Vec<_>>();
+            let content = batch_tool
+                .call(&ctx, json!({"issues": issues}))
+                .expect("batch create");
+            last_batch = content_json(&content);
+            let issue_count_u64 = u64::try_from(issue_count).expect("issue count fits u64");
+            assert_batch_counts(&last_batch, issue_count_u64, issue_count_u64, 0);
+        }
+        let batch = batch_started.elapsed();
+
+        let expected_total = issue_count
+            .checked_mul(iterations)
+            .expect("expected total issue count fits usize");
+        let storage = SqliteStorage::open(&batch_state.db_path).expect("open batch storage");
+        assert_eq!(
+            storage.count_all_issues().expect("count batch issues"),
+            expected_total
+        );
+
+        println!(
+            "{}",
+            json!({
+                "issues": issue_count,
+                "iterations": iterations,
+                "repeated_single_total_ns": repeated.as_nanos(),
+                "batch_total_ns": batch.as_nanos(),
+                "speedup": repeated.as_secs_f64() / batch.as_secs_f64(),
+                "last_batch_ok_count": last_batch["ok_count"],
+                "equality": "batch issue creates verified by final storage count and per-item ok counts"
+            })
         );
     }
 
