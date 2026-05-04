@@ -283,6 +283,7 @@ fn execute_routed_label_remove(
     beads_dir: &Path,
 ) -> Result<()> {
     let (issue_inputs, label) = parse_issues_and_label(&args.issues, args.label.as_ref())?;
+    validate_label(&label)?;
     let prepared_routes = prepare_label_routes(&issue_inputs, cli, beads_dir)?;
     let mut routed_results = Vec::new();
 
@@ -1005,6 +1006,24 @@ mod tests {
         assert!(validate_label("special@char").is_err());
         assert!(validate_label("dot.not.allowed").is_err());
         assert!(validate_label(&"a".repeat(51)).is_err());
+    }
+
+    #[test]
+    fn test_label_remove_rejects_invalid_label_before_route_preparation() {
+        let args = LabelRemoveArgs {
+            issues: vec!["bd-abc".to_string(), "has space".to_string()],
+            label: None,
+        };
+        let ctx = OutputContext::from_flags(false, false, true);
+        let err = execute_routed_label_remove(
+            &args,
+            &config::CliOverrides::default(),
+            &ctx,
+            std::path::Path::new("/missing/.beads"),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("invalid characters"));
     }
 
     #[test]

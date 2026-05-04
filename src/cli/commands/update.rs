@@ -298,6 +298,9 @@ fn prepare_single_route(
     for label in &args.add_label {
         LabelValidator::validate(label).map_err(|e| BeadsError::validation("label", e.message))?;
     }
+    for label in &args.remove_label {
+        LabelValidator::validate(label).map_err(|e| BeadsError::validation("label", e.message))?;
+    }
 
     let mut valid_set_labels = Vec::new();
     if !args.set_labels.is_empty() {
@@ -1393,6 +1396,48 @@ mod tests {
         info!(
             "test_validate_multi_issue_external_ref_update_rejects_multiple_distinct_ids: assertions passed"
         );
+    }
+
+    #[test]
+    fn test_prepare_single_route_rejects_invalid_remove_label() {
+        init_test_logging();
+        info!("test_prepare_single_route_rejects_invalid_remove_label: starting");
+
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        {
+            let mut storage_ctx =
+                config::open_storage_with_cli(&beads_dir, &CliOverrides::default())
+                    .expect("storage");
+            let issue = Issue {
+                id: "bd-label".to_string(),
+                title: "Label target".to_string(),
+                status: Status::Open,
+                priority: Priority::MEDIUM,
+                issue_type: IssueType::Task,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                ..Issue::default()
+            };
+            storage_ctx
+                .storage
+                .create_issue(&issue, "tester")
+                .expect("create issue");
+        }
+
+        let args = UpdateArgs {
+            ids: vec!["bd-label".to_string()],
+            remove_label: vec!["has space".to_string()],
+            ..Default::default()
+        };
+        let result = prepare_single_route(&args, &CliOverrides::default(), &beads_dir, false);
+        assert!(result.is_err(), "invalid remove label should fail");
+        if let Err(err) = result {
+            assert!(err.to_string().contains("invalid characters"));
+        }
+        info!("test_prepare_single_route_rejects_invalid_remove_label: assertions passed");
     }
 
     #[test]
