@@ -87,6 +87,7 @@ const PLACEHOLDER_EXACT: &[&str] = &[
 const SHOW_ISSUE_BATCH_MAX: usize = 100;
 const UPDATE_ISSUE_BATCH_MAX: usize = 100;
 const CLOSE_ISSUE_BATCH_MAX: usize = 100;
+const MANAGE_DEPENDENCIES_BATCH_MAX: usize = 100;
 
 // ---------------------------------------------------------------------------
 // Placeholder detection
@@ -2177,18 +2178,270 @@ impl ManageDependenciesTool {
     }
 }
 
+fn required_dependency_action_arg(args: &Value) -> McpResult<String> {
+    required_str_arg(args, "action").map_err(|err| {
+        McpError::with_data(
+            McpErrorCode::InvalidParams,
+            err.to_string(),
+            json!({
+                "error_type": "REQUIRED_FIELD",
+                "available_options": ["add", "remove", "list"],
+                "fix_hint": "Provide action: 'list' to view, 'add' to create, 'remove' to delete"
+            }),
+        )
+    })
+}
+
+fn invalid_dependency_action_error(action: &str) -> McpError {
+    McpError::with_data(
+        McpErrorCode::InvalidParams,
+        format!("Unknown action '{action}'"),
+        json!({
+            "error_type": "INVALID_ARGUMENT",
+            "provided": action,
+            "available_options": ["add", "remove", "list"],
+            "fix_hint": "Use 'list' to view dependencies, 'add' to create, 'remove' to delete"
+        }),
+    )
+}
+
+fn manage_dependencies_list_json(storage: &SqliteStorage, id: &str) -> McpResult<Value> {
+    require_valid_issue(storage, id)?;
+    let deps = storage.get_dependencies_full(id).map_err(beads_to_mcp)?;
+    let dependents = storage.get_dependents(id).map_err(beads_to_mcp)?;
+
+    Ok(json!({
+        "id": id,
+        "depends_on": deps.iter().map(|d| {
+            json!({
+                "id": d.depends_on_id,
+                "dep_type": d.dep_type.to_string(),
+            })
+        }).collect::<Vec<_>>(),
+        "depended_on_by": dependents,
+    }))
+}
+
+fn manage_dependency_cycle_error(id: &str, depends_on: &str) -> McpError {
+    McpError::with_data(
+        McpErrorCode::ToolExecutionError,
+        format!("Adding dependency {id} -> {depends_on} would create a cycle"),
+        json!({
+            "error_type": "CYCLE_DETECTED",
+            "recoverable": false,
+            "from": id,
+            "to": depends_on,
+            "hint": "Circular dependencies are not allowed. Check the existing dependency graph.",
+            "suggested_tool_calls": [
+                {"tool": "manage_dependencies", "arguments": {"action": "list", "id": id}},
+                {"tool": "manage_dependencies", "arguments": {"action": "list", "id": depends_on}}
+            ]
+        }),
+    )
+}
+
+fn manage_dependencies_add_json(
+    storage: &mut SqliteStorage,
+    state: &BeadsState,
+    id: &str,
+    depends_on: &str,
+    dep_type_raw: Option<&str>,
+) -> McpResult<Value> {
+    let dep_type_raw = dep_type_raw.unwrap_or("blocks");
+    let (dep_type_str, dep_coercion) = parse_dep_type(dep_type_raw)?;
+    let dep_type = dep_type_str
+        .parse::<DependencyType>()
+        .map_err(beads_to_mcp)?;
+
+    require_valid_issue(storage, id)?;
+    require_valid_issue(storage, depends_on)?;
+
+    if dep_type.is_blocking()
+        && storage
+            .would_create_cycle(id, depends_on, true)
+            .map_err(beads_to_mcp)?
+    {
+        return Err(manage_dependency_cycle_error(id, depends_on));
+    }
+
+    let added = storage
+        .add_dependency(id, depends_on, &dep_type_str, &state.actor)
+        .map_err(beads_to_mcp)?;
+
+    let mut result = json!({
+        "added": added,
+        "from": id,
+        "to": depends_on,
+        "dep_type": dep_type_str,
+    });
+    if let Some(w) = dep_coercion {
+        result["coercion"] = json!(w);
+    }
+
+    Ok(result)
+}
+
+fn manage_dependencies_remove_json(
+    storage: &mut SqliteStorage,
+    state: &BeadsState,
+    id: &str,
+    depends_on: &str,
+) -> McpResult<Value> {
+    if let Some(err) = detect_placeholder(depends_on) {
+        return Err(err);
+    }
+
+    require_valid_issue(storage, id)?;
+
+    let removed = storage
+        .remove_dependency(id, depends_on, &state.actor)
+        .map_err(beads_to_mcp)?;
+
+    Ok(json!({
+        "removed": removed,
+        "from": id,
+        "to": depends_on,
+    }))
+}
+
+fn manage_dependencies_operation_json(
+    storage: &mut SqliteStorage,
+    state: &BeadsState,
+    args: &Value,
+) -> McpResult<Value> {
+    let action = required_dependency_action_arg(args)?;
+    let id = required_str_arg(args, "id")?;
+
+    match action.as_str() {
+        "list" => manage_dependencies_list_json(storage, &id),
+        "add" => {
+            let depends_on = required_str_arg(args, "depends_on")
+                .map_err(|err| McpError::invalid_params(format!("{err} for action 'add'")))?;
+            let dep_type_raw = optional_str_arg(args, "dep_type")?;
+            manage_dependencies_add_json(storage, state, &id, &depends_on, dep_type_raw.as_deref())
+        }
+        "remove" => {
+            let depends_on = required_str_arg(args, "depends_on")
+                .map_err(|err| McpError::invalid_params(format!("{err} for action 'remove'")))?;
+            manage_dependencies_remove_json(storage, state, &id, &depends_on)
+        }
+        other => Err(invalid_dependency_action_error(other)),
+    }
+}
+
+fn manage_dependencies_batch_items(args: &Value) -> McpResult<Option<Vec<Value>>> {
+    let Some(value) = args.get("operations") else {
+        return Ok(None);
+    };
+
+    if ["action", "id", "depends_on", "dep_type"]
+        .iter()
+        .any(|key| args.get(*key).is_some())
+    {
+        return Err(McpError::invalid_params(
+            "Provide either action/id for a single dependency operation or operations[] for a batch, not both",
+        ));
+    }
+
+    let items = value.as_array().ok_or_else(|| {
+        McpError::invalid_params(format!(
+            "'operations' must be an array of objects, got {value}"
+        ))
+    })?;
+    if items.is_empty() {
+        return Err(McpError::invalid_params(
+            "'operations' must include at least one dependency operation",
+        ));
+    }
+    if items.len() > MANAGE_DEPENDENCIES_BATCH_MAX {
+        return Err(McpError::invalid_params(format!(
+            "'operations' supports at most {MANAGE_DEPENDENCIES_BATCH_MAX} items per call, got {}",
+            items.len()
+        )));
+    }
+    for (idx, item) in items.iter().enumerate() {
+        if !item.is_object() {
+            return Err(McpError::invalid_params(format!(
+                "'operations[{idx}]' must be an object, got {item}"
+            )));
+        }
+    }
+
+    Ok(Some(items.clone()))
+}
+
+fn manage_dependencies_batch_is_read_only(items: &[Value]) -> bool {
+    items
+        .iter()
+        .all(|item| item.get("action").and_then(Value::as_str) == Some("list"))
+}
+
+fn manage_dependencies_batch_error_item(index: usize, args: &Value, err: McpError) -> Value {
+    let action = args
+        .get("action")
+        .and_then(Value::as_str)
+        .map_or(Value::Null, |action| json!(action));
+    let id = args
+        .get("id")
+        .and_then(Value::as_str)
+        .map_or(Value::Null, |id| json!(id));
+    json!({
+        "index": index,
+        "action": action,
+        "id": id,
+        "ok": false,
+        "error": mcp_error_json(err),
+    })
+}
+
+fn manage_dependencies_batch_json(
+    storage: &mut SqliteStorage,
+    state: &BeadsState,
+    items: &[Value],
+) -> Value {
+    let mut ok_count = 0_u64;
+    let results = items
+        .iter()
+        .enumerate()
+        .map(
+            |(index, item)| match manage_dependencies_operation_json(storage, state, item) {
+                Ok(result) => {
+                    ok_count += 1;
+                    json!({
+                        "index": index,
+                        "action": item.get("action").and_then(Value::as_str),
+                        "id": item.get("id").and_then(Value::as_str),
+                        "ok": true,
+                        "result": result,
+                    })
+                }
+                Err(err) => manage_dependencies_batch_error_item(index, item, err),
+            },
+        )
+        .collect::<Vec<_>>();
+    let count = u64::try_from(items.len()).unwrap_or(u64::MAX);
+
+    json!({
+        "items": results,
+        "count": count,
+        "ok_count": ok_count,
+        "error_count": count.saturating_sub(ok_count),
+    })
+}
+
 impl ToolHandler for ManageDependenciesTool {
     fn definition(&self) -> Tool {
         Tool {
             name: "manage_dependencies".into(),
             description: Some(
-                "Add, remove, or list dependencies between issues.\n\n\
+                "Add, remove, or list dependencies between issues, with optional batching for graph-edit bursts.\n\n\
                  Discovery: Get issue IDs from list_issues. See beads://schema for dep types.\n\
                  When to use: Linking related issues, establishing blocking relationships.\n\
                  NOT for: Viewing blocked issues overview — use beads://issues/blocked resource.\n\
-                 Do: Use 'list' action first to see existing deps before modifying.\n\
+                 Do: Use 'list' action first to see existing deps before modifying, or operations[] for ordered batch work.\n\
                  Don't: Create circular deps — the system will reject them with guidance.\n\
                  Common mistakes: Swapping source/target for 'blocks' type; using placeholder IDs.\n\
+                 Batch semantics: operations[] uses one storage envelope and returns {items,count,ok_count,error_count}; each item has ok:true with the legacy result or ok:false with a structured error.\n\
                  Both IDs are validated before any operation."
                     .into(),
             ),
@@ -2212,9 +2465,35 @@ impl ToolHandler for ManageDependenciesTool {
                         "type": "string",
                         "description": "Dependency type: blocks (default), related, parent-child, waits-for, duplicates, supersedes, caused-by. Aliases auto-corrected (e.g. 'parent_child' → 'parent-child').",
                         "default": "blocks"
+                    },
+                    "operations": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": MANAGE_DEPENDENCIES_BATCH_MAX,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "action": {
+                                    "type": "string",
+                                    "enum": ["add", "remove", "list"]
+                                },
+                                "id": {"type": "string"},
+                                "depends_on": {"type": "string"},
+                                "dep_type": {
+                                    "type": "string",
+                                    "default": "blocks"
+                                }
+                            },
+                            "required": ["action", "id"],
+                            "additionalProperties": false
+                        },
+                        "description": "Batch of dependency operations. Returns {items,count,ok_count,error_count}; each item is either {index,action,id,ok:true,result} using the legacy single-operation result shape, or {index,action,id,ok:false,error}. Partial failures do not fail the whole batch."
                     }
                 },
-                "required": ["action", "id"],
+                "oneOf": [
+                    {"required": ["action", "id"]},
+                    {"required": ["operations"]}
+                ],
                 "additionalProperties": false
             }),
             output_schema: None,
@@ -2232,148 +2511,52 @@ impl ToolHandler for ManageDependenciesTool {
         }
     }
 
-    // The trait signature funnels `add` / `remove` / `list` into a single
-    // entry point, and each branch has its own cycle-detection, error-
-    // wrapping, and response-shape work. Extracting per-action helpers
-    // would fragment shared argument parsing for a marginal line-count
-    // win.
-    #[allow(clippy::too_many_lines)]
     fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
-        let action = required_str_arg(&args, "action").map_err(|err| {
-            McpError::with_data(
-                McpErrorCode::InvalidParams,
-                err.to_string(),
-                json!({
-                    "error_type": "REQUIRED_FIELD",
-                    "available_options": ["add", "remove", "list"],
-                    "fix_hint": "Provide action: 'list' to view, 'add' to create, 'remove' to delete"
-                }),
-            )
-        })?;
+        if let Some(items) = manage_dependencies_batch_items(&args)? {
+            let result = if manage_dependencies_batch_is_read_only(&items) {
+                let mut storage = open(&self.0)?;
+                manage_dependencies_batch_json(&mut storage, &self.0, &items)
+            } else {
+                self.0.with_mutation(|storage| {
+                    Ok(manage_dependencies_batch_json(storage, &self.0, &items))
+                })?
+            };
+            return Ok(vec![Content::text(result.to_string())]);
+        }
 
+        let action = required_dependency_action_arg(&args)?;
         let id = required_str_arg(&args, "id")?;
-
         match action.as_str() {
             "list" => {
                 let storage = open(&self.0)?;
-                require_valid_issue(&storage, &id)?;
-                let deps = storage.get_dependencies_full(&id).map_err(beads_to_mcp)?;
-                let dependents = storage.get_dependents(&id).map_err(beads_to_mcp)?;
-
-                Ok(vec![Content::text(
-                    json!({
-                        "id": id,
-                        "depends_on": deps.iter().map(|d| {
-                            json!({
-                                "id": d.depends_on_id,
-                                "dep_type": d.dep_type.to_string(),
-                            })
-                        }).collect::<Vec<_>>(),
-                        "depended_on_by": dependents,
-                    })
-                    .to_string(),
-                )])
+                let result = manage_dependencies_list_json(&storage, &id)?;
+                Ok(vec![Content::text(result.to_string())])
             }
             "add" => {
                 let depends_on = required_str_arg(&args, "depends_on")
                     .map_err(|err| McpError::invalid_params(format!("{err} for action 'add'")))?;
-
-                let dep_type_raw =
-                    optional_str_arg(&args, "dep_type")?.unwrap_or_else(|| "blocks".to_string());
-                let (dep_type_str, dep_coercion) = parse_dep_type(&dep_type_raw)?;
-                let dep_type = dep_type_str
-                    .parse::<DependencyType>()
-                    .map_err(beads_to_mcp)?;
-
-                // Read-only pre-validation
-                {
-                    let storage = open(&self.0)?;
-                    require_valid_issue(&storage, &id)?;
-                    require_valid_issue(&storage, &depends_on)?;
-
-                    // Only dependency types that affect ready work participate in cycle checks.
-                    if dep_type.is_blocking()
-                        && storage
-                            .would_create_cycle(&id, &depends_on, true)
-                            .map_err(beads_to_mcp)?
-                    {
-                        return Err(McpError::with_data(
-                            McpErrorCode::ToolExecutionError,
-                            format!("Adding dependency {id} -> {depends_on} would create a cycle"),
-                            json!({
-                                "error_type": "CYCLE_DETECTED",
-                                "recoverable": false,
-                                "from": id,
-                                "to": depends_on,
-                                "hint": "Circular dependencies are not allowed. Check the existing dependency graph.",
-                                "suggested_tool_calls": [
-                                    {"tool": "manage_dependencies", "arguments": {"action": "list", "id": id}},
-                                    {"tool": "manage_dependencies", "arguments": {"action": "list", "id": depends_on}}
-                                ]
-                            }),
-                        ));
-                    }
-                }
-
-                let added = self.0.with_mutation(|storage| {
-                    storage
-                        .add_dependency(&id, &depends_on, &dep_type_str, &self.0.actor)
-                        .map_err(beads_to_mcp)
+                let dep_type_raw = optional_str_arg(&args, "dep_type")?;
+                let result = self.0.with_mutation(|storage| {
+                    manage_dependencies_add_json(
+                        storage,
+                        &self.0,
+                        &id,
+                        &depends_on,
+                        dep_type_raw.as_deref(),
+                    )
                 })?;
-
-                let mut result = json!({
-                    "added": added,
-                    "from": id,
-                    "to": depends_on,
-                    "dep_type": dep_type_str,
-                });
-                if let Some(w) = dep_coercion {
-                    result["coercion"] = json!(w);
-                }
-
                 Ok(vec![Content::text(result.to_string())])
             }
             "remove" => {
                 let depends_on = required_str_arg(&args, "depends_on").map_err(|err| {
                     McpError::invalid_params(format!("{err} for action 'remove'"))
                 })?;
-
-                // Validate target ID (placeholder check only — it might have been deleted)
-                if let Some(err) = detect_placeholder(&depends_on) {
-                    return Err(err);
-                }
-
-                // Pre-validate source ID
-                {
-                    let storage = open(&self.0)?;
-                    require_valid_issue(&storage, &id)?;
-                }
-
                 let removed = self.0.with_mutation(|storage| {
-                    storage
-                        .remove_dependency(&id, &depends_on, &self.0.actor)
-                        .map_err(beads_to_mcp)
+                    manage_dependencies_remove_json(storage, &self.0, &id, &depends_on)
                 })?;
-
-                Ok(vec![Content::text(
-                    json!({
-                        "removed": removed,
-                        "from": id,
-                        "to": depends_on,
-                    })
-                    .to_string(),
-                )])
+                Ok(vec![Content::text(removed.to_string())])
             }
-            other => Err(McpError::with_data(
-                McpErrorCode::InvalidParams,
-                format!("Unknown action '{other}'"),
-                json!({
-                    "error_type": "INVALID_ARGUMENT",
-                    "provided": other,
-                    "available_options": ["add", "remove", "list"],
-                    "fix_hint": "Use 'list' to view dependencies, 'add' to create, 'remove' to delete"
-                }),
-            )),
+            other => Err(invalid_dependency_action_error(other)),
         }
     }
 }
@@ -3120,6 +3303,47 @@ mod tests {
         (started.elapsed(), last)
     }
 
+    fn dependency_perf_rounds(
+        prefix: &str,
+        issue_count: usize,
+        iterations: usize,
+    ) -> Vec<(String, Vec<String>)> {
+        (0..iterations)
+            .map(|round| {
+                let blocker = format!("br-mcp-dep-{prefix}-perf-blocker-{round}");
+                let ids = (0..issue_count)
+                    .map(|index| format!("br-mcp-dep-{prefix}-perf-{round}-{index:04}"))
+                    .collect::<Vec<_>>();
+                (blocker, ids)
+            })
+            .collect()
+    }
+
+    fn seed_dependency_perf_rounds(state: &BeadsState, rounds: &[(String, Vec<String>)]) {
+        for (blocker, ids) in rounds {
+            insert_test_issue(
+                state,
+                blocker,
+                &format!("Dependency perf blocker {blocker}"),
+            );
+            for id in ids {
+                insert_test_issue(state, id, &format!("Dependency perf issue {id}"));
+            }
+        }
+    }
+
+    fn assert_dependency_perf_rounds(state: &BeadsState, rounds: &[(String, Vec<String>)]) {
+        let storage = SqliteStorage::open(&state.db_path).expect("open batch storage");
+        for (blocker, ids) in rounds {
+            for id in ids {
+                let deps = storage
+                    .get_dependencies_full(id)
+                    .expect("load batch dependency");
+                assert!(deps.iter().any(|dep| dep.depends_on_id == *blocker));
+            }
+        }
+    }
+
     #[test]
     #[ignore = "perf probe for MCP read snapshot evidence"]
     fn mcp_read_snapshot_perf_probe() {
@@ -3326,7 +3550,8 @@ mod tests {
                 .call(&ctx, json!({"updates": updates}))
                 .expect("batch update");
             last_batch = content_json(&content);
-            assert_batch_counts(&last_batch, ids.len() as u64, ids.len() as u64, 0);
+            let ids_len = u64::try_from(ids.len()).expect("ids len fits in u64");
+            assert_batch_counts(&last_batch, ids_len, ids_len, 0);
         }
         let batch = batch_started.elapsed();
 
@@ -3435,6 +3660,80 @@ mod tests {
                 "speedup": repeated.as_nanos() as f64 / batch.as_nanos().max(1) as f64,
                 "last_batch_ok_count": last_batch["ok_count"],
                 "equality": "batch closes verified by final storage state and per-item ok counts",
+            })
+        );
+    }
+
+    #[test]
+    #[ignore = "perf probe for MCP manage_dependencies batch evidence"]
+    fn mcp_manage_dependencies_batch_perf_probe() {
+        let issue_count = 25_usize;
+        let iterations = 5_usize;
+
+        let repeated_temp = TempDir::new().expect("repeated tempdir");
+        let repeated_state = mcp_test_state(&repeated_temp);
+        let repeated_rounds = dependency_perf_rounds("single", issue_count, iterations);
+        seed_dependency_perf_rounds(&repeated_state, &repeated_rounds);
+
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let repeated_tool = ManageDependenciesTool::new(Arc::clone(&repeated_state));
+        let repeated_started = Instant::now();
+        for (blocker, ids) in &repeated_rounds {
+            for id in ids {
+                repeated_tool
+                    .call(
+                        &ctx,
+                        json!({
+                            "action": "add",
+                            "id": id,
+                            "depends_on": blocker,
+                        }),
+                    )
+                    .expect("single dependency add");
+            }
+        }
+        let repeated = repeated_started.elapsed();
+
+        let batch_temp = TempDir::new().expect("batch tempdir");
+        let batch_state = mcp_test_state(&batch_temp);
+        let batch_rounds = dependency_perf_rounds("batch", issue_count, iterations);
+        seed_dependency_perf_rounds(&batch_state, &batch_rounds);
+
+        let batch_tool = ManageDependenciesTool::new(Arc::clone(&batch_state));
+        let batch_started = Instant::now();
+        let mut last_batch = serde_json::Value::Null;
+        let expected_count = u64::try_from(issue_count).expect("issue count fits u64");
+        for (blocker, ids) in &batch_rounds {
+            let operations = ids
+                .iter()
+                .map(|id| {
+                    json!({
+                        "action": "add",
+                        "id": id,
+                        "depends_on": blocker,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let content = batch_tool
+                .call(&ctx, json!({"operations": operations}))
+                .expect("batch dependency add");
+            last_batch = content_json(&content);
+            assert_batch_counts(&last_batch, expected_count, expected_count, 0);
+        }
+        let batch = batch_started.elapsed();
+
+        assert_dependency_perf_rounds(&batch_state, &batch_rounds);
+
+        println!(
+            "{}",
+            json!({
+                "issues": issue_count,
+                "iterations": iterations,
+                "repeated_single_total_ns": repeated.as_nanos(),
+                "batch_total_ns": batch.as_nanos(),
+                "speedup": repeated.as_nanos() as f64 / batch.as_nanos().max(1) as f64,
+                "last_batch_ok_count": last_batch["ok_count"],
+                "equality": "batch dependency adds verified by final storage state and per-item ok counts",
             })
         );
     }
@@ -3651,6 +3950,176 @@ mod tests {
                 dep.depends_on_id == second && dep.dep_type == DependencyType::Related
             })
         );
+    }
+
+    #[test]
+    fn manage_dependencies_legacy_single_result_shapes_are_unchanged() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        insert_test_issue(&state, "br-mcp-dep-single-a", "single dependency source");
+        insert_test_issue(&state, "br-mcp-dep-single-b", "single dependency target");
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let tool = ManageDependenciesTool::new(Arc::clone(&state));
+
+        let add = content_json(
+            &tool
+                .call(
+                    &ctx,
+                    json!({
+                        "action": "add",
+                        "id": "br-mcp-dep-single-a",
+                        "depends_on": "br-mcp-dep-single-b",
+                        "dep_type": "parent_child"
+                    }),
+                )
+                .expect("single add dependency"),
+        );
+        assert_eq!(add["added"].as_bool(), Some(true));
+        assert_eq!(add["from"].as_str(), Some("br-mcp-dep-single-a"));
+        assert_eq!(add["to"].as_str(), Some("br-mcp-dep-single-b"));
+        assert_eq!(add["dep_type"].as_str(), Some("parent-child"));
+        assert!(add.get("items").is_none());
+        assert!(add.get("count").is_none());
+
+        let list = content_json(
+            &tool
+                .call(
+                    &ctx,
+                    json!({
+                        "action": "list",
+                        "id": "br-mcp-dep-single-a",
+                    }),
+                )
+                .expect("single list dependencies"),
+        );
+        assert_eq!(list["id"].as_str(), Some("br-mcp-dep-single-a"));
+        assert!(list.get("items").is_none());
+        assert!(list.get("count").is_none());
+    }
+
+    #[test]
+    fn manage_dependencies_batch_returns_ordered_items_partial_errors_and_flushes() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        insert_test_issue(&state, "br-mcp-dep-batch-a", "batch dependency source a");
+        insert_test_issue(&state, "br-mcp-dep-batch-b", "batch dependency target b");
+        insert_test_issue(
+            &state,
+            "br-mcp-dep-batch-remove",
+            "batch dependency pre-existing remove target",
+        );
+        {
+            let mut storage = SqliteStorage::open(&state.db_path).expect("open storage");
+            storage
+                .add_dependency(
+                    "br-mcp-dep-batch-a",
+                    "br-mcp-dep-batch-remove",
+                    "blocks",
+                    "mcp-test",
+                )
+                .expect("seed removable dependency");
+        }
+
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let tool = ManageDependenciesTool::new(Arc::clone(&state));
+        let content = tool
+            .call(
+                &ctx,
+                json!({
+                    "operations": [
+                        {
+                            "action": "add",
+                            "id": "br-mcp-dep-batch-a",
+                            "depends_on": "br-mcp-dep-batch-b"
+                        },
+                        {
+                            "action": "add",
+                            "id": "br-mcp-dep-batch-b",
+                            "depends_on": "br-mcp-dep-batch-a"
+                        },
+                        {
+                            "action": "add",
+                            "id": "br-mcp-dep-batch-a",
+                            "depends_on": "YOUR_ID"
+                        },
+                        {
+                            "action": "remove",
+                            "id": "br-mcp-dep-batch-a",
+                            "depends_on": "br-mcp-dep-batch-remove"
+                        },
+                        {
+                            "action": "list",
+                            "id": "br-mcp-dep-batch-a"
+                        }
+                    ]
+                }),
+            )
+            .expect("batch manage_dependencies");
+        let batch = content_json(&content);
+
+        assert_batch_counts(&batch, 5, 3, 2);
+        assert_eq!(batch["items"][0]["index"].as_u64(), Some(0));
+        assert_eq!(batch["items"][0]["ok"].as_bool(), Some(true));
+        assert_eq!(batch["items"][0]["result"]["added"].as_bool(), Some(true));
+        assert_eq!(
+            batch["items"][1]["error"]["data"]["error_type"].as_str(),
+            Some("CYCLE_DETECTED")
+        );
+        assert_eq!(
+            batch["items"][2]["error"]["data"]["error_type"].as_str(),
+            Some("PLACEHOLDER_DETECTED")
+        );
+        assert_eq!(batch["items"][3]["result"]["removed"].as_bool(), Some(true));
+        let listed = batch["items"][4]["result"]["depends_on"]
+            .as_array()
+            .expect("list result dependencies");
+        assert!(listed.iter().any(|dep| {
+            dep["id"].as_str() == Some("br-mcp-dep-batch-b")
+                && dep["dep_type"].as_str() == Some("blocks")
+        }));
+        assert!(
+            listed
+                .iter()
+                .all(|dep| dep["id"].as_str() != Some("br-mcp-dep-batch-remove"))
+        );
+
+        let storage = SqliteStorage::open(&state.db_path).expect("open storage");
+        let deps = storage
+            .get_dependencies_full("br-mcp-dep-batch-a")
+            .expect("load dependencies");
+        assert!(
+            deps.iter()
+                .any(|dep| dep.depends_on_id == "br-mcp-dep-batch-b")
+        );
+        assert!(
+            deps.iter()
+                .all(|dep| dep.depends_on_id != "br-mcp-dep-batch-remove")
+        );
+        let jsonl = fs::read_to_string(&state.jsonl_path).expect("read auto-flushed jsonl");
+        assert!(jsonl.contains("br-mcp-dep-batch-a"));
+        assert!(jsonl.contains("br-mcp-dep-batch-b"));
+    }
+
+    #[test]
+    fn manage_dependencies_batch_rejects_ambiguous_single_and_batch_args() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let tool = ManageDependenciesTool::new(state);
+
+        let err = tool
+            .call(
+                &ctx,
+                json!({
+                    "action": "list",
+                    "id": "br-one",
+                    "operations": [{"action": "list", "id": "br-two"}]
+                }),
+            )
+            .expect_err("single and batch args together should fail");
+
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
+        assert!(err.message.contains("either action/id"));
     }
 
     #[test]
