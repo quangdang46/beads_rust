@@ -3675,6 +3675,71 @@ impl SqliteStorage {
             .collect()
     }
 
+    /// Count default-visible issues grouped by label.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn count_default_visible_labels(&self) -> Result<(usize, Vec<(String, usize)>)> {
+        let issue_rows = self.conn.query(
+            "SELECT id
+             FROM issues
+             WHERE status NOT IN ('closed', 'tombstone', 'deferred')
+               AND (is_template = 0 OR is_template IS NULL)",
+        )?;
+
+        let total = issue_rows.len();
+        if total == 0 {
+            return Ok((0, Vec::new()));
+        }
+
+        let mut visible_ids = HashSet::with_capacity(total);
+        for row in &issue_rows {
+            let issue_id = row
+                .get(0)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .to_string();
+            if !issue_id.is_empty() {
+                visible_ids.insert(issue_id);
+            }
+        }
+
+        let label_rows = self
+            .conn
+            .query("SELECT issue_id, label FROM labels ORDER BY issue_id, label")?;
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        let mut labeled_visible_issues = 0usize;
+        let mut last_labeled_issue_id = String::new();
+
+        for row in &label_rows {
+            let issue_id = row.get(0).and_then(SqliteValue::as_text).unwrap_or("");
+            if !visible_ids.contains(issue_id) {
+                continue;
+            }
+
+            if issue_id != last_labeled_issue_id {
+                labeled_visible_issues += 1;
+                last_labeled_issue_id.clear();
+                last_labeled_issue_id.push_str(issue_id);
+            }
+
+            let label = row
+                .get(1)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .to_string();
+            *counts.entry(label).or_insert(0) += 1;
+        }
+
+        let unlabeled = total.saturating_sub(labeled_visible_issues);
+        if unlabeled > 0 {
+            counts.insert("(no labels)".to_string(), unlabeled);
+        }
+
+        Ok((total, counts.into_iter().collect()))
+    }
+
     fn count_default_visible_text_groups(
         &self,
         select_expr: &str,

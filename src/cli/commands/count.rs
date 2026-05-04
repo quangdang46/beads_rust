@@ -382,7 +382,14 @@ fn default_visible_group_counts(
         CountBy::Priority => storage.count_default_visible_priorities()?,
         CountBy::Type => storage.count_default_visible_types()?,
         CountBy::Assignee => storage.count_default_visible_assignees()?,
-        CountBy::Label => return Ok(None),
+        CountBy::Label => {
+            let (total, rows) = storage.count_default_visible_labels()?;
+            let groups = rows
+                .into_iter()
+                .map(|(group, count)| CountGroup { group, count })
+                .collect();
+            return Ok(Some((total, groups)));
+        }
     };
     let total = rows.iter().map(|(_, count)| *count).sum();
     let groups = rows
@@ -741,6 +748,52 @@ mod tests {
         assert_eq!(total, full_issues.len());
         assert_eq!(groups_to_map(actual_groups), expected);
         info!("test_default_visible_group_counts_match_default_filtering: assertions passed");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_default_visible_label_counts_match_default_filtering() -> Result<()> {
+        init_logging();
+        info!("test_default_visible_label_counts_match_default_filtering: starting");
+        let mut storage = SqliteStorage::open_memory()?;
+
+        let labeled = make_issue("bd-1", Status::Open, Priority::HIGH, IssueType::Task);
+        let unlabeled = make_issue("bd-2", Status::InProgress, Priority::MEDIUM, IssueType::Bug);
+        let mut closed = make_issue("bd-3", Status::Closed, Priority::LOW, IssueType::Task);
+        closed.closed_at = Some(Utc::now());
+        let deferred = make_issue(
+            "bd-4",
+            Status::Deferred,
+            Priority::CRITICAL,
+            IssueType::Feature,
+        );
+        let mut template = make_issue("bd-5", Status::Open, Priority::HIGH, IssueType::Task);
+        template.is_template = true;
+
+        storage.create_issue(&labeled, "tester")?;
+        storage.create_issue(&unlabeled, "tester")?;
+        storage.create_issue(&closed, "tester")?;
+        storage.create_issue(&deferred, "tester")?;
+        storage.create_issue(&template, "tester")?;
+        storage.add_label("bd-1", "backend", "tester")?;
+        storage.add_label("bd-3", "closed-only", "tester")?;
+        storage.add_label("bd-4", "deferred-only", "tester")?;
+        storage.add_label("bd-5", "template-only", "tester")?;
+
+        let filters = ListFilters::default();
+        let full_issues = storage.list_issues(&filters)?;
+        let expected = groups_to_map(group_counts(&storage, &full_issues, CountBy::Label)?);
+        let (total, actual_groups) = group_counts_for_filters(&storage, &filters, CountBy::Label)?;
+
+        assert_eq!(total, full_issues.len());
+        assert_eq!(groups_to_map(actual_groups), expected);
+        assert_eq!(expected.get("backend"), Some(&1));
+        assert_eq!(expected.get("(no labels)"), Some(&1));
+        assert!(!expected.contains_key("closed-only"));
+        assert!(!expected.contains_key("deferred-only"));
+        assert!(!expected.contains_key("template-only"));
+        info!("test_default_visible_label_counts_match_default_filtering: assertions passed");
 
         Ok(())
     }
