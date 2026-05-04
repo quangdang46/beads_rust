@@ -1,6 +1,6 @@
 use super::Theme;
 use crate::cli::{Cli, InheritedOutputMode, OutputFormat, command_requests_robot_json};
-use crate::format::IssueWithCounts;
+use crate::format::{IssueWithCounts, ListPage};
 use crate::format::{sanitize_terminal_inline, sanitize_terminal_text};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rich_rust::prelude::*;
@@ -256,6 +256,150 @@ fn write_toon_issue_counts_array_to_writer<W: Write>(
     Ok(())
 }
 
+fn write_toon_list_page_to_writer<W: Write>(
+    writer: &mut W,
+    page: &ListPage,
+) -> serde_json::Result<()> {
+    let mut line = String::new();
+    line.push_str("issues[");
+    line.push_str(&page.issues.len().to_string());
+    line.push_str("]:");
+    writer
+        .write_all(line.as_bytes())
+        .map_err(serde_json::Error::io)?;
+
+    for row in &page.issues {
+        write_toon_issue_counts_object_to_writer(writer, row)?;
+    }
+
+    write_toon_usize_line(writer, "total", page.total)?;
+    write_toon_usize_line(writer, "limit", page.limit)?;
+    write_toon_usize_line(writer, "offset", page.offset)?;
+    write_toon_bool_line(writer, "has_more", page.has_more)
+}
+
+fn list_page_supports_streamed_toon(page: &ListPage) -> bool {
+    page.issues
+        .iter()
+        .all(|row| row.issue.dependencies.is_empty() && row.issue.comments.is_empty())
+}
+
+fn write_toon_issue_counts_object_to_writer<W: Write>(
+    writer: &mut W,
+    row: &IssueWithCounts,
+) -> serde_json::Result<()> {
+    let issue = &row.issue;
+    let mut line = String::new();
+    line.push_str("  - id: ");
+    push_toon_string_value(&mut line, &issue.id);
+    write_toon_newline_and_line(writer, &line)?;
+
+    write_toon_issue_text_fields(writer, &mut line, issue)?;
+    write_toon_issue_workflow_fields(writer, &mut line, issue)?;
+    write_toon_issue_time_fields(writer, &mut line, issue)?;
+    write_toon_issue_source_fields(writer, &mut line, issue)?;
+    write_toon_usize_field(writer, &mut line, "dependency_count", row.dependency_count)?;
+    write_toon_usize_field(writer, &mut line, "dependent_count", row.dependent_count)
+}
+
+fn write_toon_issue_text_fields<W: Write>(
+    writer: &mut W,
+    line: &mut String,
+    issue: &crate::model::Issue,
+) -> serde_json::Result<()> {
+    write_toon_string_field(writer, line, "title", &issue.title)?;
+    write_optional_toon_string_field(writer, line, "description", issue.description.as_deref())?;
+    write_optional_toon_string_field(writer, line, "design", issue.design.as_deref())?;
+    write_optional_toon_string_field(
+        writer,
+        line,
+        "acceptance_criteria",
+        issue.acceptance_criteria.as_deref(),
+    )?;
+    write_optional_toon_string_field(writer, line, "notes", issue.notes.as_deref())
+}
+
+fn write_toon_issue_workflow_fields<W: Write>(
+    writer: &mut W,
+    line: &mut String,
+    issue: &crate::model::Issue,
+) -> serde_json::Result<()> {
+    write_toon_string_field(writer, line, "status", issue.status.as_str())?;
+    write_toon_i32_field(writer, line, "priority", issue.priority.0)?;
+    write_toon_string_field(writer, line, "issue_type", issue.issue_type.as_str())?;
+    write_optional_toon_string_field(writer, line, "assignee", issue.assignee.as_deref())?;
+    write_optional_toon_string_field(writer, line, "owner", issue.owner.as_deref())?;
+    write_optional_toon_i32_field(writer, line, "estimated_minutes", issue.estimated_minutes)
+}
+
+fn write_toon_issue_time_fields<W: Write>(
+    writer: &mut W,
+    line: &mut String,
+    issue: &crate::model::Issue,
+) -> serde_json::Result<()> {
+    write_toon_datetime_field(writer, line, "created_at", &issue.created_at)?;
+    write_optional_toon_string_field(writer, line, "created_by", issue.created_by.as_deref())?;
+    write_toon_datetime_field(writer, line, "updated_at", &issue.updated_at)?;
+    write_optional_toon_datetime_field(writer, line, "closed_at", issue.closed_at.as_ref())?;
+    write_optional_toon_string_field(writer, line, "close_reason", issue.close_reason.as_deref())?;
+    write_optional_toon_string_field(
+        writer,
+        line,
+        "closed_by_session",
+        issue.closed_by_session.as_deref(),
+    )?;
+    write_optional_toon_datetime_field(writer, line, "due_at", issue.due_at.as_ref())?;
+    write_optional_toon_datetime_field(writer, line, "defer_until", issue.defer_until.as_ref())
+}
+
+fn write_toon_issue_source_fields<W: Write>(
+    writer: &mut W,
+    line: &mut String,
+    issue: &crate::model::Issue,
+) -> serde_json::Result<()> {
+    write_optional_toon_string_field(writer, line, "external_ref", issue.external_ref.as_deref())?;
+    write_optional_toon_string_field(
+        writer,
+        line,
+        "source_system",
+        issue.source_system.as_deref(),
+    )?;
+    write_optional_toon_string_field(writer, line, "source_repo", issue.source_repo.as_deref())?;
+    write_optional_toon_datetime_field(writer, line, "deleted_at", issue.deleted_at.as_ref())?;
+    write_optional_toon_string_field(writer, line, "deleted_by", issue.deleted_by.as_deref())?;
+    write_optional_toon_string_field(
+        writer,
+        line,
+        "delete_reason",
+        issue.delete_reason.as_deref(),
+    )?;
+    write_optional_toon_string_field(
+        writer,
+        line,
+        "original_type",
+        issue.original_type.as_deref(),
+    )?;
+    write_toon_i32_field(
+        writer,
+        line,
+        "compaction_level",
+        issue.compaction_level.unwrap_or_default(),
+    )?;
+    write_optional_toon_datetime_field(writer, line, "compacted_at", issue.compacted_at.as_ref())?;
+    write_optional_toon_string_field(
+        writer,
+        line,
+        "compacted_at_commit",
+        issue.compacted_at_commit.as_deref(),
+    )?;
+    write_optional_toon_i32_field(writer, line, "original_size", issue.original_size)?;
+    write_optional_toon_string_field(writer, line, "sender", issue.sender.as_deref())?;
+    write_toon_true_field_if_set(writer, line, "ephemeral", issue.ephemeral)?;
+    write_toon_true_field_if_set(writer, line, "pinned", issue.pinned)?;
+    write_toon_true_field_if_set(writer, line, "is_template", issue.is_template)?;
+    write_toon_labels_field(writer, line, &issue.labels)
+}
+
 fn issue_counts_toon_fields(row: &IssueWithCounts) -> Option<Vec<&'static str>> {
     let issue = &row.issue;
     if !issue.labels.is_empty() || !issue.dependencies.is_empty() || !issue.comments.is_empty() {
@@ -406,6 +550,169 @@ fn push_toon_issue_counts_field(out: &mut String, row: &IssueWithCounts, field: 
         "dependent_count" => out.push_str(&row.dependent_count.to_string()),
         _ => {}
     }
+}
+
+fn write_toon_newline_and_line<W: Write>(writer: &mut W, line: &str) -> serde_json::Result<()> {
+    writer.write_all(b"\n").map_err(serde_json::Error::io)?;
+    writer
+        .write_all(line.as_bytes())
+        .map_err(serde_json::Error::io)
+}
+
+fn write_toon_field_with<W, F>(
+    writer: &mut W,
+    line: &mut String,
+    field: &str,
+    push_value: F,
+) -> serde_json::Result<()>
+where
+    W: Write,
+    F: FnOnce(&mut String),
+{
+    line.clear();
+    line.push_str("    ");
+    line.push_str(field);
+    line.push_str(": ");
+    push_value(line);
+    write_toon_newline_and_line(writer, line)
+}
+
+fn write_toon_string_field<W: Write>(
+    writer: &mut W,
+    line: &mut String,
+    field: &str,
+    value: &str,
+) -> serde_json::Result<()> {
+    write_toon_field_with(writer, line, field, |line| {
+        push_toon_string_value(line, value);
+    })
+}
+
+fn write_optional_toon_string_field<W: Write>(
+    writer: &mut W,
+    line: &mut String,
+    field: &str,
+    value: Option<&str>,
+) -> serde_json::Result<()> {
+    if let Some(value) = value {
+        write_toon_string_field(writer, line, field, value)?;
+    }
+    Ok(())
+}
+
+fn write_toon_i32_field<W: Write>(
+    writer: &mut W,
+    line: &mut String,
+    field: &str,
+    value: i32,
+) -> serde_json::Result<()> {
+    write_toon_field_with(writer, line, field, |line| {
+        line.push_str(&value.to_string());
+    })
+}
+
+fn write_optional_toon_i32_field<W: Write>(
+    writer: &mut W,
+    line: &mut String,
+    field: &str,
+    value: Option<i32>,
+) -> serde_json::Result<()> {
+    if let Some(value) = value {
+        write_toon_i32_field(writer, line, field, value)?;
+    }
+    Ok(())
+}
+
+fn write_toon_usize_field<W: Write>(
+    writer: &mut W,
+    line: &mut String,
+    field: &str,
+    value: usize,
+) -> serde_json::Result<()> {
+    write_toon_field_with(writer, line, field, |line| {
+        line.push_str(&value.to_string());
+    })
+}
+
+fn write_toon_datetime_field<W: Write>(
+    writer: &mut W,
+    line: &mut String,
+    field: &str,
+    value: &DateTime<Utc>,
+) -> serde_json::Result<()> {
+    write_toon_field_with(writer, line, field, |line| {
+        push_toon_datetime_value(line, value);
+    })
+}
+
+fn write_optional_toon_datetime_field<W: Write>(
+    writer: &mut W,
+    line: &mut String,
+    field: &str,
+    value: Option<&DateTime<Utc>>,
+) -> serde_json::Result<()> {
+    if let Some(value) = value {
+        write_toon_datetime_field(writer, line, field, value)?;
+    }
+    Ok(())
+}
+
+fn write_toon_true_field_if_set<W: Write>(
+    writer: &mut W,
+    line: &mut String,
+    field: &str,
+    value: bool,
+) -> serde_json::Result<()> {
+    if value {
+        write_toon_field_with(writer, line, field, |line| line.push_str("true"))?;
+    }
+    Ok(())
+}
+
+fn write_toon_labels_field<W: Write>(
+    writer: &mut W,
+    line: &mut String,
+    labels: &[String],
+) -> serde_json::Result<()> {
+    if labels.is_empty() {
+        return Ok(());
+    }
+
+    line.clear();
+    line.push_str("    labels[");
+    line.push_str(&labels.len().to_string());
+    line.push_str("]: ");
+    for (index, label) in labels.iter().enumerate() {
+        if index > 0 {
+            line.push(',');
+        }
+        push_toon_string_value(line, label);
+    }
+    write_toon_newline_and_line(writer, line)
+}
+
+fn write_toon_usize_line<W: Write>(
+    writer: &mut W,
+    field: &str,
+    value: usize,
+) -> serde_json::Result<()> {
+    let mut line = String::new();
+    line.push_str(field);
+    line.push_str(": ");
+    line.push_str(&value.to_string());
+    write_toon_newline_and_line(writer, &line)
+}
+
+fn write_toon_bool_line<W: Write>(
+    writer: &mut W,
+    field: &str,
+    value: bool,
+) -> serde_json::Result<()> {
+    let mut line = String::new();
+    line.push_str(field);
+    line.push_str(": ");
+    line.push_str(if value { "true" } else { "false" });
+    write_toon_newline_and_line(writer, &line)
 }
 
 fn push_toon_datetime_value(out: &mut String, value: &DateTime<Utc>) {
@@ -934,6 +1241,29 @@ impl OutputContext {
         let stdout = io::stdout();
         let mut out = io::BufWriter::with_capacity(JSON_OUTPUT_BUFFER_CAPACITY, stdout.lock());
         if let Err(err) = write_toon_issue_counts_array_to_writer(&mut out, values, &fields) {
+            self.report_serialization_error("TOON", &err);
+            return true;
+        }
+        if let Err(err) = write_json_trailer_to_writer(&mut out) {
+            self.report_serialization_error("TOON", &err);
+        }
+        true
+    }
+
+    pub(crate) fn toon_list_page_with_stats(&self, page: &ListPage, show_stats: bool) -> bool {
+        if !self.is_toon() {
+            return false;
+        }
+        if Self::should_emit_toon_stats(show_stats, std::env::var("TOON_STATS").is_ok()) {
+            return false;
+        }
+        if !list_page_supports_streamed_toon(page) {
+            return false;
+        }
+
+        let stdout = io::stdout();
+        let mut out = io::BufWriter::with_capacity(JSON_OUTPUT_BUFFER_CAPACITY, stdout.lock());
+        if let Err(err) = write_toon_list_page_to_writer(&mut out, page) {
             self.report_serialization_error("TOON", &err);
             return true;
         }
@@ -1489,6 +1819,68 @@ mod tests {
             String::from_utf8(streamed)
                 .expect("TOON output should be utf8")
             .starts_with("[2]{id,title,description,design,acceptance_criteria,notes,status,priority,issue_type,created_at,created_by,updated_at,source_repo,compaction_level,dependency_count,dependent_count}:")
+        );
+    }
+
+    #[test]
+    fn write_toon_list_page_to_writer_matches_materialized_encode_output() {
+        let closed_at = Utc
+            .with_ymd_and_hms(2026, 4, 2, 1, 40, 2)
+            .single()
+            .expect("valid timestamp");
+        let mut first = toon_test_issue("bd-c-00004", "Labeled page row");
+        first.assignee = Some("PinkTiger".to_string());
+        first.owner = Some("swarm".to_string());
+        first.estimated_minutes = Some(42);
+        first.closed_at = Some(closed_at);
+        first.close_reason = Some("fixed".to_string());
+        first.due_at = Some(closed_at);
+        first.external_ref = Some("JIRA-42".to_string());
+        first.compacted_at_commit = Some("abc123".to_string());
+        first.original_size = Some(0);
+        first.sender = Some("agent,quoted".to_string());
+        first.pinned = true;
+        first.labels = vec![
+            "perf".to_string(),
+            "needs,quotes".to_string(),
+            "swarm".to_string(),
+        ];
+        let page = ListPage {
+            issues: vec![
+                IssueWithCounts {
+                    issue: first,
+                    dependency_count: 3,
+                    dependent_count: 5,
+                },
+                IssueWithCounts {
+                    issue: toon_test_issue("bd-c-00005", "Sparse page row"),
+                    dependency_count: 0,
+                    dependent_count: 0,
+                },
+            ],
+            total: 7,
+            limit: 2,
+            offset: 1,
+            has_more: true,
+        };
+        let mut streamed = Vec::new();
+
+        write_toon_list_page_to_writer(&mut streamed, &page)
+            .expect("streaming list-page TOON output failed");
+
+        let mut toon_value =
+            JsonValue::from(serde_json::to_value(&page).expect("materialized page JSON failed"));
+        sanitize_toon_value(&mut toon_value);
+        let lines = encode_lines(toon_value, Some(toon_encode_options()));
+        let mut materialized = Vec::new();
+        write_toon_lines_to_writer(&mut materialized, &lines)
+            .expect("materialized TOON line output failed");
+
+        assert_eq!(streamed, materialized);
+        assert!(
+            String::from_utf8(streamed)
+                .expect("TOON output should be utf8")
+                .starts_with("issues[2]:\n  - id: bd-c-00004")
         );
     }
 

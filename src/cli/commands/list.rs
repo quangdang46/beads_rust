@@ -218,7 +218,9 @@ fn execute_inner(
                     offset: page_meta.offset,
                     has_more: page_meta.has_more,
                 };
-                ctx.toon_with_stats(&page, args.stats);
+                if !ctx.toon_list_page_with_stats(&page, args.stats) {
+                    ctx.toon_with_stats(&page, args.stats);
+                }
             } else {
                 stream_issues_with_counts(
                     &ctx,
