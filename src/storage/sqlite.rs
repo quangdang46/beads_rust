@@ -4064,6 +4064,15 @@ impl SqliteStorage {
             return Ok(Vec::new());
         }
 
+        if let Some(limit) = default_visible_limited_page_limit(filters) {
+            return self.search_default_visible_limited_page(
+                trimmed,
+                filters.include_deferred,
+                limit,
+                projection,
+            );
+        }
+
         let mut sql = String::from(projection.select_clause());
         let mut params: Vec<SqliteValue> = Vec::new();
 
@@ -4228,6 +4237,82 @@ impl SqliteStorage {
             issues.push(projection.parse_issue(row)?);
         }
 
+        Ok(issues)
+    }
+
+    fn search_default_visible_limited_page(
+        &self,
+        query: &str,
+        include_deferred: bool,
+        limit: usize,
+        projection: SearchIssueProjection,
+    ) -> Result<Vec<Issue>> {
+        let status_filter = if include_deferred {
+            "status NOT IN ('closed', 'tombstone')"
+        } else {
+            "status NOT IN ('closed', 'tombstone', 'deferred')"
+        };
+        let needle = query.to_ascii_lowercase();
+        let mut issues = self.search_default_visible_priority_window(
+            status_filter,
+            &needle,
+            projection,
+            "priority = ?",
+            Priority::CRITICAL.0,
+            "created_at DESC, id ASC",
+            limit,
+        )?;
+
+        let remaining = limit.saturating_sub(issues.len());
+        if remaining > 0 {
+            issues.extend(self.search_default_visible_priority_window(
+                status_filter,
+                &needle,
+                projection,
+                "priority > ?",
+                Priority::CRITICAL.0,
+                "priority ASC, created_at DESC, id ASC",
+                remaining,
+            )?);
+        }
+
+        Ok(issues)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn search_default_visible_priority_window(
+        &self,
+        status_filter: &str,
+        needle: &str,
+        projection: SearchIssueProjection,
+        priority_predicate: &str,
+        priority_value: i32,
+        order_by: &str,
+        limit: usize,
+    ) -> Result<Vec<Issue>> {
+        let sql = format!(
+            r"{}
+              AND {status_filter}
+              AND (is_template = 0 OR is_template IS NULL)
+              AND {priority_predicate}
+              AND (instr(lower(title), ?) > 0 OR instr(lower(description), ?) > 0 OR instr(lower(id), ?) > 0)
+              ORDER BY {order_by}
+              LIMIT {limit}",
+            projection.select_clause()
+        );
+        let rows = self.conn.query_with_params(
+            &sql,
+            &[
+                SqliteValue::from(i64::from(priority_value)),
+                SqliteValue::from(needle),
+                SqliteValue::from(needle),
+                SqliteValue::from(needle),
+            ],
+        )?;
+        let mut issues = Vec::with_capacity(rows.len());
+        for row in &rows {
+            issues.push(projection.parse_issue(row)?);
+        }
         Ok(issues)
     }
 
@@ -17429,6 +17514,106 @@ mod tests {
         let ids: Vec<_> = results.iter().map(|issue| issue.id.as_str()).collect();
 
         assert_eq!(ids, vec!["bd-search-a", "bd-search-b"]);
+    }
+
+    #[test]
+    fn test_search_issues_default_visible_limited_page_matches_generic_order() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let base = Utc.with_ymd_and_hms(2025, 9, 4, 0, 0, 0).unwrap();
+
+        let mut closed = make_issue(
+            "bd-search-closed",
+            "needle closed",
+            Status::Closed,
+            0,
+            None,
+            base + chrono::Duration::minutes(10),
+            None,
+        );
+        closed.closed_at = Some(base + chrono::Duration::minutes(11));
+        let mut template = make_issue(
+            "bd-search-template",
+            "needle template",
+            Status::Open,
+            0,
+            None,
+            base + chrono::Duration::minutes(9),
+            None,
+        );
+        template.is_template = true;
+
+        for issue in [
+            make_issue(
+                "bd-search-p1",
+                "needle p1",
+                Status::Open,
+                1,
+                None,
+                base + chrono::Duration::minutes(4),
+                None,
+            ),
+            make_issue(
+                "bd-search-p0-old",
+                "needle p0 old",
+                Status::Open,
+                0,
+                None,
+                base + chrono::Duration::minutes(1),
+                None,
+            ),
+            make_issue(
+                "bd-search-deferred",
+                "needle deferred",
+                Status::Deferred,
+                0,
+                None,
+                base + chrono::Duration::minutes(3),
+                None,
+            ),
+            make_issue(
+                "bd-search-p0-new",
+                "needle p0 new",
+                Status::Open,
+                0,
+                None,
+                base + chrono::Duration::minutes(2),
+                None,
+            ),
+            make_issue(
+                "bd-search-nomatch",
+                "other",
+                Status::Open,
+                0,
+                None,
+                base + chrono::Duration::minutes(5),
+                None,
+            ),
+            closed,
+            template,
+        ] {
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        let fast_filters = ListFilters {
+            include_deferred: true,
+            limit: Some(3),
+            ..ListFilters::default()
+        };
+        let generic_filters = ListFilters {
+            include_deferred: true,
+            limit: Some(3),
+            sort: Some("priority".to_string()),
+            ..ListFilters::default()
+        };
+
+        let fast_ids = issue_ids(storage.search_issues("needle", &fast_filters).unwrap());
+        let generic_ids = issue_ids(storage.search_issues("needle", &generic_filters).unwrap());
+
+        assert_eq!(fast_ids, generic_ids);
+        assert_eq!(
+            fast_ids,
+            vec!["bd-search-deferred", "bd-search-p0-new", "bd-search-p0-old",]
+        );
     }
 
     #[test]
