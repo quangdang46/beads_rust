@@ -68,7 +68,7 @@ the locked path.
 Routine matrix test:
 
 ```bash
-env CARGO_TARGET_DIR=/data/tmp/beads_rust_dustypuma_cli_fastopen \
+env CARGO_TARGET_DIR=/data/tmp/beads_rust_purplesnow_fastopen \
   cargo test --test e2e_read_only_fast_open -- --nocapture
 ```
 
@@ -87,7 +87,7 @@ This asserts:
 Perf probe:
 
 ```bash
-env CARGO_TARGET_DIR=/data/tmp/beads_rust_dustypuma_cli_fastopen \
+env CARGO_TARGET_DIR=/data/tmp/beads_rust_purplesnow_fastopen \
   cargo test --test e2e_read_only_fast_open \
   cli_read_only_fast_open_matrix_perf_probe -- --ignored --nocapture
 ```
