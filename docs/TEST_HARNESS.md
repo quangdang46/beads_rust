@@ -271,6 +271,34 @@ decomposition across queueing/lock, service CPU, IO/page reads, and
 serialization/output. See `docs/ARTIFACT_LOG_SCHEMA.md` for
 `br.numa-read-command-profile.v1`.
 
+**Swarm capacity-planning report (manual operator artifact)**
+```bash
+export BR_CAPACITY_REPORT_DIR=tests/artifacts/perf/beads-perf-<timestamp>-swarm-capacity-planning
+export BR_CAPACITY_WORKSPACE=/data/tmp/br-large-read-profile
+export BR_CAPACITY_BINARY=/data/tmp/br-release/release/br
+export BR_NUMA_PROFILE_DIR=tests/artifacts/perf/beads-perf-<timestamp>-numa-read-command-profile
+
+mkdir -p "$BR_CAPACITY_REPORT_DIR"/{inputs,golden}
+cp "$BR_NUMA_PROFILE_DIR/env.json" "$BR_CAPACITY_REPORT_DIR/inputs/numa-env.json"
+cp "$BR_NUMA_PROFILE_DIR/timing/default-summary.json" \
+  "$BR_CAPACITY_REPORT_DIR/inputs/read-default-summary.json"
+cp "$BR_NUMA_PROFILE_DIR/timing/pinned-cpu0-summary.json" \
+  "$BR_CAPACITY_REPORT_DIR/inputs/read-pinned-cpu0-summary.json"
+
+"$BR_CAPACITY_BINARY" --no-auto-import --no-auto-flush count --json \
+  > "$BR_CAPACITY_REPORT_DIR/inputs/count.json"
+"$BR_CAPACITY_BINARY" --no-auto-import --no-auto-flush sync --status --json \
+  > "$BR_CAPACITY_REPORT_DIR/inputs/sync-status.json"
+"$BR_CAPACITY_BINARY" --no-auto-import --no-auto-flush doctor --json \
+  > "$BR_CAPACITY_REPORT_DIR/inputs/doctor.json"
+```
+The report should emit both `report.json` and `report.md`. The JSON report uses
+`br.swarm-capacity-report.v1` and must include source evidence paths, issue
+count, dirty/export state, doctor status, host profile, weighted read p95,
+assumed command cadence, green/yellow/red agent bands, laptop/small-VM fallback
+guidance, and invalidation rules. The Markdown report is the operator-facing
+view. Always include `golden/report-sha256.txt` for snapshot-style checks.
+
 **Real datasets**
 ```bash
 cargo test --test bench_real_datasets -- --nocapture --ignored

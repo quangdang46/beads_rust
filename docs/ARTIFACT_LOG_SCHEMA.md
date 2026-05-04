@@ -393,6 +393,65 @@ Cross-NUMA mode is required on hosts where `numactl --hardware` reports two or
 more nodes. Single-node hosts must keep the `cross_numa` profile entry with
 `status: "unavailable_on_pilot_host"` and preserve the raw `numactl` output.
 
+### 8. Swarm Capacity Report (report.json + report.md)
+
+Capacity-planning bundles translate perf evidence into operator-facing
+concurrency bands. They do not claim a universal maximum. They record the
+assumptions, measured command mix, uncertainty, and invalidation triggers used
+to recommend green/yellow/red agent-count ranges.
+
+```json
+{
+  "schema_version": "br.swarm-capacity-report.v1",
+  "generated_at": "2026-05-04T22:30:00Z",
+  "bead": "beads_rust-72yf.41",
+  "source_evidence": {
+    "numa_profile": "tests/artifacts/perf/.../manifest.json",
+    "drift_guard_schema": "br.sequential-drift-guard.v1",
+    "count_path": "inputs/count.json",
+    "sync_status_path": "inputs/sync-status.json",
+    "doctor_path": "inputs/doctor.json"
+  },
+  "workspace": {
+    "issue_count": 12000,
+    "dirty_count": 0,
+    "doctor_ok": true
+  },
+  "hardware": {
+    "logical_cpus": 128,
+    "physical_cores": 64,
+    "memory_total_bytes": 536069881856,
+    "numa_nodes": 1
+  },
+  "model": {
+    "weighted_p95_ms": 162,
+    "assumed_commands_per_agent_per_second": 1.0,
+    "p95_latency_budget_ms": 500,
+    "uncertainty": "medium for read-heavy workloads; high for write-heavy workloads"
+  },
+  "recommendations": {
+    "high_core_host": [
+      {"band": "green", "agents": "1-64"},
+      {"band": "yellow", "agents": "65-128"},
+      {"band": "red", "agents": ">128"}
+    ],
+    "laptop_or_small_vm": [
+      {"band": "green", "agents": "1-4"},
+      {"band": "yellow", "agents": "5-8"},
+      {"band": "red", "agents": ">8"}
+    ]
+  },
+  "invalidation": {
+    "rerun_when": ["dirty_count is nonzero", "weighted p95 regresses by >5%"],
+    "protected_by": "SequentialDriftGuard"
+  }
+}
+```
+
+Each bundle must also include a human-readable `report.md`, copied input
+evidence under `inputs/`, and `golden/report-sha256.txt` for snapshot-style
+format checks.
+
 ## Directory Structure
 
 ```
@@ -437,6 +496,13 @@ tests/artifacts/perf/
     ├── timing/
     ├── syscalls/
     └── raw/
+
+tests/artifacts/perf/
+└── <swarm-capacity-report>/
+    ├── report.json
+    ├── report.md
+    ├── inputs/
+    └── golden/
 ```
 
 ## Validation Rules
@@ -469,6 +535,8 @@ tests/artifacts/perf/
     the fast path when proof obligations fail, corpus hashes drift, sample counts
     are below budget, candidate errors increase beyond budget, or p95 regression
     exceeds the configured percentage.
+15. **Capacity report uncertainty**: Capacity reports must use bands with
+    assumptions and invalidation rules, not a single unqualified maximum.
 
 ### Cross-Platform Normalization
 
