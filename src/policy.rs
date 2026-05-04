@@ -525,6 +525,18 @@ impl SequentialDriftGuard {
                 "must be greater than zero",
             ));
         }
+        if self.evidence.baseline_error_count < 0 {
+            errors.push(PolicyValidationError::new(
+                "evidence.baseline_error_count",
+                "cannot be negative",
+            ));
+        }
+        if self.evidence.candidate_error_count < 0 {
+            errors.push(PolicyValidationError::new(
+                "evidence.candidate_error_count",
+                "cannot be negative",
+            ));
+        }
         if self.action.accept_value.value_type() != self.fallback.output_value.value_type() {
             errors.push(PolicyValidationError::new(
                 "fallback.output_value",
@@ -1383,7 +1395,7 @@ mod tests {
     }
 
     #[test]
-    fn drift_guard_disables_fast_path_when_error_delta_overflows() {
+    fn drift_guard_rejects_negative_baseline_error_count() {
         let mut guard = sample_drift_guard();
         guard.evidence.baseline_error_count = i64::MIN;
         guard.evidence.candidate_error_count = i64::MAX;
@@ -1391,10 +1403,39 @@ mod tests {
         let decision = guard.evaluate();
 
         assert_eq!(decision.outcome, DriftGuardOutcome::DisableFastPath);
-        assert_eq!(decision.reason, "error_delta_overflow");
+        assert!(decision.reason.contains("invalid_guard"));
+        assert!(
+            decision
+                .reason
+                .contains("evidence.baseline_error_count cannot be negative")
+        );
+    }
+
+    #[test]
+    fn drift_guard_rejects_negative_candidate_error_count() {
+        let mut guard = sample_drift_guard();
+        guard.evidence.candidate_error_count = -1;
+
+        let validation_errors = guard
+            .validate()
+            .expect_err("negative error counts are invalid evidence");
+        assert!(validation_errors.iter().any(|error| {
+            error.field == "evidence.candidate_error_count"
+                && error.message.contains("cannot be negative")
+        }));
+
+        let decision = guard.evaluate();
+
+        assert_eq!(decision.outcome, DriftGuardOutcome::DisableFastPath);
+        assert!(decision.reason.contains("invalid_guard"));
+        assert!(
+            decision
+                .reason
+                .contains("evidence.candidate_error_count cannot be negative")
+        );
         assert_eq!(
             decision.evidence_terms.get("error_delta"),
-            Some(&PolicyValue::Integer(i64::MAX))
+            Some(&PolicyValue::Integer(-1))
         );
     }
 
