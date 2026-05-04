@@ -119,6 +119,11 @@ fn validate_label(label: &str) -> Result<()> {
     LabelValidator::validate(label).map_err(|error| BeadsError::validation("label", error.message))
 }
 
+fn validate_rename_labels(args: &LabelRenameArgs) -> Result<()> {
+    validate_label(&args.old_name)?;
+    validate_label(&args.new_name)
+}
+
 fn label_display_text(value: &str) -> String {
     sanitize_terminal_inline(value).into_owned()
 }
@@ -553,7 +558,7 @@ fn label_rename(
     ctx: &OutputContext,
 ) -> Result<()> {
     let storage = &mut storage_ctx.storage;
-    validate_label(&args.new_name)?;
+    validate_rename_labels(args)?;
 
     if args.old_name == args.new_name {
         if ctx.is_json() {
@@ -1006,6 +1011,28 @@ mod tests {
         assert!(validate_label("special@char").is_err());
         assert!(validate_label("dot.not.allowed").is_err());
         assert!(validate_label(&"a".repeat(51)).is_err());
+    }
+
+    #[test]
+    fn test_validate_rename_labels_rejects_invalid_old_name() {
+        let args = LabelRenameArgs {
+            old_name: "bad label".to_string(),
+            new_name: "backend".to_string(),
+        };
+        let err = validate_rename_labels(&args).unwrap_err();
+
+        assert!(err.to_string().contains("invalid characters"));
+    }
+
+    #[test]
+    fn test_validate_rename_labels_rejects_invalid_new_name() {
+        let args = LabelRenameArgs {
+            old_name: "backend".to_string(),
+            new_name: "bad label".to_string(),
+        };
+        let err = validate_rename_labels(&args).unwrap_err();
+
+        assert!(err.to_string().contains("invalid characters"));
     }
 
     #[test]

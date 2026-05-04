@@ -7352,6 +7352,9 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database update fails.
     pub fn rename_label(&mut self, old_name: &str, new_name: &str, actor: &str) -> Result<usize> {
+        validate_storage_label(old_name)?;
+        validate_storage_label(new_name)?;
+
         if old_name == new_name {
             return Ok(0);
         }
@@ -12985,6 +12988,49 @@ mod tests {
             storage.get_events("bd-l3", 100).unwrap().len(),
             event_count_before
         );
+    }
+
+    #[test]
+    fn test_rename_label_rejects_invalid_label_names_without_mutating() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
+
+        let issue = make_issue(
+            "bd-l-rename-invalid",
+            "Rename invalid label",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+        storage
+            .add_label("bd-l-rename-invalid", "backend", "tester")
+            .unwrap();
+
+        let new_name_error = storage
+            .rename_label("backend", "bad label", "tester")
+            .expect_err("invalid replacement label must fail before mutation");
+        assert!(new_name_error.to_string().contains("invalid characters"));
+        assert_eq!(
+            storage.get_labels("bd-l-rename-invalid").unwrap(),
+            vec!["backend".to_string()]
+        );
+
+        let old_name_error = storage
+            .rename_label("bad label", "frontend", "tester")
+            .expect_err("invalid source label must fail before mutation");
+        assert!(old_name_error.to_string().contains("invalid characters"));
+        assert_eq!(
+            storage.get_labels("bd-l-rename-invalid").unwrap(),
+            vec!["backend".to_string()]
+        );
+
+        let same_name_error = storage
+            .rename_label("bad label", "bad label", "tester")
+            .expect_err("invalid same-name rename must not be treated as a no-op");
+        assert!(same_name_error.to_string().contains("invalid characters"));
     }
 
     #[test]
