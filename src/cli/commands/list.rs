@@ -22,6 +22,8 @@ use chrono::Utc;
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 
+const LARGE_STRUCTURED_LIST_FULL_SCAN_THRESHOLD: usize = 128;
+
 /// Execute the list command.
 ///
 /// # Errors
@@ -78,14 +80,27 @@ fn execute_inner(
     // The effective limit and offset from the user's request.
     let user_limit = args.limit.unwrap_or(DEFAULT_LIST_LIMIT);
     let user_offset = args.offset.unwrap_or(DEFAULT_LIST_OFFSET);
+    let use_full_default_visible_structured_scan = should_use_full_default_visible_structured_scan(
+        args,
+        client_filters,
+        is_json_output,
+        user_limit,
+        user_offset,
+    );
+    if use_full_default_visible_structured_scan {
+        filters.limit = Some(0);
+        filters.offset = Some(0);
+    }
 
     // For paginated structured SQL-path queries, run a COUNT(*) query using the
     // same filters (without LIMIT/OFFSET) so we can include pagination metadata.
     // Unlimited output already materializes the full matching set, so its exact
     // total is the issue vector length after the list query.
     // For client-filter path, the total count is determined after filtering in Rust.
-    let needs_sql_total =
-        is_json_output && !client_filters && (user_limit != 0 || user_offset != 0);
+    let needs_sql_total = is_json_output
+        && !client_filters
+        && !use_full_default_visible_structured_scan
+        && (user_limit != 0 || user_offset != 0);
     let sql_total: Option<usize> = if needs_sql_total {
         Some(storage.count_issues_with_filters(&filters)?)
     } else {
@@ -103,7 +118,11 @@ fn execute_inner(
     } else {
         // Bump SQL limit by 1 to detect whether results were truncated (text output).
         // For JSON output, we already have the exact total from the count query.
-        let ul = filters.limit;
+        let ul = if use_full_default_visible_structured_scan {
+            Some(user_limit)
+        } else {
+            filters.limit
+        };
         if !is_json_output
             && let Some(lim) = filters.limit
             && lim > 0
@@ -192,8 +211,8 @@ fn execute_inner(
     match output_format {
         OutputFormat::Json | OutputFormat::Toon => {
             let ctx = OutputContext::from_output_format(output_format, quiet, true);
-            let use_full_relation_scan =
-                should_use_full_relation_scan(args, client_filters, user_limit, user_offset);
+            let use_full_relation_scan = use_full_default_visible_structured_scan
+                || should_use_full_relation_scan(args, client_filters, user_limit, user_offset);
 
             let has_more = if user_limit == 0 {
                 false
@@ -529,6 +548,30 @@ fn should_use_full_relation_scan(
         && args.title_contains.is_none()
         && args.label.is_empty()
         && args.label_any.is_empty()
+}
+
+fn should_use_full_default_visible_structured_scan(
+    args: &ListArgs,
+    client_filters: bool,
+    is_structured_output: bool,
+    user_limit: usize,
+    user_offset: usize,
+) -> bool {
+    is_structured_output
+        && !client_filters
+        && user_offset == 0
+        && user_limit >= LARGE_STRUCTURED_LIST_FULL_SCAN_THRESHOLD
+        && !args.all
+        && args.status.is_empty()
+        && args.type_.is_empty()
+        && args.priority.is_empty()
+        && args.assignee.is_none()
+        && !args.unassigned
+        && args.title_contains.is_none()
+        && args.label.is_empty()
+        && args.label_any.is_empty()
+        && args.sort.is_none()
+        && !args.reverse
 }
 
 fn apply_client_filters(
@@ -910,6 +953,53 @@ mod tests {
             false,
             0,
             0,
+        ));
+    }
+
+    #[test]
+    fn test_large_structured_pages_use_full_default_scan() {
+        init_logging();
+        assert!(should_use_full_default_visible_structured_scan(
+            &ListArgs::default(),
+            false,
+            true,
+            LARGE_STRUCTURED_LIST_FULL_SCAN_THRESHOLD,
+            0,
+        ));
+
+        assert!(!should_use_full_default_visible_structured_scan(
+            &ListArgs::default(),
+            false,
+            true,
+            LARGE_STRUCTURED_LIST_FULL_SCAN_THRESHOLD - 1,
+            0,
+        ));
+
+        assert!(!should_use_full_default_visible_structured_scan(
+            &ListArgs {
+                label: vec!["backend".to_string()],
+                ..Default::default()
+            },
+            false,
+            true,
+            LARGE_STRUCTURED_LIST_FULL_SCAN_THRESHOLD,
+            0,
+        ));
+
+        assert!(!should_use_full_default_visible_structured_scan(
+            &ListArgs::default(),
+            false,
+            false,
+            LARGE_STRUCTURED_LIST_FULL_SCAN_THRESHOLD,
+            0,
+        ));
+
+        assert!(!should_use_full_default_visible_structured_scan(
+            &ListArgs::default(),
+            false,
+            true,
+            LARGE_STRUCTURED_LIST_FULL_SCAN_THRESHOLD,
+            1,
         ));
     }
 
