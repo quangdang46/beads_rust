@@ -21,7 +21,7 @@ const TITLE_MAX_CHARS: usize = 500;
 const LONG_TEXT_MAX_BYTES: usize = 102_400;
 const ACTOR_MAX_CHARS: usize = 200;
 const CUSTOM_VARIANT_MAX_CHARS: usize = 50;
-const ISSUE_LABEL_MAX_COUNT: usize = 64;
+pub(crate) const ISSUE_LABEL_MAX_COUNT: usize = 64;
 
 /// Validates issue fields and invariants.
 pub struct IssueValidator;

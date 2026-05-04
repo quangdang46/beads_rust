@@ -14,7 +14,7 @@ use crate::sync::{
     METADATA_LAST_EXPORT_TIME, METADATA_LAST_IMPORT_TIME,
 };
 use crate::util::id::{normalize_prefix, parse_id};
-use crate::validation::{CommentValidator, IssueValidator};
+use crate::validation::{CommentValidator, ISSUE_LABEL_MAX_COUNT, IssueValidator, LabelValidator};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use fsqlite::Connection;
 use fsqlite::compat::{OpenFlags, open_with_flags};
@@ -6834,6 +6834,8 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database update fails.
     pub fn add_label(&mut self, issue_id: &str, label: &str, actor: &str) -> Result<bool> {
+        validate_storage_label(label)?;
+
         self.mutate("add_label", actor, |conn, ctx| {
             match Self::issue_status_in_tx(conn, issue_id)? {
                 Some(Status::Tombstone) => {
@@ -6858,6 +6860,19 @@ impl SqliteStorage {
 
             if exists > 0 {
                 return Ok(false);
+            }
+
+            let row = conn.query_row_with_params(
+                "SELECT count(*) FROM labels WHERE issue_id = ?",
+                &[SqliteValue::from(issue_id)],
+            )?;
+            let label_count = row
+                .get(0)
+                .and_then(SqliteValue::as_integer)
+                .and_then(|count| usize::try_from(count).ok())
+                .unwrap_or(usize::MAX);
+            if label_count >= ISSUE_LABEL_MAX_COUNT {
+                return Err(label_count_error());
             }
 
             conn.execute_with_params(
@@ -6986,6 +7001,7 @@ impl SqliteStorage {
                 .collect();
             let old_labels = dedupe_preserving_order(&old_labels_raw);
             let desired_labels = dedupe_preserving_order(labels);
+            validate_storage_labels(&desired_labels)?;
 
             let old_matches_desired = old_labels.len() == desired_labels.len()
                 && old_labels
@@ -11263,6 +11279,26 @@ fn dedupe_preserving_order(values: &[String]) -> Vec<String> {
     deduped
 }
 
+fn validate_storage_label(label: &str) -> Result<()> {
+    LabelValidator::validate(label).map_err(|error| BeadsError::validation("label", error.message))
+}
+
+fn validate_storage_labels(labels: &[String]) -> Result<()> {
+    if labels.len() > ISSUE_LABEL_MAX_COUNT {
+        return Err(label_count_error());
+    }
+
+    for label in labels {
+        validate_storage_label(label)?;
+    }
+
+    Ok(())
+}
+
+fn label_count_error() -> BeadsError {
+    BeadsError::validation("labels", format!("exceeds {ISSUE_LABEL_MAX_COUNT} labels"))
+}
+
 impl Drop for SqliteStorage {
     fn drop(&mut self) {
         // Read-only commands leave `mutation_count` at zero, so they keep
@@ -12704,6 +12740,56 @@ mod tests {
     }
 
     #[test]
+    fn test_add_label_rejects_invalid_storage_label() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
+
+        let issue = make_issue(
+            "bd-l-invalid",
+            "Invalid label",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+
+        let err = storage
+            .add_label("bd-l-invalid", "bad label", "tester")
+            .expect_err("invalid labels must be rejected at storage boundary");
+        assert!(err.to_string().contains("invalid characters"));
+        assert!(storage.get_labels("bd-l-invalid").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_add_label_enforces_issue_label_limit() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
+
+        let issue = make_issue("bd-l-cap", "Label cap", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue, "tester").unwrap();
+
+        for index in 0..ISSUE_LABEL_MAX_COUNT {
+            let label = format!("label-{index:02}");
+            assert!(storage.add_label("bd-l-cap", &label, "tester").unwrap());
+        }
+
+        assert!(
+            !storage.add_label("bd-l-cap", "label-00", "tester").unwrap(),
+            "duplicate labels should remain an idempotent no-op at the cap"
+        );
+        let err = storage
+            .add_label("bd-l-cap", "label-extra", "tester")
+            .expect_err("new label beyond cap must fail");
+        assert!(err.to_string().contains("exceeds 64 labels"));
+        assert_eq!(
+            storage.get_labels("bd-l-cap").unwrap().len(),
+            ISSUE_LABEL_MAX_COUNT
+        );
+    }
+
+    #[test]
     fn test_set_labels_deduplicates_input() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
@@ -12725,6 +12811,47 @@ mod tests {
 
         let labels = storage.get_labels("bd-l2").unwrap();
         assert_eq!(labels, vec!["api".to_string(), "backend".to_string()]);
+    }
+
+    #[test]
+    fn test_set_labels_validates_before_replacing_existing_labels() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
+
+        let issue = make_issue(
+            "bd-l-set-invalid",
+            "Set labels",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+        storage
+            .set_labels("bd-l-set-invalid", &["stable".to_string()], "tester")
+            .unwrap();
+
+        let err = storage
+            .set_labels("bd-l-set-invalid", &["bad label".to_string()], "tester")
+            .expect_err("invalid replacement label must fail before deleting old labels");
+        assert!(err.to_string().contains("invalid characters"));
+        assert_eq!(
+            storage.get_labels("bd-l-set-invalid").unwrap(),
+            vec!["stable".to_string()]
+        );
+
+        let too_many = (0..=ISSUE_LABEL_MAX_COUNT)
+            .map(|index| format!("label-{index:02}"))
+            .collect::<Vec<_>>();
+        let err = storage
+            .set_labels("bd-l-set-invalid", &too_many, "tester")
+            .expect_err("too many replacement labels must fail");
+        assert!(err.to_string().contains("exceeds 64 labels"));
+        assert_eq!(
+            storage.get_labels("bd-l-set-invalid").unwrap(),
+            vec!["stable".to_string()]
+        );
     }
 
     #[test]
