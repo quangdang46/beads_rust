@@ -86,6 +86,7 @@ const PLACEHOLDER_EXACT: &[&str] = &[
 
 const SHOW_ISSUE_BATCH_MAX: usize = 100;
 const UPDATE_ISSUE_BATCH_MAX: usize = 100;
+const CLOSE_ISSUE_BATCH_MAX: usize = 100;
 
 // ---------------------------------------------------------------------------
 // Placeholder detection
@@ -1932,17 +1933,175 @@ impl CloseIssueTool {
     }
 }
 
+fn close_issue_json(
+    storage: &mut SqliteStorage,
+    state: &BeadsState,
+    id: &str,
+    reason: Option<&str>,
+) -> McpResult<Value> {
+    // Validate ID exists (with placeholder detection + fuzzy suggestions).
+    require_valid_issue(storage, id)?;
+
+    // Idempotency: if already closed, return existing state without error.
+    if let Some(details) = storage
+        .get_issue_details(id, false, false, 0)
+        .map_err(beads_to_mcp)?
+        && details.issue.status == Status::Closed
+    {
+        let issue = details.issue;
+        return Ok(json!({
+            "id": issue.id,
+            "title": issue.title,
+            "status": "closed",
+            "closed_at": issue.closed_at,
+            "close_reason": issue.close_reason,
+            "already_closed": true,
+            "next_actions": ["Issue was already closed. Use list_issues to find open work."]
+        }));
+    }
+
+    let now = chrono::Utc::now();
+    let close_update = IssueUpdate {
+        status: Some(Status::Closed),
+        closed_at: Some(Some(now)),
+        close_reason: Some(reason.map(str::to_string)),
+        ..IssueUpdate::default()
+    };
+
+    let issue = storage
+        .update_issue(id, &close_update, &state.actor)
+        .map_err(beads_to_mcp)?;
+
+    let mut warnings = Vec::new();
+
+    // Check for blockers this issue had (warn about closing a blocked issue).
+    let our_blockers = match storage.get_blockers(id) {
+        Ok(blockers) => Some(blockers),
+        Err(err) => {
+            warnings.push(storage_read_warning("get_blockers", &err));
+            None
+        }
+    };
+
+    // Check what this issue was blocking (now potentially unblocked).
+    let dependents = match storage.get_blocked_issue_ids(id) {
+        Ok(dependents) => Some(dependents),
+        Err(err) => {
+            warnings.push(storage_read_warning("get_blocked_issue_ids", &err));
+            None
+        }
+    };
+
+    let mut result = json!({
+        "id": issue.id,
+        "title": issue.title,
+        "status": "closed",
+        "closed_at": issue.closed_at,
+        "close_reason": reason,
+    });
+
+    if !warnings.is_empty() {
+        result["warnings"] = json!(warnings);
+    }
+
+    if let Some(our_blockers) = our_blockers
+        && !our_blockers.is_empty()
+    {
+        result["warning"] = json!(format!(
+            "This issue was blocked by {} issue(s): {}. Consider whether those blockers are still relevant.",
+            our_blockers.len(),
+            our_blockers.join(", ")
+        ));
+    }
+
+    if let Some(dependents) = dependents {
+        if dependents.is_empty() {
+            result["next_actions"] = json!(["Issue closed successfully."]);
+        } else {
+            result["unblocked_candidates"] = json!(dependents);
+            result["next_actions"] = json!([
+                format!(
+                    "{} dependent issue(s) may now be unblocked: {}",
+                    dependents.len(),
+                    dependents.join(", ")
+                ),
+                "Use show_issue on these to check if they're now ready for work"
+            ]);
+        }
+    } else {
+        result["next_actions"] =
+            json!(["Issue closed successfully. Dependent lookup failed; see warnings."]);
+    }
+
+    Ok(result)
+}
+
+fn close_issue_batch_ids(args: &Value) -> McpResult<Option<Vec<String>>> {
+    if args.get("id").is_some() && args.get("ids").is_some() {
+        return Err(McpError::invalid_params(
+            "Provide either 'id' for a single close or 'ids' for a batch, not both",
+        ));
+    }
+
+    optional_non_empty_string_array_arg(args, "ids", CLOSE_ISSUE_BATCH_MAX)
+}
+
+fn close_issue_batch_error_item(index: usize, id: &str, err: McpError) -> Value {
+    json!({
+        "index": index,
+        "id": id,
+        "ok": false,
+        "error": mcp_error_json(err),
+    })
+}
+
+fn close_issue_batch_json(
+    storage: &mut SqliteStorage,
+    state: &BeadsState,
+    ids: &[String],
+    reason: Option<&str>,
+) -> Value {
+    let mut ok_count = 0_u64;
+    let items = ids
+        .iter()
+        .enumerate()
+        .map(
+            |(index, id)| match close_issue_json(storage, state, id, reason) {
+                Ok(result) => {
+                    ok_count += 1;
+                    json!({
+                        "index": index,
+                        "id": id,
+                        "ok": true,
+                        "result": result,
+                    })
+                }
+                Err(err) => close_issue_batch_error_item(index, id, err),
+            },
+        )
+        .collect::<Vec<_>>();
+    let count = u64::try_from(ids.len()).unwrap_or(u64::MAX);
+
+    json!({
+        "items": items,
+        "count": count,
+        "ok_count": ok_count,
+        "error_count": count.saturating_sub(ok_count),
+    })
+}
+
 impl ToolHandler for CloseIssueTool {
     fn definition(&self) -> Tool {
         Tool {
             name: "close_issue".into(),
             description: Some(
-                "Close an issue with a reason. Sets status to Closed and records close metadata.\n\n\
+                "Close one issue, or close multiple issues with a shared reason. Sets status to Closed and records close metadata.\n\n\
                  Discovery: Get IDs from list_issues.\n\
                  When to use: Completing, cancelling, or resolving an issue.\n\
                  NOT for: Changing status to anything other than closed — use update_issue.\n\
-                 Do: Provide a close_reason explaining why.\n\
+                 Do: Provide id for the legacy single-issue response, or ids[] for a per-item batch envelope.\n\
                  Don't: Close issues without checking open blockers first.\n\
+                 Batch semantics: ids[] uses one write lock/storage open/auto-flush and returns {items,count,ok_count,error_count}; each item has ok:true with the legacy result or ok:false with a structured error.\n\
                  Idempotency: Safe to retry — closing an already-closed issue is a no-op."
                     .into(),
             ),
@@ -1953,12 +2112,22 @@ impl ToolHandler for CloseIssueTool {
                         "type": "string",
                         "description": "Issue ID to close. REQUIRED. Must be a real ID from list_issues."
                     },
+                    "ids": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": CLOSE_ISSUE_BATCH_MAX,
+                        "items": {"type": "string"},
+                        "description": "Batch of issue IDs to close with the same reason. Returns {items,count,ok_count,error_count}; each item is either {index,id,ok:true,result} using the legacy single-close result shape, or {index,id,ok:false,error}. Partial failures do not fail the whole batch."
+                    },
                     "reason": {
                         "type": "string",
                         "description": "Why this issue is being closed (e.g. 'completed', 'wontfix', 'duplicate')"
                     }
                 },
-                "required": ["id"],
+                "oneOf": [
+                    {"required": ["id"]},
+                    {"required": ["ids"]}
+                ],
                 "additionalProperties": false
             }),
             output_schema: None,
@@ -1975,114 +2144,23 @@ impl ToolHandler for CloseIssueTool {
     }
 
     fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
-        let id = required_str_arg(&args, "id")?;
-
         let reason = optional_str_arg(&args, "reason")?;
-
-        let (issue, already_closed, our_blockers, dependents, warnings) =
-            self.0.with_mutation(|storage| {
-                // Validate ID exists (with placeholder detection + fuzzy suggestions)
-                require_valid_issue(storage, &id)?;
-
-                // Idempotency: if already closed, return existing state without error
-                if let Some(details) = storage
-                    .get_issue_details(&id, false, false, 0)
-                    .map_err(beads_to_mcp)?
-                    && details.issue.status == Status::Closed
-                {
-                    return Ok((details.issue, true, None, None, Vec::new()));
-                }
-
-                let now = chrono::Utc::now();
-                let close_update = IssueUpdate {
-                    status: Some(Status::Closed),
-                    closed_at: Some(Some(now)),
-                    close_reason: Some(reason.clone()),
-                    ..IssueUpdate::default()
-                };
-
-                let issue = storage
-                    .update_issue(&id, &close_update, &self.0.actor)
-                    .map_err(beads_to_mcp)?;
-
-                let mut warnings = Vec::new();
-
-                // Check for blockers this issue had (warn about closing a blocked issue)
-                let our_blockers = match storage.get_blockers(&id) {
-                    Ok(blockers) => Some(blockers),
-                    Err(err) => {
-                        warnings.push(storage_read_warning("get_blockers", &err));
-                        None
-                    }
-                };
-
-                // Check what this issue was blocking (now potentially unblocked)
-                let dependents = match storage.get_blocked_issue_ids(&id) {
-                    Ok(dependents) => Some(dependents),
-                    Err(err) => {
-                        warnings.push(storage_read_warning("get_blocked_issue_ids", &err));
-                        None
-                    }
-                };
-
-                Ok((issue, false, our_blockers, dependents, warnings))
+        if let Some(ids) = close_issue_batch_ids(&args)? {
+            let result = self.0.with_mutation(|storage| {
+                Ok(close_issue_batch_json(
+                    storage,
+                    &self.0,
+                    &ids,
+                    reason.as_deref(),
+                ))
             })?;
-
-        if already_closed {
-            return Ok(vec![Content::text(
-                json!({
-                    "id": issue.id,
-                    "title": issue.title,
-                    "status": "closed",
-                    "closed_at": issue.closed_at,
-                    "close_reason": issue.close_reason,
-                    "already_closed": true,
-                    "next_actions": ["Issue was already closed. Use list_issues to find open work."]
-                })
-                .to_string(),
-            )]);
+            return Ok(vec![Content::text(result.to_string())]);
         }
 
-        let mut result = json!({
-            "id": issue.id,
-            "title": issue.title,
-            "status": "closed",
-            "closed_at": issue.closed_at,
-            "close_reason": reason,
-        });
-
-        if !warnings.is_empty() {
-            result["warnings"] = json!(warnings);
-        }
-
-        if let Some(our_blockers) = our_blockers
-            && !our_blockers.is_empty()
-        {
-            result["warning"] = json!(format!(
-                "This issue was blocked by {} issue(s): {}. Consider whether those blockers are still relevant.",
-                our_blockers.len(),
-                our_blockers.join(", ")
-            ));
-        }
-
-        if let Some(dependents) = dependents {
-            if dependents.is_empty() {
-                result["next_actions"] = json!(["Issue closed successfully."]);
-            } else {
-                result["unblocked_candidates"] = json!(dependents);
-                result["next_actions"] = json!([
-                    format!(
-                        "{} dependent issue(s) may now be unblocked: {}",
-                        dependents.len(),
-                        dependents.join(", ")
-                    ),
-                    "Use show_issue on these to check if they're now ready for work"
-                ]);
-            }
-        } else {
-            result["next_actions"] =
-                json!(["Issue closed successfully. Dependent lookup failed; see warnings."]);
-        }
+        let id = required_str_arg(&args, "id")?;
+        let result = self
+            .0
+            .with_mutation(|storage| close_issue_json(storage, &self.0, &id, reason.as_deref()))?;
 
         Ok(vec![Content::text(result.to_string())])
     }
@@ -2452,11 +2530,12 @@ impl ToolHandler for ProjectOverviewTool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CreateIssueTool, ListIssuesTool, ManageDependenciesTool, ProjectOverviewTool,
-        ShowIssueTool, UpdateIssueTool, build_list_filters, generate_issue_id_with_checked_lookup,
-        issue_not_found_err, list_issues_json, next_available_child_id, optional_label_array_arg,
-        optional_string_array_arg, parse_update_fields, project_overview_json,
-        show_issue_batch_json, show_issue_json, storage_read_warning,
+        CloseIssueTool, CreateIssueTool, ListIssuesTool, ManageDependenciesTool,
+        ProjectOverviewTool, ShowIssueTool, UpdateIssueTool, build_list_filters,
+        generate_issue_id_with_checked_lookup, issue_not_found_err, list_issues_json,
+        next_available_child_id, optional_label_array_arg, optional_string_array_arg,
+        parse_update_fields, project_overview_json, show_issue_batch_json, show_issue_json,
+        storage_read_warning,
     };
     use crate::error::BeadsError;
     use crate::mcp::{BeadsState, McpReadSnapshotCache};
@@ -2890,6 +2969,142 @@ mod tests {
         );
     }
 
+    #[test]
+    fn close_issue_legacy_single_result_shape_is_unchanged() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        insert_test_issue(&state, "br-mcp-close-single", "single close original");
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let tool = CloseIssueTool::new(Arc::clone(&state));
+
+        let content = tool
+            .call(
+                &ctx,
+                json!({
+                    "id": "br-mcp-close-single",
+                    "reason": "single close done",
+                }),
+            )
+            .expect("single close");
+        let result = content_json(&content);
+
+        assert_eq!(result["id"].as_str(), Some("br-mcp-close-single"));
+        assert_eq!(result["status"].as_str(), Some("closed"));
+        assert_eq!(result["close_reason"].as_str(), Some("single close done"));
+        assert!(result.get("items").is_none());
+        assert!(result.get("count").is_none());
+
+        let storage = SqliteStorage::open(&state.db_path).expect("open storage");
+        let issue = storage
+            .get_issue("br-mcp-close-single")
+            .expect("get issue")
+            .expect("issue exists");
+        assert_eq!(issue.status, Status::Closed);
+    }
+
+    #[test]
+    fn close_issue_batch_returns_ordered_items_partial_errors_and_flushes() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        insert_test_issue(&state, "br-mcp-close-batch-1", "batch first close");
+        insert_test_issue(&state, "br-mcp-close-batch-2", "batch second close");
+        insert_test_issue(
+            &state,
+            "br-mcp-close-dependent",
+            "dependent unblocked by second close",
+        );
+        {
+            let mut storage = SqliteStorage::open(&state.db_path).expect("open storage");
+            storage
+                .add_dependency(
+                    "br-mcp-close-dependent",
+                    "br-mcp-close-batch-2",
+                    "blocks",
+                    "mcp-test",
+                )
+                .expect("add dependency");
+        }
+
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let tool = CloseIssueTool::new(Arc::clone(&state));
+        let content = tool
+            .call(
+                &ctx,
+                json!({
+                    "ids": [
+                        "br-mcp-close-batch-1",
+                        "missing-id",
+                        "YOUR_ID",
+                        "br-mcp-close-batch-2"
+                    ],
+                    "reason": "batch close done",
+                }),
+            )
+            .expect("batch close");
+        let batch = content_json(&content);
+
+        assert_batch_counts(&batch, 4, 2, 2);
+        assert_eq!(batch["items"][0]["index"].as_u64(), Some(0));
+        assert_eq!(batch["items"][0]["ok"].as_bool(), Some(true));
+        assert_eq!(
+            batch["items"][0]["result"]["status"].as_str(),
+            Some("closed")
+        );
+        assert_eq!(
+            batch["items"][1]["error"]["data"]["error_type"].as_str(),
+            Some("ISSUE_NOT_FOUND")
+        );
+        assert_eq!(
+            batch["items"][2]["error"]["data"]["error_type"].as_str(),
+            Some("PLACEHOLDER_DETECTED")
+        );
+        assert!(
+            batch["items"][3]["result"]["unblocked_candidates"]
+                .as_array()
+                .is_some_and(|items| items
+                    .iter()
+                    .any(|id| id.as_str() == Some("br-mcp-close-dependent")))
+        );
+
+        let storage = SqliteStorage::open(&state.db_path).expect("open storage");
+        for id in ["br-mcp-close-batch-1", "br-mcp-close-batch-2"] {
+            let issue = storage
+                .get_issue(id)
+                .expect("get issue")
+                .expect("issue exists");
+            assert_eq!(issue.status, Status::Closed);
+            assert_eq!(issue.close_reason.as_deref(), Some("batch close done"));
+        }
+        let missing = storage.get_issue("missing-id").expect("get missing");
+        assert!(missing.is_none());
+
+        let jsonl = fs::read_to_string(&state.jsonl_path).expect("read auto-flushed jsonl");
+        assert!(jsonl.contains("batch close done"));
+        assert!(jsonl.contains("br-mcp-close-batch-1"));
+        assert!(jsonl.contains("br-mcp-close-batch-2"));
+    }
+
+    #[test]
+    fn close_issue_batch_rejects_ambiguous_single_and_batch_args() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let tool = CloseIssueTool::new(state);
+
+        let err = tool
+            .call(
+                &ctx,
+                json!({
+                    "id": "br-one",
+                    "ids": ["br-two"],
+                }),
+            )
+            .expect_err("id and ids together should fail");
+
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
+        assert!(err.message.contains("either 'id'"));
+    }
+
     fn time_repeated_json_reads<F>(
         iterations: u32,
         mut read: F,
@@ -3134,6 +3349,92 @@ mod tests {
                 "speedup": repeated.as_nanos() as f64 / batch.as_nanos().max(1) as f64,
                 "last_batch_ok_count": last_batch["ok_count"],
                 "equality": "batch updates verified by final storage state and per-item ok counts",
+            })
+        );
+    }
+
+    #[test]
+    #[ignore = "perf probe for MCP close_issue batch evidence"]
+    fn mcp_close_issue_batch_perf_probe() {
+        let issue_count = 25;
+        let iterations = 5;
+        let repeated_temp = TempDir::new().expect("repeated tempdir");
+        let repeated_state = mcp_test_state(&repeated_temp);
+        let repeated_ids = (0..iterations)
+            .map(|round| {
+                (0..issue_count)
+                    .map(|index| format!("br-mcp-close-single-perf-{round}-{index:04}"))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        for ids in &repeated_ids {
+            for id in ids {
+                insert_test_issue(&repeated_state, id, &format!("Single close issue {id}"));
+            }
+        }
+
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let repeated_tool = CloseIssueTool::new(Arc::clone(&repeated_state));
+        let repeated_started = Instant::now();
+        for ids in &repeated_ids {
+            for id in ids {
+                repeated_tool
+                    .call(&ctx, json!({"id": id, "reason": "perf close done"}))
+                    .expect("single close");
+            }
+        }
+        let repeated = repeated_started.elapsed();
+
+        let batch_temp = TempDir::new().expect("batch tempdir");
+        let batch_state = mcp_test_state(&batch_temp);
+        let batch_ids = (0..iterations)
+            .map(|round| {
+                (0..issue_count)
+                    .map(|index| format!("br-mcp-close-batch-perf-{round}-{index:04}"))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        for ids in &batch_ids {
+            for id in ids {
+                insert_test_issue(&batch_state, id, &format!("Batch close issue {id}"));
+            }
+        }
+
+        let batch_tool = CloseIssueTool::new(Arc::clone(&batch_state));
+        let batch_started = Instant::now();
+        let mut last_batch = serde_json::Value::Null;
+        for ids in &batch_ids {
+            let content = batch_tool
+                .call(&ctx, json!({"ids": ids, "reason": "perf close done"}))
+                .expect("batch close");
+            last_batch = content_json(&content);
+            let len = u64::try_from(ids.len()).expect("ids length fits u64");
+            assert_batch_counts(&last_batch, len, len, 0);
+        }
+        let batch = batch_started.elapsed();
+
+        let storage = SqliteStorage::open(&batch_state.db_path).expect("open batch storage");
+        for ids in &batch_ids {
+            for id in ids {
+                let issue = storage
+                    .get_issue(id)
+                    .expect("get issue")
+                    .expect("issue exists");
+                assert_eq!(issue.status, Status::Closed);
+                assert_eq!(issue.close_reason.as_deref(), Some("perf close done"));
+            }
+        }
+
+        println!(
+            "{}",
+            json!({
+                "issues": issue_count,
+                "iterations": iterations,
+                "repeated_single_total_ns": repeated.as_nanos(),
+                "batch_total_ns": batch.as_nanos(),
+                "speedup": repeated.as_nanos() as f64 / batch.as_nanos().max(1) as f64,
+                "last_batch_ok_count": last_batch["ok_count"],
+                "equality": "batch closes verified by final storage state and per-item ok counts",
             })
         );
     }
