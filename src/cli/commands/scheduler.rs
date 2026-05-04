@@ -207,25 +207,25 @@ fn build_scheduler_output(
         storage.get_ready_issues_for_command_output(&filters, ReadySortPolicy::Priority)?;
 
     if !issues.is_empty() && storage.has_external_dependencies(true)? {
-        if candidate_limit.is_some() {
-            // External filtering can remove early fallback rows, so refill the
-            // local ready set before applying the scheduler's scoring cap.
-            filters.limit = None;
-            issues =
-                storage.get_ready_issues_for_command_output(&filters, ReadySortPolicy::Priority)?;
-        }
         let config_layer = load_scheduler_config(beads_dir, storage, storage_ctx, cli)?;
         let external_db_paths = config::external_project_db_paths(&config_layer, beads_dir);
         let external_statuses =
             storage.resolve_external_dependency_statuses(&external_db_paths, true)?;
         let external_blockers = storage.external_blockers(&external_statuses)?;
         if !external_blockers.is_empty() {
+            if should_refill_scheduler_candidates(candidate_limit, &issues, &external_blockers) {
+                // External filtering can remove early fallback rows, so refill
+                // the local ready set before applying the scheduler's scoring cap.
+                filters.limit = None;
+                issues = storage
+                    .get_ready_issues_for_command_output(&filters, ReadySortPolicy::Priority)?;
+            }
             issues.retain(|issue| !external_blockers.contains_key(&issue.id));
-        }
-        if let Some(limit) = candidate_limit
-            && issues.len() > limit
-        {
-            issues.truncate(limit);
+            if let Some(limit) = candidate_limit
+                && issues.len() > limit
+            {
+                issues.truncate(limit);
+            }
         }
     }
 
@@ -303,6 +303,18 @@ fn load_scheduler_config(
     } else {
         config::load_config(beads_dir, Some(storage), cli)
     }
+}
+
+fn should_refill_scheduler_candidates(
+    candidate_limit: Option<usize>,
+    issues: &[crate::model::Issue],
+    external_blockers: &HashMap<String, Vec<String>>,
+) -> bool {
+    candidate_limit.is_some()
+        && !external_blockers.is_empty()
+        && issues
+            .iter()
+            .any(|issue| external_blockers.contains_key(&issue.id))
 }
 
 fn load_scheduler_relation_metadata(
@@ -507,7 +519,8 @@ fn print_scheduler_text(output: &SchedulerOutput) {
 #[cfg(test)]
 mod tests {
     use super::{
-        primary_domain, project_scheduler_relation_metadata, stale_threshold_minutes, usize_to_i64,
+        primary_domain, project_scheduler_relation_metadata, should_refill_scheduler_candidates,
+        stale_threshold_minutes, usize_to_i64,
     };
     use crate::model::{Issue, IssueType};
     use crate::storage::sqlite::ListRelationMetadata;
@@ -571,6 +584,52 @@ mod tests {
         assert_eq!(dependent_counts.get("bd-a"), Some(&3));
         assert!(!dependency_counts.contains_key("bd-other"));
         assert!(!dependent_counts.contains_key("bd-other"));
+    }
+
+    #[test]
+    fn scheduler_refills_only_when_limited_prefix_loses_external_blocker() {
+        let mut first = Issue {
+            id: "bd-first".to_string(),
+            ..Issue::default()
+        };
+        let second = Issue {
+            id: "bd-second".to_string(),
+            ..Issue::default()
+        };
+        let issues = vec![first.clone(), second.clone()];
+
+        assert!(!should_refill_scheduler_candidates(
+            Some(2),
+            &issues,
+            &HashMap::new()
+        ));
+
+        let outside_blockers = HashMap::from([(
+            "bd-outside-window".to_string(),
+            vec!["external:extproj:auth".to_string()],
+        )]);
+        assert!(!should_refill_scheduler_candidates(
+            Some(2),
+            &issues,
+            &outside_blockers
+        ));
+
+        let prefix_blockers = HashMap::from([(
+            "bd-first".to_string(),
+            vec!["external:extproj:auth".to_string()],
+        )]);
+        assert!(should_refill_scheduler_candidates(
+            Some(2),
+            &issues,
+            &prefix_blockers
+        ));
+
+        first.id = "bd-unlimited".to_string();
+        assert!(!should_refill_scheduler_candidates(
+            None,
+            &[first],
+            &prefix_blockers
+        ));
     }
 
     #[test]

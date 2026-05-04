@@ -2,6 +2,7 @@ mod common;
 
 use common::cli::{BrWorkspace, extract_json_payload, run_br};
 use serde_json::Value;
+use std::fs;
 
 fn parse_created_id(stdout: &str) -> String {
     let line = stdout.lines().next().unwrap_or("");
@@ -163,6 +164,79 @@ fn scheduler_candidate_limit_refills_after_external_blockers() {
     assert!(recommended_ids.contains(&free_two.as_str()));
     assert!(!recommended_ids.contains(&blocked_one.as_str()));
     assert!(!recommended_ids.contains(&blocked_two.as_str()));
+}
+
+#[test]
+fn scheduler_candidate_limit_keeps_satisfied_external_prefix() {
+    let _log = common::test_log("scheduler_candidate_limit_keeps_satisfied_external_prefix");
+    let workspace = BrWorkspace::new();
+    let external = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_main");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    let init_external = run_br(&external, ["init"], "init_external");
+    assert!(
+        init_external.status.success(),
+        "external init failed: {}",
+        init_external.stderr
+    );
+
+    let config_path = workspace.root.join(".beads/config.yaml");
+    let external_path = external.root.display();
+    let config = format!("issue_prefix: bd\nexternal_projects:\n  extproj: \"{external_path}\"\n");
+    fs::write(&config_path, config).expect("write config");
+
+    let provider = create_labeled_issue(&external, "Provide auth", "1", "provides:auth");
+    let close = run_br(&external, ["close", &provider], "close_provider");
+    assert!(
+        close.status.success(),
+        "external close failed: {}",
+        close.stderr
+    );
+
+    let external_one = create_issue(&workspace, "Satisfied external one", "0");
+    let external_two = create_issue(&workspace, "Satisfied external two", "0");
+    let local_one = create_issue(&workspace, "Free local one", "1");
+
+    for (label, issue_id) in [
+        ("dep_external_one", &external_one),
+        ("dep_external_two", &external_two),
+    ] {
+        let dep = run_br(
+            &workspace,
+            ["dep", "add", issue_id, "external:extproj:auth"],
+            label,
+        );
+        assert!(
+            dep.status.success(),
+            "external dep add failed: {}",
+            dep.stderr
+        );
+    }
+
+    let json = scheduler_json(
+        &workspace,
+        &[
+            "scheduler",
+            "--json",
+            "--candidate-limit",
+            "2",
+            "--limit",
+            "2",
+        ],
+        "scheduler_satisfied_external_candidate_limit",
+    );
+    let recommendations = json["recommendations"].as_array().expect("recommendations");
+    let recommended_ids = recommendations
+        .iter()
+        .map(|item| item["issue"]["id"].as_str().expect("issue id"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(json["candidate_count"], 2);
+    assert_eq!(recommendations.len(), 2);
+    assert!(recommended_ids.contains(&external_one.as_str()));
+    assert!(recommended_ids.contains(&external_two.as_str()));
+    assert!(!recommended_ids.contains(&local_one.as_str()));
 }
 
 #[test]
