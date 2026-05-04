@@ -7037,6 +7037,33 @@ impl SqliteStorage {
         Ok(map)
     }
 
+    /// Get all raw label rows without ordering or grouping.
+    ///
+    /// Use this for aggregate callers that do their own counting and do not
+    /// need export-stable ordering.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub(crate) fn list_label_pairs_unordered(&self) -> Result<Vec<(String, String)>> {
+        let rows = self.conn.query("SELECT issue_id, label FROM labels")?;
+        let mut pairs = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let issue_id = row
+                .get(0)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .to_string();
+            let label = row
+                .get(1)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .to_string();
+            pairs.push((issue_id, label));
+        }
+        Ok(pairs)
+    }
+
     /// Get labels plus dependency/dependent counts for every issue that has any
     /// list relation metadata.
     ///

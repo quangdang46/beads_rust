@@ -595,24 +595,26 @@ fn compute_assignee_breakdown(issues: &[StatsIssueRow]) -> Breakdown {
 
 /// Compute breakdown by label.
 fn compute_label_breakdown(storage: &SqliteStorage, issues: &[StatsIssueRow]) -> Result<Breakdown> {
+    let active_issue_ids: HashSet<&str> = issues
+        .iter()
+        .filter(|issue| issue.status != Status::Tombstone)
+        .map(|issue| issue.id.as_str())
+        .collect();
+    let mut labeled_issue_ids: HashSet<String> = HashSet::new();
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-    let mut labels_map = storage.get_all_labels()?;
 
-    for issue in issues {
-        if issue.status == Status::Tombstone {
-            continue;
+    for (issue_id, label) in storage.list_label_pairs_unordered()? {
+        if active_issue_ids.contains(issue_id.as_str()) {
+            *counts.entry(label).or_insert(0) += 1;
+            labeled_issue_ids.insert(issue_id);
         }
-        if let Some(labels) = labels_map.remove(&issue.id) {
-            if labels.is_empty() {
-                *counts.entry("(no labels)".to_string()).or_insert(0) += 1;
-            } else {
-                for label in labels {
-                    *counts.entry(label).or_insert(0) += 1;
-                }
-            }
-        } else {
-            *counts.entry("(no labels)".to_string()).or_insert(0) += 1;
-        }
+    }
+
+    let unlabeled_count = active_issue_ids
+        .len()
+        .saturating_sub(labeled_issue_ids.len());
+    if unlabeled_count > 0 {
+        counts.insert("(no labels)".to_string(), unlabeled_count);
     }
 
     Ok(Breakdown {
@@ -1811,19 +1813,30 @@ mod tests {
         let first_issue = make_issue("t-1", Status::Open, IssueType::Task);
         let second_issue = make_issue("t-2", Status::Open, IssueType::Task);
         let third_issue = make_issue("t-3", Status::Open, IssueType::Task);
+        let tombstone_issue = make_issue("t-4", Status::Open, IssueType::Task);
+        let mut closed_issue = make_issue("t-5", Status::Closed, IssueType::Task);
+        closed_issue.closed_at = Some(Utc::now());
+        let mut template_issue = make_issue("t-6", Status::Open, IssueType::Task);
+        template_issue.is_template = true;
 
         storage.create_issue(&first_issue, "tester").unwrap();
         storage.create_issue(&second_issue, "tester").unwrap();
         storage.create_issue(&third_issue, "tester").unwrap();
+        storage.create_issue(&tombstone_issue, "tester").unwrap();
+        storage.create_issue(&closed_issue, "tester").unwrap();
+        storage.create_issue(&template_issue, "tester").unwrap();
 
         storage.add_label("t-1", "backend", "tester").unwrap();
         storage.add_label("t-1", "urgent", "tester").unwrap();
         storage.add_label("t-2", "backend", "tester").unwrap();
+        storage.add_label("t-4", "backend", "tester").unwrap();
+        storage.add_label("t-5", "closed", "tester").unwrap();
+        storage.add_label("t-6", "template", "tester").unwrap();
+        storage
+            .delete_issue("t-4", "tester", "tombstone label count target", None)
+            .unwrap();
 
-        let test_issues = [&first_issue, &second_issue, &third_issue]
-            .into_iter()
-            .map(stats_row)
-            .collect::<Vec<_>>();
+        let test_issues = storage.list_stats_issues().unwrap();
         let breakdown = compute_label_breakdown(&storage, &test_issues).unwrap();
 
         let mut map: BTreeMap<String, usize> = BTreeMap::new();
@@ -1833,6 +1846,8 @@ mod tests {
 
         assert_eq!(map.get("backend"), Some(&2));
         assert_eq!(map.get("urgent"), Some(&1));
+        assert_eq!(map.get("closed"), Some(&1));
+        assert_eq!(map.get("template"), Some(&1));
         assert_eq!(map.get("(no labels)"), Some(&1));
     }
 
