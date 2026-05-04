@@ -19,7 +19,7 @@ const SCHEDULER_SCHEMA: &str = "br.scheduler.v1";
 const PRIORITY_WEIGHT: i64 = 10;
 const DEPENDENT_WEIGHT: i64 = 3;
 const MAX_DEPENDENT_CONTRIBUTION: i64 = 30;
-const SCHEDULER_FULL_METADATA_THRESHOLD: usize = 256;
+const SCHEDULER_FULL_METADATA_THRESHOLD: usize = 96;
 
 type SchedulerRelationMetadata = (
     HashMap<String, Vec<String>>,
