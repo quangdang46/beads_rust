@@ -9,11 +9,15 @@ use beads_rust::sync::{
 use beads_rust::{BeadsError, Result, StructuredError};
 use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
+use std::ffi::OsStr;
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(not(test))]
+const DISABLE_READ_ONLY_FAST_OPEN_ENV: &str = "BR_DISABLE_READ_ONLY_FAST_OPEN";
 
 #[allow(clippy::too_many_lines)]
 fn main() {
@@ -898,6 +902,10 @@ const fn supports_auto_import_read_only_probe(cmd: &Commands) -> bool {
         | Commands::Changelog(_)
         | Commands::Graph(_)
         | Commands::Orphans(beads_rust::cli::OrphansArgs { fix: false, .. })
+        | Commands::Comments(beads_rust::cli::CommentsArgs {
+            command: None | Some(beads_rust::cli::CommentCommands::List(_)),
+            ..
+        })
         | Commands::Epic {
             command: beads_rust::cli::EpicCommands::Status(_),
         } => true,
@@ -1020,6 +1028,12 @@ fn handle_error(err: &BeadsError, json_mode: bool, color_mode: bool) -> ! {
 }
 
 fn build_cli_overrides(cli: &Cli) -> config::CliOverrides {
+    let read_only_fast_open = !cli.no_db
+        && !read_only_fast_open_disabled_for_cli()
+        && supports_read_only_fast_open(&cli.command)
+        && ((cli.no_auto_import && cli.no_auto_flush)
+            || supports_auto_import_read_only_probe(&cli.command));
+
     config::CliOverrides {
         db: cli.db.clone(),
         actor: cli.actor.clone(),
@@ -1037,11 +1051,27 @@ fn build_cli_overrides(cli: &Cli) -> config::CliOverrides {
         no_auto_import: if cli.no_auto_import { Some(true) } else { None },
         lock_timeout: cli.lock_timeout,
         held_write_lock_beads_dir: None,
-        read_only_fast_open: !cli.no_db
-            && supports_read_only_fast_open(&cli.command)
-            && ((cli.no_auto_import && cli.no_auto_flush)
-                || supports_auto_import_read_only_probe(&cli.command)),
+        read_only_fast_open,
     }
+}
+
+#[cfg(not(test))]
+fn read_only_fast_open_disabled_for_cli() -> bool {
+    std::env::var_os(DISABLE_READ_ONLY_FAST_OPEN_ENV)
+        .as_deref()
+        .is_some_and(read_only_fast_open_disable_value_is_truthy)
+}
+
+#[cfg(test)]
+const fn read_only_fast_open_disabled_for_cli() -> bool {
+    false
+}
+
+fn read_only_fast_open_disable_value_is_truthy(value: &OsStr) -> bool {
+    matches!(
+        value.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 #[cfg(test)]
@@ -1237,9 +1267,9 @@ mod tests {
         ]);
         assert!(!build_cli_overrides(&label_list_issue).read_only_fast_open);
 
-        let missing_auto_flush =
+        let comments_no_auto_import =
             Cli::parse_from(["br", "--no-auto-import", "comments", "list", "bd-abc"]);
-        assert!(!build_cli_overrides(&missing_auto_flush).read_only_fast_open);
+        assert!(build_cli_overrides(&comments_no_auto_import).read_only_fast_open);
 
         let mutating = Cli::parse_from([
             "br",
@@ -1275,6 +1305,23 @@ mod tests {
     }
 
     #[test]
+    fn read_only_fast_open_disable_env_parser_is_conservative() {
+        for value in ["1", "true", "TRUE", " yes ", "on"] {
+            assert!(
+                read_only_fast_open_disable_value_is_truthy(OsStr::new(value)),
+                "{value:?} should disable read-only fast-open"
+            );
+        }
+
+        for value in ["", "0", "false", "off", "no", "maybe"] {
+            assert!(
+                !read_only_fast_open_disable_value_is_truthy(OsStr::new(value)),
+                "{value:?} should not disable read-only fast-open"
+            );
+        }
+    }
+
+    #[test]
     fn read_only_fast_open_auto_probe_covers_preopened_commands() {
         let ready = Cli::parse_from(["br", "ready"]);
         assert!(build_cli_overrides(&ready).read_only_fast_open);
@@ -1284,6 +1331,9 @@ mod tests {
 
         let show = Cli::parse_from(["br", "show", "br-123"]);
         assert!(build_cli_overrides(&show).read_only_fast_open);
+
+        let comments_list = Cli::parse_from(["br", "comments", "list", "br-123"]);
+        assert!(build_cli_overrides(&comments_list).read_only_fast_open);
 
         let search = Cli::parse_from(["br", "search", "needle"]);
         assert!(build_cli_overrides(&search).read_only_fast_open);

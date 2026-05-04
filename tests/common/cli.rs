@@ -21,7 +21,10 @@ fn should_clear_inherited_br_env(key: &OsStr) -> bool {
         || key.starts_with("BEADS_")
         || matches!(
             key.as_ref(),
-            "BR_OUTPUT_FORMAT" | "TOON_DEFAULT_FORMAT" | "TOON_STATS"
+            "BR_DISABLE_READ_ONLY_FAST_OPEN"
+                | "BR_OUTPUT_FORMAT"
+                | "TOON_DEFAULT_FORMAT"
+                | "TOON_STATS"
         )
 }
 
@@ -304,6 +307,7 @@ mod tests {
             "BD_ACTOR",
             "BEADS_CACHE_DIR",
             "BEADS_JSONL",
+            "BR_DISABLE_READ_ONLY_FAST_OPEN",
             "BR_OUTPUT_FORMAT",
             "TOON_DEFAULT_FORMAT",
             "TOON_STATS",

@@ -97,6 +97,18 @@ RUST_LOG=error br sync --status --json
 git status --short
 ```
 
+Read-heavy commands use a current-schema read-only fast-open path when it can
+avoid startup recovery and writer-lock work. If you need to compare behavior
+against the conservative locked path, or temporarily disable the optimization
+while debugging, set:
+
+```bash
+BR_DISABLE_READ_ONLY_FAST_OPEN=1 RUST_LOG=error br list --json --limit 1
+```
+
+Only truthy values (`1`, `true`, `yes`, `on`) disable the fast path. Unset or
+false-like values keep the default fast-open behavior.
+
 ## Agent Mail And Beads
 
 Use `br` for task state and Agent Mail for collision avoidance.
