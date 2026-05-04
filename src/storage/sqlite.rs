@@ -6906,6 +6906,8 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database update fails.
     pub fn remove_label(&mut self, issue_id: &str, label: &str, actor: &str) -> Result<bool> {
+        validate_storage_label(label)?;
+
         self.mutate("remove_label", actor, |conn, ctx| {
             match Self::issue_status_in_tx(conn, issue_id)? {
                 Some(Status::Tombstone) => {
@@ -12772,6 +12774,35 @@ mod tests {
             .expect_err("invalid labels must be rejected at storage boundary");
         assert!(err.to_string().contains("invalid characters"));
         assert!(storage.get_labels("bd-l-invalid").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_remove_label_rejects_invalid_storage_label_without_mutating() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
+
+        let issue = make_issue(
+            "bd-l-remove-invalid",
+            "Invalid label removal",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+        storage
+            .add_label("bd-l-remove-invalid", "backend", "tester")
+            .unwrap();
+
+        let err = storage
+            .remove_label("bd-l-remove-invalid", "bad label", "tester")
+            .expect_err("invalid removal label must be rejected at storage boundary");
+        assert!(err.to_string().contains("invalid characters"));
+        assert_eq!(
+            storage.get_labels("bd-l-remove-invalid").unwrap(),
+            vec!["backend".to_string()]
+        );
     }
 
     #[test]
