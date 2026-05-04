@@ -525,6 +525,16 @@ impl SequentialDriftGuard {
                 "must be greater than zero",
             ));
         }
+        if self.action.accept_value.value_type() != self.fallback.output_value.value_type() {
+            errors.push(PolicyValidationError::new(
+                "fallback.output_value",
+                format!(
+                    "expected {} to match action.accept_value got {}",
+                    self.action.accept_value.value_type().as_str(),
+                    self.fallback.output_value.value_type().as_str()
+                ),
+            ));
+        }
 
         if errors.is_empty() {
             Ok(())
@@ -562,7 +572,12 @@ impl SequentialDriftGuard {
             return self.disable_decision("corpus_hash_drift".to_string());
         }
 
-        let error_delta = self.evidence.candidate_error_count - self.evidence.baseline_error_count;
+        let Some(error_delta) = checked_error_delta(
+            self.evidence.baseline_error_count,
+            self.evidence.candidate_error_count,
+        ) else {
+            return self.disable_decision("error_delta_overflow".to_string());
+        };
         if error_delta > i64::from(self.loss.max_error_delta) {
             return self.disable_decision(format!(
                 "error_delta_exceeded: got {error_delta} budget {}",
@@ -645,9 +660,10 @@ impl SequentialDriftGuard {
             ),
             (
                 "error_delta".to_string(),
-                PolicyValue::Integer(
-                    self.evidence.candidate_error_count - self.evidence.baseline_error_count,
-                ),
+                PolicyValue::Integer(reported_error_delta(
+                    self.evidence.baseline_error_count,
+                    self.evidence.candidate_error_count,
+                )),
             ),
             (
                 "replay_seed".to_string(),
@@ -791,6 +807,14 @@ fn p95_delta_pct(baseline_p95_ms: u32, candidate_p95_ms: u32) -> i64 {
         return 0;
     }
     (i64::from(candidate_p95_ms) - i64::from(baseline_p95_ms)) * 100 / i64::from(baseline_p95_ms)
+}
+
+fn checked_error_delta(baseline_error_count: i64, candidate_error_count: i64) -> Option<i64> {
+    candidate_error_count.checked_sub(baseline_error_count)
+}
+
+fn reported_error_delta(baseline_error_count: i64, candidate_error_count: i64) -> i64 {
+    candidate_error_count.saturating_sub(baseline_error_count)
 }
 
 fn validate_inputs(
@@ -1338,6 +1362,39 @@ mod tests {
         assert_eq!(
             decision.outputs.get("candidate_window_enabled"),
             Some(&PolicyValue::Boolean(false))
+        );
+    }
+
+    #[test]
+    fn drift_guard_rejects_mismatched_accept_and_fallback_output_types() {
+        let mut guard = sample_drift_guard();
+        guard.fallback.output_value = value_text("disabled");
+
+        let validation_errors = guard.validate().expect_err("mismatched output types fail");
+        assert!(validation_errors.iter().any(|error| {
+            error.field == "fallback.output_value"
+                && error.message.contains("match action.accept_value")
+        }));
+
+        let decision = guard.evaluate();
+        assert_eq!(decision.outcome, DriftGuardOutcome::DisableFastPath);
+        assert!(decision.fallback_active);
+        assert!(decision.reason.contains("invalid_guard"));
+    }
+
+    #[test]
+    fn drift_guard_disables_fast_path_when_error_delta_overflows() {
+        let mut guard = sample_drift_guard();
+        guard.evidence.baseline_error_count = i64::MIN;
+        guard.evidence.candidate_error_count = i64::MAX;
+
+        let decision = guard.evaluate();
+
+        assert_eq!(decision.outcome, DriftGuardOutcome::DisableFastPath);
+        assert_eq!(decision.reason, "error_delta_overflow");
+        assert_eq!(
+            decision.evidence_terms.get("error_delta"),
+            Some(&PolicyValue::Integer(i64::MAX))
         );
     }
 
