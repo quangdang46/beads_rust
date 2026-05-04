@@ -84,6 +84,8 @@ const PLACEHOLDER_EXACT: &[&str] = &[
     "n/a",
 ];
 
+const SHOW_ISSUE_BATCH_MAX: usize = 100;
+
 // ---------------------------------------------------------------------------
 // Placeholder detection
 // ---------------------------------------------------------------------------
@@ -763,6 +765,31 @@ fn optional_string_array_arg(args: &serde_json::Value, key: &str) -> McpResult<V
         .collect()
 }
 
+fn optional_non_empty_string_array_arg(
+    args: &serde_json::Value,
+    key: &str,
+    max_len: usize,
+) -> McpResult<Option<Vec<String>>> {
+    if args.get(key).is_none() {
+        return Ok(None);
+    }
+
+    let values = optional_string_array_arg(args, key)?;
+    if values.is_empty() {
+        return Err(McpError::invalid_params(format!(
+            "'{key}' must include at least one issue ID"
+        )));
+    }
+    if values.len() > max_len {
+        return Err(McpError::invalid_params(format!(
+            "'{key}' supports at most {max_len} issue IDs per call, got {}",
+            values.len()
+        )));
+    }
+
+    Ok(Some(values))
+}
+
 fn optional_label_array_arg(args: &serde_json::Value, key: &str) -> McpResult<Vec<String>> {
     let labels = optional_string_array_arg(args, key)?;
     for (idx, label) in labels.iter().enumerate() {
@@ -1242,18 +1269,74 @@ fn show_issue_json(storage: &SqliteStorage, id: &str) -> McpResult<Value> {
     Ok(result)
 }
 
+fn show_issue_batch_error_item(id: &str, err: McpError) -> Value {
+    json!({
+        "id": id,
+        "ok": false,
+        "error": {
+            "code": i32::from(err.code),
+            "kind": format!("{:?}", err.code),
+            "message": err.message,
+            "data": err.data.unwrap_or(Value::Null),
+        }
+    })
+}
+
+fn show_issue_batch_json(storage: &SqliteStorage, ids: &[String]) -> Value {
+    let mut ok_count = 0_u64;
+    let items: Vec<Value> = ids
+        .iter()
+        .map(|id| {
+            if let Some(err) = detect_placeholder(id) {
+                return show_issue_batch_error_item(id, err);
+            }
+
+            match show_issue_json(storage, id) {
+                Ok(issue) => {
+                    ok_count += 1;
+                    json!({
+                        "id": id,
+                        "ok": true,
+                        "issue": issue,
+                    })
+                }
+                Err(err) => show_issue_batch_error_item(id, err),
+            }
+        })
+        .collect();
+    let count = u64::try_from(ids.len()).unwrap_or(u64::MAX);
+
+    json!({
+        "items": items,
+        "count": count,
+        "ok_count": ok_count,
+        "error_count": count.saturating_sub(ok_count),
+    })
+}
+
+fn show_issue_batch_ids(args: &Value) -> McpResult<Option<Vec<String>>> {
+    if args.get("id").is_some() && args.get("ids").is_some() {
+        return Err(McpError::invalid_params(
+            "Provide either 'id' for a single issue or 'ids' for a batch, not both",
+        ));
+    }
+
+    optional_non_empty_string_array_arg(args, "ids", SHOW_ISSUE_BATCH_MAX)
+}
+
 impl ToolHandler for ShowIssueTool {
     fn definition(&self) -> Tool {
         Tool {
             name: "show_issue".into(),
             description: Some(
-                "Get full details for a single issue including comments, dependencies, and events.\n\n\
+                "Get full details for one issue, or batch details for multiple known issue IDs.\n\n\
                  Discovery: Get IDs from list_issues or project_overview.\n\
-                 When to use: You have an issue ID and need complete context.\n\
-                 NOT for: Browsing multiple issues — use list_issues instead.\n\
-                 Do: Request specific issue IDs you already know.\n\
+                 When to use: You have one or more issue IDs and need complete context.\n\
+                 NOT for: Browsing unknown issues — use list_issues instead.\n\
+                 Do: Pass id for the legacy single-issue response, or ids[] for a per-item batch envelope.\n\
                  Don't: Guess IDs — use list_issues to discover them first.\n\
                  Common mistakes: Using placeholder IDs ('YOUR_ID') — these are detected.\n\
+                 Batch semantics: ids[] uses one read storage open and returns per-item ok/error results.\n\
                  Idempotency: Safe to retry; read-only."
                     .into(),
             ),
@@ -1263,9 +1346,19 @@ impl ToolHandler for ShowIssueTool {
                     "id": {
                         "type": "string",
                         "description": "Issue ID (e.g. 'br-1a2b3c'). MUST be an exact ID from list_issues. Placeholder values are rejected."
+                    },
+                    "ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "maxItems": SHOW_ISSUE_BATCH_MAX,
+                        "description": "Batch of exact issue IDs. Returns {items,count,ok_count,error_count}; each item is either {id,ok:true,issue} or {id,ok:false,error}. Partial failures do not fail the whole batch."
                     }
                 },
-                "required": ["id"],
+                "oneOf": [
+                    {"required": ["id"]},
+                    {"required": ["ids"]}
+                ],
                 "additionalProperties": false
             }),
             output_schema: None,
@@ -1282,6 +1375,14 @@ impl ToolHandler for ShowIssueTool {
     }
 
     fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
+        if let Some(ids) = show_issue_batch_ids(&args)? {
+            let key = format!("tool:show_issue_batch:{}", json!(&ids));
+            let result = cached_read_json(&self.0, key, |storage| {
+                Ok(show_issue_batch_json(storage, &ids))
+            })?;
+            return Ok(vec![Content::text(result.to_string())]);
+        }
+
         let id = required_str_arg(&args, "id")?;
 
         // Placeholder detection before any DB work
@@ -2236,8 +2337,8 @@ mod tests {
         CreateIssueTool, ListIssuesTool, ManageDependenciesTool, ProjectOverviewTool,
         ShowIssueTool, UpdateIssueTool, build_list_filters, generate_issue_id_with_checked_lookup,
         issue_not_found_err, list_issues_json, next_available_child_id, optional_label_array_arg,
-        optional_string_array_arg, parse_update_fields, project_overview_json, show_issue_json,
-        storage_read_warning,
+        optional_string_array_arg, parse_update_fields, project_overview_json,
+        show_issue_batch_json, show_issue_json, storage_read_warning,
     };
     use crate::error::BeadsError;
     use crate::mcp::{BeadsState, McpReadSnapshotCache};
@@ -2399,6 +2500,105 @@ mod tests {
         assert_eq!(second["title"].as_str(), Some("cached show updated title"));
     }
 
+    #[test]
+    fn show_issue_batch_returns_ordered_items_and_per_item_errors() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        insert_test_issue(&state, "br-mcp-batch-1", "batch first issue");
+        insert_test_issue(&state, "br-mcp-batch-2", "batch second issue");
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let tool = ShowIssueTool::new(Arc::clone(&state));
+        let args = json!({"ids": ["br-mcp-batch-1", "missing-id", "YOUR_ID", "br-mcp-batch-2"]});
+
+        let content = tool.call(&ctx, args.clone()).expect("batch show_issue");
+        let batch = content_json(&content);
+        let direct = {
+            let storage = SqliteStorage::open(&state.db_path).expect("open storage");
+            show_issue_batch_json(
+                &storage,
+                &[
+                    "br-mcp-batch-1".to_string(),
+                    "missing-id".to_string(),
+                    "YOUR_ID".to_string(),
+                    "br-mcp-batch-2".to_string(),
+                ],
+            )
+        };
+
+        assert_eq!(batch, direct);
+        assert_eq!(batch["count"].as_u64(), Some(4));
+        assert_eq!(batch["ok_count"].as_u64(), Some(2));
+        assert_eq!(batch["error_count"].as_u64(), Some(2));
+        assert_eq!(batch["items"][0]["id"].as_str(), Some("br-mcp-batch-1"));
+        assert_eq!(
+            batch["items"][1]["error"]["data"]["error_type"].as_str(),
+            Some("ISSUE_NOT_FOUND")
+        );
+        assert_eq!(
+            batch["items"][2]["error"]["data"]["error_type"].as_str(),
+            Some("PLACEHOLDER_DETECTED")
+        );
+    }
+
+    #[test]
+    fn show_issue_rejects_ambiguous_single_and_batch_args() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let tool = ShowIssueTool::new(state);
+
+        let err = tool
+            .call(&ctx, json!({"id": "br-one", "ids": ["br-two"]}))
+            .expect_err("id and ids together should fail");
+
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
+        assert!(err.message.contains("either 'id'"));
+    }
+
+    #[test]
+    fn show_issue_batch_snapshot_matches_direct_json_and_invalidates() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state_with_read_snapshot(&temp, true);
+        insert_test_issue(&state, "br-mcp-batch-cache-1", "cached batch first title");
+        insert_test_issue(&state, "br-mcp-batch-cache-2", "cached batch second title");
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let tool = ShowIssueTool::new(Arc::clone(&state));
+        let ids = vec![
+            "br-mcp-batch-cache-1".to_string(),
+            "br-mcp-batch-cache-2".to_string(),
+        ];
+        let args = json!({"ids": ids});
+
+        let first = content_json(&tool.call(&ctx, args.clone()).expect("cached batch"));
+        let direct = {
+            let storage = SqliteStorage::open(&state.db_path).expect("open storage");
+            show_issue_batch_json(&storage, &ids)
+        };
+        assert_eq!(first, direct);
+
+        {
+            let mut storage = SqliteStorage::open(&state.db_path).expect("open storage");
+            storage
+                .update_issue(
+                    "br-mcp-batch-cache-2",
+                    &IssueUpdate {
+                        title: Some("cached batch updated title".to_string()),
+                        ..IssueUpdate::default()
+                    },
+                    "mcp-test",
+                )
+                .expect("update issue title");
+        }
+        fs::write(&state.jsonl_path, "{\"id\":\"br-mcp-batch-cache-2\"}\n")
+            .expect("update jsonl witness");
+
+        let second = content_json(&tool.call(&ctx, args).expect("fresh batch"));
+        assert_eq!(
+            second["items"][1]["issue"]["title"].as_str(),
+            Some("cached batch updated title")
+        );
+    }
+
     fn time_repeated_json_reads<F>(
         iterations: u32,
         mut read: F,
@@ -2516,6 +2716,53 @@ mod tests {
                     "cached_total_ns": cached_show_ns,
                     "speedup": direct_show_ns as f64 / cached_show_ns.max(1) as f64,
                 },
+            })
+        );
+    }
+
+    #[test]
+    #[ignore = "perf probe for MCP show_issue batch evidence"]
+    fn mcp_show_issue_batch_perf_probe() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        let ids: Vec<String> = (0..25)
+            .map(|index| format!("br-mcp-batch-perf-{index:04}"))
+            .collect();
+        for id in &ids {
+            insert_test_issue(&state, id, &format!("MCP batch perf issue {id}"));
+        }
+
+        let iterations = 10_u32;
+        let repeated_single = time_repeated_json_reads(iterations, || {
+            let mut items = Vec::with_capacity(ids.len());
+            for id in &ids {
+                let storage = SqliteStorage::open(&state.db_path).expect("open storage");
+                let issue = show_issue_json(&storage, id).expect("single show");
+                items.push(json!({"id": id, "ok": true, "issue": issue}));
+            }
+            json!({
+                "items": items,
+                "count": ids.len(),
+                "ok_count": ids.len(),
+                "error_count": 0,
+            })
+        });
+        let batch = time_repeated_json_reads(iterations, || {
+            let storage = SqliteStorage::open(&state.db_path).expect("open storage");
+            show_issue_batch_json(&storage, &ids)
+        });
+
+        assert_eq!(batch.1, repeated_single.1);
+        println!(
+            "{}",
+            json!({
+                "issues": ids.len(),
+                "iterations": iterations,
+                "repeated_single_total_ns": repeated_single.0.as_nanos(),
+                "batch_total_ns": batch.0.as_nanos(),
+                "speedup": repeated_single.0.as_nanos() as f64
+                    / batch.0.as_nanos().max(1) as f64,
+                "equality": "batch envelope matches repeated single-item issue JSON",
             })
         );
     }
