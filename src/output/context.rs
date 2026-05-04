@@ -219,40 +219,6 @@ fn write_toon_issue_counts_array_to_writer<W: Write>(
     Ok(())
 }
 
-fn write_toon_issue_counts_page_to_writer<W: Write>(
-    writer: &mut W,
-    rows: &[IssueWithCounts],
-    fields: &[&'static str],
-    meta: JsonArrayPageMeta,
-) -> serde_json::Result<()> {
-    writer.write_all(b"issues").map_err(serde_json::Error::io)?;
-    write_toon_issue_counts_array_to_writer(writer, rows, fields)?;
-    writer
-        .write_all(b"\ntotal: ")
-        .map_err(serde_json::Error::io)?;
-    write!(writer, "{}", meta.total).map_err(serde_json::Error::io)?;
-    writer
-        .write_all(b"\nlimit: ")
-        .map_err(serde_json::Error::io)?;
-    write!(writer, "{}", meta.limit).map_err(serde_json::Error::io)?;
-    writer
-        .write_all(b"\noffset: ")
-        .map_err(serde_json::Error::io)?;
-    write!(writer, "{}", meta.offset).map_err(serde_json::Error::io)?;
-    writer
-        .write_all(b"\nhas_more: ")
-        .map_err(serde_json::Error::io)?;
-    write!(writer, "{}", meta.has_more).map_err(serde_json::Error::io)
-}
-
-fn issue_counts_toon_fields_for_rows(rows: &[IssueWithCounts]) -> Option<Vec<&'static str>> {
-    if rows.is_empty() {
-        Some(Vec::new())
-    } else {
-        uniform_issue_counts_toon_fields(rows)
-    }
-}
-
 fn issue_counts_toon_fields(row: &IssueWithCounts) -> Option<Vec<&'static str>> {
     let issue = &row.issue;
     if !issue.labels.is_empty() || !issue.dependencies.is_empty() || !issue.comments.is_empty() {
@@ -919,41 +885,17 @@ impl OutputContext {
         if Self::should_emit_toon_stats(show_stats, std::env::var("TOON_STATS").is_ok()) {
             return false;
         }
-        let Some(fields) = issue_counts_toon_fields_for_rows(values) else {
+        let fields = if values.is_empty() {
+            Vec::new()
+        } else if let Some(fields) = uniform_issue_counts_toon_fields(values) {
+            fields
+        } else {
             return false;
         };
 
         let stdout = io::stdout();
         let mut out = io::BufWriter::with_capacity(JSON_OUTPUT_BUFFER_CAPACITY, stdout.lock());
         if let Err(err) = write_toon_issue_counts_array_to_writer(&mut out, values, &fields) {
-            self.report_serialization_error("TOON", &err);
-            return true;
-        }
-        if let Err(err) = write_json_trailer_to_writer(&mut out) {
-            self.report_serialization_error("TOON", &err);
-        }
-        true
-    }
-
-    pub(crate) fn toon_issue_counts_page_with_stats(
-        &self,
-        values: &[IssueWithCounts],
-        meta: JsonArrayPageMeta,
-        show_stats: bool,
-    ) -> bool {
-        if !self.is_toon() {
-            return false;
-        }
-        if Self::should_emit_toon_stats(show_stats, std::env::var("TOON_STATS").is_ok()) {
-            return false;
-        }
-        let Some(fields) = issue_counts_toon_fields_for_rows(values) else {
-            return false;
-        };
-
-        let stdout = io::stdout();
-        let mut out = io::BufWriter::with_capacity(JSON_OUTPUT_BUFFER_CAPACITY, stdout.lock());
-        if let Err(err) = write_toon_issue_counts_page_to_writer(&mut out, values, &fields, meta) {
             self.report_serialization_error("TOON", &err);
             return true;
         }
@@ -1509,75 +1451,6 @@ mod tests {
             String::from_utf8(streamed)
                 .expect("TOON output should be utf8")
             .starts_with("[2]{id,title,description,design,acceptance_criteria,notes,status,priority,issue_type,created_at,created_by,updated_at,source_repo,compaction_level,dependency_count,dependent_count}:")
-        );
-    }
-
-    #[test]
-    fn write_toon_issue_counts_page_to_writer_matches_materialized_encode_output() {
-        let rows = vec![
-            IssueWithCounts {
-                issue: toon_test_issue("bd-c-00002", "Blocked 2"),
-                dependency_count: 0,
-                dependent_count: 1,
-            },
-            IssueWithCounts {
-                issue: toon_test_issue("bd-c-00001", "123"),
-                dependency_count: 2,
-                dependent_count: 0,
-            },
-        ];
-        let meta = JsonArrayPageMeta {
-            total: 5,
-            limit: 2,
-            offset: 1,
-            has_more: true,
-        };
-        let fields = uniform_issue_counts_toon_fields(&rows).expect("uniform primitive fields");
-        let mut streamed = Vec::new();
-
-        write_toon_issue_counts_page_to_writer(&mut streamed, &rows, &fields, meta)
-            .expect("streaming issue count page TOON output failed");
-
-        let page = crate::format::ListPage {
-            issues: rows,
-            total: meta.total,
-            limit: meta.limit,
-            offset: meta.offset,
-            has_more: meta.has_more,
-        };
-        let mut toon_value = JsonValue::from(
-            serde_json::to_value(&page).expect("materialized issue count page JSON failed"),
-        );
-        sanitize_toon_value(&mut toon_value);
-        let lines = encode_lines(toon_value, Some(toon_encode_options()));
-        let mut materialized = Vec::new();
-        write_toon_lines_to_writer(&mut materialized, &lines)
-            .expect("materialized TOON line output failed");
-
-        assert_eq!(streamed, materialized);
-        assert!(
-            String::from_utf8(streamed)
-                .expect("TOON output should be utf8")
-                .starts_with("issues[2]{id,title,description,design,acceptance_criteria,notes,status,priority,issue_type,created_at,created_by,updated_at,source_repo,compaction_level,dependency_count,dependent_count}:")
-        );
-    }
-
-    #[test]
-    fn write_toon_issue_counts_page_to_writer_emits_empty_page() {
-        let meta = JsonArrayPageMeta {
-            total: 0,
-            limit: 20,
-            offset: 40,
-            has_more: false,
-        };
-        let mut streamed = Vec::new();
-
-        write_toon_issue_counts_page_to_writer(&mut streamed, &[], &[], meta)
-            .expect("streaming empty issue count page TOON output failed");
-
-        assert_eq!(
-            String::from_utf8(streamed).expect("TOON output should be utf8"),
-            "issues[0]:\ntotal: 0\nlimit: 20\noffset: 40\nhas_more: false"
         );
     }
 

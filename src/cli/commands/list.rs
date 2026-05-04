@@ -211,10 +211,6 @@ fn execute_inner(
             if matches!(output_format, OutputFormat::Toon) {
                 let issues_with_counts =
                     collect_issues_with_counts(storage, issues, use_full_relation_scan)?;
-                if ctx.toon_issue_counts_page_with_stats(&issues_with_counts, page_meta, args.stats)
-                {
-                    return Ok(());
-                }
                 let page = ListPage {
                     issues: issues_with_counts,
                     total: page_meta.total,
