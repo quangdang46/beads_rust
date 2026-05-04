@@ -4,11 +4,13 @@ use beads_rust::model::{Dependency, DependencyType, Issue, IssueType, Priority, 
 use beads_rust::storage::SqliteStorage;
 use chrono::Utc;
 use common::cli::{
-    BrWorkspace, extract_json_payload, parse_list_issues, run_br, run_br_smoke_at_root_with_env,
+    BrRun, BrWorkspace, extract_json_payload, parse_json_value, parse_list_issues, run_br,
+    run_br_smoke_at_root_with_env,
 };
 use common::isolated_workspace_failure_fixture;
 use serde_json::Value;
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -68,6 +70,64 @@ fn make_issue(id: &str, title: &str, now: chrono::DateTime<Utc>) -> Issue {
         dependencies: vec![],
         comments: vec![],
     }
+}
+
+fn dotted_parent_child_dependency(
+    issue_id: &str,
+    depends_on_id: &str,
+    now: chrono::DateTime<Utc>,
+) -> Dependency {
+    Dependency {
+        issue_id: issue_id.to_string(),
+        depends_on_id: depends_on_id.to_string(),
+        dep_type: DependencyType::ParentChild,
+        created_at: now,
+        created_by: Some("tester".to_string()),
+        metadata: Some("{}".to_string()),
+        thread_id: None,
+    }
+}
+
+fn write_dotted_jsonl_fixture(workspace: &BrWorkspace) -> PathBuf {
+    let beads_dir = workspace.root.join(".beads");
+    fs::create_dir_all(&beads_dir).expect("create .beads");
+    let jsonl_path = beads_dir.join("issues.jsonl");
+    let now = Utc::now();
+
+    let parent = make_issue("bd-rchk0.5", "Dotted parent", now);
+    let mut target = make_issue("bd-rchk0.5.6", "Dotted target", now);
+    target
+        .dependencies
+        .push(dotted_parent_child_dependency(&target.id, &parent.id, now));
+    let mut child = make_issue("bd-rchk0.5.6.1", "Dotted child", now);
+    child
+        .dependencies
+        .push(dotted_parent_child_dependency(&child.id, &target.id, now));
+    let blocker = make_issue("bd-blocker7", "Dotted blocker", now);
+
+    let records = [&parent, &target, &child, &blocker]
+        .into_iter()
+        .map(|issue| serde_json::to_string(issue).expect("serialize dotted fixture"))
+        .collect::<Vec<_>>();
+    fs::write(&jsonl_path, records.join("\n") + "\n").expect("write dotted jsonl");
+    jsonl_path
+}
+
+fn assert_br_success(run: &BrRun, context: &str) {
+    assert!(run.status.success(), "{context}: {}", run.stderr);
+}
+
+fn parse_json_array(stdout: &str, context: &str) -> Vec<Value> {
+    serde_json::from_str(&extract_json_payload(stdout)).expect(context)
+}
+
+fn read_jsonl_values(path: &Path) -> Vec<Value> {
+    fs::read_to_string(path)
+        .expect("read jsonl")
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("parse exported issue"))
+        .collect()
 }
 
 fn prepare_merge_conflict_workspace() -> (BrWorkspace, String) {
@@ -919,54 +979,17 @@ fn e2e_no_db_mixed_prefixes_are_supported() {
 }
 
 #[test]
-#[allow(clippy::too_many_lines)]
 fn e2e_dotted_ids_survive_no_db_import_update_dep_and_flush() {
     let workspace = BrWorkspace::new();
-    let beads_dir = workspace.root.join(".beads");
-    fs::create_dir_all(&beads_dir).expect("create .beads");
-    let jsonl_path = beads_dir.join("issues.jsonl");
-
-    let now = Utc::now();
-    let parent = make_issue("bd-rchk0.5", "Dotted parent", now);
-    let mut target = make_issue("bd-rchk0.5.6", "Dotted target", now);
-    target.dependencies.push(Dependency {
-        issue_id: target.id.clone(),
-        depends_on_id: parent.id.clone(),
-        dep_type: DependencyType::ParentChild,
-        created_at: now,
-        created_by: Some("tester".to_string()),
-        metadata: Some("{}".to_string()),
-        thread_id: None,
-    });
-    let mut child = make_issue("bd-rchk0.5.6.1", "Dotted child", now);
-    child.dependencies.push(Dependency {
-        issue_id: child.id.clone(),
-        depends_on_id: target.id.clone(),
-        dep_type: DependencyType::ParentChild,
-        created_at: now,
-        created_by: Some("tester".to_string()),
-        metadata: Some("{}".to_string()),
-        thread_id: None,
-    });
-    let blocker = make_issue("bd-blocker7", "Dotted blocker", now);
-    let records = [&parent, &target, &child, &blocker]
-        .into_iter()
-        .map(|issue| serde_json::to_string(issue).expect("serialize dotted fixture"))
-        .collect::<Vec<_>>();
-    fs::write(&jsonl_path, records.join("\n") + "\n").expect("write dotted jsonl");
+    let jsonl_path = write_dotted_jsonl_fixture(&workspace);
 
     let no_db_show = run_br(
         &workspace,
         ["--no-db", "show", "bd-rchk0.5.6", "--json"],
         "dotted_no_db_show",
     );
-    assert!(
-        no_db_show.status.success(),
-        "no-db show failed for dotted id: {}",
-        no_db_show.stderr
-    );
-    let show_payload = extract_json_payload(&no_db_show.stdout);
-    let shown: Vec<Value> = serde_json::from_str(&show_payload).expect("show json");
+    assert_br_success(&no_db_show, "no-db show failed for dotted id");
+    let shown = parse_json_array(&no_db_show.stdout, "show json");
     assert_eq!(shown[0]["id"].as_str(), Some("bd-rchk0.5.6"));
 
     let no_db_update = run_br(
@@ -981,13 +1004,8 @@ fn e2e_dotted_ids_survive_no_db_import_update_dep_and_flush() {
         ],
         "dotted_no_db_update",
     );
-    assert!(
-        no_db_update.status.success(),
-        "no-db update failed for dotted id: {}",
-        no_db_update.stderr
-    );
-    let updated_payload = extract_json_payload(&no_db_update.stdout);
-    let updated: Vec<Value> = serde_json::from_str(&updated_payload).expect("update json");
+    assert_br_success(&no_db_update, "no-db update failed for dotted id");
+    let updated = parse_json_array(&no_db_update.stdout, "update json");
     assert_eq!(updated[0]["id"].as_str(), Some("bd-rchk0.5.6"));
     assert_eq!(updated[0]["priority"].as_i64(), Some(1));
 
@@ -996,13 +1014,8 @@ fn e2e_dotted_ids_survive_no_db_import_update_dep_and_flush() {
         ["sync", "--import-only", "--json"],
         "dotted_import",
     );
-    assert!(
-        imported.status.success(),
-        "import failed for dotted ids: {}",
-        imported.stderr
-    );
-    let import_json: Value =
-        serde_json::from_str(&extract_json_payload(&imported.stdout)).expect("import json");
+    assert_br_success(&imported, "import failed for dotted ids");
+    let import_json = parse_json_value(&imported.stdout);
     assert_eq!(import_json["created"].as_i64(), Some(4));
 
     let db_show = run_br(
@@ -1010,13 +1023,8 @@ fn e2e_dotted_ids_survive_no_db_import_update_dep_and_flush() {
         ["show", "bd-rchk0.5.6", "--json"],
         "dotted_db_show",
     );
-    assert!(
-        db_show.status.success(),
-        "db show failed for dotted id: {}",
-        db_show.stderr
-    );
-    let db_show_json: Vec<Value> =
-        serde_json::from_str(&extract_json_payload(&db_show.stdout)).expect("db show json");
+    assert_br_success(&db_show, "db show failed for dotted id");
+    let db_show_json = parse_json_array(&db_show.stdout, "db show json");
     assert_eq!(db_show_json[0]["id"].as_str(), Some("bd-rchk0.5.6"));
     assert!(
         db_show_json[0]["dependents"]
@@ -1039,13 +1047,8 @@ fn e2e_dotted_ids_survive_no_db_import_update_dep_and_flush() {
         ],
         "dotted_db_update",
     );
-    assert!(
-        db_update.status.success(),
-        "db update failed for dotted id: {}",
-        db_update.stderr
-    );
-    let db_update_json: Vec<Value> =
-        serde_json::from_str(&extract_json_payload(&db_update.stdout)).expect("db update json");
+    assert_br_success(&db_update, "db update failed for dotted id");
+    let db_update_json = parse_json_array(&db_update.stdout, "db update json");
     assert_eq!(db_update_json[0]["id"].as_str(), Some("bd-rchk0.5.6"));
     assert_eq!(db_update_json[0]["priority"].as_i64(), Some(0));
 
@@ -1061,29 +1064,16 @@ fn e2e_dotted_ids_survive_no_db_import_update_dep_and_flush() {
         ],
         "dotted_dep_add",
     );
-    assert!(
-        dep_add.status.success(),
-        "dep add failed for dotted id: {}",
-        dep_add.stderr
-    );
+    assert_br_success(&dep_add, "dep add failed for dotted id");
 
     let flush = run_br(
         &workspace,
         ["sync", "--flush-only", "--json"],
         "dotted_flush",
     );
-    assert!(
-        flush.status.success(),
-        "flush failed after dotted mutations: {}",
-        flush.stderr
-    );
+    assert_br_success(&flush, "flush failed after dotted mutations");
 
-    let exported = fs::read_to_string(&jsonl_path).expect("read exported dotted jsonl");
-    let exported_issues: Vec<Value> = exported
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str(line).expect("parse exported issue"))
-        .collect();
+    let exported_issues = read_jsonl_values(&jsonl_path);
     assert_eq!(exported_issues.len(), 4);
     let exported_target = exported_issues
         .iter()
