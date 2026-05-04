@@ -535,6 +535,8 @@ impl JsonlIssueSummary {
 
 type JsonlDependencyDisplayEntry = (IssueWithDependencyMetadata, Priority, DateTime<Utc>);
 
+const MAX_EXACT_JSONL_SHOW_INITIAL_CAPACITY: usize = 64 * 1024;
+
 struct ExactJsonlShowIndex {
     summaries: HashMap<String, JsonlIssueSummary>,
     targets: HashMap<String, Issue>,
@@ -605,7 +607,7 @@ fn scan_exact_jsonl_show_index(
     let file = File::open(jsonl_path)?;
     sync_path::validate_jsonl_fd_metadata(&file, jsonl_path)?;
     let file_size = file.metadata().map_or(0, |metadata| metadata.len());
-    let estimated_count = usize::try_from(file_size / 500).unwrap_or(usize::MAX);
+    let estimated_count = estimated_jsonl_show_capacity(file_size);
     let mut reader = BufReader::new(file);
     let mut summaries_by_id = HashMap::with_capacity(estimated_count);
     let mut target_issues_by_id = HashMap::with_capacity(target_ids.len());
@@ -667,6 +669,12 @@ fn scan_exact_jsonl_show_index(
         targets: target_issues_by_id,
         dependents: dependents_by_target_id,
     })
+}
+
+fn estimated_jsonl_show_capacity(file_size: u64) -> usize {
+    usize::try_from(file_size / 500)
+        .unwrap_or(usize::MAX)
+        .min(MAX_EXACT_JSONL_SHOW_INITIAL_CAPACITY)
 }
 
 fn build_issue_details_from_exact_jsonl_index(
@@ -1580,6 +1588,16 @@ mod tests {
         );
         info!(
             "test_load_issue_details_from_jsonl_exact_streaming_matches_materialized: assertions passed"
+        );
+    }
+
+    #[test]
+    fn test_exact_jsonl_show_capacity_is_capped_for_sparse_or_huge_files() {
+        assert_eq!(super::estimated_jsonl_show_capacity(0), 0);
+        assert_eq!(super::estimated_jsonl_show_capacity(12_500), 25);
+        assert_eq!(
+            super::estimated_jsonl_show_capacity(u64::MAX),
+            super::MAX_EXACT_JSONL_SHOW_INITIAL_CAPACITY
         );
     }
 
