@@ -867,7 +867,7 @@ mod tests {
         let err = read_audit_stdin_limited(std::io::Cursor::new(payload)).unwrap_err();
 
         assert!(
-            matches!(err, BeadsError::Validation { field, reason } if field == "stdin" && reason.contains("maximum size")),
+            matches!(&err, BeadsError::Validation { field, reason } if field == "stdin" && reason.contains("maximum size")),
             "unexpected error: {err:?}"
         );
     }
@@ -877,7 +877,7 @@ mod tests {
         let err = read_audit_stdin_limited(std::io::Cursor::new([0xff])).unwrap_err();
 
         assert!(
-            matches!(err, BeadsError::Validation { field, reason } if field == "stdin" && reason.contains("valid UTF-8")),
+            matches!(&err, BeadsError::Validation { field, reason } if field == "stdin" && reason.contains("valid UTF-8")),
             "unexpected error: {err:?}"
         );
     }
