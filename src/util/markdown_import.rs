@@ -177,9 +177,9 @@ fn read_markdown_file_limited(path: &Path, metadata: &fs::Metadata) -> Result<St
     let file = fs::File::open(path)
         .map_err(|e| BeadsError::validation("file", format!("cannot read file: {e}")))?;
     let mut reader = file.take(MAX_MARKDOWN_IMPORT_BYTES_U64.saturating_add(1));
-    let mut content = String::new();
+    let mut content = Vec::new();
     reader
-        .read_to_string(&mut content)
+        .read_to_end(&mut content)
         .map_err(|e| BeadsError::validation("file", format!("cannot read file: {e}")))?;
     if content.len() > MAX_MARKDOWN_IMPORT_BYTES {
         return Err(BeadsError::validation(
@@ -188,7 +188,8 @@ fn read_markdown_file_limited(path: &Path, metadata: &fs::Metadata) -> Result<St
         ));
     }
 
-    Ok(content)
+    String::from_utf8(content)
+        .map_err(|e| BeadsError::validation("file", format!("markdown must be valid UTF-8: {e}")))
 }
 
 /// Parse markdown content string into a list of issues.
@@ -745,6 +746,36 @@ This is the actual description.
 
         assert!(
             matches!(err, BeadsError::Validation { field, reason } if field == "file" && reason.contains("maximum size"))
+        );
+    }
+
+    #[test]
+    fn test_read_markdown_file_limited_checks_size_before_utf8_decode() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("issues.md");
+        fs::write(&path, "## Imported\n").unwrap();
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        let mut payload = vec![b'a'; MAX_MARKDOWN_IMPORT_BYTES];
+        payload.push(0xc3);
+        fs::write(&path, payload).unwrap();
+
+        let err = read_markdown_file_limited(&path, &metadata).unwrap_err();
+
+        assert!(
+            matches!(err, BeadsError::Validation { field, reason } if field == "file" && reason.contains("maximum size"))
+        );
+    }
+
+    #[test]
+    fn test_parse_markdown_file_rejects_invalid_utf8() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("issues.md");
+        fs::write(&path, [0xff]).unwrap();
+
+        let err = parse_markdown_file(&path).unwrap_err();
+
+        assert!(
+            matches!(err, BeadsError::Validation { field, reason } if field == "file" && reason.contains("valid UTF-8"))
         );
     }
 
