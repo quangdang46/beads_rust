@@ -1571,6 +1571,18 @@ fn integrity_check_is_clean(messages: &[String]) -> bool {
     messages.len() == 1 && messages[0].trim().eq_ignore_ascii_case("ok")
 }
 
+fn fresh_force_import_maintenance_gate_applies(
+    args: &SyncArgs,
+    force_import_target_was_empty: bool,
+    import_rewrote_storage: bool,
+) -> bool {
+    args.force
+        && !args.rebuild
+        && !args.rename_prefix
+        && force_import_target_was_empty
+        && import_rewrote_storage
+}
+
 fn repair_import_integrity_if_needed(
     storage: &mut crate::storage::SqliteStorage,
     beads_dir: &Path,
@@ -1941,12 +1953,13 @@ fn execute_import(
     // reclaim, which C sqlite3's integrity_check then flags as corruption
     // (issue #248). When the target is already empty, we can INSERT directly
     // and skip the leak entirely.
-    if args.force || args.rebuild {
+    let force_import_target_was_empty = if args.force || args.rebuild {
         let existing_issue_count = storage.count_all_issues()?;
         if existing_issue_count == 0 && preserved_tombstones.is_empty() {
             debug!(
                 "Force/rebuild import: target DB already empty, skipping reset_data_tables to avoid fsqlite freelist leak"
             );
+            true
         } else {
             debug!(
                 existing_issue_count,
@@ -1954,8 +1967,11 @@ fn execute_import(
                 "Force/rebuild import: resetting data tables to avoid btree DELETE bugs; preserved tombstones will be restored atomically after import"
             );
             storage.reset_data_tables()?;
+            false
         }
-    }
+    } else {
+        false
+    };
 
     // Execute import
     info!(path = %jsonl_path.display(), "Importing from JSONL");
@@ -2056,7 +2072,31 @@ fn execute_import(
     let import_rewrote_storage = import_result.imported_count > 0
         || import_result.blocked_cache_entries > 0
         || import_result.child_counter_entries > 0;
-    if args.force || args.rebuild || import_rewrote_storage {
+    let skip_heavy_import_maintenance = if fresh_force_import_maintenance_gate_applies(
+        args,
+        force_import_target_was_empty,
+        import_rewrote_storage,
+    ) {
+        let messages = storage.integrity_check_messages()?;
+        let clean = integrity_check_is_clean(&messages);
+        if clean {
+            debug!(
+                db_path = %db_path.display(),
+                "Skipping post-import VACUUM/REINDEX: fresh force import already passed integrity_check"
+            );
+        } else {
+            warn!(
+                db_path = %db_path.display(),
+                integrity_messages = ?messages,
+                "Fresh force import reported integrity warnings; running full post-import maintenance"
+            );
+        }
+        clean
+    } else {
+        false
+    };
+
+    if (args.force || args.rebuild || import_rewrote_storage) && !skip_heavy_import_maintenance {
         // Drain the WAL before VACUUM/REINDEX so the snapshot they operate
         // on matches what's actually on disk. Without this, fsqlite's
         // post-import MVCC state lags behind and VACUUM fails silently with
@@ -2557,10 +2597,10 @@ mod tests {
     use super::{
         SyncOperation, auto_rebuild_semantic_conflict_field,
         auto_rebuild_semantic_flag_conflict_reason, detect_prefix_from_jsonl,
-        jsonl_contains_duplicate_external_refs, jsonl_contains_prefix_mismatch,
-        merge_conflict_resolution, prepare_sync_startup, should_defer_jsonl_recovery,
-        should_render_human_sync_output, sync_operation, validate_operator_requested_sync_path,
-        validate_sync_mode_args, validate_sync_paths,
+        fresh_force_import_maintenance_gate_applies, jsonl_contains_duplicate_external_refs,
+        jsonl_contains_prefix_mismatch, merge_conflict_resolution, prepare_sync_startup,
+        should_defer_jsonl_recovery, should_render_human_sync_output, sync_operation,
+        validate_operator_requested_sync_path, validate_sync_mode_args, validate_sync_paths,
     };
     use crate::cli::SyncArgs;
     use crate::config::{self, CliOverrides};
@@ -2632,6 +2672,49 @@ mod tests {
         assert!(should_render_human_sync_output(&quiet_ctx, true));
         assert!(should_render_human_sync_output(&plain_ctx, false));
         assert!(should_render_human_sync_output(&plain_ctx, true));
+    }
+
+    #[test]
+    fn fresh_force_import_maintenance_gate_only_applies_to_clean_empty_force_loads() {
+        let force_import = SyncArgs {
+            force: true,
+            ..SyncArgs::default()
+        };
+        assert!(fresh_force_import_maintenance_gate_applies(
+            &force_import,
+            true,
+            true
+        ));
+        assert!(!fresh_force_import_maintenance_gate_applies(
+            &force_import,
+            false,
+            true
+        ));
+        assert!(!fresh_force_import_maintenance_gate_applies(
+            &force_import,
+            true,
+            false
+        ));
+
+        let rebuild = SyncArgs {
+            force: true,
+            rebuild: true,
+            ..SyncArgs::default()
+        };
+        assert!(!fresh_force_import_maintenance_gate_applies(
+            &rebuild, true, true
+        ));
+
+        let rename_prefix = SyncArgs {
+            force: true,
+            rename_prefix: true,
+            ..SyncArgs::default()
+        };
+        assert!(!fresh_force_import_maintenance_gate_applies(
+            &rename_prefix,
+            true,
+            true
+        ));
     }
 
     #[test]
