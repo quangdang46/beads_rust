@@ -444,9 +444,8 @@ fn jsonl_has_conflict_markers(path: &Path) -> bool {
 
     loop {
         let buffer = match reader.fill_buf() {
-            Ok([]) => return false,
+            Ok([]) | Err(_) => return false,
             Ok(buffer) => buffer,
-            Err(_) => return false,
         };
 
         let mut consumed = 0;
@@ -459,7 +458,7 @@ fn jsonl_has_conflict_markers(path: &Path) -> bool {
                     prefix_len += 1;
                 }
                 if prefix_len == CONFLICT_MARKER_PREFIX_LEN {
-                    if is_jsonl_conflict_marker_prefix(&prefix) {
+                    if is_jsonl_conflict_marker_prefix(prefix) {
                         return true;
                     }
                     reading_prefix = false;
@@ -476,8 +475,8 @@ fn jsonl_has_conflict_markers(path: &Path) -> bool {
     }
 }
 
-fn is_jsonl_conflict_marker_prefix(prefix: &[u8; CONFLICT_MARKER_PREFIX_LEN]) -> bool {
-    prefix == b"<<<<<<<" || prefix == b">>>>>>>" || prefix == b"=======" || prefix == b"|||||||"
+fn is_jsonl_conflict_marker_prefix(prefix: [u8; CONFLICT_MARKER_PREFIX_LEN]) -> bool {
+    prefix == *b"<<<<<<<" || prefix == *b">>>>>>>" || prefix == *b"=======" || prefix == *b"|||||||"
 }
 
 fn is_orphaned_lock_file(lock_path: &Path, now: SystemTime) -> bool {
