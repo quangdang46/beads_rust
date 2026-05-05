@@ -32,8 +32,8 @@ use sha2::{Digest, Sha256};
 use crate::util::hex_encode;
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::fs;
-use std::io::{BufRead, IsTerminal, Read};
+use std::fs::{self, OpenOptions};
+use std::io::{BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::UNIX_EPOCH;
@@ -3514,8 +3514,19 @@ fn write_startup_cache_record(cache_path: &Path, record: &StartupCacheRecord) ->
     fs::create_dir_all(parent)?;
     let bytes = serde_json::to_vec(record)?;
     let tmp_path = cache_path.with_extension(format!("tmp.{}", std::process::id()));
-    fs::write(&tmp_path, bytes)?;
-    fs::rename(tmp_path, cache_path)?;
+    let mut tmp_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)?;
+    if let Err(error) = tmp_file.write_all(&bytes) {
+        drop(tmp_file);
+        let _ = fs::remove_file(&tmp_path);
+        return Err(error.into());
+    }
+    drop(tmp_file);
+    fs::rename(&tmp_path, cache_path).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp_path);
+    })?;
     Ok(())
 }
 
@@ -6281,6 +6292,55 @@ routing:
         let fallback =
             load_startup_config_with_paths_cached_at(&beads_dir, None, cache.path()).expect("load");
         assert_eq!(fallback.paths.metadata, Metadata::default());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_config_cache_rejects_existing_temp_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let cache = TempDir::new().expect("cache");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let direct =
+            load_startup_config_with_paths_uncached(&beads_dir, None).expect("startup config");
+        let witness = StartupCacheWitness::capture(&beads_dir, None);
+        let key = startup_cache_key(&beads_dir, &witness);
+        let cache_path = startup_cache_path(cache.path(), &key);
+        let tmp_path = cache_path.with_extension(format!("tmp.{}", std::process::id()));
+        let outside_target = temp.path().join("outside-cache-target.json");
+        fs::write(&outside_target, "preserve").expect("write outside target");
+        symlink(&outside_target, &tmp_path).expect("create temp symlink");
+
+        let record = StartupCacheRecord {
+            version: STARTUP_CACHE_VERSION,
+            key,
+            witness,
+            paths: direct.paths,
+            layers: direct.layers,
+            merged_config: direct.merged_config,
+        };
+        let result = write_startup_cache_record(&cache_path, &record);
+
+        assert!(result.is_err(), "pre-existing temp symlink must fail");
+        assert_eq!(
+            fs::read_to_string(&outside_target).expect("read outside target"),
+            "preserve",
+            "startup cache temp symlink target must not receive cache bytes"
+        );
+        assert!(
+            !cache_path.exists(),
+            "failed cache write must not install cache record"
+        );
+        assert!(
+            fs::symlink_metadata(&tmp_path)
+                .expect("temp symlink metadata")
+                .file_type()
+                .is_symlink(),
+            "rejected pre-existing temp symlink should be left untouched"
+        );
     }
 
     #[test]
