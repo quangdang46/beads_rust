@@ -1074,12 +1074,39 @@ pub(crate) fn repair_database_from_jsonl(
     bootstrap_layer: &ConfigLayer,
     show_progress: bool,
 ) -> Result<(SqliteStorage, ImportResult, Vec<RecoveryBackupVerification>)> {
-    let prefix = resolve_bootstrap_issue_prefix(bootstrap_layer, beads_dir, jsonl_path)?;
     let mut import_config = import_config_for_resolved_jsonl(beads_dir, db_path, jsonl_path);
     import_config.show_progress = show_progress;
     import_config.skip_prefix_validation = true;
 
-    preflight_import(jsonl_path, &import_config, Some(&prefix))?.into_result()?;
+    repair_database_from_jsonl_with_import_config(
+        beads_dir,
+        db_path,
+        jsonl_path,
+        lock_timeout,
+        bootstrap_layer,
+        show_progress,
+        import_config,
+    )
+}
+
+pub(crate) fn repair_database_from_jsonl_with_import_config(
+    beads_dir: &Path,
+    db_path: &Path,
+    jsonl_path: &Path,
+    lock_timeout: Option<u64>,
+    bootstrap_layer: &ConfigLayer,
+    show_progress: bool,
+    mut import_config: ImportConfig,
+) -> Result<(SqliteStorage, ImportResult, Vec<RecoveryBackupVerification>)> {
+    let prefix = resolve_bootstrap_issue_prefix(bootstrap_layer, beads_dir, jsonl_path)?;
+    import_config.beads_dir = Some(beads_dir.to_path_buf());
+    import_config.allow_external_jsonl =
+        implicit_external_jsonl_allowed(beads_dir, db_path, jsonl_path);
+    import_config.show_progress = show_progress;
+
+    let mut preflight_config = import_config.clone();
+    preflight_config.skip_prefix_validation = true;
+    preflight_import(jsonl_path, &preflight_config, Some(&prefix))?.into_result()?;
 
     warn!(
         db_path = %db_path.display(),

@@ -1660,6 +1660,49 @@ fn repair_import_integrity_if_needed(
     Ok(())
 }
 
+fn repair_import_integrity_with_import_config(
+    storage: &mut crate::storage::SqliteStorage,
+    beads_dir: &Path,
+    cli: &config::CliOverrides,
+    jsonl_path: &Path,
+    db_path: &Path,
+    show_progress: bool,
+    import_config: &ImportConfig,
+) -> Result<()> {
+    let messages = storage.integrity_check_messages()?;
+    if integrity_check_is_clean(&messages) {
+        return Ok(());
+    }
+
+    warn!(
+        db_path = %db_path.display(),
+        integrity_messages = ?messages,
+        "Post-import maintenance left SQLite integrity warnings; rebuilding DB from JSONL with original import semantics"
+    );
+
+    let jsonl_filter = scan_jsonl_for_tombstone_filter(jsonl_path)?;
+    let preserved_tombstones =
+        tombstones_missing_from_jsonl_tombstones(snapshot_tombstones(storage), &jsonl_filter);
+
+    let placeholder = crate::storage::SqliteStorage::open_memory()?;
+    let dirty_storage = std::mem::replace(storage, placeholder);
+    drop(dirty_storage);
+
+    let startup = config::load_startup_config_with_paths(beads_dir, cli.db.as_ref())?;
+    let (mut rebuilt_storage, _, _) = config::repair_database_from_jsonl_with_import_config(
+        beads_dir,
+        db_path,
+        jsonl_path,
+        cli.lock_timeout,
+        &startup.merged_config,
+        show_progress,
+        import_config.clone(),
+    )?;
+    restore_tombstones_after_rebuild(&mut rebuilt_storage, &preserved_tombstones)?;
+    *storage = rebuilt_storage;
+    Ok(())
+}
+
 fn auto_rebuild_semantic_flag_conflict_reason(
     args: &SyncArgs,
     cli: &config::CliOverrides,
@@ -2181,16 +2224,15 @@ fn execute_import(
             }
         }
         if args.rename_prefix {
-            let messages = storage.integrity_check_messages()?;
-            if !integrity_check_is_clean(&messages) {
-                return Err(BeadsError::Validation {
-                    field: "rename-prefix".to_string(),
-                    reason: format!(
-                        "post-import integrity repair is required but cannot replay --rename-prefix semantics; re-run with --rebuild after resolving integrity warnings: {}",
-                        messages.join("; ")
-                    ),
-                });
-            }
+            repair_import_integrity_with_import_config(
+                storage,
+                beads_dir,
+                cli,
+                jsonl_path,
+                db_path,
+                show_progress,
+                &import_config,
+            )?;
         } else {
             repair_import_integrity_if_needed(
                 storage,
