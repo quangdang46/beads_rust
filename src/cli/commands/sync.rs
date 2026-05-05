@@ -1357,26 +1357,57 @@ fn execute_flush(
     Ok(())
 }
 
+fn create_temp_manifest_file(manifest_path: &Path) -> Result<(PathBuf, File)> {
+    let pid = std::process::id();
+
+    for attempt in 0..64_u32 {
+        let extension = if attempt == 0 {
+            format!("json.{pid}.tmp")
+        } else {
+            format!("json.{pid}.{attempt}.tmp")
+        };
+        let temp_path = manifest_path.with_extension(extension);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => return Ok((temp_path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if fs::symlink_metadata(&temp_path)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                {
+                    return Err(BeadsError::Config(format!(
+                        "failed to create temp manifest file {}: {error}",
+                        temp_path.display()
+                    )));
+                }
+            }
+            Err(error) => {
+                return Err(BeadsError::Config(format!(
+                    "failed to create temp manifest file {}: {error}",
+                    temp_path.display()
+                )));
+            }
+        }
+    }
+
+    Err(BeadsError::Config(format!(
+        "failed to allocate temp manifest file for {}",
+        manifest_path.display()
+    )))
+}
+
 fn write_manifest_atomically(manifest_path: &Path, manifest: &serde_json::Value) -> Result<()> {
     use std::io::Write;
 
-    let temp_path = manifest_path.with_extension(format!("json.{}.tmp", std::process::id()));
     let content = serde_json::to_string_pretty(manifest)?;
 
     let cleanup = |path: &Path| {
         let _ = fs::remove_file(path);
     };
 
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)
-        .map_err(|e| {
-            BeadsError::Config(format!(
-                "failed to create temp manifest file {}: {e}",
-                temp_path.display()
-            ))
-        })?;
+    let (temp_path, mut file) = create_temp_manifest_file(manifest_path)?;
 
     // write_all / sync_all / durable_rename all must clean up the temp
     // file on failure; otherwise a torn manifest.json.<pid>.tmp can
@@ -2714,6 +2745,31 @@ mod tests {
                 .file_type()
                 .is_symlink(),
             "rejected pre-existing temp symlink should be left untouched"
+        );
+    }
+
+    #[test]
+    fn test_write_manifest_atomically_skips_stale_regular_temp_file() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let manifest_path = beads_dir.join(".manifest.json");
+        let stale_temp_path =
+            manifest_path.with_extension(format!("json.{}.tmp", std::process::id()));
+        fs::write(&stale_temp_path, "stale temp").unwrap();
+
+        write_manifest_atomically(&manifest_path, &serde_json::json!({ "ok": true })).unwrap();
+
+        let manifest = fs::read_to_string(&manifest_path).unwrap();
+        assert!(
+            manifest.contains("\"ok\": true"),
+            "manifest should be written through a collision-free temp path"
+        );
+        assert_eq!(
+            fs::read_to_string(&stale_temp_path).unwrap(),
+            "stale temp",
+            "stale temp collision should be left untouched"
         );
     }
 
