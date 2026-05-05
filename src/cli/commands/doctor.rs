@@ -21,7 +21,8 @@ use fsqlite_types::SqliteValue;
 use rich_rust::prelude::*;
 use serde::Serialize;
 use std::collections::BTreeSet;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -2429,9 +2430,21 @@ fn check_root_gitignore(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
         return;
     };
     let gitignore_path = project_root.join(".gitignore");
-    let Ok(content) = fs::read_to_string(&gitignore_path) else {
-        // No .gitignore is fine — nothing to warn about.
-        return;
+    let content = match read_root_gitignore_content(&gitignore_path) {
+        Ok(Some(content)) => content,
+        Ok(None) => return,
+        Err(err) => {
+            push_check(
+                checks,
+                "gitignore.beads_inner",
+                CheckStatus::Warn,
+                Some(format!("Could not inspect root .gitignore: {err}")),
+                Some(serde_json::json!({
+                    "gitignore_path": gitignore_path.display().to_string(),
+                })),
+            );
+            return;
+        }
     };
 
     let offending: Vec<String> = content
@@ -2478,8 +2491,15 @@ fn fix_root_gitignore_if_warned(
         return false;
     };
     let gitignore_path = project_root.join(".gitignore");
-    let Ok(content) = fs::read_to_string(&gitignore_path) else {
-        return false;
+    let content = match read_root_gitignore_content(&gitignore_path) {
+        Ok(Some(content)) => content,
+        Ok(None) => return false,
+        Err(err) => {
+            if !ctx.is_json() {
+                ctx.warning(&format!("Skipping .gitignore repair: {err}"));
+            }
+            return false;
+        }
     };
 
     let filtered: Vec<&str> = content
@@ -2491,7 +2511,7 @@ fn fix_root_gitignore_if_warned(
         new_content.push('\n');
     }
 
-    if let Err(err) = fs::write(&gitignore_path, new_content) {
+    if let Err(err) = write_root_gitignore_atomically(&gitignore_path, new_content.as_bytes()) {
         if !ctx.is_json() {
             ctx.warning(&format!("Failed to fix .gitignore: {err}"));
         }
@@ -2502,6 +2522,89 @@ fn fix_root_gitignore_if_warned(
         }
         true
     }
+}
+
+fn read_root_gitignore_content(gitignore_path: &Path) -> Result<Option<String>> {
+    let metadata = match fs::symlink_metadata(gitignore_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+
+    if metadata.file_type().is_symlink() {
+        return Err(BeadsError::Config(format!(
+            "refusing to inspect or repair symlinked root .gitignore: {}",
+            gitignore_path.display()
+        )));
+    }
+
+    if !metadata.is_file() {
+        return Err(BeadsError::Config(format!(
+            "root .gitignore is not a regular file: {}",
+            gitignore_path.display()
+        )));
+    }
+
+    Ok(Some(fs::read_to_string(gitignore_path)?))
+}
+
+fn root_gitignore_temp_path(gitignore_path: &Path, attempt: u32) -> PathBuf {
+    let pid = std::process::id();
+    let file_name = gitignore_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(".gitignore");
+    let temp_name = if attempt == 0 {
+        format!("{file_name}.{pid}.tmp")
+    } else {
+        format!("{file_name}.{pid}.{attempt}.tmp")
+    };
+    gitignore_path.with_file_name(temp_name)
+}
+
+fn create_root_gitignore_temp_file(gitignore_path: &Path) -> Result<(PathBuf, fs::File)> {
+    for attempt in 0..64_u32 {
+        let temp_path = root_gitignore_temp_path(gitignore_path, attempt);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => return Ok((temp_path, file)),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    Err(BeadsError::Config(format!(
+        "Failed to allocate temp .gitignore file for {}",
+        gitignore_path.display()
+    )))
+}
+
+fn write_root_gitignore_atomically(gitignore_path: &Path, contents: &[u8]) -> Result<()> {
+    let permissions = fs::symlink_metadata(gitignore_path)?.permissions();
+    let (temp_path, mut temp_file) = create_root_gitignore_temp_file(gitignore_path)?;
+    if let Err(err) = fs::set_permissions(&temp_path, permissions) {
+        tracing::warn!(
+            path = %gitignore_path.display(),
+            error = %err,
+            "Failed to apply original .gitignore permissions before atomic rewrite"
+        );
+    }
+    if let Err(err) = temp_file
+        .write_all(contents)
+        .and_then(|()| temp_file.sync_all())
+    {
+        drop(temp_file);
+        let _ = fs::remove_file(&temp_path);
+        return Err(err.into());
+    }
+    drop(temp_file);
+    crate::util::durable_rename(&temp_path, gitignore_path).inspect_err(|_| {
+        let _ = fs::remove_file(&temp_path);
+    })?;
+    Ok(())
 }
 
 fn discover_jsonl(beads_dir: &Path) -> Option<PathBuf> {
@@ -4284,6 +4387,69 @@ mod tests {
         let after_check =
             find_check(&report_after.report.checks, "gitignore.beads_inner").expect("status");
         assert!(matches!(after_check.status, CheckStatus::Ok));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_root_gitignore_warns_for_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let outside = TempDir::new().unwrap();
+        let outside_gitignore = outside.path().join("gitignore-target");
+        fs::write(&outside_gitignore, ".beads/\n").unwrap();
+        symlink(&outside_gitignore, temp.path().join(".gitignore")).unwrap();
+
+        let mut checks = Vec::new();
+        check_root_gitignore(&beads_dir, &mut checks);
+
+        let check = find_check(&checks, "gitignore.beads_inner").expect("gitignore check");
+        assert!(matches!(check.status, CheckStatus::Warn));
+        assert!(
+            check
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("symlinked root .gitignore")),
+            "warning should explain that symlinked .gitignore is unsupported: {check:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_fix_root_gitignore_if_warned_refuses_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let outside = TempDir::new().unwrap();
+        let outside_gitignore = outside.path().join("gitignore-target");
+        let original = ".beads/\nkeep-me\n";
+        fs::write(&outside_gitignore, original).unwrap();
+        let root_gitignore = temp.path().join(".gitignore");
+        symlink(&outside_gitignore, &root_gitignore).unwrap();
+
+        let mut checks = Vec::new();
+        check_root_gitignore(&beads_dir, &mut checks);
+        let report = DoctorReport {
+            ok: true,
+            workspace_health: None,
+            reliability_audit: None,
+            checks,
+        };
+        let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Json, false, true);
+
+        assert!(!fix_root_gitignore_if_warned(&beads_dir, &report, &ctx));
+        assert_eq!(fs::read_to_string(&outside_gitignore).unwrap(), original);
+        assert!(
+            fs::symlink_metadata(&root_gitignore)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "doctor repair must leave the symlink itself untouched"
+        );
     }
 
     #[test]
