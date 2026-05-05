@@ -437,10 +437,6 @@ pub fn backup_before_export(
 
     let history_dir = beads_dir.join(".br_history");
 
-    if !target_path.exists() {
-        return Ok(());
-    }
-
     if history_artifact_metadata(target_path, "backup source")?.is_none() {
         return Ok(());
     }
@@ -843,6 +839,35 @@ mod tests {
         assert!(
             !beads_dir.join(".br_history").exists(),
             "rejected symlinked source must not create history state"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_backup_before_export_rejects_broken_symlink_source_target() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let target_path = beads_dir.join("issues.jsonl");
+        symlink(temp.path().join("missing.jsonl"), &target_path).unwrap();
+
+        let err =
+            backup_before_export(&beads_dir, &HistoryConfig::default(), &target_path).unwrap_err();
+        assert!(
+            matches!(&err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        let BeadsError::Config(message) = err else {
+            return;
+        };
+        assert!(
+            message.contains("backup source") && message.contains("must not be a symlink"),
+            "unexpected message: {message}"
+        );
+        assert!(
+            !beads_dir.join(".br_history").exists(),
+            "rejected broken symlink source must not create history state"
         );
     }
 
