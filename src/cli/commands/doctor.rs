@@ -470,6 +470,16 @@ fn append_doctor_check_anomalies(check: &CheckResult, anomalies: &mut Vec<Anomal
                 },
             );
         }
+        "sqlite.integrity_check" | "sqlite3.integrity_check"
+            if is_repairable_integrity_warning_check(check) =>
+        {
+            push_anomaly(
+                anomalies,
+                AnomalyClass::DatabaseCorrupt {
+                    detail: check_message(check),
+                },
+            );
+        }
         "jsonl.parse" if matches!(check.status, CheckStatus::Error) => {
             push_anomaly(
                 anomalies,
@@ -803,19 +813,25 @@ fn repair_report_verified(report: &DoctorReport) -> bool {
 
 /// Return true if any integrity check reported partial-index row mismatches
 /// ("row N missing from index") as a warning.  These can be repaired via `REINDEX`.
+fn is_partial_index_warning_check(check: &CheckResult) -> bool {
+    if !matches!(check.status, CheckStatus::Warn) {
+        return false;
+    }
+    if check.name != "sqlite.integrity_check" && check.name != "sqlite3.integrity_check" {
+        return false;
+    }
+    check
+        .message
+        .as_deref()
+        .is_some_and(|msg| msg.to_lowercase().contains("missing from index"))
+}
+
 fn report_has_partial_index_warnings(report: &DoctorReport) -> bool {
-    report.checks.iter().any(|check| {
-        if !matches!(check.status, CheckStatus::Warn) {
-            return false;
-        }
-        if check.name != "sqlite.integrity_check" && check.name != "sqlite3.integrity_check" {
-            return false;
-        }
-        check
-            .message
-            .as_deref()
-            .is_some_and(|msg| msg.to_lowercase().contains("missing from index"))
-    })
+    report.checks.iter().any(is_partial_index_warning_check)
+}
+
+fn is_repairable_integrity_warning_check(check: &CheckResult) -> bool {
+    is_warn_level_page_anomaly_check(check) || is_partial_index_warning_check(check)
 }
 
 fn warning_repair_verified(
@@ -3775,6 +3791,63 @@ mod tests {
                 .iter()
                 .any(|anomaly| matches!(anomaly, AnomalyClass::JsonlParseError { .. })),
             "expected JSONL parse anomaly: {:?}",
+            classification.anomalies
+        );
+    }
+
+    #[test]
+    fn test_classify_doctor_checks_marks_repairable_integrity_warnings_recoverable() {
+        for (check_name, message) in [
+            ("sqlite.integrity_check", "Page 55: never used"),
+            (
+                "sqlite3.integrity_check",
+                "row 42 missing from index idx_foo",
+            ),
+        ] {
+            let temp = TempDir::new().unwrap();
+            let db_path = temp.path().join("beads.db");
+            let jsonl_path = temp.path().join("issues.jsonl");
+            let checks = vec![CheckResult {
+                name: check_name.to_string(),
+                status: CheckStatus::Warn,
+                message: Some(message.to_string()),
+                details: None,
+            }];
+
+            let classification = classify_doctor_checks(&db_path, &jsonl_path, &checks);
+
+            assert_eq!(classification.health, WorkspaceHealth::Recoverable);
+            assert!(
+                classification.anomalies.iter().any(|anomaly| {
+                    matches!(
+                        anomaly,
+                        AnomalyClass::DatabaseCorrupt { detail } if detail == message
+                    )
+                }),
+                "expected repairable integrity warning anomaly for {check_name}: {:?}",
+                classification.anomalies
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_doctor_checks_ignores_benign_integrity_warning() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let jsonl_path = temp.path().join("issues.jsonl");
+        let checks = vec![CheckResult {
+            name: "sqlite.integrity_check".to_string(),
+            status: CheckStatus::Warn,
+            message: Some("out of order index idx_foo".to_string()),
+            details: None,
+        }];
+
+        let classification = classify_doctor_checks(&db_path, &jsonl_path, &checks);
+
+        assert_eq!(classification.health, WorkspaceHealth::Healthy);
+        assert!(
+            classification.anomalies.is_empty(),
+            "benign integrity warning should not create health anomalies: {:?}",
             classification.anomalies
         );
     }
