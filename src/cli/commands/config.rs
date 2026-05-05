@@ -25,7 +25,7 @@ use shell_words::split as split_shell_words;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{debug, info, trace};
@@ -153,6 +153,48 @@ fn write_config_atomically(config_path: &Path, yaml: &str) -> Result<()> {
     drop(temp_file);
     crate::util::durable_rename(&temp_path, config_path)?;
     guard.persist();
+    Ok(())
+}
+
+fn validate_edit_config_target(config_path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    if metadata.file_type().is_symlink() {
+        return Err(BeadsError::Config(format!(
+            "Refusing to create default config through symbolic link: {}",
+            config_path.display()
+        )));
+    }
+    if !metadata.is_file() {
+        return Err(BeadsError::Config(format!(
+            "Config path is not a regular file: {}",
+            config_path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn create_default_config_if_missing(config_path: &Path, default_content: &str) -> Result<()> {
+    match fs::symlink_metadata(config_path) {
+        Ok(metadata) => return validate_edit_config_target(config_path, &metadata),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    let mut file = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(config_path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(config_path)?;
+            return validate_edit_config_target(config_path, &metadata);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    file.write_all(default_content.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    crate::util::sync_parent_directory(config_path)?;
     Ok(())
 }
 
@@ -477,9 +519,9 @@ fn edit_config() -> Result<()> {
         fs::create_dir_all(parent)?;
     }
 
-    // Create file if it doesn't exist
-    if !config_path.exists() {
-        let default_content = r"# br configuration
+    // Create the default file if needed, and reject symlinked or non-file paths
+    // before passing the config path to an editor.
+    let default_content = r"# br configuration
 # See `br config list` for available options
 
 # Issue ID prefix
@@ -491,8 +533,7 @@ fn edit_config() -> Result<()> {
 # Default issue type
 # default_type: task
 ";
-        fs::write(&config_path, default_content)?;
-    }
+    create_default_config_if_missing(&config_path, default_content)?;
 
     // Get editor
     let editor = env::var("EDITOR")
@@ -1470,6 +1511,70 @@ mod tests {
 
         let mode = fs::metadata(&config_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "atomic rewrite should preserve file mode");
+    }
+
+    #[test]
+    fn test_create_default_config_if_missing_creates_regular_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        let default_content = "display:\n  color: true\n";
+
+        create_default_config_if_missing(&config_path, default_content).unwrap();
+
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), default_content);
+        assert!(fs::symlink_metadata(&config_path).unwrap().is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_create_default_config_if_missing_refuses_dangling_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        let target_path = dir.path().join("outside-target.yaml");
+        symlink(&target_path, &config_path).unwrap();
+
+        let err = create_default_config_if_missing(&config_path, "display:\n  color: true\n")
+            .unwrap_err();
+
+        assert!(err.to_string().contains("symbolic link"));
+        assert!(
+            !target_path.exists(),
+            "dangling symlink target must remain absent"
+        );
+        assert!(
+            fs::symlink_metadata(&config_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "config path should not be replaced after refusal"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_create_default_config_if_missing_refuses_existing_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        let target_path = dir.path().join("outside-target.yaml");
+        fs::write(&target_path, "existing-target").unwrap();
+        symlink(&target_path, &config_path).unwrap();
+
+        let err = create_default_config_if_missing(&config_path, "display:\n  color: true\n")
+            .unwrap_err();
+
+        assert!(err.to_string().contains("symbolic link"));
+        assert_eq!(fs::read_to_string(&target_path).unwrap(), "existing-target");
+        assert!(
+            fs::symlink_metadata(&config_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "config path should not be replaced after refusal"
+        );
     }
 
     #[test]
