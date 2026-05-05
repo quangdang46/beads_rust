@@ -331,31 +331,32 @@ fn blocked_cache_rebuild_finding(finding: &str) -> bool {
         || finding.contains(READY_PROJECTION_CONTENT_MISMATCH_FINDING)
 }
 
+fn parse_duplicate_identifier_and_count(finding: &str, marker: &str) -> Option<(String, i64)> {
+    let (_, tail) = finding.split_once(marker)?;
+    let (identifier, count_tail) = tail.split_once("' (")?;
+    let count_text = count_tail
+        .strip_suffix(" rows)")
+        .or_else(|| count_tail.strip_suffix(" row)"))?;
+    let count = count_text.parse().ok()?;
+    Some((identifier.to_string(), count))
+}
+
 fn append_recoverable_anomaly_findings(check: &CheckResult, anomalies: &mut Vec<AnomalyClass>) {
     for finding in check_findings(check) {
         if finding.contains("sqlite_master contains duplicate") {
-            push_anomaly(
-                anomalies,
-                AnomalyClass::DuplicateSchemaRows {
-                    name: "sqlite_master".to_string(),
-                    count: 2,
-                },
-            );
+            let (name, count) = parse_duplicate_identifier_and_count(&finding, " entries for '")
+                .unwrap_or_else(|| ("unknown".to_string(), 2));
+            push_anomaly(anomalies, AnomalyClass::DuplicateSchemaRows { name, count });
         } else if finding.contains("config contains duplicate rows") {
-            push_anomaly(
-                anomalies,
-                AnomalyClass::DuplicateConfigKeys {
-                    key: "unknown".to_string(),
-                    count: 2,
-                },
-            );
+            let (key, count) = parse_duplicate_identifier_and_count(&finding, " rows for key '")
+                .unwrap_or_else(|| ("unknown".to_string(), 2));
+            push_anomaly(anomalies, AnomalyClass::DuplicateConfigKeys { key, count });
         } else if finding.contains("metadata contains duplicate rows") {
+            let (key, count) = parse_duplicate_identifier_and_count(&finding, " rows for key '")
+                .unwrap_or_else(|| ("unknown".to_string(), 2));
             push_anomaly(
                 anomalies,
-                AnomalyClass::DuplicateMetadataKeys {
-                    key: "unknown".to_string(),
-                    count: 2,
-                },
+                AnomalyClass::DuplicateMetadataKeys { key, count },
             );
         } else if finding.contains(BLOCKED_CACHE_STALE_FINDING) {
             push_anomaly(anomalies, AnomalyClass::BlockedCacheStale);
@@ -3802,6 +3803,65 @@ mod tests {
                 )
             }),
             "expected count mismatch anomaly: {:?}",
+            classification.anomalies
+        );
+    }
+
+    #[test]
+    fn test_classify_doctor_checks_preserves_duplicate_finding_details() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let jsonl_path = temp.path().join("issues.jsonl");
+        let checks = vec![CheckResult {
+            name: "db.recoverable_anomalies".to_string(),
+            status: CheckStatus::Error,
+            message: Some(
+                "sqlite_master contains duplicate table entries for 'blocked_issues_cache' (3 rows)"
+                    .to_string(),
+            ),
+            details: Some(serde_json::json!({
+                "findings": [
+                    "sqlite_master contains duplicate table entries for 'blocked_issues_cache' (3 rows)",
+                    "config contains duplicate rows for key 'issue_prefix' (4 rows)",
+                    "metadata contains duplicate rows for key 'project' (5 rows)",
+                ]
+            })),
+        }];
+
+        let classification = classify_doctor_checks(&db_path, &jsonl_path, &checks);
+
+        assert_eq!(classification.health, WorkspaceHealth::Recoverable);
+        assert!(
+            classification.anomalies.iter().any(|anomaly| {
+                matches!(
+                    anomaly,
+                    AnomalyClass::DuplicateSchemaRows { name, count }
+                        if name == "blocked_issues_cache" && *count == 3
+                )
+            }),
+            "expected schema duplicate details: {:?}",
+            classification.anomalies
+        );
+        assert!(
+            classification.anomalies.iter().any(|anomaly| {
+                matches!(
+                    anomaly,
+                    AnomalyClass::DuplicateConfigKeys { key, count }
+                        if key == "issue_prefix" && *count == 4
+                )
+            }),
+            "expected config duplicate details: {:?}",
+            classification.anomalies
+        );
+        assert!(
+            classification.anomalies.iter().any(|anomaly| {
+                matches!(
+                    anomaly,
+                    AnomalyClass::DuplicateMetadataKeys { key, count }
+                        if key == "project" && *count == 5
+                )
+            }),
+            "expected metadata duplicate details: {:?}",
             classification.anomalies
         );
     }
