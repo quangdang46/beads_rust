@@ -228,18 +228,17 @@ pub fn validate_no_git_path(path: &Path) -> PathValidation {
         };
     }
 
-    // Resolve the canonical path when possible (catches symlinks to .git)
-    if let Ok(canonical) = dunce::canonicalize(path) {
-        if has_git_component(&canonical) {
-            return PathValidation::GitPathAttempt { path: canonical };
-        }
-    } else if let Some(parent) = path.parent()
-        && let Ok(canonical_parent) = dunce::canonicalize(parent)
-        && has_git_component(&canonical_parent)
-    {
-        return PathValidation::GitPathAttempt {
-            path: canonical_parent,
+    // Resolve each existing ancestor. The final path or its immediate parent
+    // may not exist yet, but a higher symlinked ancestor can still target .git.
+    for ancestor in path.ancestors() {
+        let Ok(canonical_ancestor) = dunce::canonicalize(ancestor) else {
+            continue;
         };
+        if has_git_component(&canonical_ancestor) {
+            return PathValidation::GitPathAttempt {
+                path: canonical_ancestor,
+            };
+        }
     }
 
     PathValidation::Allowed
@@ -1154,6 +1153,57 @@ mod tests {
         assert!(
             matches!(result, PathValidation::GitPathAttempt { .. }),
             "Symlinked parents targeting .git should be rejected"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_no_git_path_rejects_missing_descendant_under_symlinked_git_parent() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("create temp dir");
+        let git_dir = temp.path().join(".git");
+        std::fs::create_dir_all(&git_dir).expect("create .git dir");
+
+        let symlink_parent = temp.path().join("gitlink");
+        symlink(&git_dir, &symlink_parent).expect("create git symlink");
+
+        let candidate = symlink_parent.join("missing").join("issues.jsonl");
+        let result = validate_no_git_path(&candidate);
+        assert!(
+            matches!(result, PathValidation::GitPathAttempt { .. }),
+            "Missing descendants under symlinked .git parents should be rejected"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_sync_path_with_external_rejects_missing_descendant_under_symlinked_git_parent()
+    {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("create temp dir");
+        let beads_dir = temp.path().join(".beads");
+        let git_dir = temp.path().join(".git");
+        std::fs::create_dir_all(&beads_dir).expect("create beads dir");
+        std::fs::create_dir_all(&git_dir).expect("create .git dir");
+
+        let symlink_parent = temp.path().join("gitlink");
+        symlink(&git_dir, &symlink_parent).expect("create git symlink");
+
+        let candidate = symlink_parent.join("missing").join("issues.jsonl");
+        let result = validate_sync_path_with_external(&candidate, &beads_dir, true);
+        assert!(
+            result.is_err(),
+            "External JSONL opt-in must not permit missing descendants under symlinked .git parents"
+        );
+        assert!(
+            result.unwrap_err().to_string().contains("git"),
+            "error should mention git path rejection"
+        );
+        assert!(
+            !git_dir.join("missing").exists(),
+            "validation must not create missing directories inside .git"
         );
     }
 
