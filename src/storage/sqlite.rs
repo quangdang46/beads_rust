@@ -2,7 +2,9 @@
 
 use crate::error::{BeadsError, Result};
 use crate::format::{IssueDetails, IssueWithDependencyMetadata};
-use crate::model::{Comment, DependencyType, Event, EventType, Issue, IssueType, Priority, Status};
+use crate::model::{
+    Comment, Dependency, DependencyType, Event, EventType, Issue, IssueType, Priority, Status,
+};
 use crate::storage::events::get_events;
 use crate::storage::schema::CURRENT_SCHEMA_VERSION;
 use crate::storage::schema::{
@@ -10961,13 +10963,15 @@ impl SqliteStorage {
         issue_id: &str,
         dependencies: &[crate::model::Dependency],
     ) -> Result<()> {
+        let unique_deps = Self::validated_unique_import_dependencies(issue_id, dependencies)?;
+
         // Remove existing dependencies where this issue is the dependent
         self.conn.execute_with_params(
             "DELETE FROM dependencies WHERE issue_id = ?",
             &[SqliteValue::from(issue_id)],
         )?;
 
-        self.insert_dependencies_for_import(issue_id, dependencies)
+        self.insert_dependency_refs_for_import(issue_id, &unique_deps)
     }
 
     fn insert_dependencies_for_import(
@@ -10975,11 +10979,15 @@ impl SqliteStorage {
         issue_id: &str,
         dependencies: &[crate::model::Dependency],
     ) -> Result<()> {
-        if dependencies.is_empty() {
-            return Ok(());
-        }
+        let unique_deps = Self::validated_unique_import_dependencies(issue_id, dependencies)?;
 
-        // Add new dependencies
+        self.insert_dependency_refs_for_import(issue_id, &unique_deps)
+    }
+
+    fn validated_unique_import_dependencies<'a>(
+        issue_id: &str,
+        dependencies: &'a [Dependency],
+    ) -> Result<Vec<&'a Dependency>> {
         let mut seen_deps = HashSet::new();
         let mut unique_deps = Vec::new();
         for dep in dependencies {
@@ -10995,6 +11003,14 @@ impl SqliteStorage {
             }
         }
 
+        Ok(unique_deps)
+    }
+
+    fn insert_dependency_refs_for_import(
+        &self,
+        issue_id: &str,
+        unique_deps: &[&Dependency],
+    ) -> Result<()> {
         if unique_deps.is_empty() {
             return Ok(());
         }
@@ -11038,13 +11054,15 @@ impl SqliteStorage {
         issue_id: &str,
         comments: &[crate::model::Comment],
     ) -> Result<()> {
+        validate_import_comments_for_issue(issue_id, comments)?;
+
         // Remove existing comments
         self.conn.execute_with_params(
             "DELETE FROM comments WHERE issue_id = ?",
             &[SqliteValue::from(issue_id)],
         )?;
 
-        self.insert_comments_for_import(issue_id, comments)
+        self.insert_comment_rows_for_import(issue_id, comments)
     }
 
     /// Insert relation rows for an issue that was just created during import.
@@ -11064,6 +11082,16 @@ impl SqliteStorage {
     }
 
     fn insert_comments_for_import(
+        &self,
+        issue_id: &str,
+        comments: &[crate::model::Comment],
+    ) -> Result<()> {
+        validate_import_comments_for_issue(issue_id, comments)?;
+
+        self.insert_comment_rows_for_import(issue_id, comments)
+    }
+
+    fn insert_comment_rows_for_import(
         &self,
         issue_id: &str,
         comments: &[crate::model::Comment],
@@ -11204,6 +11232,30 @@ fn validate_new_comment(issue_id: &str, author: &str, text: &str) -> Result<()> 
 fn validate_issue_comments_for_create(issue: &Issue) -> Result<()> {
     for comment in &issue.comments {
         validate_new_comment(&issue.id, &comment.author, &comment.body)?;
+    }
+
+    Ok(())
+}
+
+fn validate_import_comments_for_issue(issue_id: &str, comments: &[Comment]) -> Result<()> {
+    let mut seen_comment_ids = HashSet::new();
+    for comment in comments {
+        let comment_for_validation = Comment {
+            id: 1,
+            issue_id: issue_id.to_string(),
+            author: comment.author.clone(),
+            body: comment.body.clone(),
+            created_at: comment.created_at,
+        };
+        CommentValidator::validate(&comment_for_validation)
+            .map_err(BeadsError::from_validation_errors)?;
+
+        if comment.id > 0 && !seen_comment_ids.insert(comment.id) {
+            return Err(BeadsError::validation(
+                "comment.id",
+                format!("duplicate import comment id {}", comment.id),
+            ));
+        }
     }
 
     Ok(())
@@ -12974,6 +13026,58 @@ mod tests {
     }
 
     #[test]
+    fn test_sync_dependencies_for_import_validates_before_replacing_existing_dependencies() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
+
+        let issue = make_issue(
+            "bd-d-import-invalid",
+            "Import dependencies",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let stable_parent = make_issue(
+            "bd-d-import-stable",
+            "Stable parent",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+        storage.create_issue(&stable_parent, "tester").unwrap();
+        storage
+            .add_dependency(&issue.id, &stable_parent.id, "blocks", "tester")
+            .unwrap();
+
+        let invalid_parent = crate::model::Dependency {
+            issue_id: issue.id.clone(),
+            depends_on_id: "external:parent".to_string(),
+            dep_type: crate::model::DependencyType::ParentChild,
+            created_at: t1,
+            created_by: Some("import".to_string()),
+            metadata: None,
+            thread_id: None,
+        };
+        let err = storage
+            .sync_dependencies_for_import(&issue.id, &[invalid_parent])
+            .expect_err("invalid import dependency must fail before deleting old dependencies");
+        assert!(err.to_string().contains("parent-child dependencies"));
+
+        let dependencies = storage.get_dependencies_full(&issue.id).unwrap();
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0].depends_on_id, stable_parent.id);
+        assert_eq!(
+            dependencies[0].dep_type,
+            crate::model::DependencyType::Blocks
+        );
+    }
+
+    #[test]
     fn test_bulk_label_mutations_reject_tombstones() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
@@ -13916,6 +14020,9 @@ mod tests {
             None,
         );
         storage.create_issue(&issue, "tester").unwrap();
+        let existing_comment = storage
+            .add_comment(&issue.id, "bob", "existing local comment")
+            .unwrap();
 
         let first = crate::model::Comment {
             id: 42,
@@ -13936,11 +14043,52 @@ mod tests {
             .sync_comments_for_import(&issue.id, &[first, second])
             .unwrap_err();
         assert!(
-            matches!(
-                &error,
-                BeadsError::Database(db_error) if is_import_comment_id_collision(db_error)
-            ),
+            error.to_string().contains("duplicate import comment id 42"),
             "duplicate same-issue import comment IDs must remain invalid: {error:?}"
+        );
+        assert_eq!(
+            storage.get_comments(&issue.id).unwrap(),
+            vec![existing_comment]
+        );
+    }
+
+    #[test]
+    fn test_sync_comments_for_import_validates_before_replacing_existing_comments() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
+
+        let issue = make_issue(
+            "bd-c-import-invalid",
+            "Invalid import comments",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+        let existing_comment = storage
+            .add_comment(&issue.id, "bob", "existing local comment")
+            .unwrap();
+
+        let invalid_comment = crate::model::Comment {
+            id: 43,
+            issue_id: issue.id.clone(),
+            author: "alice".to_string(),
+            body: "   ".to_string(),
+            created_at: t1,
+        };
+
+        let error = storage
+            .sync_comments_for_import(&issue.id, &[invalid_comment])
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("cannot be empty"),
+            "invalid import comment body must fail validation: {error:?}"
+        );
+        assert_eq!(
+            storage.get_comments(&issue.id).unwrap(),
+            vec![existing_comment]
         );
     }
 
