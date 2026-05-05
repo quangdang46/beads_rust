@@ -53,11 +53,17 @@ impl AdaptivePolicy {
             ));
         }
         validate_name("policy_id", &self.policy_id, &mut errors);
+        validate_name(
+            "compatibility_version.family",
+            &self.compatibility_version.family,
+            &mut errors,
+        );
 
         let inputs = validate_inputs(&self.inputs, &mut errors);
         let outputs = validate_outputs(&self.outputs, &mut errors);
         let evidence_fields = validate_evidence_fields(&self.evidence_fields, &mut errors);
         validate_budgets(&self.budgets, &mut errors);
+        validate_name("fallback.reason", &self.fallback.reason, &mut errors);
 
         validate_output_values(
             "fallback.outputs",
@@ -70,6 +76,7 @@ impl AdaptivePolicy {
         for (index, rule) in self.rules.iter().enumerate() {
             let rule_scope = format!("rules[{index}]");
             validate_name(&format!("{rule_scope}.rule_id"), &rule.rule_id, &mut errors);
+            validate_name(&format!("{rule_scope}.reason"), &rule.reason, &mut errors);
             validate_output_values(
                 &format!("{rule_scope}.outputs"),
                 &rule.outputs,
@@ -1186,6 +1193,32 @@ mod tests {
                 .any(|error| error.message.contains("unknown evidence field")),
             "expected unknown evidence error, got {errors:?}"
         );
+    }
+
+    #[test]
+    fn validation_rejects_blank_audit_strings() {
+        let mut policy = sample_policy();
+        policy.compatibility_version.family = "   ".to_string();
+        policy.fallback.reason = String::new();
+        policy.rules[0].reason = "\0".to_string();
+
+        let errors = policy
+            .validate()
+            .expect_err("blank or invalid audit strings must fail validation");
+        assert!(errors.iter().any(|error| {
+            error.field == "compatibility_version.family"
+                && error.message.contains("cannot be empty")
+        }));
+        assert!(errors.iter().any(|error| {
+            error.field == "fallback.reason" && error.message.contains("cannot be empty")
+        }));
+        assert!(errors.iter().any(|error| {
+            error.field == "rules[0].reason" && error.message.contains("cannot contain NUL")
+        }));
+
+        let decision = policy.evaluate(&valid_context());
+        assert!(decision.fallback_active);
+        assert!(decision.reason.contains("invalid_policy"));
     }
 
     #[test]
