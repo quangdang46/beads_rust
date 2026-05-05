@@ -1530,6 +1530,48 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_restore_backup_rejects_internal_target_through_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let history_dir = beads_dir.join(".br_history");
+        let outside_dir = temp.path().join("outside");
+        fs::create_dir_all(&history_dir).unwrap();
+        fs::create_dir_all(&outside_dir).unwrap();
+        symlink(&outside_dir, beads_dir.join("linked")).unwrap();
+
+        let backup_name = "issues.20260220_120000.jsonl";
+        let backup_path = history_dir.join(backup_name);
+        fs::write(&backup_path, "restored\n").unwrap();
+        fs::write(
+            backup_path.with_extension("jsonl.meta.json"),
+            serde_json::json!({
+                "target": {
+                    "kind": "relative",
+                    "path": "linked/issues.jsonl",
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let ctx = OutputContext::from_flags(false, true, true);
+        let err =
+            restore_backup(&beads_dir, &history_dir, backup_name, true, None, &ctx).unwrap_err();
+
+        assert!(
+            matches!(err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        assert!(
+            !outside_dir.join("issues.jsonl").exists(),
+            "restore must not write through symlinked .beads parents"
+        );
+    }
+
     #[test]
     fn commit_restored_target_replaces_existing_atomically() {
         let dir = TempDir::new().unwrap();

@@ -554,7 +554,27 @@ pub fn validate_sync_path_with_external(
         ));
     }
 
-    // If external paths are allowed, only validate file type (not containment)
+    // If a path still points at `.beads/`, keep the stricter internal
+    // allowlist and symlink-escape checks even when external JSONL is enabled.
+    let canonical_beads =
+        dunce::canonicalize(beads_dir).unwrap_or_else(|_| beads_dir.to_path_buf());
+    let resolved_path = if path.is_relative() {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    };
+    let is_internal = path.starts_with(beads_dir)
+        || path.starts_with(&canonical_beads)
+        || resolved_path.starts_with(beads_dir)
+        || resolved_path.starts_with(&canonical_beads);
+
+    if is_internal {
+        return require_valid_sync_path(path, beads_dir);
+    }
+
+    // If external paths are allowed, only validate file type (not containment).
     if allow_external {
         // Log the external path usage (safety invariant PC-2)
         tracing::info!(path = %path.display(), "Using external JSONL path (--allow-external-jsonl)");
@@ -1101,6 +1121,26 @@ mod tests {
                 .to_string()
                 .contains("must not be a symlink"),
             "Error should explain why the external path was rejected"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_sync_path_with_external_keeps_internal_symlink_escape_checks() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, beads_dir) = setup_test_beads_dir();
+        let outside_dir = temp.path().join("outside");
+        std::fs::create_dir_all(&outside_dir).expect("create outside dir");
+        let symlink_parent = beads_dir.join("linked");
+        symlink(&outside_dir, &symlink_parent).expect("create symlinked parent");
+
+        let path = symlink_parent.join("issues.jsonl");
+        let result = validate_sync_path_with_external(&path, &beads_dir, true);
+
+        assert!(
+            result.is_err(),
+            "Internal-looking paths must not bypass .beads symlink-escape checks"
         );
     }
 

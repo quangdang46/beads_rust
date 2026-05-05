@@ -10991,6 +10991,15 @@ impl SqliteStorage {
         let mut seen_deps = HashSet::new();
         let mut unique_deps = Vec::new();
         for dep in dependencies {
+            if dep.issue_id != issue_id {
+                return Err(BeadsError::validation(
+                    "dependency.issue_id",
+                    format!(
+                        "dependency issue_id '{}' does not match import issue '{}'",
+                        dep.issue_id, issue_id
+                    ),
+                ));
+            }
             if issue_id == dep.depends_on_id {
                 return Err(BeadsError::SelfDependency {
                     id: issue_id.to_string(),
@@ -11253,6 +11262,15 @@ fn validate_issue_comments_for_create(issue: &Issue) -> Result<()> {
 fn validate_import_comments_for_issue(issue_id: &str, comments: &[Comment]) -> Result<()> {
     let mut seen_comment_ids = HashSet::new();
     for comment in comments {
+        if comment.issue_id != issue_id {
+            return Err(BeadsError::validation(
+                "comment.issue_id",
+                format!(
+                    "comment issue_id '{}' does not match import issue '{}'",
+                    comment.issue_id, issue_id
+                ),
+            ));
+        }
         let comment_for_validation = Comment {
             id: 1,
             issue_id: issue_id.to_string(),
@@ -13088,6 +13106,26 @@ mod tests {
             crate::model::DependencyType::Blocks
         );
 
+        let wrong_source = crate::model::Dependency {
+            issue_id: "bd-d-import-other".to_string(),
+            depends_on_id: stable_parent.id.clone(),
+            dep_type: crate::model::DependencyType::Blocks,
+            created_at: t1,
+            created_by: Some("import".to_string()),
+            metadata: None,
+            thread_id: None,
+        };
+        let err = storage
+            .sync_dependencies_for_import(&issue.id, &[wrong_source])
+            .expect_err("wrong dependency issue_id must fail before deleting old dependencies");
+        assert!(
+            err.to_string().contains("dependency.issue_id"),
+            "unexpected dependency owner validation error: {err:?}"
+        );
+        let dependencies = storage.get_dependencies_full(&issue.id).unwrap();
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0].depends_on_id, stable_parent.id);
+
         let invalid_metadata = crate::model::Dependency {
             issue_id: issue.id.clone(),
             depends_on_id: stable_parent.id.clone(),
@@ -14100,6 +14138,25 @@ mod tests {
         assert!(
             error.to_string().contains("duplicate import comment id 42"),
             "duplicate same-issue import comment IDs must remain invalid: {error:?}"
+        );
+        assert_eq!(
+            storage.get_comments(&issue.id).unwrap(),
+            vec![existing_comment.clone()]
+        );
+
+        let wrong_issue_comment = crate::model::Comment {
+            id: 44,
+            issue_id: "bd-c-import-other".to_string(),
+            author: "alice".to_string(),
+            body: "valid text, wrong owner".to_string(),
+            created_at: t1,
+        };
+        let error = storage
+            .sync_comments_for_import(&issue.id, &[wrong_issue_comment])
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("comment.issue_id"),
+            "wrong comment owner must fail validation: {error:?}"
         );
         assert_eq!(
             storage.get_comments(&issue.id).unwrap(),
