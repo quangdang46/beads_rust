@@ -3,7 +3,8 @@ use crate::output::{OutputContext, OutputMode};
 use crate::storage::SqliteStorage;
 use crate::util::db_path;
 use rich_rust::prelude::*;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Resolve the beads directory for init.
@@ -17,6 +18,90 @@ fn resolve_init_beads_dir(base_dir: &Path) -> PathBuf {
         }
     }
     base_dir.join(".beads")
+}
+
+fn path_entry_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn create_temp_init_file(path: &Path) -> Result<(PathBuf, File)> {
+    let pid = std::process::id();
+    let base_extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("tmp");
+
+    for attempt in 0..64_u32 {
+        let extension = if attempt == 0 {
+            format!("{base_extension}.{pid}.tmp")
+        } else {
+            format!("{base_extension}.{pid}.{attempt}.tmp")
+        };
+        let temp_path = path.with_extension(extension);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => return Ok((temp_path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    Err(BeadsError::Config(format!(
+        "Failed to allocate temp init file for {}",
+        path.display()
+    )))
+}
+
+fn write_init_file_if_missing(path: &Path, contents: &[u8]) -> Result<bool> {
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(mut file) => {
+            if let Err(error) = file.write_all(contents) {
+                drop(file);
+                let _ = fs::remove_file(path);
+                return Err(error.into());
+            }
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn write_init_file_atomically(path: &Path, contents: &[u8]) -> Result<()> {
+    let existing_permissions = fs::symlink_metadata(path)
+        .ok()
+        .filter(std::fs::Metadata::is_file)
+        .map(|metadata| metadata.permissions());
+    let (temp_path, mut temp_file) = create_temp_init_file(path)?;
+    if let Some(permissions) = existing_permissions
+        && let Err(error) = fs::set_permissions(&temp_path, permissions)
+    {
+        tracing::warn!(
+            path = %path.display(),
+            error = %error,
+            "Failed to apply original init file permissions before atomic rewrite"
+        );
+    }
+    if let Err(error) = temp_file
+        .write_all(contents)
+        .and_then(|()| temp_file.sync_all())
+    {
+        drop(temp_file);
+        let _ = fs::remove_file(&temp_path);
+        return Err(error.into());
+    }
+    drop(temp_file);
+    crate::util::durable_rename(&temp_path, path).inspect_err(|_| {
+        let _ = fs::remove_file(&temp_path);
+    })?;
+    Ok(())
 }
 
 /// Execute the init command.
@@ -82,18 +167,20 @@ pub fn execute(
 
     // Write metadata.json
     let metadata_path = beads_dir.join("metadata.json");
-    let metadata_existed = metadata_path.exists();
-    if !metadata_existed || force {
-        let metadata = r#"{
+    let metadata_existed = path_entry_exists(&metadata_path)?;
+    let metadata = r#"{
   "database": "beads.db",
   "jsonl_export": "issues.jsonl"
 }"#;
-        fs::write(metadata_path, metadata)?;
+    if force {
+        write_init_file_atomically(&metadata_path, metadata.as_bytes())?;
+    } else if !metadata_existed {
+        write_init_file_if_missing(&metadata_path, metadata.as_bytes())?;
     }
 
     // Write config.yaml template
     let config_path = beads_dir.join("config.yaml");
-    let config_existed = config_path.exists();
+    let config_existed = path_entry_exists(&config_path)?;
     if !config_existed {
         let config = format!(
             "# Beads Project Configuration
@@ -102,12 +189,12 @@ pub fn execute(
 # default_type: task
 "
         );
-        fs::write(config_path, config)?;
+        write_init_file_if_missing(&config_path, config.as_bytes())?;
     }
 
     // Write .gitignore
     let gitignore_path = beads_dir.join(".gitignore");
-    let gitignore_existed = gitignore_path.exists();
+    let gitignore_existed = path_entry_exists(&gitignore_path)?;
     if !gitignore_existed {
         let gitignore = r"# Database
 *.db
@@ -156,15 +243,15 @@ redirect
 # bv (beads viewer) lock file
 .bv.lock
 ";
-        fs::write(gitignore_path, gitignore)?;
+        write_init_file_if_missing(&gitignore_path, gitignore.as_bytes())?;
     }
 
     // Write empty issues.jsonl for compatibility with bv (beads_viewer)
     // bv expects this file to exist even if there are no issues yet
     let jsonl_path = beads_dir.join("issues.jsonl");
-    let jsonl_existed = jsonl_path.exists();
+    let jsonl_existed = path_entry_exists(&jsonl_path)?;
     if !jsonl_existed {
-        fs::write(&jsonl_path, "")?;
+        write_init_file_if_missing(&jsonl_path, b"")?;
     }
 
     if matches!(ctx.mode(), OutputMode::Quiet) {
@@ -373,6 +460,89 @@ mod tests {
         assert!(temp_dir.path().join(".beads/.gitignore").exists());
         assert!(temp_dir.path().join(".beads/issues.jsonl").exists());
         info!("test_init_creates_beads_directory: assertions passed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_init_does_not_follow_dangling_config_symlink() {
+        use std::os::unix::fs::symlink;
+
+        init_logging();
+        let temp_dir = TempDir::new().unwrap();
+        let beads_dir = temp_dir.path().join(".beads");
+        fs::create_dir(&beads_dir).unwrap();
+        let outside_target = temp_dir.path().join("outside-config.yaml");
+        let config_path = beads_dir.join("config.yaml");
+        symlink(&outside_target, &config_path).unwrap();
+
+        let ctx = OutputContext::from_flags(false, false, true);
+        let result = execute(None, false, Some(temp_dir.path()), &ctx);
+
+        assert!(result.is_ok());
+        assert!(
+            !outside_target.exists(),
+            "init must not create a dangling symlink target outside .beads"
+        );
+        assert!(
+            fs::symlink_metadata(&config_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "create-only init files should leave existing symlink entries alone"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_init_force_replaces_metadata_symlink_not_target() {
+        use std::os::unix::fs::symlink;
+
+        init_logging();
+        let temp_dir = TempDir::new().unwrap();
+        let beads_dir = temp_dir.path().join(".beads");
+        fs::create_dir(&beads_dir).unwrap();
+        let outside_target = temp_dir.path().join("outside-metadata.json");
+        let metadata_path = beads_dir.join("metadata.json");
+        symlink(&outside_target, &metadata_path).unwrap();
+
+        let ctx = OutputContext::from_flags(false, false, true);
+        let result = execute(None, true, Some(temp_dir.path()), &ctx);
+
+        assert!(result.is_ok());
+        assert!(
+            !outside_target.exists(),
+            "force init must replace the metadata symlink entry, not write its target"
+        );
+        assert!(
+            fs::metadata(&metadata_path).unwrap().is_file(),
+            "metadata should be installed as a regular file"
+        );
+        assert!(
+            !fs::symlink_metadata(&metadata_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "metadata symlink should be replaced by the forced rewrite"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_init_force_preserves_metadata_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        init_logging();
+        let temp_dir = TempDir::new().unwrap();
+        let ctx = OutputContext::from_flags(false, false, true);
+        execute(None, false, Some(temp_dir.path()), &ctx).unwrap();
+
+        let metadata_path = temp_dir.path().join(".beads/metadata.json");
+        fs::set_permissions(&metadata_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        execute(None, true, Some(temp_dir.path()), &ctx).unwrap();
+
+        let mode = fs::metadata(&metadata_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "force init should preserve metadata mode");
     }
 
     #[test]
