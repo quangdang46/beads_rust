@@ -386,16 +386,17 @@ pub fn find_unchecked_acceptance_criteria(body: &str) -> Vec<String> {
 
     // If the body has no markdown headers, treat the whole body as the
     // acceptance criteria section. acceptance_criteria column flow.
-    let has_any_header = body.lines().any(|line| line.trim_start().starts_with('#'));
+    let has_any_header = body
+        .lines()
+        .any(|line| markdown_heading_text(line).is_some());
     if !has_any_header {
         in_section = true;
     }
 
     for line in body.lines() {
         let trimmed = line.trim_start();
-        if let Some(rest) = trimmed.strip_prefix('#') {
+        if let Some(header_text) = markdown_heading_text(trimmed) {
             // Determine if this header opens / closes the acceptance criteria block.
-            let header_text = rest.trim_start_matches('#').trim();
             let lower = header_text.to_ascii_lowercase();
             // Match a header that contains "acceptance criteria" (allows variants
             // like "Acceptance Criteria (Phase 1)").
@@ -421,6 +422,23 @@ pub fn find_unchecked_acceptance_criteria(body: &str) -> Vec<String> {
     }
 
     out
+}
+
+fn markdown_heading_text(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    let level = trimmed
+        .as_bytes()
+        .iter()
+        .take_while(|byte| **byte == b'#')
+        .count();
+    if !(1..=6).contains(&level) {
+        return None;
+    }
+    let rest = trimmed.get(level..)?;
+    if rest.chars().next().is_some_and(|ch| !ch.is_whitespace()) {
+        return None;
+    }
+    Some(rest.trim())
 }
 
 /// Parse a single line for an unchecked checkbox. Accepts `- [ ]`, `* [ ]`,
@@ -628,6 +646,34 @@ mod tests {
     }
 
     #[test]
+    fn acceptance_criteria_does_not_treat_hash_references_as_section_headers() {
+        let mut policy = ClosePolicy::default();
+        policy.require_acceptance_criteria_satisfied.enabled = true;
+        let body =
+            "## Acceptance Criteria\n#123 tracks the rollout\n- [ ] Finish after the reference\n";
+        let mut evidence = evidence_with_reason("done done done done done", "bd-1");
+        evidence.description = Some(body);
+
+        let violations = evaluate(&policy, &evidence);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].gate, "acceptance_criteria_unchecked");
+        assert!(violations[0].message.contains("Finish after the reference"));
+    }
+
+    #[test]
+    fn acceptance_criteria_without_markdown_headers_scans_hash_prefixed_body() {
+        let mut policy = ClosePolicy::default();
+        policy.require_acceptance_criteria_satisfied.enabled = true;
+        let mut evidence = evidence_with_reason("done done done done done", "bd-1");
+        evidence.acceptance_criteria = Some("#123 follow-up\n- [ ] Finish referenced work\n");
+
+        let violations = evaluate(&policy, &evidence);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].gate, "acceptance_criteria_unchecked");
+        assert!(violations[0].message.contains("Finish referenced work"));
+    }
+
+    #[test]
     fn acceptance_criteria_dedupes_across_fields() {
         let mut policy = ClosePolicy::default();
         policy.require_acceptance_criteria_satisfied.enabled = true;
@@ -808,10 +854,10 @@ allow_bypass: false
         let yaml = "unknown_key: 1\n";
         std::fs::write(dir.path().join(POLICY_FILE_NAME), yaml).unwrap();
         let err = load_for_beads_dir(dir.path()).unwrap_err();
-        match err {
-            BeadsError::Config(msg) => assert!(msg.contains("unknown_key"), "{msg}"),
-            other => panic!("expected Config error, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, BeadsError::Config(msg) if msg.contains("unknown_key")),
+            "expected Config error containing unknown_key, got {err:?}"
+        );
     }
 
     #[test]
