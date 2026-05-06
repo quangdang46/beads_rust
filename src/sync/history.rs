@@ -160,6 +160,14 @@ pub(crate) fn parse_backup_filename(filename: &str) -> Option<(String, DateTime<
 fn create_backup_file(history_dir: &Path, file_stem: &str) -> Result<(PathBuf, File)> {
     let timestamp = Utc::now().format("%Y%m%d_%H%M%S_%f").to_string();
 
+    create_backup_file_for_timestamp(history_dir, file_stem, &timestamp)
+}
+
+fn create_backup_file_for_timestamp(
+    history_dir: &Path,
+    file_stem: &str,
+    timestamp: &str,
+) -> Result<(PathBuf, File)> {
     for collision_idx in 0..1024_u32 {
         let backup_name = if collision_idx == 0 {
             format!("{file_stem}.{timestamp}.jsonl")
@@ -167,6 +175,12 @@ fn create_backup_file(history_dir: &Path, file_stem: &str) -> Result<(PathBuf, F
             format!("{file_stem}.{timestamp}.{collision_idx}.jsonl")
         };
         let backup_path = history_dir.join(backup_name);
+        if history_artifact_metadata(&backup_metadata_path(&backup_path), "backup metadata")?
+            .is_some()
+        {
+            continue;
+        }
+
         match OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1165,6 +1179,34 @@ mod tests {
         assert_eq!(
             backups[0].target_path,
             invalid_metadata_target_path(backup_name)
+        );
+    }
+
+    #[test]
+    fn test_create_backup_file_skips_stale_metadata_sidecar() {
+        let temp = TempDir::new().unwrap();
+        let history_dir = temp.path();
+        let timestamp = "20260307_120000_000000";
+        let first_backup_path = history_dir.join(format!("issues.{timestamp}.jsonl"));
+        let stale_metadata_path = backup_metadata_path(&first_backup_path);
+        fs::write(&stale_metadata_path, "stale metadata\n").unwrap();
+
+        let (backup_path, file) =
+            create_backup_file_for_timestamp(history_dir, "issues", timestamp).unwrap();
+        drop(file);
+
+        assert_eq!(
+            backup_path.file_name().and_then(|name| name.to_str()),
+            Some("issues.20260307_120000_000000.1.jsonl")
+        );
+        assert!(
+            !first_backup_path.exists(),
+            "allocator should not create a backup next to stale metadata"
+        );
+        assert_eq!(
+            fs::read_to_string(&stale_metadata_path).unwrap(),
+            "stale metadata\n",
+            "stale metadata sidecar should be left untouched"
         );
     }
 
