@@ -3965,27 +3965,9 @@ pub fn external_project_db_paths(
     layer: &ConfigLayer,
     beads_dir: &Path,
 ) -> HashMap<String, PathBuf> {
-    let projects = external_projects_from_layer(layer, beads_dir);
     let mut db_paths = HashMap::new();
 
-    for (name, path) in projects {
-        let beads_path = if path.file_name().is_some_and(is_beads_dir_name) {
-            path.clone()
-        } else if path.join("_beads").is_dir() {
-            path.join("_beads")
-        } else {
-            path.join(".beads")
-        };
-
-        if !beads_path.is_dir() {
-            warn!(
-                project = %name,
-                path = %beads_path.display(),
-                "External project .beads directory not found"
-            );
-            continue;
-        }
-
+    for (name, beads_path) in external_project_beads_dirs(layer, beads_dir) {
         match ConfigPaths::resolve(&beads_path, None) {
             Ok(paths) => {
                 db_paths.insert(name, paths.db_path);
@@ -4002,6 +3984,46 @@ pub fn external_project_db_paths(
     }
 
     db_paths
+}
+
+/// Resolve configured external project `.beads` directories.
+///
+/// Projects are expected to be either a `.beads` directory or a project root
+/// containing `.beads/`.
+#[must_use]
+pub fn external_project_beads_dirs(
+    layer: &ConfigLayer,
+    beads_dir: &Path,
+) -> HashMap<String, PathBuf> {
+    let projects = external_projects_from_layer(layer, beads_dir);
+    let mut beads_dirs = HashMap::new();
+
+    for (name, path) in projects {
+        let beads_path = external_project_beads_dir(&path);
+
+        if !beads_path.is_dir() {
+            warn!(
+                project = %name,
+                path = %beads_path.display(),
+                "External project .beads directory not found"
+            );
+            continue;
+        }
+
+        beads_dirs.insert(name, beads_path);
+    }
+
+    beads_dirs
+}
+
+fn external_project_beads_dir(path: &Path) -> PathBuf {
+    if path.file_name().is_some_and(is_beads_dir_name) {
+        path.to_path_buf()
+    } else if path.join("_beads").is_dir() {
+        path.join("_beads")
+    } else {
+        path.join(".beads")
+    }
 }
 
 /// Resolve actor from a merged config layer.

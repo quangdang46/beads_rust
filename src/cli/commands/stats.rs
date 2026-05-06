@@ -3,6 +3,7 @@
 //! Shows project statistics including issue counts by status, type, priority,
 //! assignee, and label. Also supports recent activity tracking via git.
 
+use super::auto_import_external_projects_if_stale;
 use crate::cli::{OutputFormat, StatsArgs, resolve_output_format_basic_with_outer_mode};
 use crate::config;
 use crate::error::Result;
@@ -202,6 +203,7 @@ fn resolve_stats_external_blockers(
 
     let config_layer =
         ensure_stats_config_layer(beads_dir, storage, storage_ctx, cli, config_layer)?;
+    auto_import_external_projects_if_stale(config_layer, beads_dir, cli);
     let external_db_paths = config::external_project_db_paths(config_layer, beads_dir);
     let external_statuses =
         storage.resolve_external_dependency_statuses(&external_db_paths, true)?;

@@ -2,8 +2,9 @@
 
 use super::{
     RoutedWorkspaceWriteLock, acquire_routed_workspace_write_lock,
-    auto_import_storage_ctx_if_stale, finalize_batched_blocked_cache_refresh,
-    report_auto_flush_failure, resolve_issue_id, retry_mutation_with_jsonl_recovery,
+    auto_import_storage_ctx_if_stale, external_project_db_paths_after_auto_import_if_needed,
+    finalize_batched_blocked_cache_refresh, report_auto_flush_failure, resolve_issue_id,
+    retry_mutation_with_jsonl_recovery,
 };
 use crate::cli::{
     DepAddArgs, DepCommands, DepCyclesArgs, DepDirection, DepListArgs, DepRemoveArgs, DepTreeArgs,
@@ -138,8 +139,12 @@ fn execute_dep_list(
     let quiet = route_cli.quiet.unwrap_or(false);
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
-    let external_db_paths =
-        config::external_project_db_paths(&config_layer, &storage_ctx.paths.beads_dir);
+    let external_db_paths = external_project_db_paths_after_auto_import_if_needed(
+        &storage_ctx.storage,
+        &config_layer,
+        &storage_ctx.paths.beads_dir,
+        &route_cli,
+    )?;
 
     dep_list(
         args,
@@ -168,8 +173,12 @@ fn execute_local_dep_list_with_storage_ctx(
     let quiet = cli.quiet.unwrap_or(false);
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
-    let external_db_paths =
-        config::external_project_db_paths(&config_layer, &storage_ctx.paths.beads_dir);
+    let external_db_paths = external_project_db_paths_after_auto_import_if_needed(
+        &storage_ctx.storage,
+        &config_layer,
+        &storage_ctx.paths.beads_dir,
+        cli,
+    )?;
 
     dep_list(
         args,
@@ -195,8 +204,12 @@ fn execute_dep_tree(
     let config_layer = storage_ctx.load_config(&route_cli)?;
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
-    let external_db_paths =
-        config::external_project_db_paths(&config_layer, &storage_ctx.paths.beads_dir);
+    let external_db_paths = external_project_db_paths_after_auto_import_if_needed(
+        &storage_ctx.storage,
+        &config_layer,
+        &storage_ctx.paths.beads_dir,
+        &route_cli,
+    )?;
 
     dep_tree(
         args,
@@ -222,8 +235,12 @@ fn execute_local_dep_tree_with_storage_ctx(
     let config_layer = storage_ctx.load_config(cli)?;
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
-    let external_db_paths =
-        config::external_project_db_paths(&config_layer, &storage_ctx.paths.beads_dir);
+    let external_db_paths = external_project_db_paths_after_auto_import_if_needed(
+        &storage_ctx.storage,
+        &config_layer,
+        &storage_ctx.paths.beads_dir,
+        cli,
+    )?;
 
     dep_tree(
         args,

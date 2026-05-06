@@ -3,7 +3,7 @@
 //! Shows issues ready to work on next: open, unblocked, not deferred, not pinned,
 //! not ephemeral.
 
-use super::resolve_issue_id;
+use super::{auto_import_external_projects_if_stale, resolve_issue_id};
 use crate::cli::{
     OutputFormat, ReadyArgs, SortPolicy, resolve_output_format_basic_with_outer_mode,
 };
@@ -165,7 +165,9 @@ fn execute_inner(
             ready_issues =
                 get_ready_issues_for_output(storage, &filters, sort_policy, output_format)?;
         }
-        let external_db_paths = config::external_project_db_paths(&load_config_layer()?, beads_dir);
+        let config_layer = load_config_layer()?;
+        auto_import_external_projects_if_stale(&config_layer, beads_dir, cli);
+        let external_db_paths = config::external_project_db_paths(&config_layer, beads_dir);
         let external_statuses =
             storage.resolve_external_dependency_statuses(&external_db_paths, true)?;
         let external_blockers = storage.external_blockers(&external_statuses)?;

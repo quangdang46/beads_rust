@@ -3,6 +3,7 @@
 //! Ranks ready work with explicit evidence terms for agents that need a stable,
 //! machine-readable assignment surface.
 
+use super::auto_import_external_projects_if_stale;
 use crate::cli::{OutputFormat, SchedulerArgs, resolve_output_format_basic_with_outer_mode};
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -208,6 +209,7 @@ fn build_scheduler_output(
 
     if !issues.is_empty() && storage.has_external_dependencies(true)? {
         let config_layer = load_scheduler_config(beads_dir, storage, storage_ctx, cli)?;
+        auto_import_external_projects_if_stale(&config_layer, beads_dir, cli);
         let external_db_paths = config::external_project_db_paths(&config_layer, beads_dir);
         let external_statuses =
             storage.resolve_external_dependency_statuses(&external_db_paths, true)?;

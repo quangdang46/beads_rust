@@ -1,6 +1,9 @@
 //! Show command implementation.
 
-use crate::cli::commands::{acquire_routed_workspace_write_lock, auto_import_storage_ctx_if_stale};
+use crate::cli::commands::{
+    acquire_routed_workspace_write_lock, auto_import_storage_ctx_if_stale,
+    external_project_db_paths_after_auto_import_if_needed,
+};
 use crate::cli::{ShowArgs, resolve_output_format_basic_with_outer_mode};
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -357,7 +360,12 @@ fn load_issue_details_for_route(
         let use_color = config::should_use_color(&config_layer);
         let id_config = config::id_config_from_layer(&config_layer);
         let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
-        let external_db_paths = config::external_project_db_paths(&config_layer, beads_dir);
+        let external_db_paths = external_project_db_paths_after_auto_import_if_needed(
+            &storage_ctx.storage,
+            &config_layer,
+            beads_dir,
+            cli,
+        )?;
         let details_list = load_issue_details_from_storage(
             &target_ids,
             &resolver,
@@ -387,8 +395,8 @@ fn load_issue_details_for_route(
     let use_color = config::should_use_color(&config_layer);
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
-    let external_db_paths = config::external_project_db_paths(&config_layer, beads_dir);
     let details_list = if no_db {
+        let external_db_paths = config::external_project_db_paths(&config_layer, beads_dir);
         load_issue_details_from_jsonl(
             &target_ids,
             &resolver,
@@ -402,6 +410,12 @@ fn load_issue_details_for_route(
                 .expect("show should have an open storage handle")
                 .storage
         });
+        let external_db_paths = external_project_db_paths_after_auto_import_if_needed(
+            storage,
+            &config_layer,
+            beads_dir,
+            cli,
+        )?;
         load_issue_details_from_storage(&target_ids, &resolver, storage, &external_db_paths)?
     };
 

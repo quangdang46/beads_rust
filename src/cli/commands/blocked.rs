@@ -2,6 +2,7 @@
 //!
 //! Lists blocked issues from the `blocked_issues_cache`.
 
+use super::auto_import_external_projects_if_stale;
 use crate::cli::{BlockedArgs, OutputFormat, resolve_output_format_basic_with_outer_mode};
 use crate::config::{
     CliOverrides, discover_beads_dir_with_cli, external_project_db_paths, open_storage_with_cli,
@@ -144,12 +145,11 @@ fn execute_inner(
         .collect();
 
     if has_external_dependencies {
-        let external_db_paths = external_project_db_paths(
-            config_layer
-                .as_ref()
-                .expect("external dependencies require config"),
-            beads_dir,
-        );
+        let config_layer = config_layer
+            .as_ref()
+            .expect("external dependencies require config");
+        auto_import_external_projects_if_stale(config_layer, beads_dir, overrides);
+        let external_db_paths = external_project_db_paths(config_layer, beads_dir);
         let external_statuses =
             storage.resolve_external_dependency_statuses(&external_db_paths, true)?;
         let mut external_blockers = storage.external_blockers(&external_statuses)?;

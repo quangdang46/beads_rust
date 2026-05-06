@@ -6,6 +6,7 @@ use crate::output::OutputContext;
 use crate::storage::{IssueUpdate, SqliteStorage};
 use crate::sync::auto_import_if_stale;
 use crate::util::id::IdResolver;
+use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
@@ -336,6 +337,102 @@ pub(super) fn auto_import_storage_ctx_if_stale(
         no_auto_import,
     )
     .map(|_| ())
+}
+
+pub(super) fn auto_import_external_projects_if_stale(
+    config_layer: &crate::config::ConfigLayer,
+    local_beads_dir: &Path,
+    cli: &crate::config::CliOverrides,
+) {
+    if cli.allow_stale.unwrap_or(false)
+        || cli.no_auto_import.unwrap_or(false)
+        || cli.no_db.unwrap_or(false)
+        || crate::config::no_db_from_layer(config_layer).unwrap_or(false)
+        || crate::config::no_auto_import_from_layer(config_layer).unwrap_or(false)
+    {
+        return;
+    }
+
+    for (project, beads_dir) in
+        crate::config::external_project_beads_dirs(config_layer, local_beads_dir)
+    {
+        let paths = match crate::config::ConfigPaths::resolve(&beads_dir, None) {
+            Ok(paths) => paths,
+            Err(error) => {
+                tracing::warn!(
+                    project = %project,
+                    path = %beads_dir.display(),
+                    error = %error,
+                    "Skipping external project auto-import because path resolution failed"
+                );
+                continue;
+            }
+        };
+
+        if !paths.db_path.is_file() && !paths.jsonl_path.is_file() {
+            continue;
+        }
+
+        let mut route_cli = cli.clone();
+        route_cli.db = None;
+        route_cli.read_only_fast_open = false;
+        let routed_write_lock = match acquire_routed_workspace_write_lock(
+            &beads_dir,
+            true,
+            route_cli.lock_timeout,
+        ) {
+            Ok(lock) => lock,
+            Err(error) => {
+                tracing::warn!(
+                    project = %project,
+                    path = %beads_dir.display(),
+                    error = %error,
+                    "Skipping external project auto-import because the workspace write lock could not be acquired"
+                );
+                continue;
+            }
+        };
+        routed_write_lock.mark_cli_write_lock_held(&mut route_cli);
+
+        let mut storage_ctx = match crate::config::open_storage_with_cli(&beads_dir, &route_cli) {
+            Ok(storage_ctx) => storage_ctx,
+            Err(error) => {
+                tracing::warn!(
+                    project = %project,
+                    path = %beads_dir.display(),
+                    error = %error,
+                    "Skipping external project auto-import because storage could not be opened"
+                );
+                continue;
+            }
+        };
+
+        if let Err(error) = auto_import_storage_ctx_if_stale(&mut storage_ctx, &route_cli) {
+            tracing::warn!(
+                project = %project,
+                path = %beads_dir.display(),
+                error = %error,
+                "External project auto-import failed; dependency status will use the current database state"
+            );
+        }
+    }
+}
+
+pub(super) fn external_project_db_paths_after_auto_import_if_needed(
+    storage: &SqliteStorage,
+    config_layer: &crate::config::ConfigLayer,
+    beads_dir: &Path,
+    cli: &crate::config::CliOverrides,
+) -> crate::Result<HashMap<String, PathBuf>> {
+    if !storage.has_external_dependencies(true)? {
+        return Ok(HashMap::new());
+    }
+
+    auto_import_external_projects_if_stale(config_layer, beads_dir, cli);
+    Ok(crate::config::external_project_db_paths(
+        config_layer,
+        beads_dir,
+    ))
 }
 
 pub(super) struct RoutedWorkspaceWriteLock {

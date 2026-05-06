@@ -15,6 +15,43 @@ fn parse_created_id(stdout: &str) -> String {
     id_part.trim().to_string()
 }
 
+fn issue_from_jsonl(workspace: &BrWorkspace, issue_id: &str) -> Value {
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    let contents = fs::read_to_string(&jsonl_path).expect("read issues.jsonl");
+    contents
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("parse issue jsonl line"))
+        .find(|issue| {
+            issue
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id.eq(issue_id))
+        })
+        .expect("issue should exist in issues.jsonl")
+}
+
+fn write_single_issue_jsonl(workspace: &BrWorkspace, issue: &Value) {
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    let serialized = serde_json::to_string(issue).expect("serialize issue jsonl");
+    fs::write(&jsonl_path, format!("{serialized}\n")).expect("write issues.jsonl");
+}
+
+fn issue_list_contains_id(issues: &[Value], issue_id: &str) -> bool {
+    issues.iter().any(|issue| {
+        issue
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id.eq(issue_id))
+    })
+}
+
+fn set_issue_jsonl_string(issue: &mut Value, field: &str, value: &str) {
+    let object = issue
+        .as_object_mut()
+        .expect("issue jsonl entry should be an object");
+    object.insert(field.to_string(), Value::String(value.to_string()));
+}
+
 fn setup_workspace_with_issues() -> (BrWorkspace, Vec<String>) {
     let workspace = BrWorkspace::new();
 
@@ -400,6 +437,118 @@ fn ready_respects_external_dependencies() {
         !blocked_json.iter().any(|item| item["id"] == issue_id),
         "blocked list should clear after external dependency is satisfied"
     );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn ready_imports_stale_external_jsonl_before_status_probe() {
+    let _log = common::test_log("ready_imports_stale_external_jsonl_before_status_probe");
+    let workspace = BrWorkspace::new();
+    let external = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_main");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    let init_ext = run_br(&external, ["init"], "init_external");
+    assert!(
+        init_ext.status.success(),
+        "external init failed: {}",
+        init_ext.stderr
+    );
+
+    let config_path = workspace.root.join(".beads/config.yaml");
+    let external_path = external.root.display();
+    let config = format!("issue_prefix: bd\nexternal_projects:\n  extproj: \"{external_path}\"\n");
+    fs::write(&config_path, config).expect("write config");
+    fs::write(
+        external.root.join(".beads/config.yaml"),
+        "issue_prefix: bd\n",
+    )
+    .expect("write ext config");
+
+    let issue = run_br(&workspace, ["create", "Main issue"], "create_main_issue");
+    assert!(issue.status.success(), "create failed: {}", issue.stderr);
+    let issue_id = parse_created_id(&issue.stdout);
+
+    let dep_add = run_br(
+        &workspace,
+        ["dep", "add", &issue_id, "external:extproj:auth"],
+        "dep_add_external",
+    );
+    assert!(
+        dep_add.status.success(),
+        "dep add failed: {}",
+        dep_add.stderr
+    );
+
+    let provider = run_br(&external, ["create", "Provide auth"], "ext_create");
+    assert!(
+        provider.status.success(),
+        "external create failed: {}",
+        provider.stderr
+    );
+    let provider_id = parse_created_id(&provider.stdout);
+
+    let label = run_br(
+        &external,
+        ["update", &provider_id, "--add-label", "provides:auth"],
+        "ext_label",
+    );
+    assert!(
+        label.status.success(),
+        "external label failed: {}",
+        label.stderr
+    );
+
+    let ready_before = run_br(&workspace, ["ready", "--json"], "ready_before");
+    assert!(
+        ready_before.status.success(),
+        "ready before failed: {}",
+        ready_before.stderr
+    );
+    let ready_payload = extract_json_payload(&ready_before.stdout);
+    let ready_json: Vec<Value> = serde_json::from_str(&ready_payload).expect("ready json");
+    assert!(
+        !issue_list_contains_id(&ready_json, &issue_id),
+        "issue should be blocked while external provider is open in the DB"
+    );
+
+    let mut provider_jsonl = issue_from_jsonl(&external, &provider_id);
+    set_issue_jsonl_string(&mut provider_jsonl, "status", "closed");
+    set_issue_jsonl_string(&mut provider_jsonl, "updated_at", "2099-01-01T00:00:00Z");
+    set_issue_jsonl_string(&mut provider_jsonl, "closed_at", "2099-01-01T00:00:00Z");
+    set_issue_jsonl_string(&mut provider_jsonl, "close_reason", "stale JSONL closure");
+    write_single_issue_jsonl(&external, &provider_jsonl);
+
+    let ready_after = run_br(
+        &workspace,
+        ["ready", "--json"],
+        "ready_after_stale_external_jsonl",
+    );
+    assert!(
+        ready_after.status.success(),
+        "ready after failed: {}",
+        ready_after.stderr
+    );
+    let ready_payload = extract_json_payload(&ready_after.stdout);
+    let ready_json: Vec<Value> = serde_json::from_str(&ready_payload).expect("ready json");
+    assert!(
+        issue_list_contains_id(&ready_json, &issue_id),
+        "ready should import the external JSONL closure before probing dependency status"
+    );
+
+    let show_external = run_br(
+        &external,
+        ["show", &provider_id, "--json"],
+        "show_external_after_ready_import",
+    );
+    assert!(
+        show_external.status.success(),
+        "external show failed: {}",
+        show_external.stderr
+    );
+    let shown: Vec<Value> =
+        serde_json::from_str(&extract_json_payload(&show_external.stdout)).expect("show json");
+    assert_eq!(shown[0]["status"].as_str(), Some("closed"));
 }
 
 #[test]
