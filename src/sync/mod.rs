@@ -2459,8 +2459,13 @@ pub fn compute_staleness_refreshing_witnesses(
 /// fails. Opportunistic witness refresh failures are logged and ignored.
 pub fn auto_import_probe_refreshing_witnesses(
     storage: &mut SqliteStorage,
+    beads_dir: &Path,
     jsonl_path: &Path,
+    allow_external_jsonl: bool,
 ) -> Result<bool> {
+    if jsonl_path.exists() {
+        validate_sync_path_with_external(jsonl_path, beads_dir, allow_external_jsonl)?;
+    }
     let probe = compute_jsonl_newer_impl(storage, jsonl_path)?;
     if let Some(observed) = probe.refresh_witness {
         refresh_jsonl_witness_best_effort(storage, jsonl_path, &observed);
@@ -2480,7 +2485,15 @@ pub fn auto_import_probe_refreshing_witnesses(
 ///
 /// Returns an error if reading JSONL metadata, stored witnesses, or hashing
 /// fails.
-pub fn auto_import_probe(storage: &SqliteStorage, jsonl_path: &Path) -> Result<bool> {
+pub fn auto_import_probe(
+    storage: &SqliteStorage,
+    beads_dir: &Path,
+    jsonl_path: &Path,
+    allow_external_jsonl: bool,
+) -> Result<bool> {
+    if jsonl_path.exists() {
+        validate_sync_path_with_external(jsonl_path, beads_dir, allow_external_jsonl)?;
+    }
     compute_jsonl_newer_impl(storage, jsonl_path).map(|probe| probe.jsonl_newer)
 }
 
@@ -2694,6 +2707,9 @@ pub fn auto_import_if_stale(
         return Ok(AutoImportResult::default());
     }
 
+    if jsonl_path.exists() {
+        validate_sync_path_with_external(jsonl_path, beads_dir, allow_external_jsonl)?;
+    }
     let staleness = compute_staleness_refreshing_witnesses(storage, jsonl_path)?;
     if !staleness.jsonl_newer {
         return Ok(AutoImportResult::default());
@@ -6206,6 +6222,71 @@ mod tests {
         .unwrap();
         assert!(!result.attempted);
         assert_eq!(result.imported_count, 0);
+    }
+
+    #[test]
+    fn test_auto_import_probe_validates_external_path_before_hashing() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let beads_dir = temp_dir.path().join(".beads");
+        let external_jsonl = temp_dir.path().join("external").join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&external_jsonl).unwrap();
+        storage
+            .set_metadata(METADATA_JSONL_CONTENT_HASH, "stale-hash")
+            .unwrap();
+
+        let err = auto_import_probe(&storage, &beads_dir, &external_jsonl, false).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("outside the beads directory")
+                || message.contains("must be a regular file"),
+            "unexpected error: {err}"
+        );
+
+        let err = auto_import_probe_refreshing_witnesses(
+            &mut storage,
+            &beads_dir,
+            &external_jsonl,
+            false,
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("outside the beads directory")
+                || message.contains("must be a regular file"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_auto_import_if_stale_validates_external_path_before_hashing() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let beads_dir = temp_dir.path().join(".beads");
+        let external_jsonl = temp_dir.path().join("external").join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&external_jsonl).unwrap();
+        storage
+            .set_metadata(METADATA_JSONL_CONTENT_HASH, "stale-hash")
+            .unwrap();
+
+        let err = auto_import_if_stale(
+            &mut storage,
+            &beads_dir,
+            &external_jsonl,
+            None,
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("outside the beads directory")
+                || message.contains("must be a regular file"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

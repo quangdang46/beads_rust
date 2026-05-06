@@ -121,6 +121,11 @@ fn main() {
         && should_auto_import_now
         && storage_result.is_some()
     {
+        let allow_external_jsonl = config::implicit_external_jsonl_allowed(
+            &paths.beads_dir,
+            &paths.db_path,
+            &paths.jsonl_path,
+        );
         let mut auto_import_write_lock = None;
         if !ctx.overrides.read_only_fast_open && write_lock.is_none() {
             let lock_timeout = ctx.write_lock_timeout();
@@ -134,13 +139,20 @@ fn main() {
         }
         let should_attempt_auto_import = {
             match storage_result.as_mut() {
-                Some(res) if ctx.overrides.read_only_fast_open => {
-                    auto_import_probe(&res.storage, &paths.jsonl_path).unwrap_or(true)
-                }
-                Some(res) => {
-                    auto_import_probe_refreshing_witnesses(&mut res.storage, &paths.jsonl_path)
-                        .unwrap_or(true)
-                }
+                Some(res) if ctx.overrides.read_only_fast_open => auto_import_probe(
+                    &res.storage,
+                    &paths.beads_dir,
+                    &paths.jsonl_path,
+                    allow_external_jsonl,
+                )
+                .unwrap_or(true),
+                Some(res) => auto_import_probe_refreshing_witnesses(
+                    &mut res.storage,
+                    &paths.beads_dir,
+                    &paths.jsonl_path,
+                    allow_external_jsonl,
+                )
+                .unwrap_or(true),
                 None => false,
             }
         };
@@ -184,11 +196,6 @@ fn main() {
             if sync_lock.is_some()
                 && let Some(res) = storage_result.as_mut()
             {
-                let allow_external_jsonl = config::implicit_external_jsonl_allowed(
-                    &paths.beads_dir,
-                    &paths.db_path,
-                    &paths.jsonl_path,
-                );
                 let expected_prefix = match resolve_auto_import_expected_prefix(res, &ctx.overrides)
                 {
                     Ok(prefix) => Some(prefix),

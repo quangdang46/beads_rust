@@ -14,6 +14,7 @@ pub mod routing;
 use crate::error::{BeadsError, Result, ResultExt};
 use crate::model::{IssueType, Priority};
 use crate::storage::SqliteStorage;
+use crate::sync::path::validate_sync_path_with_external;
 use crate::sync::{
     ExportConfig, ImportConfig, ImportResult, JsonlTombstoneFilter, PreservedTombstone, auto_flush,
     blocking_write_lock_with_timeout, compute_jsonl_hash, export_to_jsonl_with_policy,
@@ -1098,11 +1099,16 @@ pub(crate) fn repair_database_from_jsonl_with_import_config(
     show_progress: bool,
     mut import_config: ImportConfig,
 ) -> Result<(SqliteStorage, ImportResult, Vec<RecoveryBackupVerification>)> {
-    let prefix = resolve_bootstrap_issue_prefix(bootstrap_layer, beads_dir, jsonl_path)?;
     import_config.beads_dir = Some(beads_dir.to_path_buf());
     import_config.allow_external_jsonl |=
         implicit_external_jsonl_allowed(beads_dir, db_path, jsonl_path);
     import_config.show_progress = show_progress;
+    let prefix = resolve_bootstrap_issue_prefix(
+        bootstrap_layer,
+        beads_dir,
+        jsonl_path,
+        import_config.allow_external_jsonl,
+    )?;
 
     let mut preflight_config = import_config.clone();
     preflight_config.skip_prefix_validation = true;
@@ -2282,7 +2288,9 @@ impl OpenStorageResult {
     pub fn load_config(&self, cli: &CliOverrides) -> Result<ConfigLayer> {
         load_config_from_startup_layers(
             &self.startup_layers,
+            &self.paths.beads_dir,
             &self.paths.jsonl_path,
+            self.allow_external_jsonl,
             Some(&self.storage),
             cli,
         )
@@ -2607,8 +2615,16 @@ fn open_storage_with_startup_config_impl(
 
     if no_db {
         let mut storage = SqliteStorage::open_memory()?;
-        let prefix = resolve_bootstrap_issue_prefix(&merged_layer, &beads_dir, &paths.jsonl_path)?;
+        let prefix = resolve_bootstrap_issue_prefix(
+            &merged_layer,
+            &beads_dir,
+            &paths.jsonl_path,
+            allow_external_jsonl,
+        )?;
         storage.set_config("issue_prefix", &prefix)?;
+        if paths.jsonl_path.exists() {
+            validate_sync_path_with_external(&paths.jsonl_path, &beads_dir, allow_external_jsonl)?;
+        }
 
         // Capture the JSONL content hash BEFORE the import so later
         // `flush_no_db_if_dirty` can detect that the file we imported from
@@ -2760,6 +2776,7 @@ fn resolve_bootstrap_issue_prefix(
     bootstrap_layer: &ConfigLayer,
     beads_dir: &Path,
     jsonl_path: &Path,
+    allow_external_jsonl: bool,
 ) -> Result<String> {
     if let Some(prefix) = get_value(bootstrap_layer, &["issue_prefix", "issue-prefix", "prefix"]) {
         let trimmed = prefix.trim();
@@ -2768,7 +2785,9 @@ fn resolve_bootstrap_issue_prefix(
         }
     }
 
-    if let Some(prefix) = first_prefix_from_jsonl(jsonl_path)? {
+    if let Some(prefix) =
+        first_prefix_from_resolved_jsonl(beads_dir, jsonl_path, allow_external_jsonl)?
+    {
         return Ok(normalize_prefix(&prefix));
     }
 
@@ -2783,6 +2802,18 @@ fn resolve_bootstrap_issue_prefix(
     }
 
     Ok("br".to_string())
+}
+
+fn first_prefix_from_resolved_jsonl(
+    beads_dir: &Path,
+    jsonl_path: &Path,
+    allow_external_jsonl: bool,
+) -> Result<Option<String>> {
+    if !jsonl_path.is_file() {
+        return Ok(None);
+    }
+    validate_sync_path_with_external(jsonl_path, beads_dir, allow_external_jsonl)?;
+    first_prefix_from_jsonl(jsonl_path)
 }
 
 fn import_config_for_resolved_jsonl(
@@ -3242,12 +3273,26 @@ pub fn load_config(
     cli: &CliOverrides,
 ) -> Result<ConfigLayer> {
     let startup = load_startup_config_with_paths(beads_dir, cli.db.as_ref())?;
-    load_config_from_startup_layers(&startup.layers, &startup.paths.jsonl_path, storage, cli)
+    let allow_external_jsonl = implicit_external_jsonl_allowed(
+        &startup.paths.beads_dir,
+        &startup.paths.db_path,
+        &startup.paths.jsonl_path,
+    );
+    load_config_from_startup_layers(
+        &startup.layers,
+        &startup.paths.beads_dir,
+        &startup.paths.jsonl_path,
+        allow_external_jsonl,
+        storage,
+        cli,
+    )
 }
 
 fn load_config_from_startup_layers(
     startup_layers: &[ConfigLayer],
+    beads_dir: &Path,
     jsonl_path: &Path,
+    allow_external_jsonl: bool,
     storage: Option<&SqliteStorage>,
     cli: &CliOverrides,
 ) -> Result<ConfigLayer> {
@@ -3259,7 +3304,9 @@ fn load_config_from_startup_layers(
     // Uses a fast single-line read (not full-file scan) since this runs on
     // every command.
     let mut jsonl_inferred = ConfigLayer::default();
-    if let Some(prefix) = first_prefix_from_jsonl(jsonl_path)? {
+    if let Some(prefix) =
+        first_prefix_from_resolved_jsonl(beads_dir, jsonl_path, allow_external_jsonl)?
+    {
         jsonl_inferred
             .runtime
             .insert("issue_prefix".to_string(), prefix);
@@ -5794,8 +5841,9 @@ routing:
             .runtime
             .insert("issue_prefix".to_string(), "cfg".to_string());
 
-        let prefix = resolve_bootstrap_issue_prefix(&bootstrap_layer, &beads_dir, &jsonl_path)
-            .expect("prefix");
+        let prefix =
+            resolve_bootstrap_issue_prefix(&bootstrap_layer, &beads_dir, &jsonl_path, false)
+                .expect("prefix");
         assert_eq!(prefix, "cfg");
     }
 
@@ -5809,7 +5857,7 @@ routing:
         fs::write(&jsonl_path, "").expect("write empty jsonl");
 
         let prefix =
-            resolve_bootstrap_issue_prefix(&ConfigLayer::default(), &beads_dir, &jsonl_path)
+            resolve_bootstrap_issue_prefix(&ConfigLayer::default(), &beads_dir, &jsonl_path, false)
                 .expect("prefix");
         assert_eq!(prefix, "mpn");
     }
@@ -6812,6 +6860,40 @@ routing:
     }
 
     #[test]
+    fn open_storage_with_cli_no_db_validates_external_jsonl_before_hashing() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let external_jsonl = temp.path().join("external-store").join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        fs::create_dir_all(&external_jsonl).expect("create external jsonl directory");
+
+        let mut layer = ConfigLayer::default();
+        layer
+            .startup
+            .insert("no-db".to_string(), "true".to_string());
+        let startup = StartupConfig {
+            paths: ConfigPaths {
+                beads_dir: beads_dir.clone(),
+                db_path: beads_dir.join(DEFAULT_DB_FILENAME),
+                jsonl_path: external_jsonl,
+                metadata: Metadata::default(),
+            },
+            layers: vec![layer.clone()],
+            merged_config: layer,
+        };
+
+        let err =
+            open_storage_with_startup_config_impl(startup, &CliOverrides::default(), false, false)
+                .expect_err("external no-db JSONL should be rejected before hashing");
+        let message = err.to_string();
+        assert!(
+            message.contains("outside the beads directory")
+                || message.contains("must be a regular file"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn open_storage_with_cli_no_db_keeps_distinct_closed_issues_with_identical_content() {
         let temp = TempDir::new().expect("tempdir");
         let beads_dir = temp.path().join(".beads");
@@ -6887,6 +6969,32 @@ routing:
             &external_db,
             &external_jsonl
         ));
+    }
+
+    #[test]
+    fn load_config_validates_external_jsonl_before_prefix_inference() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let external_dir = temp.path().join("external-store");
+        let external_jsonl = external_dir.join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        fs::create_dir_all(&external_dir).expect("create external dir");
+        write_single_issue_jsonl(&external_jsonl, "bd-extcfg", "External config prefix");
+        let storage = SqliteStorage::open_memory().expect("storage");
+
+        let err = load_config_from_startup_layers(
+            &[],
+            &beads_dir,
+            &external_jsonl,
+            false,
+            Some(&storage),
+            &CliOverrides::default(),
+        )
+        .expect_err("external JSONL should be rejected before prefix inference");
+        assert!(
+            err.to_string().contains("outside the beads directory"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
