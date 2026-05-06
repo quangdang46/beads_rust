@@ -4528,7 +4528,9 @@ fn process_import_action(
 ) -> Result<()> {
     match action {
         CollisionAction::Insert => {
-            if insert_new_import_issue(storage, issue)? {
+            if insert_new_import_issue(storage, issue)?
+                && !storage.has_owned_relation_rows_for_import(&issue.id)?
+            {
                 storage.insert_new_issue_relations_for_import(issue)?;
             } else {
                 sync_issue_relations(storage, issue)?;
@@ -7147,6 +7149,50 @@ mod tests {
             external_rows.len(),
             1,
             "external dependency endpoints must survive import cleanup"
+        );
+    }
+
+    #[test]
+    fn test_import_new_issue_replaces_preexisting_owned_relation_orphans() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("issues.jsonl");
+
+        let parent = make_test_issue("bd-parent", "Parent");
+        storage.create_issue(&parent, "tester").unwrap();
+
+        storage
+            .execute_test_sql(
+                "PRAGMA foreign_keys = OFF;
+                 INSERT INTO labels (issue_id, label)
+                 VALUES ('bd-new', 'stale-label');
+                 INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
+                 VALUES ('bd-new', 'bd-parent', 'blocks', '2026-01-01T00:00:00Z', 'legacy');
+                 INSERT INTO comments (issue_id, author, text, created_at)
+                 VALUES ('bd-new', 'legacy', 'stale comment', '2026-01-01T00:00:00Z');
+                 PRAGMA foreign_keys = ON;",
+            )
+            .unwrap();
+
+        let issue = make_test_issue("bd-new", "Clean import");
+        let json = serde_json::to_string(&issue).unwrap();
+        fs::write(&path, format!("{json}\n")).unwrap();
+
+        let result =
+            import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd-")).unwrap();
+
+        assert_eq!(result.created_count, 1);
+        assert!(
+            storage.get_labels("bd-new").unwrap().is_empty(),
+            "fresh import must delete stale owned labels"
+        );
+        assert!(
+            storage.get_dependencies_full("bd-new").unwrap().is_empty(),
+            "fresh import must delete stale owned dependencies"
+        );
+        assert!(
+            storage.get_comments("bd-new").unwrap().is_empty(),
+            "fresh import must delete stale owned comments"
         );
     }
 

@@ -10876,6 +10876,32 @@ impl SqliteStorage {
         Ok(self.insert_issue_row_for_import(issue, &timestamps)? > 0)
     }
 
+    /// Check whether relation rows already exist for an imported issue ID.
+    ///
+    /// This is used to guard the insert-only relation fast path. A newly
+    /// inserted issue row can still attach to stale relation rows that were
+    /// already present with foreign keys disabled, so callers must verify this
+    /// before skipping relation deletes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub(crate) fn has_owned_relation_rows_for_import(&self, issue_id: &str) -> Result<bool> {
+        let row = self.conn.query_row_with_params(
+            "SELECT
+                 EXISTS(SELECT 1 FROM labels WHERE issue_id = ?)
+                 OR EXISTS(SELECT 1 FROM dependencies WHERE issue_id = ?)
+                 OR EXISTS(SELECT 1 FROM comments WHERE issue_id = ?)",
+            &[
+                SqliteValue::from(issue_id),
+                SqliteValue::from(issue_id),
+                SqliteValue::from(issue_id),
+            ],
+        )?;
+
+        Ok(row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0) != 0)
+    }
+
     /// Replace an issue's dirty marker inside the current write transaction.
     ///
     /// # Errors
@@ -14369,6 +14395,31 @@ mod tests {
         assert_eq!(
             storage.get_comments(&other.id).unwrap(),
             vec![existing_comment]
+        );
+    }
+
+    #[test]
+    fn test_has_owned_relation_rows_for_import_detects_orphan_rows() {
+        let storage = SqliteStorage::open_memory().unwrap();
+
+        assert!(
+            !storage
+                .has_owned_relation_rows_for_import("bd-stale")
+                .unwrap()
+        );
+
+        storage
+            .conn
+            .execute(
+                "PRAGMA foreign_keys = OFF;
+                 INSERT INTO labels (issue_id, label) VALUES ('bd-stale', 'old-label');",
+            )
+            .unwrap();
+
+        assert!(
+            storage
+                .has_owned_relation_rows_for_import("bd-stale")
+                .unwrap()
         );
     }
 
