@@ -1,9 +1,9 @@
 //! Defer and Undefer command implementations.
 
 use crate::cli::commands::{
-    acquire_routed_workspace_write_lock, finalize_batched_blocked_cache_refresh,
-    preserve_blocked_cache_on_error, report_auto_flush_failure, resolve_issue_ids,
-    update_issue_with_recovery,
+    acquire_routed_workspace_write_lock, auto_import_storage_ctx_if_stale,
+    finalize_batched_blocked_cache_refresh, preserve_blocked_cache_on_error,
+    report_auto_flush_failure, resolve_issue_ids, update_issue_with_recovery,
 };
 use crate::cli::{DeferArgs, UndeferArgs};
 use crate::config;
@@ -213,6 +213,7 @@ fn execute_defer_route(
     let _routed_write_lock =
         acquire_routed_workspace_write_lock(beads_dir, auto_flush_external, cli.lock_timeout)?;
     let mut storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
+    auto_import_storage_ctx_if_stale(&mut storage_ctx, cli)?;
 
     let config_layer = storage_ctx.load_config(cli)?;
     let actor = config::resolve_actor(&config_layer);
@@ -466,6 +467,7 @@ fn execute_undefer_route(
     let _routed_write_lock =
         acquire_routed_workspace_write_lock(beads_dir, auto_flush_external, cli.lock_timeout)?;
     let mut storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
+    auto_import_storage_ctx_if_stale(&mut storage_ctx, cli)?;
 
     let config_layer = storage_ctx.load_config(cli)?;
     let actor = config::resolve_actor(&config_layer);

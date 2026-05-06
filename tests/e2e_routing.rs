@@ -76,6 +76,12 @@ fn issue_from_jsonl(workspace: &BrWorkspace, issue_id: &str) -> Value {
         .expect("issue should exist in issues.jsonl")
 }
 
+fn write_single_issue_jsonl(workspace: &BrWorkspace, issue: &Value) {
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    let serialized = serde_json::to_string(issue).expect("serialize issue jsonl");
+    fs::write(&jsonl_path, format!("{serialized}\n")).expect("write issues.jsonl");
+}
+
 fn last_touched_path(workspace: &BrWorkspace) -> PathBuf {
     beads_rust::util::last_touched_path(&workspace.root.join(".beads"))
 }
@@ -1146,6 +1152,93 @@ fn e2e_routing_defer_and_undefer_external_issue_via_main_workspace() {
     assert_eq!(undeferred_issue[0]["status"].as_str(), Some("open"));
 
     let undeferred_jsonl_issue = issue_from_jsonl(&external_workspace, &external_id);
+    assert_eq!(undeferred_jsonl_issue["status"].as_str(), Some("open"));
+}
+
+#[test]
+fn e2e_routing_defer_and_undefer_import_stale_external_jsonl() {
+    let _log = common::test_log("e2e_routing_defer_and_undefer_import_stale_external_jsonl");
+
+    let main_workspace = BrWorkspace::new();
+    let external_workspace = BrWorkspace::new();
+
+    init_workspace(&main_workspace, "init_main");
+    init_workspace(&external_workspace, "init_external");
+    configure_external_route(&main_workspace, &external_workspace);
+
+    let external_id = create_issue_and_get_id(
+        &external_workspace,
+        "External defer stale db target",
+        "create_external_defer_stale_target",
+    );
+    let routed_input = routed_partial_id(&external_id);
+
+    let mut jsonl_issue = issue_from_jsonl(&external_workspace, &external_id);
+    jsonl_issue["title"] = Value::String("External defer title from JSONL".to_string());
+    jsonl_issue["updated_at"] = Value::String("2099-01-01T00:00:00Z".to_string());
+    write_single_issue_jsonl(&external_workspace, &jsonl_issue);
+
+    let defer = run_br(
+        &main_workspace,
+        ["defer", &routed_input, "--json"],
+        "defer_external_stale_jsonl_via_route",
+    );
+    assert!(defer.status.success(), "defer failed: {}", defer.stderr);
+    let deferred: Value =
+        serde_json::from_str(&extract_json_payload(&defer.stdout)).expect("defer json");
+    let deferred_array = deferred["deferred"].as_array().expect("deferred array");
+    assert_eq!(deferred_array.len(), 1);
+    assert_eq!(deferred_array[0]["id"].as_str(), Some(external_id.as_str()));
+    assert_eq!(deferred_array[0]["status"].as_str(), Some("deferred"));
+    assert_eq!(
+        deferred_array[0]["title"].as_str(),
+        Some("External defer title from JSONL")
+    );
+
+    let deferred_jsonl_issue = issue_from_jsonl(&external_workspace, &external_id);
+    assert_eq!(
+        deferred_jsonl_issue["title"].as_str(),
+        Some("External defer title from JSONL")
+    );
+    assert_eq!(deferred_jsonl_issue["status"].as_str(), Some("deferred"));
+
+    let mut stale_deferred_jsonl_issue = deferred_jsonl_issue;
+    stale_deferred_jsonl_issue["title"] =
+        Value::String("External undefer title from JSONL".to_string());
+    stale_deferred_jsonl_issue["updated_at"] = Value::String("2099-01-02T00:00:00Z".to_string());
+    write_single_issue_jsonl(&external_workspace, &stale_deferred_jsonl_issue);
+
+    let undefer = run_br(
+        &main_workspace,
+        ["undefer", &routed_input, "--json"],
+        "undefer_external_stale_jsonl_via_route",
+    );
+    assert!(
+        undefer.status.success(),
+        "undefer failed: {}",
+        undefer.stderr
+    );
+    let undeferred: Value =
+        serde_json::from_str(&extract_json_payload(&undefer.stdout)).expect("undefer json");
+    let undeferred_array = undeferred["undeferred"]
+        .as_array()
+        .expect("undeferred array");
+    assert_eq!(undeferred_array.len(), 1);
+    assert_eq!(
+        undeferred_array[0]["id"].as_str(),
+        Some(external_id.as_str())
+    );
+    assert_eq!(undeferred_array[0]["status"].as_str(), Some("open"));
+    assert_eq!(
+        undeferred_array[0]["title"].as_str(),
+        Some("External undefer title from JSONL")
+    );
+
+    let undeferred_jsonl_issue = issue_from_jsonl(&external_workspace, &external_id);
+    assert_eq!(
+        undeferred_jsonl_issue["title"].as_str(),
+        Some("External undefer title from JSONL")
+    );
     assert_eq!(undeferred_jsonl_issue["status"].as_str(), Some("open"));
 }
 
