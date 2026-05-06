@@ -1511,6 +1511,67 @@ fn e2e_routing_comments_add_and_list_external_issue_via_main_workspace() {
 }
 
 #[test]
+fn e2e_routing_comments_list_imports_stale_external_jsonl() {
+    let _log = common::test_log("e2e_routing_comments_list_imports_stale_external_jsonl");
+
+    let main_workspace = BrWorkspace::new();
+    let external_workspace = BrWorkspace::new();
+
+    init_workspace(&main_workspace, "init_main");
+    init_workspace(&external_workspace, "init_external");
+    configure_external_route(&main_workspace, &external_workspace);
+
+    let external_id = create_issue_and_get_id(
+        &external_workspace,
+        "External comments stale db target",
+        "create_external_comments_stale_target",
+    );
+    let routed_input = routed_partial_id(&external_id);
+
+    let mut jsonl_issue = issue_from_jsonl(&external_workspace, &external_id);
+    jsonl_issue["comments"] = serde_json::json!([
+        {
+            "id": 1,
+            "issue_id": external_id,
+            "author": "jsonl-author",
+            "text": "External comment from stale JSONL",
+            "created_at": "2099-01-01T00:00:00Z"
+        }
+    ]);
+    jsonl_issue["updated_at"] = Value::String("2099-01-01T00:00:00Z".to_string());
+    write_single_issue_jsonl(&external_workspace, &jsonl_issue);
+
+    let comment_list = run_br(
+        &main_workspace,
+        ["comments", "list", &routed_input, "--json"],
+        "comments_list_external_stale_jsonl_via_route",
+    );
+    assert!(
+        comment_list.status.success(),
+        "comments list failed: {}",
+        comment_list.stderr
+    );
+    let comments: Vec<Value> =
+        serde_json::from_str(&extract_json_payload(&comment_list.stdout)).expect("comments json");
+    assert_eq!(comments.len(), 1);
+    assert_eq!(comments[0]["issue_id"].as_str(), Some(external_id.as_str()));
+    assert_eq!(
+        comments[0]["text"].as_str(),
+        Some("External comment from stale JSONL")
+    );
+
+    let shown = show_issue_json(
+        &external_workspace,
+        &external_id,
+        "show_external_after_stale_comments_list",
+    );
+    assert_eq!(
+        shown[0]["comments"][0]["text"].as_str(),
+        Some("External comment from stale JSONL")
+    );
+}
+
+#[test]
 fn e2e_routing_comments_add_sets_invoking_workspace_last_touched_for_follow_up_update() {
     let _log = common::test_log(
         "e2e_routing_comments_add_sets_invoking_workspace_last_touched_for_follow_up_update",

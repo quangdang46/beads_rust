@@ -171,6 +171,20 @@ pub enum BeadsError {
     /// All requested items were skipped (already closed, not found, etc.).
     #[error("Nothing to do: {reason}")]
     NothingToDo { reason: String },
+
+    // === Policy Errors ===
+    /// One or more closure-time policy gates fired.
+    ///
+    /// Display format intentionally repeats the gate that fired and a
+    /// short explanation so terminal output stays readable; structured
+    /// callers should serialise the inner [`crate::close_policy::PolicyViolation`]s
+    /// via [`StructuredError::context`].
+    #[error("Policy violation closing {issue_id}: {summary}")]
+    PolicyViolation {
+        issue_id: String,
+        summary: String,
+        violations: Vec<crate::close_policy::PolicyViolation>,
+    },
 }
 
 impl BeadsError {
@@ -235,6 +249,7 @@ impl BeadsError {
                 | Self::InvalidPriority { .. }
                 | Self::PrefixMismatch { .. }
                 | Self::AmbiguousId { .. }
+                | Self::PolicyViolation { .. }
         )
     }
 
@@ -270,6 +285,9 @@ impl BeadsError {
             Self::InvalidType { .. } => {
                 Some("Valid types: task, bug, feature, epic, chore, docs, question")
             }
+            Self::PolicyViolation { .. } => Some(
+                "Fix the violation(s) above, or pass --bypass-policy --bypass-reason \"<text>\" if your project's policy.yaml allows bypass.",
+            ),
             _ => None,
         }
     }

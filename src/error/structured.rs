@@ -125,6 +125,10 @@ pub enum ErrorCode {
     /// All requested items were skipped; nothing to do
     NothingToDo,
 
+    // === Policy Errors (exit code 4) ===
+    /// Closure-time policy gate fired (issue #274)
+    PolicyViolation,
+
     // === Internal Errors (exit code 1) ===
     /// Unexpected internal error
     InternalError,
@@ -176,6 +180,8 @@ impl ErrorCode {
             Self::YamlError => "YAML_ERROR",
             // Operational
             Self::NothingToDo => "NOTHING_TO_DO",
+            // Policy
+            Self::PolicyViolation => "POLICY_VIOLATION",
             // Internal
             Self::InternalError => "INTERNAL_ERROR",
         }
@@ -232,7 +238,8 @@ impl ErrorCode {
             | Self::InvalidStatus
             | Self::InvalidType
             | Self::InvalidPriority
-            | Self::RequiredField => 4,
+            | Self::RequiredField
+            | Self::PolicyViolation => 4,
             // Dependency (5)
             Self::CycleDetected
             | Self::DependencyNotFound
@@ -640,6 +647,18 @@ impl StructuredError {
             BeadsError::NothingToDo { reason } => {
                 (ErrorCode::NothingToDo, Some(json!({"reason": reason})))
             }
+            BeadsError::PolicyViolation {
+                issue_id,
+                summary,
+                violations,
+            } => (
+                ErrorCode::PolicyViolation,
+                Some(json!({
+                    "issue_id": issue_id,
+                    "summary": summary,
+                    "violations": violations,
+                })),
+            ),
             BeadsError::Config(_) => (ErrorCode::ConfigError, None),
             BeadsError::ExternalCommand { command, reason } => (
                 ErrorCode::IoError,

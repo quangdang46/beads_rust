@@ -339,6 +339,18 @@ pub(super) fn auto_import_storage_ctx_if_stale(
     .map(|_| ())
 }
 
+pub(super) fn cli_for_routed_workspace(
+    cli: &crate::config::CliOverrides,
+    is_external: bool,
+) -> crate::config::CliOverrides {
+    let mut route_cli = cli.clone();
+    if is_external {
+        route_cli.db = None;
+        route_cli.read_only_fast_open = false;
+    }
+    route_cli
+}
+
 pub(super) fn auto_import_external_projects_if_stale(
     config_layer: &crate::config::ConfigLayer,
     local_beads_dir: &Path,
@@ -373,9 +385,7 @@ pub(super) fn auto_import_external_projects_if_stale(
             continue;
         }
 
-        let mut route_cli = cli.clone();
-        route_cli.db = None;
-        route_cli.read_only_fast_open = false;
+        let mut route_cli = cli_for_routed_workspace(cli, true);
         let routed_write_lock = match acquire_routed_workspace_write_lock(
             &beads_dir,
             true,
@@ -465,7 +475,14 @@ pub(super) fn acquire_routed_workspace_write_lock(
         return Ok(RoutedWorkspaceWriteLock::local());
     }
 
-    let file = crate::sync::blocking_write_lock_with_timeout(beads_dir, lock_timeout_ms)?;
+    let lock_path = beads_dir.join(".write.lock");
+    let file =
+        crate::sync::blocking_write_lock_with_timeout(beads_dir, lock_timeout_ms).map_err(|err| {
+            BeadsError::Config(format!(
+                "Routed external workspace is busy: target write lock at {} could not be acquired: {err}",
+                lock_path.display()
+            ))
+        })?;
     Ok(RoutedWorkspaceWriteLock {
         _lock: Some(file),
         beads_dir: Some(beads_dir.to_path_buf()),
@@ -630,7 +647,9 @@ mod tests {
         })?;
         let message = err.to_string();
         assert!(
-            message.contains("Timed out after 1ms waiting for write lock"),
+            message.contains("Routed external workspace is busy")
+                && message.contains("target write lock")
+                && message.contains("Timed out after 1ms waiting for write lock"),
             "{message}"
         );
         Ok(())

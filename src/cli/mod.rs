@@ -2190,6 +2190,34 @@ pub struct CloseArgs {
     /// Machine-readable output (alias for --json)
     #[arg(long)]
     pub robot: bool,
+
+    // Closure-time policy gates (issue #274 — Phase 1).
+    //
+    // All fields below are inert when the project has no `.beads/policy.yaml`
+    // file. Solo-dev workflows see no behavior change; only opt-in repos
+    // observe gating or attribution capture.
+    //
+    /// Tier 1 attribution: agent name (env: BR_AGENT_NAME).
+    #[arg(long, value_name = "NAME", env = "BR_AGENT_NAME")]
+    pub agent_name: Option<String>,
+
+    /// Tier 1 attribution: harness identifier (env: BR_HARNESS).
+    #[arg(long, value_name = "HARNESS", env = "BR_HARNESS")]
+    pub harness: Option<String>,
+
+    /// Tier 1 attribution: model identifier (env: BR_MODEL).
+    #[arg(long, value_name = "MODEL", env = "BR_MODEL")]
+    pub model: Option<String>,
+
+    /// Bypass closure-time policy gates. Requires `--bypass-reason`.
+    /// Only honoured when `.beads/policy.yaml` has `allow_bypass: true`
+    /// (which is the default).
+    #[arg(long)]
+    pub bypass_policy: bool,
+
+    /// Reason for bypassing policy gates. Required when `--bypass-policy` is set.
+    #[arg(long, value_name = "REASON")]
+    pub bypass_reason: Option<String>,
 }
 
 /// Arguments for the reopen command.

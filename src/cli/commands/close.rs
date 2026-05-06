@@ -6,12 +6,16 @@ use crate::cli::commands::{
     finalize_batched_blocked_cache_refresh, preserve_blocked_cache_on_error,
     report_auto_flush_failure, resolve_issue_ids, update_issue_with_recovery,
 };
+use crate::close_policy::{
+    self, AttributionTier, AttributionValues, CloseEvidence, ClosePolicy, PolicyDocument,
+    PolicyViolation,
+};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::sanitize_terminal_inline;
-use crate::model::{IssueType, Status};
+use crate::model::{Issue, IssueType, Status};
 use crate::output::OutputContext;
-use crate::storage::IssueUpdate;
+use crate::storage::{IssueUpdate, SqliteStorage};
 use crate::util::id::{IdResolver, ResolverConfig};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -31,6 +35,16 @@ pub struct CloseArgs {
     pub session: Option<String>,
     /// Return newly unblocked issues (single ID only)
     pub suggest_next: bool,
+    /// Tier 1 attribution: agent name (issue #274 Phase 1).
+    pub agent_name: Option<String>,
+    /// Tier 1 attribution: harness identifier.
+    pub harness: Option<String>,
+    /// Tier 1 attribution: model identifier.
+    pub model: Option<String>,
+    /// Bypass closure-time policy gates.
+    pub bypass_policy: bool,
+    /// Reason for bypass. Required when `bypass_policy = true`.
+    pub bypass_reason: Option<String>,
 }
 
 impl From<&CliCloseArgs> for CloseArgs {
@@ -41,8 +55,121 @@ impl From<&CliCloseArgs> for CloseArgs {
             force: cli.force,
             session: cli.session.clone(),
             suggest_next: cli.suggest_next,
+            agent_name: cli.agent_name.clone(),
+            harness: cli.harness.clone(),
+            model: cli.model.clone(),
+            bypass_policy: cli.bypass_policy,
+            bypass_reason: cli.bypass_reason.clone(),
         }
     }
+}
+
+/// Aggregate of policy gates that fired for a single candidate close.
+struct EvaluatedGates {
+    violations: Vec<PolicyViolation>,
+}
+
+/// Validate the `--bypass-policy` / `--bypass-reason` flag pair before
+/// touching storage. Mirrors the documented contract: bypass requires a
+/// non-empty reason and is meaningless without `--bypass-policy`.
+fn validate_bypass_args(args: &CloseArgs) -> Result<()> {
+    if args.bypass_policy {
+        let reason_present = args
+            .bypass_reason
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty());
+        if !reason_present {
+            return Err(BeadsError::validation(
+                "bypass-reason",
+                "--bypass-policy requires --bypass-reason \"<text>\"",
+            ));
+        }
+    } else if args
+        .bypass_reason
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty())
+    {
+        return Err(BeadsError::validation(
+            "bypass-policy",
+            "--bypass-reason was set without --bypass-policy",
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve attribution values for the close. CLI flags take precedence over
+/// env vars; both are ignored when the policy.yaml `attribution.tier` is
+/// `off`. Tier 2/3 ("require"/"allowlist") are out of scope for Phase 1.
+fn resolve_attribution_for_close(
+    args: &CloseArgs,
+    policy_doc: &PolicyDocument,
+) -> AttributionValues {
+    if policy_doc.close_policy.attribution.tier == AttributionTier::Off {
+        return AttributionValues::default();
+    }
+    AttributionValues::resolve_from_env(
+        args.agent_name.as_deref(),
+        args.harness.as_deref(),
+        args.model.as_deref(),
+    )
+}
+
+/// Run every enabled gate against `issue` and produce the (possibly empty)
+/// violation list.
+fn evaluate_close_policy(
+    policy: &ClosePolicy,
+    storage: &SqliteStorage,
+    issue_id: &str,
+    issue: &Issue,
+    args: &CloseArgs,
+    close_actor: &str,
+) -> Result<EvaluatedGates> {
+    // Look up the in_progress actor only when the gate is enabled — this
+    // saves a query per close for repos that don't enable that specific
+    // gate.
+    let in_progress_actor = if policy.forbid_self_close_after_in_progress.enabled {
+        storage.find_last_in_progress_actor(issue_id)?
+    } else {
+        None
+    };
+
+    let evidence = CloseEvidence {
+        issue_id,
+        close_reason: args.reason.as_deref(),
+        description: issue.description.as_deref(),
+        design: issue.design.as_deref(),
+        acceptance_criteria: issue.acceptance_criteria.as_deref(),
+        notes: issue.notes.as_deref(),
+        close_actor,
+        in_progress_actor: in_progress_actor.as_deref(),
+    };
+
+    let violations = close_policy::evaluate(policy, &evidence);
+    Ok(EvaluatedGates { violations })
+}
+
+fn summarize_violations(violations: &[PolicyViolation]) -> String {
+    if let [single] = violations {
+        return single.message.clone();
+    }
+    let lines: Vec<String> = violations
+        .iter()
+        .map(|v| format!("- {}", v.message))
+        .collect();
+    format!("{} gates fired:\n{}", violations.len(), lines.join("\n"))
+}
+
+fn emit_bypass_warning(ctx: &OutputContext, issue_id: &str, violations: &[PolicyViolation]) {
+    let summary = summarize_violations(violations);
+    let id = sanitize_terminal_inline(issue_id);
+    let summary = sanitize_terminal_inline(&summary);
+    ctx.warning(&format!(
+        "Closing {} despite policy violation(s) (--bypass-policy): {}",
+        id.as_ref(),
+        summary.as_ref()
+    ));
 }
 
 /// Execute the close command from CLI args.
@@ -344,10 +471,7 @@ pub fn execute(
 ) -> Result<()> {
     let args = CloseArgs {
         ids,
-        reason: None,
-        force: false,
-        session: None,
-        suggest_next: false,
+        ..CloseArgs::default()
     };
 
     execute_with_args(&args, json, cli, ctx)
@@ -367,6 +491,10 @@ pub fn execute_with_args(
 ) -> Result<()> {
     tracing::info!("Executing close command");
     let use_structured_output = use_json || ctx.is_json() || ctx.is_toon();
+
+    // Up-front bypass argument-pair validation. Done before any storage IO so
+    // a misuse of the bypass flag never silently slips past policy gates.
+    validate_bypass_args(args)?;
 
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let mut target_inputs = args.ids.clone();
@@ -501,6 +629,18 @@ fn execute_route(
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
     let resolved_ids = resolve_issue_ids(&storage_ctx.storage, &resolver, &args.ids)?;
+
+    // Closure-time policy gates (issue #274 Phase 1). Loading happens once per
+    // route; if the file is absent the doc is the all-off default.
+    let policy_doc = close_policy::load_for_beads_dir(beads_dir)?;
+    let policy_active = policy_doc.close_policy.is_active();
+    let attribution = resolve_attribution_for_close(args, &policy_doc);
+    if args.bypass_policy && !policy_doc.allow_bypass {
+        return Err(BeadsError::validation(
+            "bypass-policy",
+            ".beads/policy.yaml has allow_bypass: false; --bypass-policy is disabled",
+        ));
+    }
 
     let epic_counts = storage_ctx.storage.get_epic_counts()?;
     let blocked_before: Vec<String> = if args.suggest_next {
@@ -694,6 +834,43 @@ fn execute_route(
             continue;
         }
 
+        // Closure-time policy gate evaluation (issue #274 Phase 1).
+        //
+        // Skipped entirely when the project has no policy.yaml or every gate
+        // is disabled, preserving the current behavior for solo-dev workflows.
+        // When `--bypass-policy --bypass-reason "<text>"` is supplied AND the
+        // project's policy.yaml allows it, gate violations are recorded in
+        // `close_metadata` (with `bypassed_policy = 1`) but do not block the
+        // close.
+        let gates_fired = if policy_active {
+            let evaluated_gates = evaluate_close_policy(
+                &policy_doc.close_policy,
+                &storage_ctx.storage,
+                id,
+                issue,
+                args,
+                &actor,
+            )?;
+            if !evaluated_gates.violations.is_empty() && !args.bypass_policy {
+                let summary = summarize_violations(&evaluated_gates.violations);
+                return Err(BeadsError::PolicyViolation {
+                    issue_id: id.clone(),
+                    summary,
+                    violations: evaluated_gates.violations,
+                });
+            }
+            if !evaluated_gates.violations.is_empty() && args.bypass_policy {
+                emit_bypass_warning(ctx, id, &evaluated_gates.violations);
+            }
+            evaluated_gates
+                .violations
+                .into_iter()
+                .map(|v| v.gate)
+                .collect::<Vec<String>>()
+        } else {
+            Vec::new()
+        };
+
         let now = Utc::now();
         let close_reason = args.reason.clone().unwrap_or_else(|| "done".to_string());
         let update = IssueUpdate {
@@ -721,6 +898,31 @@ fn execute_route(
         )?;
         cache_dirty = true;
         tracing::info!(id = %id, reason = ?args.reason, "Issue closed");
+
+        // Best-effort persistence of attribution + bypass auditing. Failure to
+        // record metadata never undoes a successful close: the close already
+        // committed, and burning down a successful close because of an
+        // optional auxiliary table would be a regression for solo-dev users
+        // whose schema couldn't migrate. We log and move on.
+        let bypass_reason = if args.bypass_policy {
+            args.bypass_reason.as_deref()
+        } else {
+            None
+        };
+        let metadata_result = storage_ctx.storage.record_close_metadata(
+            id,
+            &attribution,
+            args.bypass_policy && !gates_fired.is_empty(),
+            bypass_reason,
+            &gates_fired,
+        );
+        if let Err(error) = metadata_result {
+            tracing::warn!(
+                issue_id = %id,
+                error = %error,
+                "failed to record closure-time policy metadata; close already committed"
+            );
+        }
 
         let closed = ClosedIssue {
             id: id.clone(),
@@ -898,6 +1100,11 @@ mod tests {
             force: true,
             session: Some("session-456".to_string()),
             suggest_next: true,
+            agent_name: Some("agent-1".to_string()),
+            harness: Some("codex-cli".to_string()),
+            model: Some("gpt-5".to_string()),
+            bypass_policy: true,
+            bypass_reason: Some("Manual override approved".to_string()),
         };
         assert_eq!(args.ids.len(), 2);
         assert_eq!(args.ids[0], "bd-abc");
@@ -905,6 +1112,14 @@ mod tests {
         assert!(args.force);
         assert_eq!(args.session.as_deref(), Some("session-456"));
         assert!(args.suggest_next);
+        assert_eq!(args.agent_name.as_deref(), Some("agent-1"));
+        assert_eq!(args.harness.as_deref(), Some("codex-cli"));
+        assert_eq!(args.model.as_deref(), Some("gpt-5"));
+        assert!(args.bypass_policy);
+        assert_eq!(
+            args.bypass_reason.as_deref(),
+            Some("Manual override approved")
+        );
     }
 
     // =========================================================================
@@ -1307,12 +1522,23 @@ mod tests {
             force: true,
             session: Some("sess".to_string()),
             suggest_next: true,
+            agent_name: Some("agent-clone".to_string()),
+            harness: Some("harness-clone".to_string()),
+            model: Some("model-clone".to_string()),
+            bypass_policy: true,
+            bypass_reason: Some("Clone bypass reason".to_string()),
         };
         let cloned = args.clone();
         assert_eq!(cloned.ids, args.ids);
         assert_eq!(cloned.reason, args.reason);
         assert_eq!(cloned.force, args.force);
         assert_eq!(cloned.session, args.session);
+        assert_eq!(cloned.suggest_next, args.suggest_next);
+        assert_eq!(cloned.agent_name, args.agent_name);
+        assert_eq!(cloned.harness, args.harness);
+        assert_eq!(cloned.model, args.model);
+        assert_eq!(cloned.bypass_policy, args.bypass_policy);
+        assert_eq!(cloned.bypass_reason, args.bypass_reason);
         assert_eq!(cloned.suggest_next, args.suggest_next);
     }
 

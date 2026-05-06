@@ -2,7 +2,7 @@
 
 use crate::cli::commands::{
     acquire_routed_workspace_write_lock, auto_import_storage_ctx_if_stale,
-    external_project_db_paths_after_auto_import_if_needed,
+    cli_for_routed_workspace, external_project_db_paths_after_auto_import_if_needed,
 };
 use crate::cli::{ShowArgs, resolve_output_format_basic_with_outer_mode};
 use crate::config;
@@ -112,8 +112,7 @@ fn execute_routed(
             let normalized_batch_beads_dir =
                 dunce::canonicalize(&batch_beads_dir).unwrap_or_else(|_| batch_beads_dir.clone());
             let use_preloaded = normalized_batch_beads_dir == normalized_local_beads_dir;
-            let mut batch_cli = cli.clone();
-            batch_cli.db = if use_preloaded { cli.db.clone() } else { None };
+            let mut batch_cli = cli_for_routed_workspace(cli, !use_preloaded);
             let routed_write_lock = acquire_routed_workspace_write_lock(
                 &batch_beads_dir,
                 !use_preloaded,
@@ -163,8 +162,7 @@ fn execute_routed(
         let normalized_batch_beads_dir =
             dunce::canonicalize(&batch.beads_dir).unwrap_or_else(|_| batch.beads_dir.clone());
         let use_preloaded = normalized_batch_beads_dir == normalized_local_beads_dir;
-        let mut batch_cli = cli.clone();
-        batch_cli.db = if use_preloaded { cli.db.clone() } else { None };
+        let mut batch_cli = cli_for_routed_workspace(cli, !use_preloaded);
         let routed_write_lock = acquire_routed_workspace_write_lock(
             &batch.beads_dir,
             !use_preloaded,

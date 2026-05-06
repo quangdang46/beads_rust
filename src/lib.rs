@@ -24,6 +24,7 @@
 
 pub mod cache;
 pub mod cli;
+pub mod close_policy;
 pub mod config;
 pub mod error;
 pub mod format;

@@ -7,7 +7,7 @@ use crate::error::{BeadsError, Result};
 use crate::model::{IssueType, Priority, Status};
 use crate::util::content_hash_from_parts;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 8;
+pub const CURRENT_SCHEMA_VERSION: i32 = 9;
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 
 /// The complete SQL schema for the beads database.
@@ -212,6 +212,30 @@ pub const SCHEMA_SQL: &str = r"
         last_child INTEGER NOT NULL DEFAULT 0,
         FOREIGN KEY (parent_id) REFERENCES issues(id) ON DELETE CASCADE
     );
+
+    -- Close metadata (issue #274 — closure-time policy gates Phase 1).
+    --
+    -- One row per terminal close. Tier 1 attribution + bypass-policy auditing
+    -- live here so the issues table stays untouched (avoids breaking JSONL
+    -- round-trip and the wide SELECT statements throughout sqlite.rs).
+    --
+    -- All gate-related columns are nullable / default-valued so older
+    -- databases upgraded with a single ALTER TABLE chain remain valid.
+    CREATE TABLE IF NOT EXISTS close_metadata (
+        issue_id TEXT PRIMARY KEY,
+        closed_by_agent_name TEXT,
+        closed_by_harness TEXT,
+        closed_by_model TEXT,
+        bypassed_policy INTEGER NOT NULL DEFAULT 0,
+        bypass_reason TEXT,
+        policy_gates_fired TEXT,
+        recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_close_metadata_recorded_at ON close_metadata(recorded_at);
+    CREATE INDEX IF NOT EXISTS idx_close_metadata_bypassed
+        ON close_metadata(bypassed_policy)
+        WHERE bypassed_policy = 1;
 ";
 
 /// Split a SQL script into individual statements, respecting string literals,
@@ -1296,6 +1320,39 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
     if user_version < 7 && table_exists(conn, "issues") {
         tracing::info!("Migrating database to schema version 7 (Go bd content hashes)");
         rebuild_content_hashes_for_go_parity(conn)?;
+    }
+
+    // v9: Add close_metadata table for closure-time policy gates (issue #274).
+    //
+    // Pure additive migration: a brand-new dedicated table to capture the
+    // optional Phase 1 fields (Tier 1 attribution + policy bypass auditing).
+    // Older databases get the table on next open; no existing rows or columns
+    // change. Repos that never enable a policy never read or write to it, so
+    // the migration is a no-op for solo-dev workflows.
+    if user_version < 9 {
+        tracing::info!(
+            "Migrating database to schema version 9 (close_metadata table for policy gates)"
+        );
+        execute_batch(
+            conn,
+            r"
+            CREATE TABLE IF NOT EXISTS close_metadata (
+                issue_id TEXT PRIMARY KEY,
+                closed_by_agent_name TEXT,
+                closed_by_harness TEXT,
+                closed_by_model TEXT,
+                bypassed_policy INTEGER NOT NULL DEFAULT 0,
+                bypass_reason TEXT,
+                policy_gates_fired TEXT,
+                recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_close_metadata_recorded_at ON close_metadata(recorded_at);
+            CREATE INDEX IF NOT EXISTS idx_close_metadata_bypassed
+                ON close_metadata(bypassed_policy)
+                WHERE bypassed_policy = 1;
+            ",
+        )?;
     }
 
     // v8: Backfill storage-class NULL values in NOT NULL DEFAULT columns.

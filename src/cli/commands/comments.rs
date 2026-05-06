@@ -2,8 +2,8 @@
 
 use super::{
     RoutedWorkspaceWriteLock, acquire_routed_workspace_write_lock,
-    auto_import_storage_ctx_if_stale, report_auto_flush_failure, resolve_issue_id,
-    retry_mutation_with_jsonl_recovery,
+    auto_import_storage_ctx_if_stale, cli_for_routed_workspace, report_auto_flush_failure,
+    resolve_issue_id, retry_mutation_with_jsonl_recovery,
 };
 use crate::cli::{CommentAddArgs, CommentCommands, CommentsArgs};
 use crate::config;
@@ -206,10 +206,7 @@ fn open_routed_storage_for_input(
     RoutedWorkspaceWriteLock,
 )> {
     let route = config::routing::resolve_route(issue_input, local_beads_dir)?;
-    let mut route_cli = cli.clone();
-    if route.is_external {
-        route_cli.db = None;
-    }
+    let mut route_cli = cli_for_routed_workspace(cli, route.is_external);
     let routed_write_lock = acquire_routed_workspace_write_lock(
         &route.beads_dir,
         route.is_external,

@@ -3,7 +3,8 @@
 //! Checks issues for missing recommended template sections based on issue type.
 
 use super::{
-    acquire_routed_workspace_write_lock, auto_import_storage_ctx_if_stale, resolve_issue_id,
+    acquire_routed_workspace_write_lock, auto_import_storage_ctx_if_stale,
+    cli_for_routed_workspace, resolve_issue_id,
 };
 use crate::cli::LintArgs;
 use crate::config;
@@ -395,11 +396,7 @@ fn fetch_issues_in_resolved_order(
 }
 
 fn routed_cli_for_batch(cli: &config::CliOverrides, is_external: bool) -> config::CliOverrides {
-    let mut routed_cli = cli.clone();
-    if is_external {
-        routed_cli.db = None;
-    }
-    routed_cli
+    cli_for_routed_workspace(cli, is_external)
 }
 
 fn lint_issues(issues: &[Issue]) -> LintSummary {

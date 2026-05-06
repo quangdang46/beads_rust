@@ -4,8 +4,8 @@
 
 use super::{
     RoutedWorkspaceWriteLock, acquire_routed_workspace_write_lock,
-    auto_import_storage_ctx_if_stale, report_auto_flush_failure, resolve_issue_id,
-    retry_mutation_with_jsonl_recovery,
+    auto_import_storage_ctx_if_stale, cli_for_routed_workspace, report_auto_flush_failure,
+    resolve_issue_id, retry_mutation_with_jsonl_recovery,
 };
 use crate::cli::{LabelAddArgs, LabelCommands, LabelListArgs, LabelRemoveArgs, LabelRenameArgs};
 use crate::config;
@@ -426,11 +426,7 @@ fn prepare_label_routes(
 }
 
 fn routed_cli_for_batch(cli: &config::CliOverrides, is_external: bool) -> config::CliOverrides {
-    let mut route_cli = cli.clone();
-    if is_external {
-        route_cli.db = None;
-    }
-    route_cli
+    cli_for_routed_workspace(cli, is_external)
 }
 
 fn render_label_action_results(

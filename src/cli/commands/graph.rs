@@ -6,7 +6,8 @@
 //! - `br graph --all`: Show connected components for all nonterminal issues
 
 use super::{
-    acquire_routed_workspace_write_lock, auto_import_storage_ctx_if_stale, resolve_issue_id,
+    acquire_routed_workspace_write_lock, auto_import_storage_ctx_if_stale,
+    cli_for_routed_workspace, resolve_issue_id,
 };
 use crate::cli::GraphArgs;
 use crate::config;
@@ -91,14 +92,14 @@ fn routed_cli_for_graph(
     args: &GraphArgs,
     local_beads_dir: &std::path::Path,
 ) -> Result<config::CliOverrides> {
-    let mut route_cli = cli.clone();
-    if let Some(issue_input) = args.issue.as_deref()
+    let is_external = if let Some(issue_input) = args.issue.as_deref()
         && !args.all
-        && config::routing::resolve_route(issue_input, local_beads_dir)?.is_external
     {
-        route_cli.db = None;
-    }
-    Ok(route_cli)
+        config::routing::resolve_route(issue_input, local_beads_dir)?.is_external
+    } else {
+        false
+    };
+    Ok(cli_for_routed_workspace(cli, is_external))
 }
 
 fn open_storage_for_graph(
@@ -110,7 +111,7 @@ fn open_storage_for_graph(
         && !args.all
     {
         let route = config::routing::resolve_route(issue_input, local_beads_dir)?;
-        let mut route_cli = cli.clone();
+        let mut route_cli = cli_for_routed_workspace(cli, route.is_external);
         let routed_write_lock = acquire_routed_workspace_write_lock(
             &route.beads_dir,
             route.is_external,
@@ -145,8 +146,7 @@ pub fn execute_with_storage_ctx(
     {
         let route = config::routing::resolve_route(issue_input, local_beads_dir)?;
         if route.is_external {
-            let mut route_cli = cli.clone();
-            route_cli.db = None;
+            let mut route_cli = cli_for_routed_workspace(cli, true);
             let routed_write_lock = acquire_routed_workspace_write_lock(
                 &route.beads_dir,
                 true,

@@ -1642,6 +1642,158 @@ impl SqliteStorage {
         crate::storage::events::get_all_events(&self.conn, limit)
     }
 
+    /// Find the actor who most recently transitioned `issue_id` into the
+    /// `in_progress` state. Returns `None` when the issue never had such a
+    /// transition recorded — typical of issues that went from `open` to
+    /// `closed` without a claim step.
+    ///
+    /// Used by the closure-time `forbid_self_close_after_in_progress` policy
+    /// gate (issue #274 Phase 1).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying event query fails.
+    pub fn find_last_in_progress_actor(&self, issue_id: &str) -> Result<Option<String>> {
+        let events = crate::storage::events::get_events(&self.conn, issue_id, 0)?;
+        // get_events returns DESC ordering by created_at then id, so the first
+        // matching event is the most recent transition into in_progress.
+        for event in events {
+            if event.event_type == crate::model::EventType::StatusChanged
+                && event
+                    .new_value
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|v| v.eq_ignore_ascii_case("in_progress"))
+            {
+                let actor = event.actor.trim();
+                if actor.is_empty() {
+                    return Ok(None);
+                }
+                return Ok(Some(actor.to_string()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Persist closure-time policy metadata (issue #274 Phase 1) for `issue_id`.
+    ///
+    /// Inserts (or replaces) one row in the `close_metadata` table with the
+    /// supplied attribution + bypass auditing values. All fields are optional:
+    /// passing every-`None` still records a row that pins `bypassed_policy = 0`
+    /// for the close, which keeps the table strictly additive — every close
+    /// performed under an active policy is queryable later.
+    ///
+    /// `policy_gates_fired` is stored as the JSON serialisation of the gate
+    /// names that fired (or that were waived by `--bypass-policy`). An empty
+    /// slice serialises to `"[]"` so callers can always rely on JSON typing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database write fails or JSON serialisation of
+    /// `policy_gates_fired` fails.
+    pub fn record_close_metadata(
+        &self,
+        issue_id: &str,
+        attribution: &crate::close_policy::AttributionValues,
+        bypassed: bool,
+        bypass_reason: Option<&str>,
+        policy_gates_fired: &[String],
+    ) -> Result<()> {
+        // Skip when the row would carry no information whatsoever — keeps the
+        // table empty for repos that haven't enabled any policy and didn't
+        // pass any attribution flags. This preserves the "no observable change
+        // for solo dev" invariant (#274 default behavior).
+        if attribution.is_empty() && !bypassed && policy_gates_fired.is_empty() {
+            return Ok(());
+        }
+
+        let gates_json = serde_json::to_string(policy_gates_fired).map_err(BeadsError::from)?;
+
+        // INSERT OR REPLACE: a re-close (e.g. close → reopen → close) overwrites
+        // the prior row. If the project ever needs full history, querying the
+        // events table gives an audit trail; `close_metadata` is the
+        // currently-effective metadata for the most recent close.
+        self.conn.execute_with_params(
+            "INSERT OR REPLACE INTO close_metadata (
+                issue_id,
+                closed_by_agent_name,
+                closed_by_harness,
+                closed_by_model,
+                bypassed_policy,
+                bypass_reason,
+                policy_gates_fired,
+                recorded_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+            &[
+                SqliteValue::from(issue_id),
+                attribution
+                    .agent_name
+                    .as_deref()
+                    .map_or(SqliteValue::Null, SqliteValue::from),
+                attribution
+                    .harness
+                    .as_deref()
+                    .map_or(SqliteValue::Null, SqliteValue::from),
+                attribution
+                    .model
+                    .as_deref()
+                    .map_or(SqliteValue::Null, SqliteValue::from),
+                SqliteValue::from(i64::from(bypassed)),
+                bypass_reason.map_or(SqliteValue::Null, SqliteValue::from),
+                SqliteValue::from(gates_json.as_str()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Read a previously-stored close-metadata row, or `None` when no policy
+    /// metadata was recorded for this close. Used by tests + future
+    /// observability commands.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_close_metadata(&self, issue_id: &str) -> Result<Option<CloseMetadataRow>> {
+        if !crate::storage::schema::table_exists(&self.conn, "close_metadata") {
+            return Ok(None);
+        }
+        let rows = self.conn.query_with_params(
+            "SELECT closed_by_agent_name, closed_by_harness, closed_by_model, \
+                    bypassed_policy, bypass_reason, policy_gates_fired, recorded_at \
+             FROM close_metadata WHERE issue_id = ?",
+            &[SqliteValue::from(issue_id)],
+        )?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        let bypassed = row
+            .get(3)
+            .and_then(SqliteValue::as_integer)
+            .unwrap_or_default()
+            != 0;
+        let gates_json: Option<String> =
+            row.get(5).and_then(SqliteValue::as_text).map(String::from);
+        let policy_gates_fired = match gates_json.as_deref() {
+            Some(json) if !json.is_empty() => {
+                serde_json::from_str::<Vec<String>>(json).map_err(BeadsError::from)?
+            }
+            _ => Vec::new(),
+        };
+        Ok(Some(CloseMetadataRow {
+            closed_by_agent_name: row.get(0).and_then(SqliteValue::as_text).map(String::from),
+            closed_by_harness: row.get(1).and_then(SqliteValue::as_text).map(String::from),
+            closed_by_model: row.get(2).and_then(SqliteValue::as_text).map(String::from),
+            bypassed_policy: bypassed,
+            bypass_reason: row.get(4).and_then(SqliteValue::as_text).map(String::from),
+            policy_gates_fired,
+            recorded_at: row
+                .get(6)
+                .and_then(SqliteValue::as_text)
+                .map(String::from)
+                .unwrap_or_default(),
+        }))
+    }
+
     /// Execute a mutation with the 4-step transaction protocol.
     ///
     /// Retries on all transient BUSY errors (from BEGIN, DML, or COMMIT) with
@@ -9511,6 +9663,25 @@ pub struct ListFilters {
     pub updated_before: Option<DateTime<Utc>>,
     /// Filter by `updated_at` >= timestamp
     pub updated_after: Option<DateTime<Utc>>,
+}
+
+/// Closure-time policy metadata row (issue #274 Phase 1).
+///
+/// One row per terminal close that carried any opt-in policy data — Tier 1
+/// attribution, a `--bypass-policy` waiver, or the list of gates that fired.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloseMetadataRow {
+    pub closed_by_agent_name: Option<String>,
+    pub closed_by_harness: Option<String>,
+    pub closed_by_model: Option<String>,
+    pub bypassed_policy: bool,
+    pub bypass_reason: Option<String>,
+    /// Names of gates that fired during evaluation. Always serialised as a
+    /// JSON array on disk; empty when no gates fired (e.g. clean Tier 1
+    /// capture, or a successful close on a project with no `policy.yaml`).
+    pub policy_gates_fired: Vec<String>,
+    /// Timestamp the metadata row was recorded, in ISO 8601 / RFC 3339.
+    pub recorded_at: String,
 }
 
 /// Lean issue row used by the stats command.

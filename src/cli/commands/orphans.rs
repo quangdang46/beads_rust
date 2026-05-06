@@ -306,9 +306,7 @@ fn execute_inner(
                     let close_args = CloseArgs {
                         ids: vec![orphan.issue_id.clone()],
                         reason: Some("Implemented (detected by orphans scan)".to_string()),
-                        force: false,
-                        session: None,
-                        suggest_next: false,
+                        ..CloseArgs::default()
                     };
 
                     if let Err(e) = close::execute_with_args(&close_args, false, cli, ctx) {
