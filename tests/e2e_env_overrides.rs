@@ -704,6 +704,50 @@ fn e2e_no_db_with_beads_jsonl() {
 }
 
 #[test]
+fn e2e_no_db_sync_status_external_beads_jsonl_honors_allow_flag() {
+    let _log = common::test_log("e2e_no_db_sync_status_external_beads_jsonl_honors_allow_flag");
+    let workspace = BrWorkspace::new();
+
+    let beads_dir = workspace.temp_dir.path().join(".beads");
+    fs::create_dir_all(&beads_dir).expect("create .beads");
+
+    let external_dir = workspace.temp_dir.path().join("external-no-db");
+    fs::create_dir_all(&external_dir).expect("create external dir");
+    let external_jsonl = external_dir.join("issues.jsonl");
+    fs::write(
+        &external_jsonl,
+        "{\"id\":\"ext-1\",\"title\":\"No-db external JSONL sync status\",\"status\":\"open\",\"priority\":2,\"issue_type\":\"task\",\"created_at\":\"2026-01-01T00:00:00Z\",\"updated_at\":\"2026-01-01T00:00:00Z\"}\n",
+    )
+    .expect("write external jsonl");
+
+    let env_vars = vec![
+        ("BEADS_DIR", beads_dir.to_str().unwrap()),
+        ("BEADS_JSONL", external_jsonl.to_str().unwrap()),
+    ];
+
+    let status = run_br_with_env(
+        &workspace,
+        [
+            "--no-db",
+            "sync",
+            "--status",
+            "--allow-external-jsonl",
+            "--json",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ],
+        env_vars,
+        "no_db_sync_status_external_jsonl",
+    );
+    assert!(
+        status.status.success(),
+        "no-db sync --status should honor --allow-external-jsonl during startup import: stdout={} stderr={}",
+        status.stdout,
+        status.stderr
+    );
+}
+
+#[test]
 fn e2e_no_db_ignores_lock_timeout_flag() {
     let _log = common::test_log("e2e_no_db_ignores_lock_timeout_flag");
     let workspace = BrWorkspace::new();

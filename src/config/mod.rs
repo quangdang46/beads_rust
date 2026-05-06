@@ -1075,7 +1075,7 @@ pub(crate) fn repair_database_from_jsonl(
     bootstrap_layer: &ConfigLayer,
     show_progress: bool,
 ) -> Result<(SqliteStorage, ImportResult, Vec<RecoveryBackupVerification>)> {
-    let mut import_config = import_config_for_resolved_jsonl(beads_dir, db_path, jsonl_path);
+    let mut import_config = import_config_for_resolved_jsonl(beads_dir, db_path, jsonl_path, false);
     import_config.show_progress = show_progress;
     import_config.skip_prefix_validation = true;
 
@@ -2687,8 +2687,12 @@ fn open_storage_with_startup_config_impl(
             None
         };
         if paths.jsonl_path.is_file() {
-            let mut import_config =
-                import_config_for_resolved_jsonl(&beads_dir, &paths.db_path, &paths.jsonl_path);
+            let mut import_config = import_config_for_resolved_jsonl(
+                &beads_dir,
+                &paths.db_path,
+                &paths.jsonl_path,
+                allow_external_jsonl,
+            );
             import_config.skip_prefix_validation = true;
             import_from_jsonl(
                 &mut storage,
@@ -2863,10 +2867,12 @@ fn import_config_for_resolved_jsonl(
     beads_dir: &Path,
     db_path: &Path,
     jsonl_path: &Path,
+    explicit_allow_external_jsonl: bool,
 ) -> ImportConfig {
     ImportConfig {
         beads_dir: Some(beads_dir.to_path_buf()),
-        allow_external_jsonl: implicit_external_jsonl_allowed(beads_dir, db_path, jsonl_path),
+        allow_external_jsonl: explicit_allow_external_jsonl
+            || implicit_external_jsonl_allowed(beads_dir, db_path, jsonl_path),
         show_progress: false,
         ..Default::default()
     }
