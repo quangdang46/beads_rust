@@ -4,7 +4,6 @@
 //! that are still `open/in_progress` but referenced in commits.
 
 use crate::cli::OrphansArgs;
-use crate::cli::commands::auto_import_storage_ctx_if_stale;
 use crate::cli::commands::close::{self, CloseArgs};
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -124,14 +123,11 @@ fn execute_inner(
     beads_dir: &Path,
     preloaded_storage_ctx: Option<&config::OpenStorageResult>,
 ) -> Result<()> {
-    let mut owned_storage_ctx = if preloaded_storage_ctx.is_some() {
+    let owned_storage_ctx = if preloaded_storage_ctx.is_some() {
         None
     } else {
         Some(config::open_storage_with_cli(beads_dir, cli)?)
     };
-    if let Some(storage_ctx) = owned_storage_ctx.as_mut() {
-        auto_import_owned_storage_ctx_if_stale(storage_ctx, cli)?;
-    }
     let storage_ctx = preloaded_storage_ctx
         .or(owned_storage_ctx.as_ref())
         .expect("orphans should have an open storage context");
@@ -330,13 +326,6 @@ fn execute_inner(
     }
 
     Ok(())
-}
-
-fn auto_import_owned_storage_ctx_if_stale(
-    storage_ctx: &mut config::OpenStorageResult,
-    cli: &config::CliOverrides,
-) -> Result<()> {
-    auto_import_storage_ctx_if_stale(storage_ctx, cli)
 }
 
 fn git_repo_root_for_path(path: &Path) -> Option<PathBuf> {

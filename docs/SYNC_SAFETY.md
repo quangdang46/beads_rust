@@ -173,6 +173,7 @@ Paths outside `.beads/` require the explicit `--allow-external-jsonl` opt-in.
 - If import preflight rejects a path, it stops before opening or parsing that path
 - Automatic flush validates the JSONL target before inspecting an existing file
 - Startup auto-import and no-db prefix inference validate existing JSONL targets before hashing or reading them
+- `br sync --allow-external-jsonl` carries that path policy through startup recovery and config loading
 - Paths are canonicalized before use
 
 ---

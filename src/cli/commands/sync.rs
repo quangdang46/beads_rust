@@ -178,15 +178,22 @@ fn prepare_sync_startup(
     startup_write_lock_held: bool,
 ) -> Result<SyncStartupState> {
     let (beads_dir, startup, path_policy) = resolve_sync_startup_paths(args, cli)?;
+    let allow_external_jsonl = path_policy.allow_external_jsonl;
 
     let open_result = if startup_write_lock_held {
-        config::open_storage_with_startup_config_under_write_lock(
+        config::open_storage_with_startup_config_under_write_lock_and_jsonl_policy(
             startup,
             cli,
             should_defer_jsonl_recovery(args),
+            allow_external_jsonl,
         )?
     } else {
-        config::open_storage_with_startup_config(startup, cli, should_defer_jsonl_recovery(args))?
+        config::open_storage_with_startup_config_and_jsonl_policy(
+            startup,
+            cli,
+            should_defer_jsonl_recovery(args),
+            allow_external_jsonl,
+        )?
     };
 
     Ok(SyncStartupState {
@@ -1859,7 +1866,12 @@ fn execute_import(
     // invariant. Only compute an expected prefix when the caller explicitly
     // asked to rename imported IDs into the configured prefix.
     let target_prefix = if args.rename_prefix {
-        let layer = config::load_config(beads_dir, Some(storage), cli)?;
+        let layer = config::load_config_with_external_jsonl_policy(
+            beads_dir,
+            Some(storage),
+            cli,
+            path_policy.allow_external_jsonl,
+        )?;
         let id_cfg = config::id_config_from_layer(&layer);
         Some(if id_cfg.prefix == "br" {
             // Prefix is still the default — check if we should auto-detect from JSONL

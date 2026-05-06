@@ -292,6 +292,82 @@ fn e2e_beads_jsonl_external_path() {
 }
 
 #[test]
+fn e2e_beads_jsonl_external_rename_prefix_honors_allow_flag_during_config_load() {
+    let _log = common::test_log(
+        "e2e_beads_jsonl_external_rename_prefix_honors_allow_flag_during_config_load",
+    );
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_external_rename_prefix");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let set_prefix = run_br(
+        &workspace,
+        ["config", "set", "issue_prefix=target"],
+        "set_prefix_external_rename_prefix",
+    );
+    assert!(
+        set_prefix.status.success(),
+        "config set failed: {}",
+        set_prefix.stderr
+    );
+
+    let external_dir = workspace.temp_dir.path().join("external-rename");
+    fs::create_dir_all(&external_dir).expect("create external dir");
+    let external_jsonl = external_dir.join("rename-source.jsonl");
+    fs::write(
+        &external_jsonl,
+        "{\"id\":\"legacy-1\",\"title\":\"External rename prefix import\",\"status\":\"open\",\"priority\":2,\"issue_type\":\"task\",\"created_at\":\"2026-01-01T00:00:00Z\",\"updated_at\":\"2026-01-01T00:00:00Z\"}\n",
+    )
+    .expect("write external jsonl");
+
+    let env_vars = vec![("BEADS_JSONL", external_jsonl.to_str().unwrap())];
+    let sync = run_br_with_env(
+        &workspace,
+        [
+            "sync",
+            "--import-only",
+            "--allow-external-jsonl",
+            "--force",
+            "--rename-prefix",
+            "--json",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ],
+        env_vars,
+        "sync_external_rename_prefix",
+    );
+    assert!(
+        sync.status.success(),
+        "external rename-prefix import should honor --allow-external-jsonl during config load: stdout={} stderr={}",
+        sync.stdout,
+        sync.stderr
+    );
+
+    let list = run_br(
+        &workspace,
+        ["--no-auto-import", "list", "--json"],
+        "list_external_rename_prefix",
+    );
+    assert!(list.status.success(), "list failed: {}", list.stderr);
+    let issues = parse_list_issues(&list.stdout);
+    let imported = issues
+        .iter()
+        .find(|issue| {
+            issue.get("title").and_then(Value::as_str) == Some("External rename prefix import")
+        })
+        .expect("renamed imported issue should be listed");
+    let id = imported
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("imported issue id");
+    assert!(
+        id.starts_with("target-"),
+        "renamed imported issue should use configured prefix, got {id}"
+    );
+}
+
+#[test]
 fn e2e_beads_jsonl_env_overrides_metadata() {
     let _log = common::test_log("e2e_beads_jsonl_env_overrides_metadata");
     let workspace = BrWorkspace::new();

@@ -2523,7 +2523,28 @@ pub fn open_storage_with_startup_config(
     cli: &CliOverrides,
     defer_jsonl_recovery: bool,
 ) -> Result<OpenStorageResult> {
-    open_storage_with_startup_config_impl(startup, cli, defer_jsonl_recovery, false)
+    open_storage_with_startup_config_impl(startup, cli, defer_jsonl_recovery, false, false)
+}
+
+/// Open storage with an explicit JSONL path policy supplied by a command that
+/// already validated its resolved path.
+///
+/// # Errors
+///
+/// Returns an error if JSONL import or storage setup fails.
+pub(crate) fn open_storage_with_startup_config_and_jsonl_policy(
+    startup: StartupConfig,
+    cli: &CliOverrides,
+    defer_jsonl_recovery: bool,
+    allow_external_jsonl: bool,
+) -> Result<OpenStorageResult> {
+    open_storage_with_startup_config_impl(
+        startup,
+        cli,
+        defer_jsonl_recovery,
+        false,
+        allow_external_jsonl,
+    )
 }
 
 /// Open storage with a preloaded startup snapshot while a caller-held write lock
@@ -2537,7 +2558,28 @@ pub fn open_storage_with_startup_config_under_write_lock(
     cli: &CliOverrides,
     defer_jsonl_recovery: bool,
 ) -> Result<OpenStorageResult> {
-    open_storage_with_startup_config_impl(startup, cli, defer_jsonl_recovery, true)
+    open_storage_with_startup_config_impl(startup, cli, defer_jsonl_recovery, true, false)
+}
+
+/// Open storage with a preloaded startup snapshot, a caller-held write lock,
+/// and an explicit JSONL path policy.
+///
+/// # Errors
+///
+/// Returns an error if JSONL import or storage setup fails.
+pub(crate) fn open_storage_with_startup_config_under_write_lock_and_jsonl_policy(
+    startup: StartupConfig,
+    cli: &CliOverrides,
+    defer_jsonl_recovery: bool,
+    allow_external_jsonl: bool,
+) -> Result<OpenStorageResult> {
+    open_storage_with_startup_config_impl(
+        startup,
+        cli,
+        defer_jsonl_recovery,
+        true,
+        allow_external_jsonl,
+    )
 }
 
 fn open_sqlite_storage_for_startup(
@@ -2590,6 +2632,7 @@ fn open_storage_with_startup_config_impl(
     cli: &CliOverrides,
     defer_jsonl_recovery: bool,
     write_lock_already_held: bool,
+    explicit_allow_external_jsonl: bool,
 ) -> Result<OpenStorageResult> {
     let StartupConfig {
         paths,
@@ -2605,8 +2648,8 @@ fn open_storage_with_startup_config_impl(
     let merged_layer = ConfigLayer::merge_layers(&all_layers);
 
     let no_db = no_db_from_layer(&merged_layer).unwrap_or(false);
-    let allow_external_jsonl =
-        implicit_external_jsonl_allowed(&beads_dir, &paths.db_path, &paths.jsonl_path);
+    let allow_external_jsonl = explicit_allow_external_jsonl
+        || implicit_external_jsonl_allowed(&beads_dir, &paths.db_path, &paths.jsonl_path);
 
     let resolved_lock_timeout = cli
         .lock_timeout
@@ -3272,12 +3315,22 @@ pub fn load_config(
     storage: Option<&SqliteStorage>,
     cli: &CliOverrides,
 ) -> Result<ConfigLayer> {
+    load_config_with_external_jsonl_policy(beads_dir, storage, cli, false)
+}
+
+pub(crate) fn load_config_with_external_jsonl_policy(
+    beads_dir: &Path,
+    storage: Option<&SqliteStorage>,
+    cli: &CliOverrides,
+    allow_external_jsonl: bool,
+) -> Result<ConfigLayer> {
     let startup = load_startup_config_with_paths(beads_dir, cli.db.as_ref())?;
-    let allow_external_jsonl = implicit_external_jsonl_allowed(
-        &startup.paths.beads_dir,
-        &startup.paths.db_path,
-        &startup.paths.jsonl_path,
-    );
+    let allow_external_jsonl = allow_external_jsonl
+        || implicit_external_jsonl_allowed(
+            &startup.paths.beads_dir,
+            &startup.paths.db_path,
+            &startup.paths.jsonl_path,
+        );
     load_config_from_startup_layers(
         &startup.layers,
         &startup.paths.beads_dir,
@@ -6882,9 +6935,14 @@ routing:
             merged_config: layer,
         };
 
-        let err =
-            open_storage_with_startup_config_impl(startup, &CliOverrides::default(), false, false)
-                .expect_err("external no-db JSONL should be rejected before hashing");
+        let err = open_storage_with_startup_config_impl(
+            startup,
+            &CliOverrides::default(),
+            false,
+            false,
+            false,
+        )
+        .expect_err("external no-db JSONL should be rejected before hashing");
         let message = err.to_string();
         assert!(
             message.contains("outside the beads directory")
