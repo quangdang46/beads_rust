@@ -11,7 +11,7 @@ use crate::util::markdown_import::{parse_dependency, parse_markdown_file};
 use crate::util::time::parse_flexible_timestamp;
 use crate::validation::{IssueValidator, LabelValidator};
 use chrono::{DateTime, Utc};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
 
@@ -710,6 +710,19 @@ fn execute_import(
     let mut standin_to_id: HashMap<String, String> = HashMap::new();
     // Deferred deps: (issue_id, raw_dep_strings, dep_types_from_cli)
     let mut deferred_deps: Vec<(String, Vec<String>)> = Vec::new();
+    let mut deferred_parent_deps: Vec<(String, String)> = Vec::new();
+    let import_title_keys: HashSet<String> = parsed_issues
+        .iter()
+        .map(|issue| issue.title.trim().to_lowercase())
+        .filter(|title| !title.is_empty())
+        .collect();
+    let import_standin_keys: HashSet<String> = parsed_issues
+        .iter()
+        .filter_map(|issue| {
+            let id = issue.stand_in_id.as_ref()?.trim().to_lowercase();
+            (!id.is_empty()).then_some(id)
+        })
+        .collect();
 
     for parsed in parsed_issues {
         let title = parsed.title.trim().to_string();
@@ -726,18 +739,26 @@ fn execute_import(
 
         // Resolve parent (item-specific header or CLI global fallback)
         let parent_candidate = parsed.parent.as_deref().or(args.parent.as_deref());
-        let resolved_parent = parent_candidate
-            .map(|p| {
-                let p_lower = p.to_lowercase();
-                if let Some(id) = standin_to_id.get(&p_lower) {
-                    Ok(id.clone())
-                } else if let Some(id) = title_to_id.get(&p_lower) {
-                    Ok(id.clone())
-                } else {
-                    resolve_issue_id(storage, &id_resolver, p)
-                }
-            })
-            .transpose()?;
+        let mut deferred_parent_ref = None;
+        let resolved_parent: Option<String> = if let Some(p) = parent_candidate {
+            let p_trimmed = p.trim();
+            let p_lower = p_trimmed.to_lowercase();
+            if let Some(id) = standin_to_id
+                .get(&p_lower)
+                .or_else(|| title_to_id.get(&p_lower))
+            {
+                Some(id.clone())
+            } else if parsed.parent.is_some()
+                && (import_standin_keys.contains(&p_lower) || import_title_keys.contains(&p_lower))
+            {
+                deferred_parent_ref = Some(p_trimmed.to_string());
+                None
+            } else {
+                Some(resolve_issue_id(storage, &id_resolver, p)?)
+            }
+        } else {
+            None
+        };
 
         let mut retries = 0;
         let mut final_id = String::new();
@@ -904,6 +925,10 @@ fn execute_import(
         }
         let id = final_id;
 
+        if let Some(parent_ref) = deferred_parent_ref {
+            deferred_parent_deps.push((id.clone(), parent_ref));
+        }
+
         // Collect dependencies for deferred resolution (Phase 2).
         // Must be OUTSIDE the retry loop so we only record the final (non-colliding) ID.
         let mut deps = parsed.dependencies.clone();
@@ -931,6 +956,37 @@ fn execute_import(
     // Phase 2: Resolve and wire up deferred dependencies.
     // Now that all issues exist in storage, we can resolve intra-file references
     // by title or stand-in ID, as well as references to pre-existing issues.
+    if !deferred_parent_deps.is_empty() && !args.dry_run {
+        for (issue_id, parent_ref) in &deferred_parent_deps {
+            let parent_lower = parent_ref.to_lowercase();
+            let Some(parent_id) = standin_to_id
+                .get(&parent_lower)
+                .or_else(|| title_to_id.get(&parent_lower))
+            else {
+                eprintln!(
+                    "warning: unresolved parent '{}' for issue {}",
+                    create_display_text(parent_ref),
+                    create_display_text(issue_id)
+                );
+                continue;
+            };
+            if parent_id == issue_id {
+                eprintln!(
+                    "warning: skipping self-parent for issue {}",
+                    create_display_text(issue_id)
+                );
+                continue;
+            }
+            if let Err(err) = storage.add_dependency(issue_id, parent_id, "parent-child", &actor) {
+                eprintln!(
+                    "warning: failed to add parent {} → {}: {err}",
+                    create_display_text(issue_id),
+                    create_display_text(parent_id)
+                );
+            }
+        }
+    }
+
     if !deferred_deps.is_empty() && !args.dry_run {
         let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix.clone()));
 
