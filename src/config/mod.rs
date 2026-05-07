@@ -75,7 +75,9 @@ const EXCLUDED_JSONL_FILES: &[&str] = &[
 /// Startup metadata describing DB + JSONL paths.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Metadata {
+    #[serde(default = "default_database_filename")]
     pub database: String,
+    #[serde(default = "default_jsonl_export_filename")]
     pub jsonl_export: String,
     #[serde(default)]
     pub backend: Option<String>,
@@ -83,11 +85,19 @@ pub struct Metadata {
     pub deletions_retention_days: Option<u64>,
 }
 
+fn default_database_filename() -> String {
+    DEFAULT_DB_FILENAME.to_string()
+}
+
+fn default_jsonl_export_filename() -> String {
+    DEFAULT_JSONL_FILENAME.to_string()
+}
+
 impl Default for Metadata {
     fn default() -> Self {
         Self {
-            database: DEFAULT_DB_FILENAME.to_string(),
-            jsonl_export: DEFAULT_JSONL_FILENAME.to_string(),
+            database: default_database_filename(),
+            jsonl_export: default_jsonl_export_filename(),
             backend: None,
             deletions_retention_days: None,
         }
@@ -4778,6 +4788,35 @@ labels:
         let loaded = Metadata::load(&beads_dir).expect("metadata");
         assert_eq!(loaded.database, "test.db");
         assert_eq!(loaded.jsonl_export, "test.jsonl");
+    }
+
+    #[test]
+    fn metadata_load_tolerates_legacy_bd_migration_files() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let metadata_path = beads_dir.join("metadata.json");
+        let metadata = "{\n  \"database\": \"beads.db\",\n  \"created_at\": \"2025-01-01T00:00:00Z\",\n  \"version\": 1\n}";
+        fs::write(metadata_path, metadata).expect("write metadata");
+
+        let loaded = Metadata::load(&beads_dir).expect("metadata");
+        assert_eq!(loaded.database, "beads.db");
+        assert_eq!(loaded.jsonl_export, DEFAULT_JSONL_FILENAME);
+    }
+
+    #[test]
+    fn metadata_load_tolerates_missing_database_field() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let metadata_path = beads_dir.join("metadata.json");
+        fs::write(metadata_path, r#"{"jsonl_export": "issues.jsonl"}"#).expect("write metadata");
+
+        let loaded = Metadata::load(&beads_dir).expect("metadata");
+        assert_eq!(loaded.database, DEFAULT_DB_FILENAME);
+        assert_eq!(loaded.jsonl_export, "issues.jsonl");
     }
 
     #[test]
