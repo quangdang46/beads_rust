@@ -66,6 +66,11 @@ struct NewIdInput<'a> {
     id_config: &'a crate::util::id::IdConfig,
 }
 
+enum ImportReferenceResolution {
+    Resolved(String),
+    Ambiguous(Vec<String>),
+}
+
 /// Execute the create command.
 ///
 /// # Errors
@@ -706,8 +711,8 @@ fn execute_import(
 
     // Phase 1: Create all issues, deferring intra-file dependency resolution.
     // Maps for resolving symbolic references between issues in the same import.
-    let mut title_to_id: HashMap<String, String> = HashMap::new();
-    let mut standin_to_id: HashMap<String, String> = HashMap::new();
+    let mut title_to_ids: HashMap<String, Vec<String>> = HashMap::new();
+    let mut standin_to_ids: HashMap<String, Vec<String>> = HashMap::new();
     // Deferred deps: (issue_id, raw_dep_strings, dep_types_from_cli)
     let mut deferred_deps: Vec<(String, Vec<String>)> = Vec::new();
     let mut deferred_parent_deps: Vec<(String, String)> = Vec::new();
@@ -716,6 +721,11 @@ fn execute_import(
         .map(|issue| issue.title.trim().to_lowercase())
         .filter(|title| !title.is_empty())
         .collect();
+    let duplicate_import_title_keys = duplicate_import_keys(
+        parsed_issues
+            .iter()
+            .map(|issue| issue.title.trim().to_lowercase()),
+    );
     let import_standin_keys: HashSet<String> = parsed_issues
         .iter()
         .filter_map(|issue| {
@@ -723,6 +733,11 @@ fn execute_import(
             (!id.is_empty()).then_some(id)
         })
         .collect();
+    let duplicate_import_standin_keys =
+        duplicate_import_keys(parsed_issues.iter().filter_map(|issue| {
+            let id = issue.stand_in_id.as_ref()?.trim().to_lowercase();
+            (!id.is_empty()).then_some(id)
+        }));
 
     for parsed in parsed_issues {
         let title = parsed.title.trim().to_string();
@@ -743,11 +758,16 @@ fn execute_import(
         let resolved_parent: Option<String> = if let Some(p) = parent_candidate {
             let p_trimmed = p.trim();
             let p_lower = p_trimmed.to_lowercase();
-            if let Some(id) = standin_to_id
-                .get(&p_lower)
-                .or_else(|| title_to_id.get(&p_lower))
+            if parsed.parent.is_some()
+                && (duplicate_import_standin_keys.contains(&p_lower)
+                    || duplicate_import_title_keys.contains(&p_lower))
             {
-                Some(id.clone())
+                deferred_parent_ref = Some(p_trimmed.to_string());
+                None
+            } else if let Some(ImportReferenceResolution::Resolved(id)) =
+                lookup_import_reference(&standin_to_ids, &title_to_ids, p_trimmed)
+            {
+                Some(id)
             } else if parsed.parent.is_some()
                 && (import_standin_keys.contains(&p_lower) || import_title_keys.contains(&p_lower))
             {
@@ -938,12 +958,18 @@ fn execute_import(
         }
 
         // Register this issue for intra-file dependency resolution.
-        title_to_id.insert(title.to_lowercase(), id.clone());
+        title_to_ids
+            .entry(title.to_lowercase())
+            .or_default()
+            .push(id.clone());
         if let Some(ref sid) = parsed.stand_in_id {
             let sid_trimmed = sid.trim().to_string();
             if !sid_trimmed.is_empty() {
                 // Case-insensitive, consistent with title-based resolution.
-                standin_to_id.insert(sid_trimmed.to_lowercase(), id.clone());
+                standin_to_ids
+                    .entry(sid_trimmed.to_lowercase())
+                    .or_default()
+                    .push(id.clone());
             }
         }
 
@@ -958,30 +984,34 @@ fn execute_import(
     // by title or stand-in ID, as well as references to pre-existing issues.
     if !deferred_parent_deps.is_empty() && !args.dry_run {
         for (issue_id, parent_ref) in &deferred_parent_deps {
-            let parent_lower = parent_ref.to_lowercase();
-            let Some(parent_id) = standin_to_id
-                .get(&parent_lower)
-                .or_else(|| title_to_id.get(&parent_lower))
-            else {
-                eprintln!(
-                    "warning: unresolved parent '{}' for issue {}",
-                    create_display_text(parent_ref),
-                    create_display_text(issue_id)
-                );
-                continue;
-            };
-            if parent_id == issue_id {
+            let parent_id =
+                match lookup_import_reference(&standin_to_ids, &title_to_ids, parent_ref) {
+                    Some(ImportReferenceResolution::Resolved(parent_id)) => parent_id,
+                    Some(ImportReferenceResolution::Ambiguous(ids)) => {
+                        warn_ambiguous_import_reference("parent", parent_ref, issue_id, &ids);
+                        continue;
+                    }
+                    None => {
+                        eprintln!(
+                            "warning: unresolved parent '{}' for issue {}",
+                            create_display_text(parent_ref),
+                            create_display_text(issue_id)
+                        );
+                        continue;
+                    }
+                };
+            if parent_id == *issue_id {
                 eprintln!(
                     "warning: skipping self-parent for issue {}",
                     create_display_text(issue_id)
                 );
                 continue;
             }
-            if let Err(err) = storage.add_dependency(issue_id, parent_id, "parent-child", &actor) {
+            if let Err(err) = storage.add_dependency(issue_id, &parent_id, "parent-child", &actor) {
                 eprintln!(
                     "warning: failed to add parent {} → {}: {err}",
                     create_display_text(issue_id),
-                    create_display_text(parent_id)
+                    create_display_text(&parent_id)
                 );
             }
         }
@@ -995,12 +1025,16 @@ fn execute_import(
                 // First, check the raw string against intra-file maps before parsing.
                 // This handles titles containing colons (e.g., "Step 1: Setup Database")
                 // that would otherwise be misinterpreted as typed dependencies.
-                let raw_lower = dep_str.to_lowercase();
-                let (type_str, resolved_dep_id) = if let Some(id) = standin_to_id
-                    .get(&raw_lower)
-                    .or_else(|| title_to_id.get(&raw_lower))
+                let (type_str, resolved_dep_id) = if let Some(import_ref) =
+                    lookup_import_reference(&standin_to_ids, &title_to_ids, dep_str)
                 {
-                    ("blocks".to_string(), id.clone())
+                    match import_ref {
+                        ImportReferenceResolution::Resolved(id) => ("blocks".to_string(), id),
+                        ImportReferenceResolution::Ambiguous(ids) => {
+                            warn_ambiguous_import_reference("dependency", dep_str, issue_id, &ids);
+                            continue;
+                        }
+                    }
                 } else {
                     // No raw match — parse as type:id or bare id.
                     let (mut t, dep_id, valid) = parse_dependency(dep_str);
@@ -1018,10 +1052,21 @@ fn execute_import(
 
                     // Resolution order: stand-in ID → title → storage ID
                     // All intra-file lookups are case-insensitive.
-                    let resolved = if let Some(id) = standin_to_id.get(&dep_id.to_lowercase()) {
-                        id.clone()
-                    } else if let Some(id) = title_to_id.get(&dep_id.to_lowercase()) {
-                        id.clone()
+                    let resolved = if let Some(import_ref) =
+                        lookup_import_reference(&standin_to_ids, &title_to_ids, &dep_id)
+                    {
+                        match import_ref {
+                            ImportReferenceResolution::Resolved(id) => id,
+                            ImportReferenceResolution::Ambiguous(ids) => {
+                                warn_ambiguous_import_reference(
+                                    "dependency",
+                                    &dep_id,
+                                    issue_id,
+                                    &ids,
+                                );
+                                continue;
+                            }
+                        }
                     } else {
                         match resolve_dependency_id(&resolver, storage, &dep_id) {
                             Ok(r) => r,
@@ -1142,6 +1187,52 @@ fn execute_import(
     }
     auto_flush_after_create(&mut storage_ctx, ctx);
     Ok(())
+}
+
+fn duplicate_import_keys(keys: impl IntoIterator<Item = String>) -> HashSet<String> {
+    let mut seen = HashSet::new();
+    let mut duplicates = HashSet::new();
+    for key in keys {
+        if key.is_empty() {
+            continue;
+        }
+        if !seen.insert(key.clone()) {
+            duplicates.insert(key);
+        }
+    }
+    duplicates
+}
+
+fn lookup_import_reference(
+    standin_to_ids: &HashMap<String, Vec<String>>,
+    title_to_ids: &HashMap<String, Vec<String>>,
+    reference: &str,
+) -> Option<ImportReferenceResolution> {
+    let key = reference.trim().to_lowercase();
+    if key.is_empty() {
+        return None;
+    }
+
+    standin_to_ids
+        .get(&key)
+        .or_else(|| title_to_ids.get(&key))
+        .map(|ids| {
+            if ids.len() == 1 {
+                ImportReferenceResolution::Resolved(ids[0].clone())
+            } else {
+                ImportReferenceResolution::Ambiguous(ids.clone())
+            }
+        })
+}
+
+fn warn_ambiguous_import_reference(kind: &str, reference: &str, issue_id: &str, ids: &[String]) {
+    eprintln!(
+        "warning: ambiguous {} '{}' for issue {} matches multiple imported issues: {}",
+        create_display_text(kind),
+        create_display_text(reference),
+        create_display_text(issue_id),
+        create_display_list(ids.iter().map(String::as_str))
+    );
 }
 
 fn is_marker_only_dependency(dep_id: &str) -> bool {

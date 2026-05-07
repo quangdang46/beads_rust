@@ -748,3 +748,121 @@ feature
         "dependency should resolve title with colon to the generated ID"
     );
 }
+
+#[test]
+fn test_markdown_import_ambiguous_duplicate_title_dependency_warns_and_skips() {
+    let workspace = BrWorkspace::new();
+
+    let output = run_br(&workspace, ["init"], "init_duplicate_title_dep");
+    assert!(output.status.success(), "init failed");
+
+    let md_path = workspace.root.join("issues.md");
+    let content = r"## Shared Target
+### Type
+task
+
+## Dependent
+### Type
+feature
+### Dependencies
+- Shared Target
+
+## Shared Target
+### Type
+bug
+";
+    fs::write(&md_path, content).expect("write md");
+
+    let output = run_br(
+        &workspace,
+        ["create", "--file", "issues.md", "--json"],
+        "create_duplicate_title_dep_json",
+    );
+    assert!(
+        output.status.success(),
+        "create --file --json failed: {}",
+        output.stderr
+    );
+    assert!(
+        output
+            .stderr
+            .contains("ambiguous dependency 'Shared Target'"),
+        "expected ambiguous dependency warning, got: {}",
+        output.stderr
+    );
+
+    let payload = extract_json_payload(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&payload).expect("json parse");
+    let issues = json.as_array().expect("json array");
+    assert_eq!(issues.len(), 3);
+
+    let dependent = issues
+        .iter()
+        .find(|issue| issue["title"].as_str() == Some("Dependent"))
+        .expect("dependent issue");
+    let dep_count = dependent
+        .get("dependencies")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    assert_eq!(
+        dep_count, 0,
+        "ambiguous title dependency should be skipped, got: {dependent:?}"
+    );
+}
+
+#[test]
+fn test_markdown_import_ambiguous_duplicate_standin_dependency_warns_and_skips() {
+    let workspace = BrWorkspace::new();
+
+    let output = run_br(&workspace, ["init"], "init_duplicate_standin_dep");
+    assert!(output.status.success(), "init failed");
+
+    let md_path = workspace.root.join("issues.md");
+    let content = r"## First Target
+### ID
+target
+
+## Second Target
+### ID
+target
+
+## Dependent
+### Dependencies
+- target
+";
+    fs::write(&md_path, content).expect("write md");
+
+    let output = run_br(
+        &workspace,
+        ["create", "--file", "issues.md", "--json"],
+        "create_duplicate_standin_dep_json",
+    );
+    assert!(
+        output.status.success(),
+        "create --file --json failed: {}",
+        output.stderr
+    );
+    assert!(
+        output.stderr.contains("ambiguous dependency 'target'"),
+        "expected ambiguous dependency warning, got: {}",
+        output.stderr
+    );
+
+    let payload = extract_json_payload(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&payload).expect("json parse");
+    let issues = json.as_array().expect("json array");
+    assert_eq!(issues.len(), 3);
+
+    let dependent = issues
+        .iter()
+        .find(|issue| issue["title"].as_str() == Some("Dependent"))
+        .expect("dependent issue");
+    let dep_count = dependent
+        .get("dependencies")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    assert_eq!(
+        dep_count, 0,
+        "ambiguous stand-in dependency should be skipped, got: {dependent:?}"
+    );
+}
