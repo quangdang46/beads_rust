@@ -6985,10 +6985,10 @@ impl SqliteStorage {
                         cache_ids.push(previous_parent);
                     }
                 }
-                if let Some(parent_id) = parent_id {
-                    if !cache_ids.contains(&parent_id) {
-                        cache_ids.push(parent_id);
-                    }
+                if let Some(parent_id) = parent_id
+                    && !cache_ids.contains(&parent_id)
+                {
+                    cache_ids.push(parent_id);
                 }
                 ctx.invalidate_cache_for(&cache_ids);
             }
