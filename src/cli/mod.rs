@@ -989,6 +989,15 @@ pub struct CreateArgs {
     #[arg(long = "type", short = 't', add = ArgValueCompleter::new(issue_type_completer))]
     pub type_: Option<String>,
 
+    /// Human-readable slug embedded in the generated ID. Example: `--slug
+    /// survey-my-thing` produces an ID of the form `br-survey-my-thing-<hash>`,
+    /// keeping the configured prefix and the uniquifying hash suffix. The slug
+    /// is normalized to lowercase ASCII alphanumeric + single hyphens (runs of
+    /// other characters collapse to one hyphen, leading/trailing hyphens are
+    /// stripped, length is capped at 48 characters after normalization).
+    #[arg(long)]
+    pub slug: Option<String>,
+
     /// Priority (0-4 or P0-P4)
     #[arg(long, short = 'p', add = ArgValueCompleter::new(priority_completer))]
     pub priority: Option<String>,

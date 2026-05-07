@@ -6,7 +6,7 @@ use crate::format::{format_type_label, sanitize_terminal_inline};
 use crate::model::{Dependency, DependencyType, Issue, IssueType, Priority, Status};
 use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
-use crate::util::id::{IdGenerator, IdResolver, ResolverConfig, child_id};
+use crate::util::id::{IdGenerationInput, IdGenerator, IdResolver, ResolverConfig, child_id};
 use crate::util::markdown_import::{parse_dependency, parse_markdown_file};
 use crate::util::time::parse_flexible_timestamp;
 use crate::validation::{IssueValidator, LabelValidator};
@@ -319,7 +319,12 @@ pub fn create_issue_impl(
             issue_count: count,
             id_config: &config.id_config,
         };
-        let id = generate_new_id(storage, resolved_parent.as_deref(), &id_input)?;
+        let id = generate_new_id(
+            storage,
+            resolved_parent.as_deref(),
+            &id_input,
+            args.slug.as_deref(),
+        )?;
 
         // Set closed_at if status is Closed
         let closed_at = if matches!(status, Status::Closed) {
@@ -421,10 +426,18 @@ pub fn create_issue_impl(
 }
 
 /// Generate a new ID, supporting both hierarchical and hash-based formats.
+///
+/// When `slug` is `Some(non-empty)` and the issue is non-hierarchical, the
+/// resulting ID embeds the normalized slug between the prefix and the hash:
+/// `<prefix>-<slug>-<hash>`. Hierarchical (parent-anchored) IDs ignore the
+/// slug — child IDs use the parent ID + child number scheme and have no slug
+/// segment. An empty / non-`Some` slug falls back to the historical
+/// hash-only behavior.
 fn generate_new_id(
     storage: &SqliteStorage,
     parent_id: Option<&str>,
     input: &NewIdInput<'_>,
+    slug: Option<&str>,
 ) -> Result<String> {
     if let Some(parent_id) = parent_id {
         // Verify parent exists
@@ -462,21 +475,42 @@ fn generate_new_id(
         // Standard ID generation for non-child issues
         let id_gen = IdGenerator::new(input.id_config.clone());
         let id_check_err: std::cell::RefCell<Option<BeadsError>> = std::cell::RefCell::new(None);
-        let generated_id = id_gen.generate(
-            input.title,
-            input.description,
-            input.creator,
-            input.now,
-            input.issue_count,
-            |id| match storage.id_exists(id) {
-                Ok(exists) => exists,
-                Err(e) => {
-                    id_check_err.replace(Some(e));
-                    // Treat as "exists" to force retry with a different ID
-                    true
-                }
-            },
-        );
+
+        let generated_id = match slug {
+            Some(s) if !s.trim().is_empty() => id_gen.generate_with_slug(
+                IdGenerationInput {
+                    title: input.title,
+                    description: input.description,
+                    creator: input.creator,
+                    created_at: input.now,
+                    issue_count: input.issue_count,
+                },
+                s,
+                |id| match storage.id_exists(id) {
+                    Ok(exists) => exists,
+                    Err(e) => {
+                        id_check_err.replace(Some(e));
+                        true
+                    }
+                },
+            ),
+            _ => id_gen.generate(
+                input.title,
+                input.description,
+                input.creator,
+                input.now,
+                input.issue_count,
+                |id| match storage.id_exists(id) {
+                    Ok(exists) => exists,
+                    Err(e) => {
+                        id_check_err.replace(Some(e));
+                        // Treat as "exists" to force retry with a different ID
+                        true
+                    }
+                },
+            ),
+        };
+
         if let Some(err) = id_check_err.into_inner() {
             return Err(err);
         }
@@ -793,7 +827,7 @@ fn execute_import(
                 issue_count: count,
                 id_config: &id_config,
             };
-            let id = match generate_new_id(storage, resolved_parent.as_deref(), &id_input) {
+            let id = match generate_new_id(storage, resolved_parent.as_deref(), &id_input, None) {
                 Ok(id) => id,
                 Err(err) => {
                     eprintln!("✗ Failed to create {}: {err}", create_display_text(&title));
@@ -1260,6 +1294,7 @@ mod tests {
             title: Some("Test Issue".to_string()),
             title_flag: None,
             type_: None,
+            slug: None,
             priority: None,
             description: None,
             assignee: None,

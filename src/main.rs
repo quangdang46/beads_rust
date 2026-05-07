@@ -1097,6 +1097,7 @@ mod tests {
             title: Some("test-title".to_string()),
             title_flag: None,
             type_: None,
+            slug: None,
             priority: None,
             description: None,
             assignee: None,
