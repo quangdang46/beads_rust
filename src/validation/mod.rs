@@ -378,11 +378,11 @@ impl LabelValidator {
 
         if !label
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ':' || c == '/')
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ':')
         {
             return Err(ValidationError::new(
                 "label",
-                "invalid characters (only alphanumeric, hyphen, underscore, colon, slash allowed)",
+                "invalid characters (only alphanumeric, hyphen, underscore, colon allowed)",
             ));
         }
 
@@ -719,6 +719,9 @@ mod tests {
     #[test]
     fn label_validation_rejects_invalid_characters() {
         let err = LabelValidator::validate("bad label").unwrap_err();
+        assert_eq!(err.field, "label");
+
+        let err = LabelValidator::validate("has/slash").unwrap_err();
         assert_eq!(err.field, "label");
     }
 
