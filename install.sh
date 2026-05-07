@@ -572,7 +572,7 @@ do_uninstall() {
 # Platform Detection
 # ============================================================================
 detect_platform() {
-    local os arch
+    local os arch libc
 
     case "$(uname -s)" in
         Linux*)  os="linux" ;;
@@ -588,7 +588,34 @@ detect_platform() {
         *) die "Unsupported architecture: $(uname -m)" ;;
     esac
 
-    echo "${os}_${arch}"
+    # Distinguish glibc vs musl on Linux. Alpine and other musl-based distros
+    # need the statically linked musl binary; the gnu artifact references
+    # libgcc_s/_Unwind_* symbols that musl's libc-compat shim does not provide
+    # (see #284).
+    libc=""
+    if [ "$os" = "linux" ]; then
+        if [ -f /etc/alpine-release ]; then
+            libc="musl"
+        elif command -v ldd >/dev/null 2>&1; then
+            # `ldd --version` emits to stderr on glibc and stdout on musl;
+            # capture both. musl's ldd identifies itself as "musl libc".
+            if ldd --version 2>&1 | grep -qi 'musl'; then
+                libc="musl"
+            fi
+        fi
+        # Only musl_arm64 and musl_amd64 are published; armv7 keeps gnu (no musl
+        # artifact yet). If we somehow detected musl on armv7, fall back to gnu
+        # rather than fabricating an artifact name that does not exist.
+        if [ "$libc" = "musl" ] && [ "$arch" != "amd64" ] && [ "$arch" != "arm64" ]; then
+            libc=""
+        fi
+    fi
+
+    if [ -n "$libc" ]; then
+        echo "${os}_${libc}_${arch}"
+    else
+        echo "${os}_${arch}"
+    fi
 }
 
 # ============================================================================

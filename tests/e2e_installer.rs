@@ -117,16 +117,22 @@ fn e2e_installer_platform_detection_linux_x64() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let platform = stdout.trim();
 
-        // Verify platform format: os_arch
+        // Verify platform format: os_arch or os_libc_arch (the libc segment
+        // is only emitted on Linux when a non-glibc libc is detected — see
+        // detect_platform in install.sh and #284).
         assert!(
             platform.contains('_'),
-            "Platform should be os_arch format, got: {platform}"
+            "Platform should be os[_libc]_arch format, got: {platform}"
         );
 
         let parts: Vec<&str> = platform.split('_').collect();
-        assert_eq!(parts.len(), 2, "Platform should have exactly 2 parts");
+        assert!(
+            parts.len() == 2 || parts.len() == 3,
+            "Platform should have 2 or 3 parts, got {parts:?}"
+        );
 
         let valid_os = ["linux", "darwin", "windows"];
+        let valid_libc = ["musl"];
         let valid_arch = ["amd64", "arm64", "armv7"];
 
         assert!(
@@ -135,12 +141,29 @@ fn e2e_installer_platform_detection_linux_x64() {
             parts[0],
             valid_os
         );
-        assert!(
-            valid_arch.contains(&parts[1]),
-            "Invalid arch: {}, expected one of {:?}",
-            parts[1],
-            valid_arch
-        );
+
+        if parts.len() == 3 {
+            assert_eq!(parts[0], "linux", "libc segment is only valid on Linux");
+            assert!(
+                valid_libc.contains(&parts[1]),
+                "Invalid libc: {}, expected one of {:?}",
+                parts[1],
+                valid_libc
+            );
+            assert!(
+                valid_arch.contains(&parts[2]),
+                "Invalid arch: {}, expected one of {:?}",
+                parts[2],
+                valid_arch
+            );
+        } else {
+            assert!(
+                valid_arch.contains(&parts[1]),
+                "Invalid arch: {}, expected one of {:?}",
+                parts[1],
+                valid_arch
+            );
+        }
     }
     // Note: Function might fail if sourcing install.sh has issues, that's OK for this test
 }
@@ -183,11 +206,15 @@ fn e2e_installer_detects_system_platform() {
     let output = run_installer_function(&temp, "detect_platform", "detect_platform");
     if output.status.success() {
         let detected = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let expected = format!("{expected_os}_{expected_arch}");
+        // Accept either the 2-part (glibc / non-Linux) or 3-part (musl) form.
+        // The exact libc segment depends on the host's libc — we don't try to
+        // probe it here, only verify that the os/arch alignment is correct.
+        let two_part = format!("{expected_os}_{expected_arch}");
+        let three_part_musl = format!("{expected_os}_musl_{expected_arch}");
 
-        assert_eq!(
-            detected, expected,
-            "Platform detection mismatch: got {detected}, expected {expected}"
+        assert!(
+            detected == two_part || detected == three_part_musl,
+            "Platform detection mismatch: got {detected}, expected {two_part} or {three_part_musl}"
         );
     }
 }
