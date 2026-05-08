@@ -989,17 +989,8 @@ ensure_rust() {
 # Pre-build cleanup for source builds
 # ============================================================================
 prepare_for_build() {
-    # Kill any stuck cargo processes
-    pkill -9 -f "cargo build" 2>/dev/null || true
-
-    # Clear cargo locks
-    rm -f ~/.cargo/.package-cache 2>/dev/null || true
-    rm -f ~/.cargo/registry/.crate-cache.lock 2>/dev/null || true
-
-    # Clean up old br build directories
-    rm -rf /tmp/br-build-* 2>/dev/null || true
-
-    # Check disk space (need at least 1GB)
+    # Source builds use TMP-scoped clone and target directories, so preflight
+    # must not disturb unrelated Cargo processes or shared Cargo caches.
     local avail_kb
     if [[ "$OSTYPE" == "darwin"* ]]; then
         avail_kb=$(df -k /tmp | tail -1 | awk '{print $4}')
@@ -1008,12 +999,8 @@ prepare_for_build() {
     fi
 
     if [ "$avail_kb" -lt 1048576 ]; then
-        log_warn "Low disk space in /tmp ($(( avail_kb / 1024 ))MB). Cleaning up..."
-        rm -rf /tmp/cargo-target 2>/dev/null || true
-        rm -rf ~/.cargo/registry/cache 2>/dev/null || true
+        log_warn "Low disk space in /tmp ($(( avail_kb / 1024 ))MB). Source build may fail; set TMPDIR to a larger filesystem and retry if needed."
     fi
-
-    sleep 1
 }
 
 # ============================================================================

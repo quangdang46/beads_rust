@@ -97,6 +97,21 @@ fn run_installer_function(temp_dir: &TempDir, _function_name: &str, function_cal
         .expect("Failed to run installer function")
 }
 
+fn install_script_contents() -> String {
+    let install_script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("install.sh");
+    fs::read_to_string(install_script).expect("read install.sh")
+}
+
+fn shell_function_section<'a>(script: &'a str, function_name: &str) -> &'a str {
+    let marker = format!("{function_name}() {{");
+    let start = script.find(&marker).expect("function marker") + marker.len();
+    let tail = &script[start..];
+    let end = tail
+        .find("\n# ============================================================================")
+        .unwrap_or(tail.len());
+    &tail[..end]
+}
+
 // ============================================================================
 // Platform Detection Tests
 // ============================================================================
@@ -605,6 +620,28 @@ fn e2e_installer_from_source_flag_accepted() {
         stdout.contains("br installer") || stdout.contains("--from-source"),
         "Should accept --from-source flag"
     );
+}
+
+#[test]
+fn e2e_installer_source_build_preflight_does_not_touch_shared_cargo_state() {
+    let script = install_script_contents();
+    let prepare_for_build = shell_function_section(&script, "prepare_for_build");
+
+    assert!(
+        !prepare_for_build.contains("pkill"),
+        "source-build preflight must not kill unrelated cargo processes"
+    );
+    for forbidden_path in [
+        "~/.cargo/.package-cache",
+        "~/.cargo/registry/.crate-cache.lock",
+        "~/.cargo/registry/cache",
+        "/tmp/cargo-target",
+    ] {
+        assert!(
+            !prepare_for_build.contains(forbidden_path),
+            "source-build preflight must not delete shared Cargo state: {forbidden_path}"
+        );
+    }
 }
 
 // ============================================================================
