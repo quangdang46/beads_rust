@@ -1041,9 +1041,15 @@ fn classify_history(args: &HistoryArgs) -> CommandCompatibility {
 mod tests {
     use super::*;
     use crate::cli::{Cli, CommentListArgs, CommentsArgs, DepListArgs, DepRemoveArgs, DepTreeArgs};
+    use crate::model::{Event, Issue, IssueType, Priority, Status};
+    use crate::storage::SqliteStorage;
+    use crate::sync::{ExportConfig, export_to_jsonl_with_policy, finalize_export};
+    use chrono::{TimeZone, Utc};
     use clap::Parser;
-    use serde_json::json;
-    use std::path::PathBuf;
+    use serde_json::{Value as JsonValue, json};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::str::FromStr;
 
     const NOW_UNIX_MS: u64 = 1_000;
     const FUTURE_UNIX_MS: u64 = 2_000;
@@ -1082,6 +1088,266 @@ mod tests {
     fn classify_argv(argv: &[&str]) -> CommandCompatibility {
         let cli = Cli::parse_from(argv.iter().copied());
         classify_command(&cli.command)
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct EventFingerprint {
+        issue_id: String,
+        event_type: String,
+        actor: String,
+        comment: Option<String>,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct CreateBurstState {
+        results: Vec<MutationResult>,
+        issues: Vec<Issue>,
+        event_order: Vec<EventFingerprint>,
+        jsonl_bytes: String,
+        dirty_ids: Vec<String>,
+        needs_flush: Option<String>,
+        export_hashes: Vec<(String, String)>,
+    }
+
+    fn create_burst_envelope(
+        index: usize,
+        title: &str,
+        issue_type: &str,
+        priority: i32,
+        labels: &[&str],
+    ) -> MutationEnvelope {
+        envelope(
+            &format!("create-{index}"),
+            CompatibleMutation::CreateIssue,
+            FUTURE_UNIX_MS,
+            json!({
+                "title": title,
+                "description": format!("description for {title}"),
+                "type": issue_type,
+                "priority": priority.to_string(),
+                "labels": labels,
+            }),
+        )
+    }
+
+    fn json_arg_str<'a>(arguments: &'a JsonValue, key: &str) -> &'a str {
+        arguments
+            .get(key)
+            .and_then(JsonValue::as_str)
+            .expect("missing string argument")
+    }
+
+    fn test_create_issue_from_envelope(envelope: &MutationEnvelope, sequence: usize) -> Issue {
+        let arguments = &envelope.arguments;
+        let timestamp_second = u32::try_from(sequence).expect("test sequence fits in timestamp");
+        let created_at = Utc
+            .with_ymd_and_hms(2026, 5, 8, 12, 0, timestamp_second)
+            .single()
+            .expect("valid deterministic timestamp");
+        let labels = arguments
+            .get("labels")
+            .and_then(JsonValue::as_array)
+            .expect("labels array")
+            .iter()
+            .map(|label| {
+                label
+                    .as_str()
+                    .expect("label should be a string")
+                    .to_string()
+            })
+            .collect();
+        let priority =
+            Priority::from_str(json_arg_str(arguments, "priority")).expect("valid priority");
+        let issue_type =
+            IssueType::from_str(json_arg_str(arguments, "type")).expect("valid issue type");
+
+        let mut issue = Issue {
+            id: format!("bd-burst-{sequence:03}"),
+            title: json_arg_str(arguments, "title").to_string(),
+            description: Some(json_arg_str(arguments, "description").to_string()),
+            status: Status::Open,
+            priority,
+            issue_type,
+            created_at,
+            updated_at: created_at,
+            created_by: Some(envelope.actor.clone()),
+            source_repo: Some("write-combining-parity".to_string()),
+            labels,
+            ..Issue::default()
+        };
+        issue.content_hash = Some(issue.compute_content_hash());
+        issue
+    }
+
+    fn apply_test_create(
+        storage: &mut SqliteStorage,
+        envelope: &MutationEnvelope,
+        sequence: usize,
+    ) -> MutationResult {
+        let issue = test_create_issue_from_envelope(envelope, sequence);
+        storage
+            .create_issue(&issue, &envelope.actor)
+            .expect("test create should write");
+        let stdout = serde_json::to_string(&json!({
+            "id": issue.id,
+            "title": issue.title,
+            "status": issue.status.as_str(),
+        }))
+        .expect("serialize create result");
+        MutationResult::new(
+            envelope.idempotency_key.clone(),
+            envelope.family,
+            0,
+            stdout,
+            "",
+            CombinedFlushOutcome::NotRequested,
+        )
+    }
+
+    fn flush_to_jsonl(storage: &mut SqliteStorage, jsonl_path: &Path) -> String {
+        let config = ExportConfig {
+            force: true,
+            is_default_path: true,
+            ..ExportConfig::default()
+        };
+        let (result, _) =
+            export_to_jsonl_with_policy(storage, jsonl_path, &config).expect("export JSONL");
+        let issue_hashes = result.issue_hashes.clone();
+        finalize_export(storage, &result, Some(&issue_hashes), jsonl_path)
+            .expect("finalize export");
+        fs::read_to_string(jsonl_path).expect("read exported JSONL")
+    }
+
+    fn event_fingerprints(events: Vec<Event>) -> Vec<EventFingerprint> {
+        events
+            .into_iter()
+            .rev()
+            .map(|event| EventFingerprint {
+                issue_id: event.issue_id,
+                event_type: event.event_type.as_str().to_string(),
+                actor: event.actor,
+                comment: event.comment,
+            })
+            .collect()
+    }
+
+    fn export_hashes_for(storage: &SqliteStorage, issues: &[Issue]) -> Vec<(String, String)> {
+        issues
+            .iter()
+            .map(|issue| {
+                let (hash, _) = storage
+                    .get_export_hash(&issue.id)
+                    .expect("read export hash")
+                    .expect("missing export hash");
+                (issue.id.clone(), hash)
+            })
+            .collect()
+    }
+
+    fn create_burst_state(
+        storage: &SqliteStorage,
+        jsonl_bytes: String,
+        results: Vec<MutationResult>,
+    ) -> CreateBurstState {
+        let mut issues = storage
+            .get_all_issues_for_export()
+            .expect("read exported issues");
+        issues.sort_by(|left, right| left.id.cmp(&right.id));
+        let event_order = event_fingerprints(storage.get_all_events(0).expect("read events"));
+        let dirty_ids = storage.get_dirty_issue_ids().expect("read dirty ids");
+        let needs_flush = storage
+            .get_metadata("needs_flush")
+            .expect("read needs_flush");
+        let export_hashes = export_hashes_for(storage, &issues);
+
+        CreateBurstState {
+            results,
+            issues,
+            event_order,
+            jsonl_bytes,
+            dirty_ids,
+            needs_flush,
+            export_hashes,
+        }
+    }
+
+    fn mark_results_flushed(results: &mut [MutationResult]) {
+        for result in results {
+            result.flush = CombinedFlushOutcome::Succeeded;
+        }
+    }
+
+    fn mark_report_flushed(report: &mut BatchReport) {
+        for response in &mut report.responses {
+            if let BatchResponseOutcome::Applied(result) = &mut response.outcome {
+                result.flush = CombinedFlushOutcome::Succeeded;
+            }
+        }
+    }
+
+    fn applied_results(report: &BatchReport) -> Vec<MutationResult> {
+        report
+            .responses
+            .iter()
+            .filter_map(|response| match &response.outcome {
+                BatchResponseOutcome::Applied(result) => Some(result.clone()),
+                BatchResponseOutcome::Skipped(_) => None,
+            })
+            .collect()
+    }
+
+    fn executed(result: std::result::Result<BatchReport, BatchExecutionError>) -> BatchReport {
+        assert!(
+            result.is_ok(),
+            "unexpected batch execution error: {result:?}"
+        );
+        match result {
+            Ok(report) => report,
+            Err(err) => {
+                assert_eq!(Some(err), None);
+                BatchReport {
+                    schema_version: String::new(),
+                    family: None,
+                    responses: Vec::new(),
+                }
+            }
+        }
+    }
+
+    fn run_direct_create_burst(envelopes: &[MutationEnvelope]) -> CreateBurstState {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let jsonl_path = dir.path().join("direct.jsonl");
+        let mut storage = SqliteStorage::open_memory().expect("open direct storage");
+        let mut results = Vec::with_capacity(envelopes.len());
+        let mut jsonl_bytes = String::new();
+
+        for (index, envelope) in envelopes.iter().enumerate() {
+            let result = apply_test_create(&mut storage, envelope, index + 1);
+            jsonl_bytes = flush_to_jsonl(&mut storage, &jsonl_path);
+            results.push(result);
+        }
+        mark_results_flushed(&mut results);
+
+        create_burst_state(&storage, jsonl_bytes, results)
+    }
+
+    fn run_combined_create_burst(envelopes: &[MutationEnvelope]) -> CreateBurstState {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let jsonl_path = dir.path().join("combined.jsonl");
+        let mut storage = SqliteStorage::open_memory().expect("open combined storage");
+        let mut sequence = 0;
+        let mut report = executed(execute_batch_with(
+            envelopes,
+            BatchLimits::default(),
+            NOW_UNIX_MS,
+            |envelope| {
+                sequence += 1;
+                apply_test_create(&mut storage, envelope, sequence)
+            },
+        ));
+        let jsonl_bytes = flush_to_jsonl(&mut storage, &jsonl_path);
+        mark_report_flushed(&mut report);
+        create_burst_state(&storage, jsonl_bytes, applied_results(&report))
     }
 
     fn reported(result: std::result::Result<BatchReport, BatchReportError>) -> BatchReport {
@@ -2043,6 +2309,35 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![0, 1, 2, 3]
         );
+    }
+
+    #[test]
+    fn create_burst_combined_harness_matches_direct_sequential_state() {
+        let envelopes = vec![
+            create_burst_envelope(1, "First combined create", "task", 1, &["swarm", "claim"]),
+            create_burst_envelope(2, "Second combined create", "feature", 2, &["swarm"]),
+            create_burst_envelope(
+                3,
+                "Third combined create",
+                "bug",
+                0,
+                &["swarm", "regression"],
+            ),
+        ];
+
+        let direct = run_direct_create_burst(&envelopes);
+        let combined = run_combined_create_burst(&envelopes);
+
+        assert_eq!(combined.results.len(), envelopes.len());
+        assert_eq!(direct.results, combined.results);
+        assert_eq!(direct.issues, combined.issues);
+        assert_eq!(direct.event_order, combined.event_order);
+        assert_eq!(direct.jsonl_bytes, combined.jsonl_bytes);
+        assert_eq!(direct.dirty_ids, Vec::<String>::new());
+        assert_eq!(combined.dirty_ids, Vec::<String>::new());
+        assert_eq!(direct.needs_flush.as_deref(), Some("false"));
+        assert_eq!(combined.needs_flush.as_deref(), Some("false"));
+        assert_eq!(direct.export_hashes, combined.export_hashes);
     }
 
     #[test]
