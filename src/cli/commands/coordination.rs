@@ -6,9 +6,10 @@ use crate::cli::{
 };
 use crate::config;
 use crate::coordination::{
-    ClaimAssessmentInput, ClaimOwnerKind, CoordinationClaimRow, CoordinationComment,
-    CoordinationIssueRow, CoordinationStatusOutput, CoordinationWorkspaceCounts,
-    ReservationEvidence, assess_claim,
+    AgentMailAgentSnapshot, AgentMailReservationSnapshot, ClaimAssessmentInput, ClaimOwnerKind,
+    CoordinationClaimRow, CoordinationComment, CoordinationIssueRow, CoordinationStatusOutput,
+    CoordinationWorkspaceCounts, ReservationEvidence, ReservationEvidenceProvenance, assess_claim,
+    reservation_evidence_from_snapshots,
 };
 use crate::error::{BeadsError, Result};
 use crate::format::{sanitize_terminal_inline, truncate_title};
@@ -16,6 +17,10 @@ use crate::model::{Comment, Issue, Status};
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::{ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage};
 use chrono::{DateTime, Utc};
+use serde::de::DeserializeOwned;
+use serde_json::Value;
+use std::collections::HashMap;
+use std::fs;
 use std::path::Path;
 
 /// Execute `br coordination status`.
@@ -70,6 +75,7 @@ fn execute_status_inner(
         outer_ctx.inherited_output_mode(),
         args.robot,
     );
+    let snapshots = SnapshotContext::from_args(args)?;
     let quiet = cli.quiet.unwrap_or(false);
     let ctx = OutputContext::from_output_format(output_format, quiet, true);
     if matches!(ctx.mode(), OutputMode::Quiet) {
@@ -80,6 +86,7 @@ fn execute_status_inner(
         storage,
         owner_kind_from_arg(args.owner_kind),
         args.comments,
+        &snapshots,
         Utc::now(),
     )?;
 
@@ -96,6 +103,7 @@ fn build_coordination_status_output(
     storage: &SqliteStorage,
     owner_kind: ClaimOwnerKind,
     comment_limit: usize,
+    snapshots: &SnapshotContext,
     generated_at: DateTime<Utc>,
 ) -> Result<CoordinationStatusOutput> {
     let filters = ListFilters {
@@ -118,18 +126,33 @@ fn build_coordination_status_output(
         .into_iter()
         .map(|issue| {
             let issue_id = issue.id.clone();
+            let comments = comments_by_issue
+                .get(&issue_id)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let agent = snapshots.agent_for(issue.assignee.as_deref());
+            let reservation = snapshots.reservation_for(
+                &issue_id,
+                issue.assignee.as_deref(),
+                comments,
+                generated_at,
+            );
+            let owner_kind = if agent.is_some() {
+                ClaimOwnerKind::SwarmAgent
+            } else {
+                owner_kind
+            };
             build_claim_row(
                 issue,
                 ClaimRowContext {
                     owner_kind,
+                    reservation,
+                    agent,
                     generated_at,
                     labels: labels_by_issue.get(&issue_id).cloned().unwrap_or_default(),
                     dependency_count: dependency_counts.get(&issue_id).copied().unwrap_or(0),
                     dependent_count: dependent_counts.get(&issue_id).copied().unwrap_or(0),
-                    comments: comments_by_issue
-                        .get(&issue_id)
-                        .map(Vec::as_slice)
-                        .unwrap_or(&[]),
+                    comments,
                     comment_limit,
                 },
             )
@@ -146,6 +169,8 @@ fn build_coordination_status_output(
 
 struct ClaimRowContext<'a> {
     owner_kind: ClaimOwnerKind,
+    reservation: ReservationEvidence,
+    agent: Option<AgentMailAgentSnapshot>,
     generated_at: DateTime<Utc>,
     labels: Vec<String>,
     dependency_count: usize,
@@ -161,7 +186,7 @@ fn build_claim_row(issue: Issue, context: ClaimRowContext<'_>) -> CoordinationCl
         updated_at: issue.updated_at,
         now: context.generated_at,
         owner_kind: context.owner_kind,
-        reservation: ReservationEvidence::NoSnapshot,
+        reservation: context.reservation,
     });
     let issue = CoordinationIssueRow {
         id: issue.id,
@@ -175,7 +200,165 @@ fn build_claim_row(issue: Issue, context: ClaimRowContext<'_>) -> CoordinationCl
         latest_comments,
     };
 
-    CoordinationClaimRow { issue, assessment }
+    CoordinationClaimRow {
+        issue,
+        agent: context.agent,
+        assessment,
+    }
+}
+
+#[derive(Default)]
+struct SnapshotContext {
+    reservations: Option<Vec<AgentMailReservationSnapshot>>,
+    agents_by_name: HashMap<String, AgentMailAgentSnapshot>,
+}
+
+impl SnapshotContext {
+    fn from_args(args: &CoordinationStatusArgs) -> Result<Self> {
+        let reservations = args
+            .reservations
+            .as_deref()
+            .map(|path| read_snapshot_rows(path, "reservation", "reservations"))
+            .transpose()?;
+        let agents = args
+            .agents
+            .as_deref()
+            .map(|path| read_snapshot_rows(path, "agent", "agents"))
+            .transpose()?
+            .unwrap_or_default();
+        let agents_by_name = agents
+            .into_iter()
+            .map(|agent: AgentMailAgentSnapshot| (agent_key(&agent.name), agent))
+            .collect();
+
+        Ok(Self {
+            reservations,
+            agents_by_name,
+        })
+    }
+
+    fn agent_for(&self, assignee: Option<&str>) -> Option<AgentMailAgentSnapshot> {
+        assignee
+            .map(agent_key)
+            .and_then(|key| self.agents_by_name.get(&key).cloned())
+    }
+
+    fn reservation_for(
+        &self,
+        issue_id: &str,
+        assignee: Option<&str>,
+        comments: &[Comment],
+        now: DateTime<Utc>,
+    ) -> ReservationEvidence {
+        reservation_evidence_from_snapshots(
+            issue_id,
+            assignee,
+            comments,
+            self.reservations.as_deref(),
+            now,
+        )
+    }
+}
+
+fn agent_key(name: &str) -> String {
+    name.trim().to_ascii_lowercase()
+}
+
+fn read_snapshot_rows<T>(path: &Path, kind: &str, array_key: &str) -> Result<Vec<T>>
+where
+    T: DeserializeOwned,
+{
+    let raw = fs::read_to_string(path).map_err(|err| {
+        BeadsError::validation(
+            "coordination_snapshot",
+            format!("failed to read {kind} snapshot {}: {err}", path.display()),
+        )
+    })?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(value) => parse_snapshot_value(value, path, kind, array_key),
+        Err(json_error) => parse_snapshot_jsonl(trimmed, path, kind).map_err(|line_error| {
+            BeadsError::validation(
+                "coordination_snapshot",
+                format!(
+                    "failed to parse {kind} snapshot {} as JSON ({json_error}) or JSONL ({line_error})",
+                    path.display()
+                ),
+            )
+        }),
+    }
+}
+
+fn parse_snapshot_value<T>(value: Value, path: &Path, kind: &str, array_key: &str) -> Result<Vec<T>>
+where
+    T: DeserializeOwned,
+{
+    match value {
+        Value::Array(_) => serde_json::from_value(value).map_err(|err| {
+            BeadsError::validation(
+                "coordination_snapshot",
+                format!("invalid {kind} snapshot array {}: {err}", path.display()),
+            )
+        }),
+        Value::Object(mut object) => {
+            if let Some(rows) = object.remove(array_key) {
+                return serde_json::from_value(rows).map_err(|err| {
+                    BeadsError::validation(
+                        "coordination_snapshot",
+                        format!(
+                            "invalid {kind} snapshot field `{array_key}` in {}: {err}",
+                            path.display()
+                        ),
+                    )
+                });
+            }
+            serde_json::from_value(Value::Object(object))
+                .map(|row| vec![row])
+                .map_err(|err| {
+                    BeadsError::validation(
+                        "coordination_snapshot",
+                        format!("invalid {kind} snapshot object {}: {err}", path.display()),
+                    )
+                })
+        }
+        _ => Err(BeadsError::validation(
+            "coordination_snapshot",
+            format!(
+                "{kind} snapshot {} must be a JSON object, JSON array, or JSONL stream",
+                path.display()
+            ),
+        )),
+    }
+}
+
+fn parse_snapshot_jsonl<T>(
+    raw: &str,
+    path: &Path,
+    kind: &str,
+) -> std::result::Result<Vec<T>, String>
+where
+    T: DeserializeOwned,
+{
+    let mut rows = Vec::new();
+    for (idx, line) in raw.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let row = serde_json::from_str(trimmed).map_err(|err| {
+            format!(
+                "line {} in {} is not a valid {kind} row: {err}",
+                idx + 1,
+                path.display()
+            )
+        })?;
+        rows.push(row);
+    }
+    Ok(rows)
 }
 
 fn latest_comments(comments: &[Comment], limit: usize) -> Vec<CoordinationComment> {
@@ -274,6 +457,23 @@ fn print_text_output(output: &CoordinationStatusOutput) {
             claim.issue.dependent_count,
             text_labels(&claim.issue.labels)
         );
+        if let Some(agent) = &claim.agent {
+            println!(
+                "  agent: {} | last_active: {} | contact: {}",
+                sanitize_terminal_inline(&agent.name),
+                agent.last_active_ts,
+                sanitize_terminal_inline(&agent.contact_policy)
+            );
+        }
+        if let Some((state, holder, provenance)) = reservation_text(&claim.assessment.reservation) {
+            println!(
+                "  reservation: {} holder={} path={} matched_on={}",
+                state,
+                sanitize_terminal_inline(holder),
+                sanitize_terminal_inline(&provenance.path_pattern),
+                text_match_reasons(provenance)
+            );
+        }
         if let Some(comment) = claim.issue.latest_comments.first() {
             println!(
                 "  latest_comment: {}: {}",
@@ -296,13 +496,48 @@ fn text_labels(labels: &[String]) -> String {
         .join(",")
 }
 
+fn reservation_text(
+    reservation: &ReservationEvidence,
+) -> Option<(&'static str, &str, &ReservationEvidenceProvenance)> {
+    match reservation {
+        ReservationEvidence::Active {
+            holder,
+            provenance: Some(provenance),
+            ..
+        } => Some(("active", holder, provenance)),
+        ReservationEvidence::Expired {
+            holder,
+            provenance: Some(provenance),
+            ..
+        } => Some(("expired", holder, provenance)),
+        _ => None,
+    }
+}
+
+fn text_match_reasons(provenance: &ReservationEvidenceProvenance) -> String {
+    provenance
+        .matched_on
+        .iter()
+        .map(|reason| reason.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ClaimRowContext, build_claim_row, latest_comments, owner_kind_from_arg};
+    use super::{
+        ClaimRowContext, SnapshotContext, build_claim_row, latest_comments, owner_kind_from_arg,
+        parse_snapshot_value,
+    };
     use crate::cli::CoordinationOwnerKindArg;
-    use crate::coordination::{ClaimClassification, ClaimOwnerKind, RecommendedAction};
+    use crate::coordination::{
+        AgentMailAgentSnapshot, AgentMailReservationSnapshot, ClaimClassification, ClaimOwnerKind,
+        RecommendedAction, ReservationEvidence,
+    };
     use crate::model::{Comment, Issue, IssueType, Priority, Status};
     use chrono::{Duration, TimeZone, Utc};
+    use serde_json::json;
+    use std::path::Path;
 
     fn now() -> chrono::DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 5, 8, 9, 0, 0)
@@ -329,6 +564,8 @@ mod tests {
             issue(now() - Duration::hours(2), Some("TopazFox")),
             ClaimRowContext {
                 owner_kind: ClaimOwnerKind::SwarmAgent,
+                reservation: ReservationEvidence::NoSnapshot,
+                agent: None,
                 generated_at: now(),
                 labels: vec!["coordination".to_string()],
                 dependency_count: 2,
@@ -387,5 +624,46 @@ mod tests {
             owner_kind_from_arg(CoordinationOwnerKindArg::Unknown),
             ClaimOwnerKind::Unknown
         );
+    }
+
+    #[test]
+    fn snapshot_context_matches_agent_names_case_insensitively() {
+        let mut context = SnapshotContext::default();
+        context.agents_by_name.insert(
+            "topazfox".to_string(),
+            AgentMailAgentSnapshot {
+                name: "TopazFox".to_string(),
+                task_description: "coordination work".to_string(),
+                last_active_ts: now(),
+                contact_policy: "auto".to_string(),
+            },
+        );
+
+        let agent = context
+            .agent_for(Some(" topazFOX "))
+            .expect("agent snapshot should match");
+
+        assert_eq!(agent.name, "TopazFox");
+    }
+
+    #[test]
+    fn parse_snapshot_value_rejects_malformed_rows() {
+        let value = json!({
+            "reservations": [
+                {
+                    "holder": "TopazFox",
+                    "path_pattern": "src/coordination.rs"
+                }
+            ]
+        });
+
+        let result = parse_snapshot_value::<AgentMailReservationSnapshot>(
+            value,
+            Path::new("reservations.json"),
+            "reservation",
+            "reservations",
+        );
+
+        assert!(result.is_err(), "missing timestamp fields must be invalid");
     }
 }

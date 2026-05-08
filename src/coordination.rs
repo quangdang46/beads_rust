@@ -53,6 +53,69 @@ impl ClaimOwnerKind {
     }
 }
 
+/// Why an Agent Mail reservation snapshot was associated with an issue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReservationSnapshotMatchReason {
+    /// Reservation holder matches the issue assignee.
+    HolderMatchesAssignee,
+    /// Reservation reason or thread id names the issue id.
+    IssueId,
+    /// A recent issue comment names the reservation path pattern.
+    CommentPath,
+}
+
+impl ReservationSnapshotMatchReason {
+    /// Stable snake_case value used in text projections.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HolderMatchesAssignee => "holder_matches_assignee",
+            Self::IssueId => "issue_id",
+            Self::CommentPath => "comment_path",
+        }
+    }
+}
+
+/// Minimal offline reservation snapshot row exported from Agent Mail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AgentMailReservationSnapshot {
+    pub holder: String,
+    pub path_pattern: String,
+    pub exclusive: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub expires_ts: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub released_ts: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+}
+
+/// Minimal offline agent-liveness snapshot row exported from Agent Mail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AgentMailAgentSnapshot {
+    pub name: String,
+    pub task_description: String,
+    pub last_active_ts: DateTime<Utc>,
+    pub contact_policy: String,
+}
+
+/// Provenance copied from a matching reservation snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReservationEvidenceProvenance {
+    pub path_pattern: String,
+    pub exclusive: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub expires_ts: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub released_ts: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    pub matched_on: Vec<ReservationSnapshotMatchReason>,
+}
+
 /// Optional Agent Mail reservation evidence supplied by the caller.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", tag = "state", content = "detail")]
@@ -67,12 +130,16 @@ pub enum ReservationEvidence {
         holder: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         expires_at: Option<DateTime<Utc>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provenance: Option<ReservationEvidenceProvenance>,
     },
     /// A matching reservation exists but is no longer active.
     Expired {
         holder: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         released_at: Option<DateTime<Utc>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provenance: Option<ReservationEvidenceProvenance>,
     },
     /// Snapshot data was supplied but could not be trusted.
     InvalidSnapshot { reason: String },
@@ -223,6 +290,8 @@ pub struct CoordinationIssueRow {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CoordinationClaimRow {
     pub issue: CoordinationIssueRow,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentMailAgentSnapshot>,
     pub assessment: ClaimAssessment,
 }
 
@@ -427,15 +496,112 @@ fn evidence_sources_for(reservation: &ReservationEvidence) -> Vec<CoordinationEv
     sources
 }
 
+/// Derive reservation evidence for one issue from an optional offline snapshot.
+#[must_use]
+pub fn reservation_evidence_from_snapshots(
+    issue_id: &str,
+    assignee: Option<&str>,
+    comments: &[Comment],
+    reservations: Option<&[AgentMailReservationSnapshot]>,
+    now: DateTime<Utc>,
+) -> ReservationEvidence {
+    let Some(reservations) = reservations else {
+        return ReservationEvidence::NoSnapshot;
+    };
+
+    let mut expired_match = None;
+    for reservation in reservations {
+        let matched_on = reservation_match_reasons(issue_id, assignee, comments, reservation);
+        if matched_on.is_empty() {
+            continue;
+        }
+
+        let provenance = reservation.provenance(matched_on);
+        if reservation.is_active(now) {
+            return ReservationEvidence::Active {
+                holder: reservation.holder.clone(),
+                expires_at: Some(reservation.expires_ts),
+                provenance: Some(provenance),
+            };
+        }
+
+        expired_match.get_or_insert_with(|| ReservationEvidence::Expired {
+            holder: reservation.holder.clone(),
+            released_at: reservation.released_ts,
+            provenance: Some(provenance),
+        });
+    }
+
+    expired_match.unwrap_or(ReservationEvidence::NoReservation)
+}
+
+fn reservation_match_reasons(
+    issue_id: &str,
+    assignee: Option<&str>,
+    comments: &[Comment],
+    reservation: &AgentMailReservationSnapshot,
+) -> Vec<ReservationSnapshotMatchReason> {
+    let mut reasons = Vec::new();
+    let holder = reservation.holder.trim();
+
+    if assignee
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty() && value.eq_ignore_ascii_case(holder))
+    {
+        reasons.push(ReservationSnapshotMatchReason::HolderMatchesAssignee);
+    }
+
+    if reservation
+        .reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains(issue_id))
+        || reservation
+            .thread_id
+            .as_deref()
+            .is_some_and(|thread_id| thread_id == issue_id)
+    {
+        reasons.push(ReservationSnapshotMatchReason::IssueId);
+    }
+
+    let path = reservation.path_pattern.trim();
+    if !path.is_empty() && comments.iter().any(|comment| comment.body.contains(path)) {
+        reasons.push(ReservationSnapshotMatchReason::CommentPath);
+    }
+
+    reasons
+}
+
+impl AgentMailReservationSnapshot {
+    fn is_active(&self, now: DateTime<Utc>) -> bool {
+        self.released_ts.is_none() && self.expires_ts > now
+    }
+
+    fn provenance(
+        &self,
+        matched_on: Vec<ReservationSnapshotMatchReason>,
+    ) -> ReservationEvidenceProvenance {
+        ReservationEvidenceProvenance {
+            path_pattern: self.path_pattern.clone(),
+            exclusive: self.exclusive,
+            reason: self.reason.clone(),
+            expires_ts: self.expires_ts,
+            released_ts: self.released_ts,
+            thread_id: self.thread_id.clone(),
+            matched_on,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        COORDINATION_SCHEMA_VERSION, ClaimAssessmentInput, ClaimClassification, ClaimOwnerKind,
-        CoordinationClaimRow, CoordinationComment, CoordinationEvidenceSource,
-        CoordinationIssueRow, CoordinationStatusOutput, CoordinationWorkspaceCounts,
-        RecommendedAction, ReservationEvidence, assess_claim,
+        AgentMailReservationSnapshot, COORDINATION_SCHEMA_VERSION, ClaimAssessmentInput,
+        ClaimClassification, ClaimOwnerKind, CoordinationClaimRow, CoordinationComment,
+        CoordinationEvidenceSource, CoordinationIssueRow, CoordinationStatusOutput,
+        CoordinationWorkspaceCounts, RecommendedAction, ReservationEvidence, assess_claim,
+        reservation_evidence_from_snapshots,
     };
-    use crate::model::{IssueType, Priority, Status};
+    use crate::model::{Comment, IssueType, Priority, Status};
     use chrono::{Duration, TimeZone, Utc};
 
     fn now() -> chrono::DateTime<Utc> {
@@ -475,6 +641,7 @@ mod tests {
                     created_at: now(),
                 }],
             },
+            agent: None,
             assessment,
         }
     }
@@ -542,6 +709,7 @@ mod tests {
             ReservationEvidence::Expired {
                 holder: "TopazFox".to_string(),
                 released_at: None,
+                provenance: None,
             },
         ));
 
@@ -564,6 +732,7 @@ mod tests {
             ReservationEvidence::Active {
                 holder: "TopazFox".to_string(),
                 expires_at: Some(now() + Duration::minutes(30)),
+                provenance: None,
             },
         ));
 
@@ -696,5 +865,101 @@ mod tests {
                 "CoordinationStatusOutput schema should require {field}"
             );
         }
+    }
+
+    #[test]
+    fn reservation_snapshot_active_match_blocks_reclaim_with_provenance() {
+        let reservations = vec![AgentMailReservationSnapshot {
+            holder: "TopazFox".to_string(),
+            path_pattern: "src/coordination.rs".to_string(),
+            exclusive: true,
+            reason: Some("beads_rust-sc6u optional snapshot work".to_string()),
+            expires_ts: now() + Duration::minutes(30),
+            released_ts: None,
+            thread_id: Some("beads_rust-sc6u".to_string()),
+        }];
+        let evidence = reservation_evidence_from_snapshots(
+            "beads_rust-sc6u",
+            Some("TopazFox"),
+            &[],
+            Some(&reservations),
+            now(),
+        );
+        let assessment = assess_claim(ClaimAssessmentInput {
+            assignee: Some("TopazFox".to_string()),
+            updated_at: now() - Duration::hours(12),
+            now: now(),
+            owner_kind: ClaimOwnerKind::SwarmAgent,
+            reservation: evidence,
+        });
+
+        assert_eq!(
+            assessment.classification,
+            ClaimClassification::BlockedByActiveReservation
+        );
+        assert!(matches!(
+            assessment.reservation,
+            ReservationEvidence::Active {
+                provenance: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn reservation_snapshot_absent_match_marks_no_reservation() {
+        let reservations = vec![AgentMailReservationSnapshot {
+            holder: "AmberLion".to_string(),
+            path_pattern: "src/other.rs".to_string(),
+            exclusive: true,
+            reason: Some("different bead".to_string()),
+            expires_ts: now() + Duration::minutes(30),
+            released_ts: None,
+            thread_id: Some("beads_rust-other".to_string()),
+        }];
+        let evidence = reservation_evidence_from_snapshots(
+            "beads_rust-sc6u",
+            Some("TopazFox"),
+            &[],
+            Some(&reservations),
+            now(),
+        );
+
+        assert_eq!(evidence, ReservationEvidence::NoReservation);
+    }
+
+    #[test]
+    fn reservation_snapshot_comment_path_match_is_enough_to_correlate() {
+        let reservations = vec![AgentMailReservationSnapshot {
+            holder: "AmberLion".to_string(),
+            path_pattern: "src/coordination.rs".to_string(),
+            exclusive: true,
+            reason: None,
+            expires_ts: now() - Duration::minutes(5),
+            released_ts: None,
+            thread_id: None,
+        }];
+        let comments = vec![Comment {
+            id: 1,
+            issue_id: "beads_rust-sc6u".to_string(),
+            author: "TopazFox".to_string(),
+            body: "files: src/coordination.rs".to_string(),
+            created_at: now(),
+        }];
+        let evidence = reservation_evidence_from_snapshots(
+            "beads_rust-sc6u",
+            Some("TopazFox"),
+            &comments,
+            Some(&reservations),
+            now(),
+        );
+
+        assert!(matches!(
+            evidence,
+            ReservationEvidence::Expired {
+                provenance: Some(_),
+                ..
+            }
+        ));
     }
 }

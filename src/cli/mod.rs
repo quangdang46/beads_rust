@@ -1278,6 +1278,14 @@ pub struct CoordinationStatusArgs {
     #[arg(long, default_value_t = 2)]
     pub comments: usize,
 
+    /// Offline Agent Mail reservation snapshot file (JSON array, wrapper object, or JSONL)
+    #[arg(long)]
+    pub reservations: Option<PathBuf>,
+
+    /// Offline Agent Mail agent snapshot file (JSON array, wrapper object, or JSONL)
+    #[arg(long)]
+    pub agents: Option<PathBuf>,
+
     /// Output format (text, json, toon). Env: BR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT.
     #[arg(long, value_enum)]
     pub format: Option<OutputFormatBasic>,

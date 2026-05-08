@@ -95,14 +95,49 @@ a projection of the same fields, not a separate policy.
 br coordination status --json
 br coordination status --format toon
 br coordination status --owner-kind swarm-agent
+br coordination status --reservations reservations.json --agents agents.jsonl --json
 ```
 
 The command is read-only. It opens the same local storage as other list-style
 commands, computes local issue counts and relation counts, attaches bounded
-latest-comment excerpts, and classifies each claim with `ReservationEvidence` set
-to `no_snapshot`. Snapshot correlation is a separate follow-up; until then stale
-assigned claims become `no_mail_snapshot` with `inspect_mail`, not
-`reclaim_candidate`.
+latest-comment excerpts, and classifies each claim with either explicit
+`no_snapshot` evidence or an operator-provided offline Agent Mail snapshot.
+
+Snapshot files are optional and local-only. `br` does not call Agent Mail or any
+network service. Reservation snapshots may be JSON arrays, wrapper objects with a
+`reservations` array, or JSONL streams with one row per reservation:
+
+```json
+{
+  "holder": "TopazFox",
+  "path_pattern": "src/coordination.rs",
+  "exclusive": true,
+  "reason": "beads_rust-sc6u",
+  "expires_ts": "2026-05-08T12:00:00Z",
+  "released_ts": null,
+  "thread_id": "beads_rust-sc6u"
+}
+```
+
+Agent snapshots use the same JSON/JSONL wrapping rules with an `agents` array:
+
+```json
+{
+  "name": "TopazFox",
+  "task_description": "coordination status work",
+  "last_active_ts": "2026-05-08T10:00:00Z",
+  "contact_policy": "auto"
+}
+```
+
+Reservations correlate to claims by assignee/holder, bead id in
+`reason`/`thread_id`, or path patterns named in recent comments. A matching
+active reservation changes stale-looking work to
+`blocked_by_active_reservation` with `leave_active`. Missing snapshots remain
+`no_mail_snapshot`; supplied snapshots with no matching reservation become
+`no_reservation` evidence and allow the normal stale/reclaim policy to apply.
+Malformed or unreadable snapshot files fail with structured validation errors
+instead of silently weakening evidence.
 
 ## Agent Mail Boundary
 
