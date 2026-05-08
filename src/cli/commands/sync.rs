@@ -19,10 +19,11 @@ use crate::sync::{
     ImportConfig, METADATA_JSONL_CONTENT_HASH, METADATA_LAST_EXPORT_TIME,
     METADATA_LAST_IMPORT_TIME, MergeContext, OrphanMode, analyze_jsonl, compute_jsonl_hash,
     compute_staleness, export_temp_path, export_to_jsonl_with_policy, finalize_export,
-    get_issue_ids_from_jsonl, import_from_jsonl, load_base_snapshot, read_issues_from_jsonl,
-    require_safe_sync_overwrite_path, require_valid_sync_path, restore_tombstones_after_rebuild,
-    save_base_snapshot_from_jsonl, scan_jsonl_for_tombstone_filter, snapshot_tombstones,
-    three_way_merge, tombstones_missing_from_jsonl_tombstones, validate_no_git_path,
+    get_issue_ids_from_jsonl, id_matches_expected_prefix, import_from_jsonl, load_base_snapshot,
+    read_issues_from_jsonl, require_safe_sync_overwrite_path, require_valid_sync_path,
+    restore_tombstones_after_rebuild, save_base_snapshot_from_jsonl,
+    scan_jsonl_for_tombstone_filter, snapshot_tombstones, three_way_merge,
+    tombstones_missing_from_jsonl_tombstones, validate_no_git_path,
     validate_sync_path_with_external,
 };
 use crate::util::id::split_prefix_remainder;
@@ -1780,14 +1781,12 @@ fn auto_rebuild_semantic_conflict_field(args: &SyncArgs) -> &'static str {
 }
 
 fn jsonl_contains_prefix_mismatch(jsonl_path: &Path, expected_prefix: &str) -> Result<bool> {
-    let expected_prefix = expected_prefix.trim_end_matches('-');
     for issue in read_issues_from_jsonl(jsonl_path)? {
         if issue.status == crate::model::Status::Tombstone {
             continue;
         }
-        match split_prefix_remainder(&issue.id) {
-            Some((prefix, _)) if prefix == expected_prefix => {}
-            _ => return Ok(true),
+        if !id_matches_expected_prefix(&issue.id, expected_prefix) {
+            return Ok(true);
         }
     }
     Ok(false)
@@ -3975,6 +3974,18 @@ mod tests {
         .unwrap();
 
         assert!(!jsonl_contains_prefix_mismatch(&jsonl_path, "bd").unwrap());
+
+        let slugged = make_test_issue("bd-survey-my-thing-abc123", "Slugged");
+        fs::write(
+            &jsonl_path,
+            format!("{}\n", serde_json::to_string(&slugged).unwrap()),
+        )
+        .unwrap();
+
+        assert!(
+            !jsonl_contains_prefix_mismatch(&jsonl_path, "bd").unwrap(),
+            "slugged IDs generated from prefix bd should not be treated as mismatches"
+        );
 
         let mismatch = make_test_issue("other-gamma", "Mismatch");
         fs::write(

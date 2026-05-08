@@ -4514,9 +4514,22 @@ pub fn import_from_jsonl(
     }
 }
 
-fn id_matches_expected_prefix(id: &str, expected_prefix: &str) -> bool {
+pub(crate) fn id_matches_expected_prefix(id: &str, expected_prefix: &str) -> bool {
     let normalized_prefix = expected_prefix.trim_end_matches('-');
-    parse_id(id).is_ok_and(|parsed| parsed.prefix == normalized_prefix)
+    if normalized_prefix.is_empty() {
+        return false;
+    }
+
+    parse_id(id).is_ok_and(|parsed| {
+        // Slugged root IDs are shaped as `<prefix>-<slug>-<hash>`.
+        // `parse_id` treats the slug as part of the hyphenated prefix, so
+        // prefix guardrails must accept this generated prefix family.
+        parsed.prefix == normalized_prefix
+            || parsed
+                .prefix
+                .strip_prefix(normalized_prefix)
+                .is_some_and(|suffix| suffix.starts_with('-'))
+    })
 }
 
 /// Process a single import action.
@@ -8456,6 +8469,50 @@ mod tests {
             PreflightCheckStatus::Pass,
             "prefix_match should pass for matching prefix"
         );
+    }
+
+    #[test]
+    fn test_preflight_import_prefix_accepts_slugged_ids() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).unwrap();
+        let jsonl_path = beads_dir.join("issues.jsonl");
+
+        let issue = make_test_issue("bd-survey-my-thing-abc123", "Slugged issue");
+        let json = serde_json::to_string(&issue).unwrap();
+        std::fs::write(&jsonl_path, format!("{json}\n")).unwrap();
+
+        let config = ImportConfig {
+            beads_dir: Some(beads_dir),
+            ..Default::default()
+        };
+
+        let result = preflight_import(&jsonl_path, &config, Some("bd")).unwrap();
+        let prefix_check = result.checks.iter().find(|c| c.name == "prefix_match");
+        assert!(
+            prefix_check.is_some(),
+            "prefix_match check should be present"
+        );
+        assert_eq!(
+            prefix_check.unwrap().status,
+            PreflightCheckStatus::Pass,
+            "slugged IDs generated from the expected prefix should pass"
+        );
+    }
+
+    #[test]
+    fn test_id_matches_expected_prefix_keeps_non_delimited_supersets_out() {
+        assert!(id_matches_expected_prefix(
+            "bd-survey-my-thing-abc123",
+            "bd"
+        ));
+        assert!(id_matches_expected_prefix(
+            "bd-survey-my-thing-abc123",
+            "bd-"
+        ));
+        assert!(!id_matches_expected_prefix("bdx-survey-abc123", "bd"));
+        assert!(!id_matches_expected_prefix("x-bd-survey-abc123", "bd"));
+        assert!(!id_matches_expected_prefix("bd-survey-abc123", ""));
     }
 
     #[test]
