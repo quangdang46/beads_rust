@@ -709,6 +709,7 @@ pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::R
              4. Use list_issues to find specific issues\n\n\
              Discovery resources: beads://project/info, beads://schema, \
              beads://labels, beads://issues/ready, beads://issues/blocked, \
+             beads://issues/in_progress, beads://coordination/status, \
              beads://issues/deferred, beads://issues/bottlenecks, \
              beads://graph/health, beads://events/recent\n\n\
              Guided workflows:\n\
@@ -725,7 +726,7 @@ pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::R
         .tool(tools::CloseIssueTool::new(state.clone()))
         .tool(tools::ManageDependenciesTool::new(state.clone()))
         .tool(tools::ProjectOverviewTool::new(state.clone()))
-        // Resources (11)
+        // Resources (12)
         .resource(resources::ProjectInfoResource::new(state.clone()))
         .resource(resources::IssueResource::new(state.clone()))
         .resource(resources::SchemaResource)
@@ -733,6 +734,7 @@ pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::R
         .resource(resources::ReadyIssuesResource::new(state.clone()))
         .resource(resources::BlockedIssuesResource::new(state.clone()))
         .resource(resources::InProgressResource::new(state.clone()))
+        .resource(resources::CoordinationStatusResource::new(state.clone()))
         .resource(resources::EventsResource::new(state.clone()))
         .resource(resources::DeferredIssuesResource::new(state.clone()))
         .resource(resources::GraphHealthResource::new(state.clone()))

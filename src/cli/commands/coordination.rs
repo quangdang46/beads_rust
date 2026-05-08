@@ -82,13 +82,24 @@ fn execute_status_inner(
         return Ok(());
     }
 
-    let output = build_coordination_status_output(
-        storage,
-        owner_kind_from_arg(args.owner_kind),
-        args.comments,
-        &snapshots,
-        Utc::now(),
-    )?;
+    let owner_kind = owner_kind_from_arg(args.owner_kind);
+    let generated_at = Utc::now();
+    let output = if snapshots.has_snapshots() {
+        build_coordination_status_output(
+            storage,
+            owner_kind,
+            args.comments,
+            &snapshots,
+            generated_at,
+        )?
+    } else {
+        build_coordination_status_without_snapshots(
+            storage,
+            owner_kind,
+            args.comments,
+            generated_at,
+        )?
+    };
 
     match output_format {
         OutputFormat::Json => ctx.json_pretty(&output),
@@ -97,6 +108,24 @@ fn execute_status_inner(
     }
 
     Ok(())
+}
+
+/// Build the shared coordination status envelope without offline Agent Mail
+/// snapshots. MCP serve uses this path to mirror `br coordination status --json`
+/// while keeping the resource read-only and filesystem-local.
+pub(crate) fn build_coordination_status_without_snapshots(
+    storage: &SqliteStorage,
+    owner_kind: ClaimOwnerKind,
+    comment_limit: usize,
+    generated_at: DateTime<Utc>,
+) -> Result<CoordinationStatusOutput> {
+    build_coordination_status_output(
+        storage,
+        owner_kind,
+        comment_limit,
+        &SnapshotContext::default(),
+        generated_at,
+    )
 }
 
 fn build_coordination_status_output(
@@ -257,6 +286,10 @@ impl SnapshotContext {
 
     const fn has_reservation_snapshot(&self) -> bool {
         self.reservations.is_some()
+    }
+
+    fn has_snapshots(&self) -> bool {
+        self.reservations.is_some() || !self.agents_by_name.is_empty()
     }
 
     fn reservation_for(

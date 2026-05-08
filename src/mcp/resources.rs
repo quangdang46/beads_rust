@@ -6,12 +6,15 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use fastmcp_rust::{
     McpContext, McpError, McpErrorCode, McpResult, Resource, ResourceContent, ResourceHandler,
     ResourceTemplate,
 };
 use serde_json::{Value, json};
 
+use crate::cli::commands::coordination::build_coordination_status_without_snapshots;
+use crate::coordination::ClaimOwnerKind;
 use crate::error::StructuredError;
 use crate::model::{Event, Issue, Status};
 use crate::storage::{ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage};
@@ -81,6 +84,49 @@ fn issue_not_found_resource(storage: &SqliteStorage, id: &str) -> McpResult<McpE
         structured.message,
         data,
     ))
+}
+
+const COORDINATION_STATUS_URI: &str = "beads://coordination/status";
+
+fn coordination_status_error(message: impl Into<String>) -> McpError {
+    let message = message.into();
+    McpError::with_data(
+        McpErrorCode::ToolExecutionError,
+        format!("failed to build coordination status: {message}"),
+        json!({
+            "error_type": "COORDINATION_STATUS_FAILED",
+            "recoverable": true,
+            "message": message,
+            "resource": COORDINATION_STATUS_URI,
+            "suggested_tool_calls": [
+                {"tool": "project_overview", "arguments": {}}
+            ],
+            "suggested_cli_commands": [
+                "br coordination status --json",
+                "br show <id> --json",
+                "br comments list <id> --json"
+            ],
+            "snapshot_hint": "This MCP resource is read-only and does not call Agent Mail. Use the CLI --reservations and --agents flags when reservation evidence is required."
+        }),
+    )
+}
+
+fn coordination_status_resource_json_at(
+    storage: &SqliteStorage,
+    generated_at: DateTime<Utc>,
+) -> McpResult<Value> {
+    let output = build_coordination_status_without_snapshots(
+        storage,
+        ClaimOwnerKind::SwarmAgent,
+        2,
+        generated_at,
+    )
+    .map_err(|err| coordination_status_error(err.to_string()))?;
+    serde_json::to_value(output).map_err(|err| coordination_status_error(err.to_string()))
+}
+
+fn coordination_status_resource_json(storage: &SqliteStorage) -> McpResult<Value> {
+    coordination_status_resource_json_at(storage, Utc::now())
 }
 
 // ---------------------------------------------------------------------------
@@ -567,7 +613,48 @@ impl ResourceHandler for InProgressResource {
 }
 
 // ---------------------------------------------------------------------------
-// 8. events/recent — recent audit events
+// 8. coordination/status — hidden in-progress claim diagnosis
+// ---------------------------------------------------------------------------
+
+pub struct CoordinationStatusResource(Arc<BeadsState>);
+impl CoordinationStatusResource {
+    pub fn new(state: Arc<BeadsState>) -> Self {
+        Self(state)
+    }
+}
+
+impl ResourceHandler for CoordinationStatusResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: COORDINATION_STATUS_URI.into(),
+            name: "Coordination Status".into(),
+            description: Some(
+                "Read-only stale-claim diagnosis for in-progress work. Mirrors \
+                 `br coordination status --json` with the br.coordination.v1 \
+                 evidence shape, without network listeners, background daemons, \
+                 or direct Agent Mail calls. Use the CLI snapshot flags when \
+                 reservation or agent-liveness evidence is required."
+                    .into(),
+            ),
+            mime_type: Some("application/json".into()),
+            icon: None,
+            version: None,
+            tags: vec![],
+        }
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        let storage = self
+            .0
+            .open_read_storage()
+            .map_err(|err| coordination_status_error(err.to_string()))?;
+        let value = coordination_status_resource_json(&storage)?;
+        Ok(resource_json(COORDINATION_STATUS_URI, &value))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 9. events/recent — recent audit events
 // ---------------------------------------------------------------------------
 
 pub struct EventsResource(Arc<BeadsState>);
@@ -623,7 +710,7 @@ impl ResourceHandler for EventsResource {
 }
 
 // ---------------------------------------------------------------------------
-// 9. issues/deferred — deferred work items
+// 10. issues/deferred — deferred work items
 // ---------------------------------------------------------------------------
 
 pub struct DeferredIssuesResource(Arc<BeadsState>);
@@ -683,7 +770,7 @@ impl ResourceHandler for DeferredIssuesResource {
 }
 
 // ---------------------------------------------------------------------------
-// 10. graph/health — dependency graph health metrics (bv-inspired)
+// 11. graph/health — dependency graph health metrics (bv-inspired)
 // ---------------------------------------------------------------------------
 
 /// Compute the longest path length in the "blocks" DAG from a given node.
@@ -882,7 +969,7 @@ impl ResourceHandler for GraphHealthResource {
 }
 
 // ---------------------------------------------------------------------------
-// 11. issues/bottlenecks — highest-impact blockers (bv-inspired)
+// 12. issues/bottlenecks — highest-impact blockers (bv-inspired)
 // ---------------------------------------------------------------------------
 
 /// Compute bottleneck issues: those that block the most other open issues.
@@ -983,15 +1070,18 @@ mod tests {
     use std::fs;
     use std::sync::Arc;
 
-    use chrono::Utc;
+    use chrono::{Duration, TimeZone, Utc};
     use fastmcp_rust::{Cx, McpContext, ResourceContent, ResourceHandler};
     use serde_json::{Value, json};
     use tempfile::TempDir;
 
     use super::{
-        IssueResource, ReadyIssuesResource, graph_has_cycle, issue_not_found_resource,
+        COORDINATION_STATUS_URI, CoordinationStatusResource, IssueResource, ReadyIssuesResource,
+        coordination_status_resource_json_at, graph_has_cycle, issue_not_found_resource,
         issue_resource_json, read_project_config,
     };
+    use crate::cli::commands::coordination::build_coordination_status_without_snapshots;
+    use crate::coordination::{COORDINATION_SCHEMA_VERSION, ClaimOwnerKind};
     use crate::mcp::{BeadsState, McpReadSnapshotCache};
     use crate::model::{Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
@@ -1015,21 +1105,38 @@ mod tests {
     }
 
     fn insert_resource_issue(state: &BeadsState, id: &str, title: &str) {
+        insert_resource_issue_with_status(state, id, title, Status::Open, None, Utc::now());
+    }
+
+    fn insert_resource_issue_with_status(
+        state: &BeadsState,
+        id: &str,
+        title: &str,
+        status: Status,
+        assignee: Option<&str>,
+        updated_at: chrono::DateTime<Utc>,
+    ) {
         let mut storage = SqliteStorage::open(&state.db_path).expect("open storage");
-        let now = Utc::now();
         let issue = Issue {
             id: id.to_string(),
             title: title.to_string(),
-            status: Status::Open,
+            status,
             priority: Priority::MEDIUM,
             issue_type: IssueType::Task,
-            created_at: now,
-            updated_at: now,
+            assignee: assignee.map(str::to_string),
+            created_at: updated_at,
+            updated_at,
             ..Issue::default()
         };
         storage
             .create_issue(&issue, "mcp-resource-test")
             .expect("create issue");
+    }
+
+    fn fixed_now() -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 5, 8, 12, 0, 0)
+            .single()
+            .expect("valid timestamp")
     }
 
     fn resource_text_json(contents: &[ResourceContent]) -> Value {
@@ -1097,6 +1204,79 @@ mod tests {
         };
 
         assert_eq!(cached, direct);
+    }
+
+    #[test]
+    fn coordination_status_resource_matches_cli_builder_for_claims() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_resource_state(&temp, false);
+        let now = fixed_now();
+        insert_resource_issue_with_status(
+            &state,
+            "br-mcp-claim",
+            "resource claim details",
+            Status::InProgress,
+            Some("TopazFox"),
+            now - Duration::minutes(30),
+        );
+
+        let storage = SqliteStorage::open(&state.db_path).expect("open storage");
+        let resource_value =
+            coordination_status_resource_json_at(&storage, now).expect("resource status");
+        let cli_value = serde_json::to_value(
+            build_coordination_status_without_snapshots(
+                &storage,
+                ClaimOwnerKind::SwarmAgent,
+                2,
+                now,
+            )
+            .expect("cli status"),
+        )
+        .expect("serialize cli status");
+
+        assert_eq!(resource_value, cli_value);
+        assert_eq!(
+            resource_value["schema_version"],
+            COORDINATION_SCHEMA_VERSION
+        );
+        assert_eq!(resource_value["summary"]["total_claims"].as_u64(), Some(1));
+        assert_eq!(
+            resource_value["claims"][0]["assessment"]["classification"],
+            "fresh"
+        );
+    }
+
+    #[test]
+    fn coordination_status_resource_returns_empty_claim_set() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_resource_state(&temp, false);
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let resource = CoordinationStatusResource::new(Arc::clone(&state));
+
+        let content = resource.read(&ctx).expect("read coordination resource");
+        let value = resource_text_json(&content);
+
+        assert_eq!(content[0].uri, COORDINATION_STATUS_URI);
+        assert_eq!(value["schema_version"], COORDINATION_SCHEMA_VERSION);
+        assert_eq!(value["summary"]["total_claims"].as_u64(), Some(0));
+        assert_eq!(value["claims"].as_array().map(Vec::len), Some(0));
+    }
+
+    #[test]
+    fn coordination_status_resource_returns_structured_errors() {
+        let storage = SqliteStorage::open_memory().expect("storage");
+        storage
+            .execute_raw("DROP TABLE issues")
+            .expect("drop issues table");
+
+        let err = coordination_status_resource_json_at(&storage, fixed_now())
+            .expect_err("coordination storage failure must be structured");
+        let data = err.data.expect("structured MCP error data");
+
+        assert_eq!(data["error_type"], "COORDINATION_STATUS_FAILED");
+        assert_eq!(data["resource"], COORDINATION_STATUS_URI);
+        assert!(data["suggested_tool_calls"].is_array());
+        assert!(data["suggested_cli_commands"].is_array());
     }
 
     #[test]

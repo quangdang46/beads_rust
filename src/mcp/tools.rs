@@ -2892,6 +2892,7 @@ fn project_overview_json(state: &BeadsState, storage: &SqliteStorage) -> McpResu
                 "beads://labels — all labels with counts",
                 "beads://issues/ready — actionable work",
                 "beads://issues/blocked — stuck items with blockers",
+                "beads://coordination/status — stale-claim diagnosis using br.coordination.v1",
                 "beads://issues/bottlenecks — highest-impact blockers (bv-style)",
                 "beads://graph/health — dependency graph health metrics",
                 "beads://issues/in_progress — current work",

@@ -332,7 +332,10 @@ on a network port, and uses the same SQLite database, JSONL export path, write
 locks, audit events, and sync safety model as the normal CLI. It does not run
 git. Use shell/JSON
 commands for simple scripts; use MCP when an agent benefits from discoverable
-tools, resources, prompts, and structured recovery hints.
+tools, resources, prompts, and structured recovery hints. MCP clients can read
+`beads://coordination/status` for the same `br.coordination.v1` stale-claim
+evidence shape as `br coordination status --json`; use the CLI snapshot flags
+when Agent Mail reservation or liveness evidence is required.
 
 ### Verify Installation
 

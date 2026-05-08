@@ -254,6 +254,12 @@ snapshot when available:
 br coordination status --reservations reservations.json --agents agents.jsonl --json
 ```
 
+MCP-capable agents can read `beads://coordination/status` for the same
+`br.coordination.v1` evidence envelope without shelling out. The MCP resource is
+read-only and does not call Agent Mail, so it reports
+`reservation.state == "no_snapshot"` unless you use the CLI command above with
+offline reservation and agent snapshots.
+
 The output is advisory only. `reclaim_allowed_by_policy=true` means the local
 policy and supplied snapshot evidence allow the documented audit-comment plus
 claim sequence. `suggested_commands` is empty for fresh claims, active
@@ -570,6 +576,7 @@ Resources:
 - `beads://issues/ready`
 - `beads://issues/blocked`
 - `beads://issues/in_progress`
+- `beads://coordination/status`
 - `beads://issues/deferred`
 - `beads://issues/bottlenecks`
 - `beads://graph/health`
