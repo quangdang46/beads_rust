@@ -6,10 +6,10 @@ The verifier is intentionally local and deterministic. It does not contact GitHu
 
 ## Verifier
 
-Agents should run the verifier through RCH:
+Agents should run the verifier's Cargo target through RCH:
 
 ```bash
-rch exec -- ./scripts/verify-workflow-action-pins.sh
+rch exec -- env CARGO_TARGET_DIR=${TMPDIR:-/tmp}/rch_target_beads_rust_ci_supply cargo test --test workflow_action_pins -- --nocapture
 ```
 
 Local operators can run the same script directly:
@@ -53,7 +53,27 @@ Release workflow shell fragments have a separate focused harness:
 ./scripts/verify-release-workflow-fragments.sh
 ```
 
+Agents should run the same test target through RCH:
+
+```bash
+rch exec -- env CARGO_TARGET_DIR=${TMPDIR:-/tmp}/rch_target_beads_rust_ci_supply cargo test --test workflow_release_fragments -- --nocapture
+```
+
 That harness parses `.github/workflows/release.yml` and executes the high-risk release fragments against fixtures for reliability override validation, required artifact detection, checksum aggregation, checksum verification, and release-note branch coverage.
+
+The ACFS installer notification workflow also has a focused local harness:
+
+```bash
+./scripts/verify-notify-acfs-workflow.sh
+```
+
+Agents should run the same test target through RCH:
+
+```bash
+rch exec -- env CARGO_TARGET_DIR=${TMPDIR:-/tmp}/rch_target_beads_rust_ci_supply cargo test --test workflow_notify_acfs -- --nocapture
+```
+
+That harness parses `.github/workflows/notify-acfs.yml` and checks the installer checksum, previous-checksum fallback, changed/unchanged comparison, dry-run branch, missing-token notice, repository-dispatch payload, `main` branch trigger, and summary output without sending network notifications.
 
 ## Updating A Pin
 
@@ -64,8 +84,8 @@ When changing or adding an external action:
 3. Run `./scripts/audit-workflow-action-pins.sh --format json` and review the `manual_update_steps` for each affected row.
 4. Update the workflow `uses:` entry to the exact 40-character SHA.
 5. Update `.github/action-pins.jsonl` with the same workflow path, action name, SHA, tag/provenance label, and source note.
-6. Run `rch exec -- ./scripts/verify-workflow-action-pins.sh`.
-7. For workflow edits, also run `git diff --check`, `actionlint` if available, and the relevant targeted workflow harness such as `./scripts/verify-release-workflow-fragments.sh`.
+6. Run `rch exec -- env CARGO_TARGET_DIR=${TMPDIR:-/tmp}/rch_target_beads_rust_ci_supply cargo test --test workflow_action_pins -- --nocapture`.
+7. For workflow edits, also run `git diff --check`, `actionlint` if available, and the relevant targeted workflow harness such as `./scripts/verify-release-workflow-fragments.sh` or `./scripts/verify-notify-acfs-workflow.sh`.
 8. Run `ubs` on the changed workflow, inventory, script, test, and docs files before committing.
 
 This repository's integration branch is `main`. Any legacy branch mirroring is an explicit release/operator responsibility and should not be reintroduced as a workflow trigger target.

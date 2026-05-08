@@ -47,8 +47,9 @@ jobs:
       - name: Get previous checksum
         id: previous
         run: |
-          if git show HEAD~1:"${{ env.INSTALLER_PATH }}" > /tmp/prev 2>/dev/null; then
-            PREV=$(sha256sum /tmp/prev | cut -d' ' -f1)
+          previous_installer="$(mktemp)"
+          if git show HEAD~1:"${{ env.INSTALLER_PATH }}" > "$previous_installer" 2>/dev/null; then
+            PREV=$(sha256sum "$previous_installer" | cut -d' ' -f1)
             echo "prev_sha256=$PREV" >> "$GITHUB_OUTPUT"
             echo "Previous SHA256: $PREV"
           else
