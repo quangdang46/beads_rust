@@ -6,8 +6,8 @@
 //! tests exist.
 
 use crate::cli::{
-    CloseArgs, Commands, CommentAddArgs, CommentCommands, CreateArgs, DepAddArgs, DepCommands,
-    DepRemoveArgs, ReopenArgs, UpdateArgs,
+    CloseArgs, Commands, CommentAddArgs, CommentCommands, ConfigCommands, CreateArgs, DepAddArgs,
+    DepCommands, DepRemoveArgs, HistoryArgs, HistoryCommands, ReopenArgs, UpdateArgs,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -882,6 +882,11 @@ pub fn classify_command(command: &Commands) -> CommandCompatibility {
         Commands::Close(args) => classify_close(args),
         Commands::Reopen(args) => classify_reopen(args),
         Commands::Dep { command } => classify_dependency(command),
+        Commands::Config { command } => classify_config(command),
+        Commands::History(args) => classify_history(args),
+        Commands::Sync(_) | Commands::Doctor(_) => {
+            CommandCompatibility::DirectOnly(DirectOnlyReason::UnsafeCommand)
+        }
         Commands::List(_)
         | Commands::Show(_)
         | Commands::Search(_)
@@ -1010,10 +1015,33 @@ fn classify_dependency_remove(_args: &DepRemoveArgs) -> CommandCompatibility {
     CommandCompatibility::Candidate(CompatibleMutation::RemoveDependency)
 }
 
+fn classify_config(command: &ConfigCommands) -> CommandCompatibility {
+    match command {
+        ConfigCommands::List { .. } | ConfigCommands::Get { .. } | ConfigCommands::Path => {
+            CommandCompatibility::DirectOnly(DirectOnlyReason::ReadOnly)
+        }
+        ConfigCommands::Set { .. } | ConfigCommands::Delete { .. } | ConfigCommands::Edit => {
+            CommandCompatibility::DirectOnly(DirectOnlyReason::UnsafeCommand)
+        }
+    }
+}
+
+fn classify_history(args: &HistoryArgs) -> CommandCompatibility {
+    match args.command.as_ref() {
+        None | Some(HistoryCommands::List | HistoryCommands::Diff { .. }) => {
+            CommandCompatibility::DirectOnly(DirectOnlyReason::ReadOnly)
+        }
+        Some(HistoryCommands::Restore { .. } | HistoryCommands::Prune { .. }) => {
+            CommandCompatibility::DirectOnly(DirectOnlyReason::UnsafeCommand)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{CommentListArgs, CommentsArgs, DepListArgs, DepRemoveArgs, DepTreeArgs};
+    use crate::cli::{Cli, CommentListArgs, CommentsArgs, DepListArgs, DepRemoveArgs, DepTreeArgs};
+    use clap::Parser;
     use serde_json::json;
     use std::path::PathBuf;
 
@@ -1051,6 +1079,11 @@ mod tests {
         MutationResult::new(key, family, 0, "ok", "", CombinedFlushOutcome::Succeeded)
     }
 
+    fn classify_argv(argv: &[&str]) -> CommandCompatibility {
+        let cli = Cli::parse_from(argv.iter().copied());
+        classify_command(&cli.command)
+    }
+
     fn reported(result: std::result::Result<BatchReport, BatchReportError>) -> BatchReport {
         assert!(result.is_ok(), "unexpected batch-report error: {result:?}");
         match result {
@@ -1077,6 +1110,133 @@ mod tests {
             classify_command(&command),
             CommandCompatibility::Candidate(CompatibleMutation::CreateIssue)
         );
+    }
+
+    #[test]
+    fn parsed_cli_candidate_shapes_match_allowlist() {
+        let cases: &[(&[&str], CompatibleMutation)] = &[
+            (
+                &["br", "create", "Queueable issue"],
+                CompatibleMutation::CreateIssue,
+            ),
+            (
+                &["br", "create", "--title", "Queueable issue"],
+                CompatibleMutation::CreateIssue,
+            ),
+            (
+                &["br", "comments", "add", "br-1", "done"],
+                CompatibleMutation::AddComment,
+            ),
+            (
+                &["br", "comments", "add", "br-1", "--message", "done"],
+                CompatibleMutation::AddComment,
+            ),
+            (
+                &["br", "update", "br-1", "--status", "in_progress"],
+                CompatibleMutation::UpdateIssue,
+            ),
+            (
+                &["br", "update", "br-1", "--add-label", "ops"],
+                CompatibleMutation::UpdateIssue,
+            ),
+            (&["br", "close", "br-1"], CompatibleMutation::CloseIssue),
+            (&["br", "reopen", "br-1"], CompatibleMutation::ReopenIssue),
+            (
+                &["br", "dep", "add", "br-1", "br-2"],
+                CompatibleMutation::AddDependency,
+            ),
+            (
+                &["br", "dep", "remove", "br-1", "br-2"],
+                CompatibleMutation::RemoveDependency,
+            ),
+        ];
+
+        for (argv, expected) in cases {
+            assert_eq!(
+                classify_argv(argv),
+                CommandCompatibility::Candidate(*expected),
+                "argv: {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parsed_cli_direct_only_shapes_match_reasons() {
+        let cases: &[(&[&str], DirectOnlyReason)] = &[
+            (
+                &["br", "create", "--dry-run", "Preview issue"],
+                DirectOnlyReason::DryRun,
+            ),
+            (
+                &["br", "create", "--file", "issues.md"],
+                DirectOnlyReason::FileInput,
+            ),
+            (&["br", "create"], DirectOnlyReason::MissingPayload),
+            (
+                &["br", "create", "Child issue", "--parent", "br-parent"],
+                DirectOnlyReason::UnsupportedOption,
+            ),
+            (
+                &["br", "comments", "add", "br-1", "--file", "comment.md"],
+                DirectOnlyReason::FileInput,
+            ),
+            (
+                &["br", "comments", "add", "br-1"],
+                DirectOnlyReason::MissingPayload,
+            ),
+            (
+                &["br", "update", "--status", "open"],
+                DirectOnlyReason::MissingExplicitTarget,
+            ),
+            (&["br", "update", "br-1"], DirectOnlyReason::MissingPayload),
+            (
+                &["br", "update", "br-1", "--parent", "br-parent"],
+                DirectOnlyReason::UnsupportedOption,
+            ),
+            (
+                &["br", "close", "br-1", "--suggest-next"],
+                DirectOnlyReason::UnsupportedOption,
+            ),
+            (
+                &["br", "dep", "add", "br-1", "br-2", "--metadata", "{}"],
+                DirectOnlyReason::UnsupportedOption,
+            ),
+            (
+                &["br", "audit", "record", "--stdin"],
+                DirectOnlyReason::UnsafeCommand,
+            ),
+            (&["br", "sync", "--status"], DirectOnlyReason::UnsafeCommand),
+            (
+                &["br", "sync", "--flush-only"],
+                DirectOnlyReason::UnsafeCommand,
+            ),
+            (
+                &["br", "config", "get", "ui.color"],
+                DirectOnlyReason::ReadOnly,
+            ),
+            (
+                &["br", "config", "set", "ui.color", "never"],
+                DirectOnlyReason::UnsafeCommand,
+            ),
+            (&["br", "history", "list"], DirectOnlyReason::ReadOnly),
+            (
+                &["br", "history", "restore", "issues.backup.jsonl"],
+                DirectOnlyReason::UnsafeCommand,
+            ),
+            (&["br", "doctor"], DirectOnlyReason::UnsafeCommand),
+            (
+                &["br", "doctor", "--repair"],
+                DirectOnlyReason::UnsafeCommand,
+            ),
+        ];
+
+        for (argv, expected) in cases {
+            assert_eq!(
+                classify_argv(argv),
+                CommandCompatibility::DirectOnly(*expected),
+                "argv: {argv:?}"
+            );
+        }
     }
 
     #[test]
