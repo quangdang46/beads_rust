@@ -11,11 +11,11 @@ use crate::format::sanitize_terminal_inline;
 use crate::model::{Issue, Status};
 use crate::output::{IssueTable, IssueTableColumns, OutputContext, OutputMode};
 use crate::storage::ListFilters;
-use crate::util::id::normalize_id;
+use crate::util::{id::normalize_id, parse_id};
 use regex::Regex;
 use rich_rust::prelude::*;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -160,8 +160,11 @@ fn execute_inner(
         return Ok(());
     };
 
-    // Get git log and extract issue references
-    let commit_refs = get_git_commit_refs(&prefix, &repo_root)?;
+    // Get git log and extract issue references. Use the candidate issues'
+    // prefixes instead of only the configured default so mixed-prefix imports
+    // and slugged IDs are still discoverable.
+    let scan_prefixes = issue_prefixes_for_orphan_scan(&issues, &prefix);
+    let commit_refs = get_git_commit_refs_for_prefixes(&scan_prefixes, &repo_root)?;
 
     trace!(
         commit_refs = commit_refs.len(),
@@ -346,11 +349,27 @@ fn git_repo_root_for_path(path: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Get git commit references containing issue IDs.
-///
-/// Returns Vec of (`commit_hash`, `commit_message`, `issue_id`) tuples.
-/// The list is ordered from most recent to oldest commit.
+fn issue_prefixes_for_orphan_scan(issues: &[Issue], default_prefix: &str) -> Vec<String> {
+    let mut prefixes = BTreeSet::from([default_prefix.to_string()]);
+    prefixes.extend(
+        issues
+            .iter()
+            .filter_map(|issue| parse_id(&issue.id).ok().map(|parsed| parsed.prefix)),
+    );
+
+    let mut prefixes: Vec<_> = prefixes.into_iter().collect();
+    prefixes.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+    prefixes
+}
+
 fn get_git_commit_refs(prefix: &str, repo_root: &Path) -> Result<Vec<(String, String, String)>> {
+    get_git_commit_refs_for_prefixes(&[prefix.to_string()], repo_root)
+}
+
+fn get_git_commit_refs_for_prefixes(
+    prefixes: &[String],
+    repo_root: &Path,
+) -> Result<Vec<(String, String, String)>> {
     let mut child = Command::new("git")
         .args(["log", "--oneline", "--all"])
         .current_dir(repo_root)
@@ -361,7 +380,7 @@ fn get_git_commit_refs(prefix: &str, repo_root: &Path) -> Result<Vec<(String, St
     let stdout = child.stdout.take().expect("Failed to open git log stdout");
 
     // Parse the stream as it comes in
-    let refs_result = parse_git_log(BufReader::new(stdout), prefix);
+    let refs_result = parse_git_log_for_prefixes(BufReader::new(stdout), prefixes);
 
     // Wait for the process to finish and check status
     let status = child.wait()?;
@@ -386,15 +405,40 @@ fn get_git_commit_refs(prefix: &str, repo_root: &Path) -> Result<Vec<(String, St
 ///
 /// Looks for patterns like `(bd-abc123)` or `bd-abc123` in commit messages.
 fn parse_git_log<R: BufRead>(reader: R, prefix: &str) -> Result<Vec<(String, String, String)>> {
-    // Pattern matches prefix-id including hierarchical IDs like bd-abc.1
+    parse_git_log_for_prefixes(reader, &[prefix.to_string()])
+}
+
+fn parse_git_log_for_prefixes<R: BufRead>(
+    reader: R,
+    prefixes: &[String],
+) -> Result<Vec<(String, String, String)>> {
+    if prefixes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut prefixes = prefixes
+        .iter()
+        .filter(|prefix| !prefix.is_empty())
+        .cloned()
+        .collect::<Vec<_>>();
+    prefixes.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+    prefixes.dedup();
+
+    let prefix_pattern = prefixes
+        .iter()
+        .map(|prefix| regex::escape(prefix))
+        .collect::<Vec<_>>()
+        .join("|");
+    if prefix_pattern.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Pattern matches prefix-id including hierarchical IDs like bd-abc.1.2
     // We use word boundaries \b to avoid matching suffix/prefix (e.g. abd-123 or bd-123a)
     // although matching bd-123a is technically valid if 123a is the hash.
     // The previous regex forced parens: r"\(({}-[a-zA-Z0-9]+(?:\.[0-9]+)?)\)"
     // Use (?i) for case-insensitive matching (user input in commits varies)
-    let pattern = format!(
-        r"(?i)\b({}-[a-z0-9]+(?:\.[0-9]+)?)\b",
-        regex::escape(prefix)
-    );
+    let pattern = format!(r"(?i)\b((?:{prefix_pattern})-[a-z0-9]+(?:\.[0-9]+)*)\b",);
     let re = Regex::new(&pattern)
         .map_err(|e| crate::error::BeadsError::internal(format!("Invalid regex pattern: {e}")))?;
 
@@ -517,11 +561,11 @@ jkl3456 Multi-ref (bd-foo) and bd-bar";
 
     #[test]
     fn test_parse_git_log_hierarchical_ids() {
-        let log = "abc1234 Fix child (bd-parent.1)";
+        let log = "abc1234 Fix child (bd-parent.1.2)";
         let refs = parse_git_log(Cursor::new(log), "bd").unwrap();
 
         assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].2, "bd-parent.1");
+        assert_eq!(refs[0].2, "bd-parent.1.2");
     }
 
     #[test]
@@ -531,6 +575,27 @@ jkl3456 Multi-ref (bd-foo) and bd-bar";
 
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].2, "proj-xyz");
+    }
+
+    #[test]
+    fn test_parse_git_log_multiple_prefixes() {
+        let log = "abc1234 Fix imported issue ext-xyz and local bd-abc";
+        let prefixes = vec!["bd".to_string(), "ext".to_string()];
+        let refs = parse_git_log_for_prefixes(Cursor::new(log), &prefixes).unwrap();
+
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].2, "ext-xyz");
+        assert_eq!(refs[1].2, "bd-abc");
+    }
+
+    #[test]
+    fn test_parse_git_log_prefers_longest_slugged_prefix() {
+        let log = "abc1234 Fix slugged issue bd-survey-abc";
+        let prefixes = vec!["bd".to_string(), "bd-survey".to_string()];
+        let refs = parse_git_log_for_prefixes(Cursor::new(log), &prefixes).unwrap();
+
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].2, "bd-survey-abc");
     }
 
     #[test]
