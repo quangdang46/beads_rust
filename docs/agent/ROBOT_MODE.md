@@ -44,7 +44,8 @@ When using text output, `--wrap` wraps long lines instead of truncating.
 
 ## TOON decode tool (`tru`)
 
-If you want to decode TOON back into JSON for piping, you need `tru` (the TOON CLI).
+If you want to decode TOON back into nested JSON for piping, you need `tru`
+with safe path expansion because br emits safe folded keys.
 
 If `tru` is not available, prefer `--format json` / `--json` instead.
 

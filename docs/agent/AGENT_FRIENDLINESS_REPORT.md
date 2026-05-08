@@ -22,7 +22,7 @@ Recent work (this repo):
 ### Machine output formats
 
 - JSON: `--json` (global) or `--format json` (command-level when supported)
-- TOON: `--format toon` (decode via `tru --decode`)
+- TOON: `--format toon` (decode via `tru --decode --expand-paths safe`)
 - Default format (if you omit `--format`/`--json`): `BR_OUTPUT_FORMAT` > `TOON_DEFAULT_FORMAT`
 
 ### Schema surface

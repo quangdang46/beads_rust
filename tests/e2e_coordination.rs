@@ -3,7 +3,8 @@ mod common;
 use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_with_stdin};
 use serde_json::{Value, json};
 use std::fs;
-use toon_rust::try_decode as parse_toon;
+use toon_rust::options::ExpandPathsMode;
+use toon_rust::{DecodeOptions, try_decode as parse_toon};
 
 fn claim_by_id<'a>(json: &'a Value, id: &str) -> &'a Value {
     json["claims"]
@@ -178,6 +179,15 @@ fn parse_error_json(stderr: &str) -> Option<Value> {
             .and_then(|start| stderr.get(start..))
             .and_then(|payload| serde_json::from_str(payload).ok())
     })
+}
+
+fn parse_toon_as_nested_json(toon: &str) -> Value {
+    let decode_options = DecodeOptions {
+        indent: None,
+        strict: None,
+        expand_paths: Some(ExpandPathsMode::Safe),
+    };
+    Value::from(parse_toon(toon.trim(), Some(decode_options)).expect("valid TOON"))
 }
 
 #[test]
@@ -482,10 +492,11 @@ fn coordination_status_toon_decodes() {
     );
 
     assert!(result.status.success(), "toon failed: {}", result.stderr);
-    let decoded = parse_toon(result.stdout.trim(), None).expect("valid TOON");
-    let json = Value::from(decoded);
+    let json = parse_toon_as_nested_json(&result.stdout);
     assert_eq!(json["schema_version"], "br.coordination.v1");
     assert_eq!(json["claims"].as_array().expect("claims").len(), 2);
+    let stale = claim_by_id(&json, "bd-stale");
+    assert_eq!(stale["assessment"]["reservation"]["state"], "no_snapshot");
 }
 
 #[test]

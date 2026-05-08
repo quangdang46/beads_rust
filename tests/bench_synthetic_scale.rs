@@ -56,7 +56,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
 use tempfile::TempDir;
-use toon_rust::try_decode as parse_toon;
+use toon_rust::options::ExpandPathsMode;
+use toon_rust::{DecodeOptions, try_decode as parse_toon};
 
 // =============================================================================
 // Configuration
@@ -1817,7 +1818,12 @@ fn normalize_coordination_output(format: &str, stdout: &[u8]) -> std::io::Result
                 format!("coordination TOON output was not UTF-8: {err}"),
             )
         })?;
-        Value::from(parse_toon(raw.trim(), None).map_err(|err| {
+        let decode_options = DecodeOptions {
+            indent: None,
+            strict: None,
+            expand_paths: Some(ExpandPathsMode::Safe),
+        };
+        Value::from(parse_toon(raw.trim(), Some(decode_options)).map_err(|err| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("coordination TOON output did not decode: {err}"),
@@ -1834,6 +1840,28 @@ fn normalize_coordination_output(format: &str, stdout: &[u8]) -> std::io::Result
 
     normalize_coordination_value(&mut value);
     Ok(value)
+}
+
+#[test]
+fn coordination_normalization_expands_safe_toon_key_folding() {
+    let toon = br#"schema_version: br.coordination.v1
+generated_at: "2026-05-08T00:00:00Z"
+summary:
+  total_claims: 1
+claims[1]:
+  - assessment:
+      updated_age_minutes: 42
+      reservation.state: active
+"#;
+
+    let normalized =
+        normalize_coordination_output("toon", toon).expect("TOON normalization should decode");
+
+    assert_eq!(
+        normalized.pointer("/claims/0/assessment/reservation/state"),
+        Some(&Value::String("active".to_string()))
+    );
+    assert_eq!(reservation_state_count(&normalized, "active"), 1);
 }
 
 fn normalize_coordination_value(value: &mut Value) {

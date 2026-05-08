@@ -95,7 +95,7 @@ br show br-123 --format toon
 Decode TOON to JSON when you need to pipe into JSON tools:
 
 ```bash
-br ready --format toon --limit 10 | tru --decode | jq '.[0]'
+br ready --format toon --limit 10 | tru --decode --expand-paths safe | jq '.[0]'
 ```
 
 ### Environment Defaults

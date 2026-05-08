@@ -1,7 +1,7 @@
 # Coordination Evidence Contract
 
-Status: design and helper contract for future coordination CLI, MCP, scheduler,
-and audit work. The first user-facing surface is the read-only
+Status: implemented helper contract shared by coordination CLI, MCP, scheduler,
+and audit work. The primary user-facing surface is the read-only
 `br coordination status` command.
 
 ## Purpose
@@ -67,7 +67,7 @@ CoordinationStatusOutput {
   schema_version: "br.coordination.v1",
   generated_at: DateTime<Utc>,
   summary: CoordinationSummary,
-  claims: [ClaimAssessment]
+  claims: [CoordinationClaimRow]
 }
 ```
 
