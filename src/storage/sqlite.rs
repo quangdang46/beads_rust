@@ -6467,6 +6467,49 @@ impl SqliteStorage {
         Ok(())
     }
 
+    fn canonical_standard_dependency_type(dep_type: &str) -> Option<&'static str> {
+        match dep_type.to_ascii_lowercase().as_str() {
+            "blocks" => Some("blocks"),
+            "parent-child" => Some("parent-child"),
+            "conditional-blocks" => Some("conditional-blocks"),
+            "waits-for" => Some("waits-for"),
+            "related" => Some("related"),
+            "discovered-from" => Some("discovered-from"),
+            "replies-to" => Some("replies-to"),
+            "relates-to" => Some("relates-to"),
+            "duplicates" => Some("duplicates"),
+            "supersedes" => Some("supersedes"),
+            "caused-by" => Some("caused-by"),
+            _ => None,
+        }
+    }
+
+    fn validate_new_parent_child_parent_in_tx(
+        conn: &Connection,
+        issue_id: &str,
+        depends_on_id: &str,
+    ) -> Result<bool> {
+        let existing_parent = conn
+            .query_with_params(
+                "SELECT depends_on_id FROM dependencies WHERE issue_id = ? AND type COLLATE NOCASE = 'parent-child' ORDER BY rowid ASC LIMIT 1",
+                &[SqliteValue::from(issue_id)],
+            )?
+            .first()
+            .and_then(|row| row.get(0).and_then(SqliteValue::as_text))
+            .map(str::to_string);
+
+        match existing_parent {
+            Some(existing_parent) if existing_parent == depends_on_id => Ok(false),
+            Some(existing_parent) => Err(BeadsError::Validation {
+                field: "depends_on_id".to_string(),
+                reason: format!(
+                    "issue {issue_id} already has parent {existing_parent}; clear or replace the existing parent before adding {depends_on_id}"
+                ),
+            }),
+            None => Ok(true),
+        }
+    }
+
     /// Find issue IDs that end with the given hash substring.
     ///
     /// # Errors
@@ -6629,6 +6672,8 @@ impl SqliteStorage {
             "{}"
         };
 
+        let dep_type = Self::canonical_standard_dependency_type(dep_type).unwrap_or(dep_type);
+
         Self::validate_parent_child_endpoints(issue_id, depends_on_id, dep_type)?;
 
         self.mutate("add_dependency", actor, |conn, ctx| {
@@ -6647,6 +6692,12 @@ impl SqliteStorage {
                 }
             }
             Self::ensure_dependency_target_exists_in_tx(conn, depends_on_id)?;
+
+            if dep_type == "parent-child"
+                && !Self::validate_new_parent_child_parent_in_tx(conn, issue_id, depends_on_id)?
+            {
+                return Ok(false);
+            }
 
             // Cycle check runs INSIDE the transaction (BEGIN IMMEDIATE) to
             // prevent TOCTOU races where a concurrent writer could insert an
@@ -11883,6 +11934,27 @@ mod tests {
         storage.conn.execute("PRAGMA foreign_keys = ON").unwrap();
     }
 
+    fn insert_parent_child_dependency_for_test(
+        storage: &SqliteStorage,
+        child_id: &str,
+        parent_id: &str,
+        created_at: DateTime<Utc>,
+    ) {
+        storage
+            .conn
+            .execute_with_params(
+                "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
+                 VALUES (?, ?, 'parent-child', ?, ?)",
+                &[
+                    SqliteValue::from(child_id),
+                    SqliteValue::from(parent_id),
+                    SqliteValue::from(created_at.to_rfc3339()),
+                    SqliteValue::from("tester"),
+                ],
+            )
+            .unwrap();
+    }
+
     #[test]
     fn test_open_memory() {
         let storage = SqliteStorage::open_memory();
@@ -13718,6 +13790,91 @@ mod tests {
     }
 
     #[test]
+    fn test_add_dependency_rejects_second_parent_child_parent() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 2, 0, 0, 0).unwrap();
+
+        let child = make_issue(
+            "bd-single-parent-child",
+            "Child",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let parent_a = make_issue(
+            "bd-single-parent-a",
+            "Parent A",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let parent_b = make_issue(
+            "bd-single-parent-b",
+            "Parent B",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+
+        storage.create_issue(&child, "tester").unwrap();
+        storage.create_issue(&parent_a, "tester").unwrap();
+        storage.create_issue(&parent_b, "tester").unwrap();
+
+        assert!(
+            storage
+                .add_dependency(
+                    "bd-single-parent-child",
+                    "bd-single-parent-a",
+                    "Parent-Child",
+                    "tester",
+                )
+                .unwrap()
+        );
+        assert!(
+            !storage
+                .add_dependency(
+                    "bd-single-parent-child",
+                    "bd-single-parent-a",
+                    "parent-child",
+                    "tester",
+                )
+                .unwrap(),
+            "adding the same parent-child row should remain idempotent"
+        );
+
+        let error = storage
+            .add_dependency(
+                "bd-single-parent-child",
+                "bd-single-parent-b",
+                "parent-child",
+                "tester",
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                BeadsError::Validation { field, reason }
+                    if field == "depends_on_id"
+                        && reason.contains("already has parent bd-single-parent-a")
+            ),
+            "unexpected second-parent error: {error:?}"
+        );
+        assert_eq!(
+            storage
+                .get_parent_id("bd-single-parent-child")
+                .unwrap()
+                .as_deref(),
+            Some("bd-single-parent-a")
+        );
+    }
+
+    #[test]
     fn test_dependency_mutations_reject_tombstone_issue() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 7, 2, 0, 0, 0).unwrap();
@@ -13919,25 +14076,17 @@ mod tests {
         storage.create_issue(&child, "tester").unwrap();
         storage.create_issue(&parent, "tester").unwrap();
         storage.create_issue(&extra_parent, "tester").unwrap();
-        assert!(
-            storage
-                .add_dependency(
-                    "bd-parent-cleanup-child",
-                    "bd-parent-cleanup-parent",
-                    "parent-child",
-                    "tester",
-                )
-                .unwrap()
+        insert_parent_child_dependency_for_test(
+            &storage,
+            "bd-parent-cleanup-child",
+            "bd-parent-cleanup-parent",
+            t1,
         );
-        assert!(
-            storage
-                .add_dependency(
-                    "bd-parent-cleanup-child",
-                    "bd-parent-cleanup-extra-parent",
-                    "parent-child",
-                    "tester",
-                )
-                .unwrap()
+        insert_parent_child_dependency_for_test(
+            &storage,
+            "bd-parent-cleanup-child",
+            "bd-parent-cleanup-extra-parent",
+            t1,
         );
         assert_eq!(
             storage
@@ -14027,25 +14176,17 @@ mod tests {
         storage.create_issue(&child, "tester").unwrap();
         storage.create_issue(&parent_a, "tester").unwrap();
         storage.create_issue(&parent_b, "tester").unwrap();
-        assert!(
-            storage
-                .add_dependency(
-                    "bd-remove-parent-child",
-                    "bd-remove-parent-a",
-                    "parent-child",
-                    "tester",
-                )
-                .unwrap()
+        insert_parent_child_dependency_for_test(
+            &storage,
+            "bd-remove-parent-child",
+            "bd-remove-parent-a",
+            t1,
         );
-        assert!(
-            storage
-                .add_dependency(
-                    "bd-remove-parent-child",
-                    "bd-remove-parent-b",
-                    "parent-child",
-                    "tester",
-                )
-                .unwrap()
+        insert_parent_child_dependency_for_test(
+            &storage,
+            "bd-remove-parent-child",
+            "bd-remove-parent-b",
+            t1,
         );
         storage.rebuild_blocked_cache(true).unwrap();
         assert!(storage.is_blocked("bd-remove-parent-a").unwrap());
