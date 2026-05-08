@@ -936,6 +936,7 @@ mod tests {
         let expected_tables = vec![
             "blocked_issues_cache".to_string(),
             "child_counters".to_string(),
+            "close_metadata".to_string(),
             "comments".to_string(),
             "config".to_string(),
             "dependencies".to_string(),
