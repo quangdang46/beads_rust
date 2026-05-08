@@ -7715,6 +7715,66 @@ impl SqliteStorage {
         Ok(map)
     }
 
+    /// Get the latest comments for multiple issues in batch.
+    ///
+    /// Rows are returned in ascending timestamp order within each issue so
+    /// callers can reuse the same presentation logic as [`Self::get_comments`]
+    /// without materializing older comments they will discard.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_latest_comments_for_issues(
+        &self,
+        issue_ids: &[String],
+        limit: usize,
+    ) -> Result<std::collections::HashMap<String, Vec<Comment>>> {
+        const SQLITE_VAR_LIMIT: usize = 899;
+        let mut map: std::collections::HashMap<String, Vec<Comment>> =
+            std::collections::HashMap::new();
+
+        if issue_ids.is_empty() || limit == 0 {
+            return Ok(map);
+        }
+
+        let row_limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        for chunk in issue_ids.chunks(SQLITE_VAR_LIMIT) {
+            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+            let sql = format!(
+                "SELECT id, issue_id, author, text, created_at
+                 FROM (
+                     SELECT id, issue_id, author, text, created_at,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY issue_id
+                                ORDER BY created_at DESC, id DESC
+                            ) AS row_number
+                     FROM comments
+                     WHERE issue_id IN ({})
+                 )
+                 WHERE row_number <= ?
+                 ORDER BY issue_id ASC, created_at ASC, id ASC",
+                placeholders.join(",")
+            );
+
+            let mut params: Vec<SqliteValue> = chunk
+                .iter()
+                .map(|id| SqliteValue::from(id.as_str()))
+                .collect();
+            params.push(SqliteValue::from(row_limit));
+
+            let rows = self.conn.query_with_params(&sql, &params)?;
+
+            for row in &rows {
+                let comment = comment_from_row(row)?;
+                map.entry(comment.issue_id.clone())
+                    .or_default()
+                    .push(comment);
+            }
+        }
+
+        Ok(map)
+    }
+
     /// Count how many audit events belong to an issue.
     ///
     /// # Errors
@@ -14737,6 +14797,61 @@ mod tests {
             by_issue["bd-c-numeric-time"][0].created_at,
             comments[0].created_at
         );
+    }
+
+    #[test]
+    fn test_get_latest_comments_for_issues_bounds_each_issue() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
+        let issue_a = make_issue("bd-c-latest-a", "A", Status::Open, 2, None, t1, None);
+        let issue_b = make_issue("bd-c-latest-b", "B", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue_a, "tester").unwrap();
+        storage.create_issue(&issue_b, "tester").unwrap();
+
+        for (issue_id, body, created_at) in [
+            ("bd-c-latest-a", "a-old", "2025-07-01T00:00:00Z"),
+            ("bd-c-latest-a", "a-middle", "2025-07-02T00:00:00Z"),
+            ("bd-c-latest-a", "a-new", "2025-07-03T00:00:00Z"),
+            ("bd-c-latest-b", "b-old", "2025-07-01T00:00:00Z"),
+            ("bd-c-latest-b", "b-new", "2025-07-02T00:00:00Z"),
+        ] {
+            storage
+                .conn
+                .execute_with_params(
+                    "INSERT INTO comments (issue_id, author, text, created_at) VALUES (?, ?, ?, ?)",
+                    &[
+                        SqliteValue::from(issue_id),
+                        SqliteValue::from("tester"),
+                        SqliteValue::from(body),
+                        SqliteValue::from(created_at),
+                    ],
+                )
+                .unwrap();
+        }
+
+        let by_issue = storage
+            .get_latest_comments_for_issues(
+                &["bd-c-latest-a".to_string(), "bd-c-latest-b".to_string()],
+                2,
+            )
+            .unwrap();
+
+        let issue_a_bodies = by_issue["bd-c-latest-a"]
+            .iter()
+            .map(|comment| comment.body.as_str())
+            .collect::<Vec<_>>();
+        let issue_b_bodies = by_issue["bd-c-latest-b"]
+            .iter()
+            .map(|comment| comment.body.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(issue_a_bodies, ["a-middle", "a-new"]);
+        assert_eq!(issue_b_bodies, ["b-old", "b-new"]);
+
+        let empty = storage
+            .get_latest_comments_for_issues(&["bd-c-latest-a".to_string()], 0)
+            .unwrap();
+        assert!(empty.is_empty());
     }
 
     #[test]

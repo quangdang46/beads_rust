@@ -120,7 +120,13 @@ fn build_coordination_status_output(
     let labels_by_issue = storage.get_labels_for_issues(&issue_ids)?;
     let (dependency_counts, dependent_counts) =
         storage.count_relation_counts_for_issues(&issue_ids)?;
-    let comments_by_issue = storage.get_comments_for_issues(&issue_ids)?;
+    let comment_scan_limit = if snapshots.has_reservation_snapshot() {
+        comment_limit.max(1)
+    } else {
+        comment_limit
+    };
+    let comments_by_issue =
+        storage.get_latest_comments_for_issues(&issue_ids, comment_scan_limit)?;
 
     let claims: Vec<CoordinationClaimRow> = issues
         .into_iter()
@@ -247,6 +253,10 @@ impl SnapshotContext {
         assignee
             .map(agent_key)
             .and_then(|key| self.agents_by_name.get(&key).cloned())
+    }
+
+    const fn has_reservation_snapshot(&self) -> bool {
+        self.reservations.is_some()
     }
 
     fn reservation_for(
@@ -664,6 +674,15 @@ mod tests {
             .expect("agent snapshot should match");
 
         assert_eq!(agent.name, "TopazFox");
+    }
+
+    #[test]
+    fn snapshot_context_reports_reservation_snapshot_presence() {
+        let mut context = SnapshotContext::default();
+        assert!(!context.has_reservation_snapshot());
+
+        context.reservations = Some(Vec::new());
+        assert!(context.has_reservation_snapshot());
     }
 
     #[test]
