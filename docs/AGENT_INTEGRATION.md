@@ -260,6 +260,52 @@ read-only and does not call Agent Mail, so it reports
 `reservation.state == "no_snapshot"` unless you use the CLI command above with
 offline reservation and agent snapshots.
 
+Operator runbook for a queue that appears dry:
+
+```bash
+# 1. Confirm actionable work and graph-priority output agree
+br ready --json
+bv --robot-next
+
+# 2. Inspect hidden in-progress claims without mutating them
+br list --status in_progress --json
+br coordination status --json
+
+# 3. If a claim looks stale, inspect the local issue trail
+br show <id> --json
+br comments list <id> --json
+git status --short
+```
+
+If Agent Mail is healthy, add reservation and liveness snapshots before making
+any ownership decision. `br` consumes those snapshots offline; it does not call
+Agent Mail itself:
+
+```bash
+br coordination status \
+  --reservations reservations.jsonl \
+  --agents agents.jsonl \
+  --json
+```
+
+Safe reclaim is still a manual, auditable sequence. Review
+`required_human_confirmation`, `reclaim_allowed_by_policy`, and
+`suggested_commands` first:
+
+```bash
+br coordination status --reservations reservations.jsonl --agents agents.jsonl --json \
+  | jq '.claims[] | {id: .issue.id, action: .assessment.recommended_action, reclaim_allowed_by_policy, required_human_confirmation, suggested_commands}'
+
+br comments add <id> --author "$BD_ACTOR" \
+  --message "reclaim: previous in_progress claim appears abandoned; evidence: updated_at=<timestamp>, assignee=<name>, no active reservation or pane" \
+  --json
+br update <id> --claim --json
+```
+
+Only run the final two commands when the advisory output and human policy allow
+it. `br coordination status` never auto-reclaims, never runs git, and never
+creates or releases Agent Mail reservations.
+
 The output is advisory only. `reclaim_allowed_by_policy=true` means the local
 policy and supplied snapshot evidence allow the documented audit-comment plus
 claim sequence. `suggested_commands` is empty for fresh claims, active

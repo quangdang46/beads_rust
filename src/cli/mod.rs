@@ -2923,6 +2923,10 @@ mod tests {
         "`--notes-contains <TEXT>` | Notes contains substring",
         "`--format <FMT>` | Output format: text, json, csv, toon",
         "`--days <N>` | Issues not updated in N days (default: 30)",
+        "`--reservations <PATH>` | Offline Agent Mail reservation snapshot",
+        "`--agents <PATH>` | Offline Agent Mail agent snapshot",
+        "br coordination status --reservations reservations.json --agents agents.jsonl --json",
+        "beads://coordination/status",
         "`issue-with-counts`, `issue-details`",
     ];
 

@@ -563,8 +563,18 @@ invalid snapshots, and human/unknown ownership do not emit reclaim commands.
 # Inspect current in-progress claims
 br coordination status --json
 
+# Queue-dry diagnosis: ready work may be hidden behind old claims
+br ready --json
+bv --robot-next
+br list --status in_progress --json
+br coordination status --json
+
 # Use offline Agent Mail snapshots without requiring a live MCP service
 br coordination status --reservations reservations.json --agents agents.jsonl --json
+
+# Review advisory reclaim output before copying any suggested command
+br coordination status --reservations reservations.json --agents agents.jsonl --json \
+  | jq '.claims[] | {id: .issue.id, reclaim_allowed_by_policy, required_human_confirmation, suggested_commands}'
 ```
 
 ---
@@ -1027,14 +1037,17 @@ network listener.
 **Resources:** `beads://project/info`, `beads://issues/{id}`,
 `beads://schema`, `beads://labels`, `beads://issues/ready`,
 `beads://issues/blocked`, `beads://issues/in_progress`,
-`beads://issues/deferred`, `beads://issues/bottlenecks`,
-`beads://graph/health`, `beads://events/recent`.
+`beads://coordination/status`, `beads://issues/deferred`,
+`beads://issues/bottlenecks`, `beads://graph/health`,
+`beads://events/recent`.
 
 **Prompts:** `triage`, `status_report`, `plan_next_work`, `polish_backlog`.
 
 **Safety:** MCP mutations use the same local storage, audit trail, `.write.lock`,
 and JSONL auto-flush behavior as CLI mutations. The server never runs git and
-does not synchronize repositories.
+does not synchronize repositories. `beads://coordination/status` is read-only
+and does not call Agent Mail; use `br coordination status --reservations
+<PATH> --agents <PATH> --json` when reservation evidence is required.
 
 **Example MCP client entry:**
 

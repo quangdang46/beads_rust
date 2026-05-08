@@ -59,6 +59,7 @@ You need to track issues for your project, but:
 br init                              # Initialize in your repo
 br create "Fix login timeout" -p 1   # Create high-priority issue
 br ready                             # See what's actionable
+br coordination status --json        # Inspect hidden in-progress claims
 br close br-abc123                   # Close when done; JSONL auto-flushes by default
 br sync --flush-only                 # Optional final export check before git commit
 ```
@@ -427,6 +428,7 @@ git commit -m "Fix: login timeout (br-a1b2c3)"
 | `blocked` | Blocked issues | `br blocked` |
 | `search` | Full-text search | `br search "authentication"` |
 | `stale` | Stale issues | `br stale --days 30` |
+| `coordination status` | Hidden in-progress claim diagnosis | `br coordination status --json` |
 | `count` | Count with grouping | `br count --by status` |
 | `query` | Manage saved queries | `br query save mine --status open --assignee alice` |
 
@@ -764,10 +766,16 @@ Yes! br is designed for AI agent integration:
 br list --json
 br ready --json
 br show br-abc123 --json
+br coordination status --json
 
 # Create issues programmatically
 br create "Title" --json  # Returns created issue as JSON
 ```
+
+When `br ready --json` is empty but `bv --robot-next` or a human operator
+suspects work is hidden behind old claims, use `br coordination status --json`
+alongside Agent Mail reservations. The command is read-only: it does not call
+Agent Mail, does not run git, and never auto-reclaims a bead.
 
 See [AGENTS.md](AGENTS.md) for the complete agent integration guide.
 
