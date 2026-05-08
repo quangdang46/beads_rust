@@ -57,7 +57,7 @@ jobs:
           done
 
           echo "=== Downloaded checksums ==="
-          cat *.sha256 2>/dev/null || echo "No checksum files found"
+          cat ./*.sha256 2>/dev/null || echo "No checksum files found"
 
       - name: Extract SHA256 hashes
         id: hashes
