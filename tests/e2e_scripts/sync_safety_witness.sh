@@ -190,11 +190,11 @@ emit_event "harness_end" "$WORKSPACE" "true" ""
 VIO_FILE=$(mktemp)
 echo "0" > "$VIO_FILE"
 
-# Re-derive violation count by greping the event log (single-line int)
-ACTUAL_VIOLATIONS=$(grep -c '"allowed":false' "$EVENT_LOG" 2>/dev/null | head -1)
-ACTUAL_VIOLATIONS=${ACTUAL_VIOLATIONS:-0}
-ACTUAL_TOTAL=$(grep -cE '"op":"(create|delete)"' "$EVENT_LOG" 2>/dev/null | head -1)
-ACTUAL_TOTAL=${ACTUAL_TOTAL:-0}
+# Re-derive violation count by greping the event log (single-line int).
+# Use awk for counting to avoid grep returning 1 on no-matches under
+# set -euo pipefail.
+ACTUAL_VIOLATIONS=$(awk '/"allowed":false/ { c++ } END { print c+0 }' "$EVENT_LOG")
+ACTUAL_TOTAL=$(awk '/"op":"(create|delete)"/ { c++ } END { print c+0 }' "$EVENT_LOG")
 
 log_summary "=== sync_safety_witness.sh SUMMARY ==="
 log_summary "  total operations: ${ACTUAL_TOTAL}"
