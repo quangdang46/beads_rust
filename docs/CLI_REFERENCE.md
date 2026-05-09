@@ -1024,6 +1024,8 @@ Use this as the first discovery call in automation:
 br capabilities --format json
 br capabilities --format json --command "create"
 br capabilities --format json --command "comments add"
+br capabilities --format json --command "dep add"
+br capabilities --format json --command "query save"
 br capabilities --format json --command "update"
 ```
 

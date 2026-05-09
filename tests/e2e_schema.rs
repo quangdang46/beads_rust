@@ -394,6 +394,97 @@ fn e2e_capabilities_command_detail_high_traffic_safety_notes_json() {
 }
 
 #[test]
+fn e2e_capabilities_command_detail_workflow_safety_notes_json() {
+    let _log = common::test_log("e2e_capabilities_command_detail_workflow_safety_notes_json");
+    let workspace = BrWorkspace::new();
+
+    let cases = [
+        (
+            "create",
+            "write",
+            "examples",
+            "--slug",
+            "create slug task recipe",
+        ),
+        (
+            "create",
+            "write",
+            "safety_notes",
+            "--file",
+            "create import safety note",
+        ),
+        (
+            "comments add",
+            "write",
+            "safety_notes",
+            "--message",
+            "comment text-source safety note",
+        ),
+        (
+            "comments list",
+            "read",
+            "safety_notes",
+            "read-only",
+            "comment list read-only note",
+        ),
+        (
+            "dep add",
+            "write",
+            "safety_notes",
+            "waits on",
+            "dependency argument-order note",
+        ),
+        (
+            "dep list",
+            "read",
+            "examples",
+            "--direction both",
+            "dependency list direction recipe",
+        ),
+        (
+            "dep cycles",
+            "read",
+            "safety_notes",
+            "--blocking-only",
+            "dependency cycles planning note",
+        ),
+        (
+            "query save",
+            "write",
+            "safety_notes",
+            "already exists",
+            "query save replacement note",
+        ),
+        (
+            "query run",
+            "read",
+            "examples",
+            "--status open",
+            "query run override recipe",
+        ),
+        (
+            "query delete",
+            "write",
+            "safety_notes",
+            "never deletes issues",
+            "query delete scope note",
+        ),
+    ];
+
+    for (command, operation, field, needle, context) in cases {
+        let output = capabilities_command_detail_output(&workspace, command);
+        let detail = output
+            .get("command_detail")
+            .expect("capabilities output should include command_detail");
+        assert_eq!(
+            detail.get("operation").and_then(Value::as_str),
+            Some(operation)
+        );
+        assert_array_text_contains(detail, field, needle, context);
+    }
+}
+
+#[test]
 fn e2e_robot_docs_guide_text_is_concise() {
     let _log = common::test_log("e2e_robot_docs_guide_text_is_concise");
     let workspace = BrWorkspace::new();

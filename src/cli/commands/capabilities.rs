@@ -478,14 +478,17 @@ fn parent_examples(name: &str) -> &'static [&'static str] {
         "comments" => &[
             "br comments list br-abc --json",
             "br comments add br-abc --message \"Investigation notes\" --json",
+            "br comments add br-abc --file notes.md --json",
         ],
         "dep" => &[
-            "br dep list br-abc --format json",
-            "br dep add br-abc br-def --json",
+            "br dep add br-task br-blocker --type blocks --json",
+            "br dep list br-task --direction both --format json",
+            "br dep cycles --blocking-only --format json",
         ],
         "query" => &[
             "br query list --json",
-            "br query save p0-open --priority 0 --format json",
+            "br query save p0-open --priority 0 --status open --description \"P0 open work\" --format json",
+            "br query run p0-open --assignee agent-name --format json",
         ],
         "label" => &[
             "br label list --json",
@@ -503,6 +506,22 @@ fn parent_examples(name: &str) -> &'static [&'static str] {
 
 fn command_safety_notes(name: &str) -> &'static [&'static str] {
     match name {
+        "comments" | "comments add" | "comments list" => comments_safety_notes(name),
+        "dep" | "dep add" | "dep remove" | "dep list" | "dep tree" | "dep cycles" => {
+            dep_safety_notes(name)
+        }
+        "query" | "query save" | "query run" | "query list" | "query delete" => {
+            query_safety_notes(name)
+        }
+        "create" => &[
+            "Creates a new issue and updates the last-touched issue unless `--dry-run` is supplied.",
+            "`--file` bulk import cannot be combined with title arguments, `--external-ref`, or `--dry-run`.",
+            "Use `--silent` when automation only needs the created issue ID on stdout.",
+        ],
+        "q" => &[
+            "Quick capture creates an issue from title words and prints only the ID.",
+            "Use full `create` when automation needs JSON, parent, deps, due, defer, or external-ref fields.",
+        ],
         "update" => &[
             "Pass explicit IDs in automation; without IDs, update uses the last-touched issue.",
             "`--claim` refuses blocked issues unless `--force` is supplied.",
@@ -541,6 +560,84 @@ fn command_safety_notes(name: &str) -> &'static [&'static str] {
     }
 }
 
+fn comments_safety_notes(name: &str) -> &'static [&'static str] {
+    match name {
+        "comments" => &[
+            "Bare `br comments <id>` lists comments; `comments add` is the mutating subcommand.",
+            "Use `--message` or `--file` for scripted comments instead of relying on shell word joining.",
+        ],
+        "comments add" => &[
+            "Adds an audit comment and updates the last-touched issue.",
+            "Use exactly one text source: positional words, `--message`, or `--file`.",
+            "`--author` overrides the resolved actor for the comment only.",
+        ],
+        "comments list" => &[
+            "Comments list is read-only; use `--wrap` only for human text output.",
+            "Use `--json` when automation needs stable comment objects.",
+        ],
+        _ => &[],
+    }
+}
+
+fn dep_safety_notes(name: &str) -> &'static [&'static str] {
+    match name {
+        "dep" => &[
+            "`dep add <issue> <depends-on>` means `<issue>` waits on `<depends-on>`; do not reverse the order.",
+            "Blocking dependencies reject self-dependencies and cycles.",
+            "Read-only inspection lives under `dep list`, `dep tree`, and `dep cycles`.",
+        ],
+        "dep add" => &[
+            "`dep add <issue> <depends-on>` means `<issue>` waits on `<depends-on>`.",
+            "Default dependency type is `blocks`; use `--type parent-child` only for parent/child hierarchy.",
+            "External dependency IDs must start with `external:` and are not locally resolved.",
+        ],
+        "dep remove" => &[
+            "Removes the edge from `<issue>` to `<depends-on>`; it does not delete either issue.",
+            "JSON output reports `not_found` when the dependency edge was absent.",
+        ],
+        "dep list" => &[
+            "Dependency list is read-only; `--direction down` shows what the issue waits on.",
+            "Use `--direction up` for dependents and `--direction both` for a full local neighborhood.",
+        ],
+        "dep tree" => &[
+            "Dependency tree is read-only; `--direction down` follows blockers from the root issue.",
+            "Use `--max-depth` to bound large graphs in automation.",
+        ],
+        "dep cycles" => &[
+            "Cycle detection is read-only.",
+            "Use `--blocking-only` when planning ready-work unblock order.",
+        ],
+        _ => &[],
+    }
+}
+
+fn query_safety_notes(name: &str) -> &'static [&'static str] {
+    match name {
+        "query" => &[
+            "Saved queries live in br config storage, not in shell history.",
+            "`query run` is read-only; `query save` and `query delete` mutate saved-query config.",
+        ],
+        "query save" => &[
+            "Query names cannot be empty and cannot contain `:` or `/`.",
+            "Saving fails if the name already exists; delete the old query first to replace it.",
+            "Saved filters use the same filter flags as `br list`.",
+        ],
+        "query run" => &[
+            "Query run is read-only and executes the saved filters through the list command.",
+            "Additional CLI filters override or refine the saved filter set for that run.",
+        ],
+        "query list" => &[
+            "Query list is read-only and returns saved-query metadata.",
+            "Malformed saved query entries are skipped rather than executed.",
+        ],
+        "query delete" => &[
+            "Deletes only the saved query definition; it never deletes issues.",
+            "Deletion fails with a validation error when the saved query name does not exist.",
+        ],
+        _ => &[],
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn command_contract(name: &str) -> CommandContract {
     match name {
@@ -551,55 +648,78 @@ fn command_contract(name: &str) -> CommandContract {
             examples: &[
                 "br comments add br-abc --message \"Investigation notes\" --json",
                 "br comment add br-abc \"Short note\" --json",
+                "br comments add br-abc --file notes.md --author Codex --json",
             ],
         },
         "comments list" => CommandContract {
             operation: "read",
             workspace: "required",
             machine_output: &["json", "text"],
-            examples: &["br comments list br-abc --json"],
+            examples: &[
+                "br comments list br-abc --json",
+                "br comments br-abc --json",
+            ],
         },
         "dep add" => CommandContract {
             operation: "write",
             workspace: "required",
             machine_output: &["json", "text"],
-            examples: &["br dep add br-abc br-def --type blocks --json"],
+            examples: &[
+                "br dep add br-task br-blocker --type blocks --json",
+                "br dep add br-child br-parent --type parent-child --json",
+                "br dep add br-task external:repo-123 --metadata '{\"repo\":\"other\"}' --json",
+            ],
         },
         "dep remove" => CommandContract {
             operation: "write",
             workspace: "required",
             machine_output: &["json", "text"],
-            examples: &["br dep remove br-abc br-def --json"],
+            examples: &["br dep remove br-task br-blocker --json"],
         },
         "dep list" => CommandContract {
             operation: "read",
             workspace: "required",
             machine_output: &["json", "toon", "text"],
-            examples: &["br dep list br-abc --direction both --format json"],
+            examples: &[
+                "br dep list br-task --direction down --format json",
+                "br dep list br-task --direction both --type blocks --format toon",
+            ],
         },
         "dep tree" => CommandContract {
             operation: "read",
             workspace: "required",
             machine_output: &["json", "toon", "text"],
-            examples: &["br dep tree br-abc --format json"],
+            examples: &[
+                "br dep tree br-task --direction down --max-depth 5 --format json",
+                "br dep tree br-task --direction up --format text",
+            ],
         },
         "dep cycles" => CommandContract {
             operation: "read",
             workspace: "required",
             machine_output: &["json", "toon", "text"],
-            examples: &["br dep cycles --format json"],
+            examples: &[
+                "br dep cycles --format json",
+                "br dep cycles --blocking-only --format toon",
+            ],
         },
         "query save" => CommandContract {
             operation: "write",
             workspace: "required",
             machine_output: &["json", "csv", "toon", "text"],
-            examples: &["br query save p0-open --priority 0 --format json"],
+            examples: &[
+                "br query save p0-open --priority 0 --status open --description \"P0 open work\" --format json",
+                "br query save mine --assignee agent-name --status in_progress --format json",
+            ],
         },
         "query run" => CommandContract {
             operation: "read",
             workspace: "required",
             machine_output: &["json", "csv", "toon", "text"],
-            examples: &["br query run p0-open --format json"],
+            examples: &[
+                "br query run p0-open --format json",
+                "br query run p0-open --status open --format toon",
+            ],
         },
         "query list" => CommandContract {
             operation: "read",
@@ -689,7 +809,11 @@ fn command_contract(name: &str) -> CommandContract {
             operation: "write",
             workspace: "required",
             machine_output: &["json", "text"],
-            examples: &["br create \"Fix login\" --type bug --priority 1 --json"],
+            examples: &[
+                "br create \"Fix login\" --type bug --priority 1 --json",
+                "br create --title \"Investigate slow ready\" --slug slow-ready --labels perf,agent-workflow --json",
+                "br create --file backlog.md --json",
+            ],
         },
         "q" => CommandContract {
             operation: "write",
