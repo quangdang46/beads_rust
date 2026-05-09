@@ -213,3 +213,6 @@ tests/artifacts/perf/
 tests/artifacts/perf/**/perf.data
 tests/artifacts/perf/**/*.beads/
 *.perf.data
+
+# Beads compliance audit dir (managed by /beads-compliance-and-completion-verification skill)
+/beads_compliance_audit/
