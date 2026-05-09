@@ -194,6 +194,15 @@ fn e2e_capabilities_command_detail_nested_alias_json() {
     let detail = &json["command_detail"];
 
     assert_eq!(detail["path"], "comments add");
+    assert_eq!(detail["operation"], "write");
+    assert!(
+        detail["examples"]
+            .as_array()
+            .is_some_and(|examples| examples.iter().any(|example| example
+                .as_str()
+                .is_some_and(|text| text.contains("br comments add")))),
+        "missing nested command examples: {detail}"
+    );
     assert!(
         detail["arguments"].as_array().is_some_and(|arguments| {
             arguments
@@ -204,6 +213,82 @@ fn e2e_capabilities_command_detail_nested_alias_json() {
                     .any(|argument| argument["kind"] == "positional" && argument["id"] == "id")
         }),
         "missing nested command argument metadata: {detail}"
+    );
+}
+
+#[test]
+fn e2e_capabilities_command_detail_group_contracts_json() {
+    let _log = common::test_log("e2e_capabilities_command_detail_group_contracts_json");
+    let workspace = BrWorkspace::new();
+
+    let dep_add = run_br(
+        &workspace,
+        ["capabilities", "--format", "json", "--command", "dep add"],
+        "capabilities_command_detail_dep_add_json",
+    );
+    assert!(
+        dep_add.status.success(),
+        "capabilities dep add detail failed: {}",
+        dep_add.stderr
+    );
+    let dep_add_payload = extract_json_payload(&dep_add.stdout);
+    let dep_add_json: Value = serde_json::from_str(&dep_add_payload).expect("valid JSON output");
+    let dep_add_detail = &dep_add_json["command_detail"];
+    assert_eq!(dep_add_detail["operation"], "write");
+    assert_eq!(dep_add_detail["workspace"], "required");
+    assert!(
+        dep_add_detail["examples"]
+            .as_array()
+            .is_some_and(|examples| examples.iter().any(|example| example
+                .as_str()
+                .is_some_and(|text| text.contains("br dep add")))),
+        "missing dep add examples: {dep_add_detail}"
+    );
+
+    let query_run = run_br(
+        &workspace,
+        ["capabilities", "--format", "json", "--command", "query run"],
+        "capabilities_command_detail_query_run_json",
+    );
+    assert!(
+        query_run.status.success(),
+        "capabilities query run detail failed: {}",
+        query_run.stderr
+    );
+    let query_run_payload = extract_json_payload(&query_run.stdout);
+    let query_run_json: Value =
+        serde_json::from_str(&query_run_payload).expect("valid JSON output");
+    let query_run_detail = &query_run_json["command_detail"];
+    assert_eq!(query_run_detail["operation"], "read");
+    assert!(
+        query_run_detail["machine_output"]
+            .as_array()
+            .is_some_and(|formats| formats.iter().any(|format| format == "json")),
+        "missing query run machine output formats: {query_run_detail}"
+    );
+
+    let dep_group = run_br(
+        &workspace,
+        ["capabilities", "--format", "json", "--command", "dep"],
+        "capabilities_command_detail_dep_group_json",
+    );
+    assert!(
+        dep_group.status.success(),
+        "capabilities dep group detail failed: {}",
+        dep_group.stderr
+    );
+    let dep_group_payload = extract_json_payload(&dep_group.stdout);
+    let dep_group_json: Value =
+        serde_json::from_str(&dep_group_payload).expect("valid JSON output");
+    let dep_group_detail = &dep_group_json["command_detail"];
+    assert_eq!(dep_group_detail["operation"], "mixed");
+    assert!(
+        dep_group_detail["examples"]
+            .as_array()
+            .is_some_and(|examples| examples.iter().any(|example| example
+                .as_str()
+                .is_some_and(|text| text.contains("br dep list")))),
+        "missing dep parent examples: {dep_group_detail}"
     );
 }
 

@@ -387,13 +387,10 @@ fn command_matches_path_segment(command: &ClapCommand, segment: &str) -> bool {
 }
 
 fn command_detail(command: &ClapCommand, canonical_path: &[String]) -> CommandDetail {
-    let contract = command_contract(
-        canonical_path
-            .first()
-            .map_or_else(|| command.get_name(), String::as_str),
-    );
+    let contract_path = canonical_path.join(" ");
+    let contract = command_contract(&contract_path);
     CommandDetail {
-        path: canonical_path.join(" "),
+        path: contract_path,
         name: command.get_name().to_string(),
         summary: command
             .get_about()
@@ -473,9 +470,142 @@ fn subcommand_capability(command: &ClapCommand) -> SubcommandCapability {
     }
 }
 
+fn parent_examples(name: &str) -> &'static [&'static str] {
+    match name {
+        "comments" => &[
+            "br comments list br-abc --json",
+            "br comments add br-abc --message \"Investigation notes\" --json",
+        ],
+        "dep" => &[
+            "br dep list br-abc --format json",
+            "br dep add br-abc br-def --json",
+        ],
+        "query" => &[
+            "br query list --json",
+            "br query save p0-open --priority 0 --format json",
+        ],
+        "label" => &[
+            "br label list --json",
+            "br label add br-abc --label needs-review --json",
+        ],
+        "epic" => &[
+            "br epic status --json",
+            "br epic close-eligible --dry-run --json",
+        ],
+        "config" => &["br config get output.format --json"],
+        "history" => &["br history list --json"],
+        _ => &[],
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn command_contract(name: &str) -> CommandContract {
     match name {
+        "comments add" => CommandContract {
+            operation: "write",
+            workspace: "required",
+            machine_output: &["json", "text"],
+            examples: &[
+                "br comments add br-abc --message \"Investigation notes\" --json",
+                "br comment add br-abc \"Short note\" --json",
+            ],
+        },
+        "comments list" => CommandContract {
+            operation: "read",
+            workspace: "required",
+            machine_output: &["json", "text"],
+            examples: &["br comments list br-abc --json"],
+        },
+        "dep add" => CommandContract {
+            operation: "write",
+            workspace: "required",
+            machine_output: &["json", "text"],
+            examples: &["br dep add br-abc br-def --type blocks --json"],
+        },
+        "dep remove" => CommandContract {
+            operation: "write",
+            workspace: "required",
+            machine_output: &["json", "text"],
+            examples: &["br dep remove br-abc br-def --json"],
+        },
+        "dep list" => CommandContract {
+            operation: "read",
+            workspace: "required",
+            machine_output: &["json", "toon", "text"],
+            examples: &["br dep list br-abc --direction both --format json"],
+        },
+        "dep tree" => CommandContract {
+            operation: "read",
+            workspace: "required",
+            machine_output: &["json", "toon", "text"],
+            examples: &["br dep tree br-abc --format json"],
+        },
+        "dep cycles" => CommandContract {
+            operation: "read",
+            workspace: "required",
+            machine_output: &["json", "toon", "text"],
+            examples: &["br dep cycles --format json"],
+        },
+        "query save" => CommandContract {
+            operation: "write",
+            workspace: "required",
+            machine_output: &["json", "csv", "toon", "text"],
+            examples: &["br query save p0-open --priority 0 --format json"],
+        },
+        "query run" => CommandContract {
+            operation: "read",
+            workspace: "required",
+            machine_output: &["json", "csv", "toon", "text"],
+            examples: &["br query run p0-open --format json"],
+        },
+        "query list" => CommandContract {
+            operation: "read",
+            workspace: "required",
+            machine_output: &["json", "text"],
+            examples: &["br query list --json"],
+        },
+        "query delete" => CommandContract {
+            operation: "write",
+            workspace: "required",
+            machine_output: &["json", "text"],
+            examples: &["br query delete stale-filter --json"],
+        },
+        "label add" => CommandContract {
+            operation: "write",
+            workspace: "required",
+            machine_output: &["json", "text"],
+            examples: &["br label add br-abc --label needs-review --json"],
+        },
+        "label remove" => CommandContract {
+            operation: "write",
+            workspace: "required",
+            machine_output: &["json", "text"],
+            examples: &["br label remove br-abc --label needs-review --json"],
+        },
+        "label list" => CommandContract {
+            operation: "read",
+            workspace: "required",
+            machine_output: &["json", "text"],
+            examples: &["br label list --json"],
+        },
+        "label rename" => CommandContract {
+            operation: "write",
+            workspace: "required",
+            machine_output: &["json", "text"],
+            examples: &["br label rename old-label new-label --json"],
+        },
+        "epic status" => CommandContract {
+            operation: "read",
+            workspace: "required",
+            machine_output: &["json", "text"],
+            examples: &["br epic status --json"],
+        },
+        "epic close-eligible" => CommandContract {
+            operation: "read",
+            workspace: "required",
+            machine_output: &["json", "text"],
+            examples: &["br epic close-eligible --dry-run --json"],
+        },
         "capabilities" => CommandContract {
             operation: "read",
             workspace: "none",
@@ -642,7 +772,7 @@ fn command_contract(name: &str) -> CommandContract {
             operation: "mixed",
             workspace: "required",
             machine_output: &["json", "toon", "text"],
-            examples: &[],
+            examples: parent_examples(name),
         },
         "graph" | "orphans" | "changelog" | "lint" | "audit" => CommandContract {
             operation: "mixed",
