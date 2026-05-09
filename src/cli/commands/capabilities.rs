@@ -483,7 +483,7 @@ fn parent_examples(name: &str) -> &'static [&'static str] {
         "dep" => &[
             "br dep add br-task br-blocker --type blocks --json",
             "br dep list br-task --direction both --format json",
-            "br dep cycles --blocking-only --format json",
+            "br dep cycles --blocking-only --json",
         ],
         "query" => &[
             "br query list --json",
@@ -606,6 +606,7 @@ fn dep_safety_notes(name: &str) -> &'static [&'static str] {
         "dep cycles" => &[
             "Cycle detection is read-only.",
             "Use `--blocking-only` when planning ready-work unblock order.",
+            "Use global `--json` for machine output; `dep cycles` does not accept a local `--format` flag.",
         ],
         _ => &[],
     }
@@ -690,8 +691,8 @@ fn command_contract(name: &str) -> CommandContract {
             workspace: "required",
             machine_output: &["json", "toon", "text"],
             examples: &[
-                "br dep tree br-task --direction down --max-depth 5 --format json",
-                "br dep tree br-task --direction up --format text",
+                "br dep tree br-task --direction down --max-depth 5 --json",
+                "br dep tree br-task --direction up --format mermaid",
             ],
         },
         "dep cycles" => CommandContract {
@@ -699,8 +700,8 @@ fn command_contract(name: &str) -> CommandContract {
             workspace: "required",
             machine_output: &["json", "toon", "text"],
             examples: &[
-                "br dep cycles --format json",
-                "br dep cycles --blocking-only --format toon",
+                "br dep cycles --json",
+                "br dep cycles --blocking-only --json",
             ],
         },
         "query save" => CommandContract {

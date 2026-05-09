@@ -323,6 +323,28 @@ fn assert_array_text_contains(detail: &Value, field: &str, needle: &str, context
     );
 }
 
+type CommandDetailCase = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+);
+
+fn assert_command_detail_cases(workspace: &BrWorkspace, cases: &[CommandDetailCase]) {
+    for (command, operation, field, needle, context) in cases {
+        let output = capabilities_command_detail_output(workspace, command);
+        let detail = output
+            .get("command_detail")
+            .expect("capabilities output should include command_detail");
+        assert_eq!(
+            detail.get("operation").and_then(Value::as_str),
+            Some(*operation)
+        );
+        assert_array_text_contains(detail, field, needle, context);
+    }
+}
+
 #[test]
 fn e2e_capabilities_command_detail_high_traffic_safety_notes_json() {
     let _log = common::test_log("e2e_capabilities_command_detail_high_traffic_safety_notes_json");
@@ -380,17 +402,7 @@ fn e2e_capabilities_command_detail_high_traffic_safety_notes_json() {
         ),
     ];
 
-    for (command, operation, field, needle, context) in cases {
-        let output = capabilities_command_detail_output(&workspace, command);
-        let detail = output
-            .get("command_detail")
-            .expect("capabilities output should include command_detail");
-        assert_eq!(
-            detail.get("operation").and_then(Value::as_str),
-            Some(operation)
-        );
-        assert_array_text_contains(detail, field, needle, context);
-    }
+    assert_command_detail_cases(&workspace, &cases);
 }
 
 #[test]
@@ -449,6 +461,20 @@ fn e2e_capabilities_command_detail_workflow_safety_notes_json() {
             "dependency cycles planning note",
         ),
         (
+            "dep cycles",
+            "read",
+            "examples",
+            "--json",
+            "dependency cycles machine-output recipe",
+        ),
+        (
+            "dep tree",
+            "read",
+            "examples",
+            "--json",
+            "dependency tree machine-output recipe",
+        ),
+        (
             "query save",
             "write",
             "safety_notes",
@@ -471,17 +497,28 @@ fn e2e_capabilities_command_detail_workflow_safety_notes_json() {
         ),
     ];
 
-    for (command, operation, field, needle, context) in cases {
+    assert_command_detail_cases(&workspace, &cases);
+
+    for command in ["dep cycles", "dep tree"] {
         let output = capabilities_command_detail_output(&workspace, command);
         let detail = output
             .get("command_detail")
             .expect("capabilities output should include command_detail");
-        assert_eq!(
-            detail.get("operation").and_then(Value::as_str),
-            Some(operation)
-        );
-        assert_array_text_contains(detail, field, needle, context);
+        assert_array_text_excludes(detail, "examples", "--format json", command);
+        assert_array_text_excludes(detail, "examples", "--format toon", command);
     }
+}
+
+fn assert_array_text_excludes(detail: &Value, field: &str, needle: &str, context: &str) {
+    assert!(
+        detail
+            .get(field)
+            .and_then(Value::as_array)
+            .is_some_and(|values| values
+                .iter()
+                .all(|value| value.as_str().is_none_or(|text| !text.contains(needle)))),
+        "unexpected {context} {field} entry containing {needle}: {detail}"
+    );
 }
 
 #[test]

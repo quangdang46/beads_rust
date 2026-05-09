@@ -10785,15 +10785,38 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn detect_all_cycles(&self) -> Result<Vec<Vec<String>>> {
-        let graph = self.load_dependency_cycle_graph()?;
+        self.detect_cycles(false)
+    }
+
+    /// Detect cycles in dependency types that affect ready-work blocking.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn detect_blocking_cycles(&self) -> Result<Vec<Vec<String>>> {
+        self.detect_cycles(true)
+    }
+
+    fn detect_cycles(&self, blocking_only: bool) -> Result<Vec<Vec<String>>> {
+        let graph = self.load_dependency_cycle_graph(blocking_only)?;
         Ok(Self::cycle_witnesses_from_graph(&graph))
     }
 
-    fn load_dependency_cycle_graph(&self) -> Result<BTreeMap<String, Vec<String>>> {
+    fn load_dependency_cycle_graph(
+        &self,
+        blocking_only: bool,
+    ) -> Result<BTreeMap<String, Vec<String>>> {
         let mut graph: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        let rows1 = self.conn.query(
-            "SELECT issue_id, depends_on_id FROM dependencies WHERE type != 'parent-child'",
-        )?;
+        let rows1 = if blocking_only {
+            self.conn.query(
+                "SELECT issue_id, depends_on_id FROM dependencies \
+                 WHERE type IN ('blocks', 'conditional-blocks', 'waits-for')",
+            )?
+        } else {
+            self.conn.query(
+                "SELECT issue_id, depends_on_id FROM dependencies WHERE type != 'parent-child'",
+            )?
+        };
         for row in &rows1 {
             let from = cycle_endpoint(row.get(0));
             let to = cycle_endpoint(row.get(1));
@@ -14570,6 +14593,27 @@ mod tests {
             .would_create_cycle("bd-cy3", "bd-cy1", true)
             .unwrap();
         assert!(creates_cycle);
+    }
+
+    #[test]
+    fn test_detect_blocking_cycles_ignores_related_edges() -> Result<()> {
+        let mut storage = SqliteStorage::open_memory()?;
+        let t1 = Utc
+            .with_ymd_and_hms(2025, 7, 3, 0, 0, 0)
+            .single()
+            .ok_or_else(|| BeadsError::internal("invalid test timestamp"))?;
+
+        let issue_a = make_issue("bd-rel-cy1", "A", Status::Open, 2, None, t1, None);
+        let issue_b = make_issue("bd-rel-cy2", "B", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue_a, "tester")?;
+        storage.create_issue(&issue_b, "tester")?;
+
+        storage.add_dependency("bd-rel-cy1", "bd-rel-cy2", "related", "tester")?;
+        storage.add_dependency("bd-rel-cy2", "bd-rel-cy1", "related", "tester")?;
+
+        assert!(!storage.detect_all_cycles()?.is_empty());
+        assert!(storage.detect_blocking_cycles()?.is_empty());
+        Ok(())
     }
 
     #[test]

@@ -1566,12 +1566,16 @@ fn parse_external_dep_id(dep_id: &str) -> Option<(String, String)> {
 }
 
 fn dep_cycles(
-    _args: &DepCyclesArgs,
+    args: &DepCyclesArgs,
     storage: &SqliteStorage,
     _json: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let cycles = storage.detect_all_cycles()?;
+    let cycles = if args.blocking_only {
+        storage.detect_blocking_cycles()?
+    } else {
+        storage.detect_all_cycles()?
+    };
     let count = cycles.len();
 
     if ctx.is_json() || ctx.is_toon() {
