@@ -1592,14 +1592,15 @@ fn dep_cycles(
         return Ok(());
     }
 
+    let cycle_scope = cycle_scope_label(args.blocking_only);
     if count == 0 {
-        ctx.success("No dependency cycles detected.");
+        ctx.success(&format!("No {cycle_scope} cycles detected."));
     } else if ctx.is_rich() {
         // Rich mode: Show cycles with red highlighting in a panel
-        render_cycles_rich(ctx, &cycles, count);
+        render_cycles_rich(ctx, &cycles, count, args.blocking_only);
     } else {
         // Plain mode: Simple text output
-        ctx.warning(&format!("Found {count} dependency cycle(s):"));
+        ctx.warning(&format!("Found {count} {cycle_scope} cycle(s):"));
         for (i, cycle) in cycles.iter().enumerate() {
             ctx.print_line(&format!("  {}. {}", i + 1, format_cycle_plain(cycle)));
         }
@@ -1609,20 +1610,44 @@ fn dep_cycles(
 }
 
 /// Render cycles in rich mode with red highlighting
-fn render_cycles_rich(ctx: &OutputContext, cycles: &[Vec<String>], count: usize) {
+fn render_cycles_rich(
+    ctx: &OutputContext,
+    cycles: &[Vec<String>],
+    count: usize,
+    blocking_only: bool,
+) {
     let theme = ctx.theme();
-    let content = build_cycles_rich_text(cycles, count, theme);
+    let content = build_cycles_rich_text(cycles, count, theme, blocking_only);
+    let title = if blocking_only {
+        "Blocking Dependency Cycles"
+    } else {
+        "Dependency Cycles"
+    };
     let panel = Panel::from_rich_text(&content, ctx.width())
-        .title(Text::new("Dependency Cycles"))
+        .title(Text::new(title))
         .border_style(theme.error.clone());
 
     ctx.render(&panel);
 }
 
-fn build_cycles_rich_text(cycles: &[Vec<String>], count: usize, theme: &Theme) -> Text {
+fn cycle_scope_label(blocking_only: bool) -> &'static str {
+    if blocking_only {
+        "blocking dependency"
+    } else {
+        "dependency"
+    }
+}
+
+fn build_cycles_rich_text(
+    cycles: &[Vec<String>],
+    count: usize,
+    theme: &Theme,
+    blocking_only: bool,
+) -> Text {
     let mut content = Text::new("");
+    let cycle_scope = cycle_scope_label(blocking_only);
     content.append_styled(
-        &format!("⚠ {count} dependency cycle(s) detected:\n\n"),
+        &format!("⚠ {count} {cycle_scope} cycle(s) detected:\n\n"),
         theme.error.clone().bold(),
     );
 
@@ -2279,7 +2304,7 @@ mod tests {
         assert!(plain.contains("bd-a\\u{1b}[2J -> bd-b\\u{7}bell"));
 
         let theme = Theme::default();
-        let rich_text = build_cycles_rich_text(&cycles, 1, &theme);
+        let rich_text = build_cycles_rich_text(&cycles, 1, &theme, false);
         let rendered = Panel::from_rich_text(&rich_text, 100).render_plain(100);
 
         assert!(!rendered.contains("[bold"));
@@ -2290,6 +2315,11 @@ mod tests {
         assert!(rendered.contains("bd-a\\u{1b}[2J"));
         assert!(rendered.contains("bd-b\\u{7}bell"));
         assert!(rich_text.spans().len() > 1, "rich text should carry styles");
+
+        let blocking_rich_text = build_cycles_rich_text(&cycles, 1, &theme, true);
+        let blocking_rendered = Panel::from_rich_text(&blocking_rich_text, 100).render_plain(100);
+
+        assert!(blocking_rendered.contains("blocking dependency cycle(s)"));
     }
 
     #[test]

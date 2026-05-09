@@ -10760,8 +10760,8 @@ impl SqliteStorage {
 
     /// Check if adding a dependency would create a cycle.
     ///
-    /// If `blocking_only` is true, only considers blocking dependency types
-    /// ('blocks', 'parent-child', 'conditional-blocks') for cycle detection.
+    /// If `blocking_only` is true, only considers dependency types that affect ready-work
+    /// blocking: `blocks`, `conditional-blocks`, `waits-for`, and reversed `parent-child`.
     ///
     /// # Errors
     ///
@@ -10789,6 +10789,10 @@ impl SqliteStorage {
     }
 
     /// Detect cycles in dependency types that affect ready-work blocking.
+    ///
+    /// This uses the same edge semantics as `would_create_cycle(..., true)`:
+    /// `blocks`, `conditional-blocks`, and `waits-for` point from dependent to blocker;
+    /// `parent-child` edges are reversed so parent/child hierarchy cycles are still reported.
     ///
     /// # Errors
     ///
