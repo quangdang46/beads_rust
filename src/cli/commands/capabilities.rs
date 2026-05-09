@@ -602,11 +602,12 @@ fn dep_safety_notes(name: &str) -> &'static [&'static str] {
         "dep tree" => &[
             "Dependency tree is read-only; `--direction down` follows blockers from the root issue.",
             "Use `--max-depth` to bound large graphs in automation.",
+            "Use global `--json` for JSON or `BR_OUTPUT_FORMAT=toon` for TOON; local `--format` selects text or mermaid.",
         ],
         "dep cycles" => &[
             "Cycle detection is read-only.",
             "Use `--blocking-only` when planning ready-work unblock order.",
-            "Use global `--json` for machine output; `dep cycles` does not accept a local `--format` flag.",
+            "Use global `--json` for JSON or `BR_OUTPUT_FORMAT=toon` for TOON; `dep cycles` does not accept a local `--format` flag.",
         ],
         _ => &[],
     }
@@ -692,6 +693,7 @@ fn command_contract(name: &str) -> CommandContract {
             machine_output: &["json", "toon", "text"],
             examples: &[
                 "br dep tree br-task --direction down --max-depth 5 --json",
+                "BR_OUTPUT_FORMAT=toon br dep tree br-task --direction down --max-depth 5",
                 "br dep tree br-task --direction up --format mermaid",
             ],
         },
@@ -702,6 +704,7 @@ fn command_contract(name: &str) -> CommandContract {
             examples: &[
                 "br dep cycles --json",
                 "br dep cycles --blocking-only --json",
+                "BR_OUTPUT_FORMAT=toon br dep cycles --blocking-only",
             ],
         },
         "query save" => CommandContract {

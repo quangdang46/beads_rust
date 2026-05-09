@@ -406,6 +406,82 @@ fn e2e_capabilities_command_detail_high_traffic_safety_notes_json() {
 }
 
 #[test]
+fn e2e_capabilities_command_detail_dependency_safety_notes_json() {
+    let _log = common::test_log("e2e_capabilities_command_detail_dependency_safety_notes_json");
+    let workspace = BrWorkspace::new();
+
+    let cases = [
+        (
+            "dep add",
+            "write",
+            "safety_notes",
+            "waits on",
+            "dependency argument-order note",
+        ),
+        (
+            "dep list",
+            "read",
+            "examples",
+            "--direction both",
+            "dependency list direction recipe",
+        ),
+        (
+            "dep cycles",
+            "read",
+            "safety_notes",
+            "--blocking-only",
+            "dependency cycles planning note",
+        ),
+        (
+            "dep cycles",
+            "read",
+            "examples",
+            "--json",
+            "dependency cycles machine-output recipe",
+        ),
+        (
+            "dep cycles",
+            "read",
+            "examples",
+            "BR_OUTPUT_FORMAT=toon",
+            "dependency cycles TOON env recipe",
+        ),
+        (
+            "dep tree",
+            "read",
+            "examples",
+            "--json",
+            "dependency tree machine-output recipe",
+        ),
+        (
+            "dep tree",
+            "read",
+            "examples",
+            "BR_OUTPUT_FORMAT=toon",
+            "dependency tree TOON env recipe",
+        ),
+        (
+            "dep tree",
+            "read",
+            "safety_notes",
+            "local `--format` selects text or mermaid",
+            "dependency tree local format note",
+        ),
+    ];
+
+    assert_command_detail_cases(&workspace, &cases);
+
+    for command in ["dep cycles", "dep tree"] {
+        let output = capabilities_command_detail_output(&workspace, command);
+        let detail = output
+            .get("command_detail")
+            .expect("capabilities output should include command_detail");
+        assert_array_text_excludes(detail, "examples", "--format json", command);
+        assert_array_text_excludes(detail, "examples", "--format toon", command);
+    }
+}
+
+#[test]
 fn e2e_capabilities_command_detail_workflow_safety_notes_json() {
     let _log = common::test_log("e2e_capabilities_command_detail_workflow_safety_notes_json");
     let workspace = BrWorkspace::new();
@@ -440,41 +516,6 @@ fn e2e_capabilities_command_detail_workflow_safety_notes_json() {
             "comment list read-only note",
         ),
         (
-            "dep add",
-            "write",
-            "safety_notes",
-            "waits on",
-            "dependency argument-order note",
-        ),
-        (
-            "dep list",
-            "read",
-            "examples",
-            "--direction both",
-            "dependency list direction recipe",
-        ),
-        (
-            "dep cycles",
-            "read",
-            "safety_notes",
-            "--blocking-only",
-            "dependency cycles planning note",
-        ),
-        (
-            "dep cycles",
-            "read",
-            "examples",
-            "--json",
-            "dependency cycles machine-output recipe",
-        ),
-        (
-            "dep tree",
-            "read",
-            "examples",
-            "--json",
-            "dependency tree machine-output recipe",
-        ),
-        (
             "query save",
             "write",
             "safety_notes",
@@ -498,15 +539,6 @@ fn e2e_capabilities_command_detail_workflow_safety_notes_json() {
     ];
 
     assert_command_detail_cases(&workspace, &cases);
-
-    for command in ["dep cycles", "dep tree"] {
-        let output = capabilities_command_detail_output(&workspace, command);
-        let detail = output
-            .get("command_detail")
-            .expect("capabilities output should include command_detail");
-        assert_array_text_excludes(detail, "examples", "--format json", command);
-        assert_array_text_excludes(detail, "examples", "--format toon", command);
-    }
 }
 
 fn assert_array_text_excludes(detail: &Value, field: &str, needle: &str, context: &str) {
