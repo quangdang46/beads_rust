@@ -190,6 +190,8 @@ Every command supports `--json` for AI coding agents:
 br list --json | jq '.issues[] | select(.priority <= 1)'
 br ready --json  # Structured output for agents
 br show br-abc123 --json
+br capabilities --format json
+br robot-docs guide
 ```
 
 For routine operator or agent use, prefer `RUST_LOG=error br ...` to suppress internal Rust dependency logs while preserving normal stdout/JSON output:
@@ -476,8 +478,10 @@ git commit -m "Fix: login timeout (br-a1b2c3)"
 |---------|-------------|---------|
 | `agents` | Manage AGENTS.md workflow instructions | `br agents --add --force` |
 | `audit` | Record and label agent interactions | `br audit record --kind note` |
+| `capabilities` | Describe machine-readable contracts and safety guarantees | `br capabilities --format json` |
 | `completions` | Generate shell completions | `br completions zsh` |
 | `info` | Show workspace diagnostics | `br info` |
+| `robot-docs` | Print concise docs for automation agents | `br robot-docs guide` |
 | `schema` | Emit JSON Schemas for outputs | `br schema all --format json` |
 | `where` | Show active `.beads` directory | `br where` |
 
@@ -767,6 +771,8 @@ br list --json
 br ready --json
 br show br-abc123 --json
 br coordination status --json
+br capabilities --format json
+br robot-docs guide
 
 # Create issues programmatically
 br create "Title" --json  # Returns created issue as JSON

@@ -11,6 +11,7 @@ use common::cli::{BrWorkspace, extract_json_payload, run_br};
 use serde_json::Value;
 #[cfg(feature = "self_update")]
 use std::{fs, path::PathBuf};
+use toon_rust::try_decode as parse_toon;
 
 #[cfg(feature = "self_update")]
 const UPDATE_AGENT_BASELINE_ENV: &str = "UPDATE_AGENT_BASELINE";
@@ -62,7 +63,7 @@ fn e2e_schema_toon_decodes() {
     let toon = run.stdout.trim();
     assert!(!toon.is_empty(), "TOON output should be non-empty");
 
-    let decoded = toon_rust::try_decode(toon, None).expect("valid TOON");
+    let decoded = parse_toon(toon, None).expect("valid TOON");
     let json = Value::from(decoded);
 
     assert_eq!(json["tool"], "br");
@@ -77,6 +78,112 @@ fn e2e_schema_toon_decodes() {
         has_nested || has_folded,
         "expected IssueDetails schema (nested or folded), got keys: {:?}",
         json.as_object().map(|o| o.keys().collect::<Vec<_>>())
+    );
+}
+
+#[test]
+fn e2e_capabilities_json_no_workspace() {
+    let _log = common::test_log("e2e_capabilities_json_no_workspace");
+    let workspace = BrWorkspace::new();
+
+    let run = run_br(
+        &workspace,
+        ["capabilities", "--format", "json"],
+        "capabilities_json",
+    );
+    assert!(
+        run.status.success(),
+        "capabilities json failed: {}",
+        run.stderr
+    );
+
+    let payload = extract_json_payload(&run.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("valid JSON output");
+
+    assert_eq!(json["tool"], "br");
+    assert_eq!(json["contract_version"], "br.capabilities.v1");
+    assert!(
+        json["features"].as_array().is_some_and(|features| {
+            features
+                .iter()
+                .any(|feature| feature["name"] == "agent_machine_output")
+        }),
+        "missing agent_machine_output feature: {json}"
+    );
+    assert!(
+        json["commands"].as_array().is_some_and(|commands| {
+            commands
+                .iter()
+                .any(|command| command["name"] == "capabilities")
+                && commands
+                    .iter()
+                    .any(|command| command["name"] == "robot-docs")
+        }),
+        "missing new agent commands: {json}"
+    );
+    assert!(
+        json["exit_codes"].as_array().is_some_and(|codes| {
+            codes
+                .iter()
+                .any(|code| code["code"] == 4 && code["category"] == "validation")
+        }),
+        "missing exit-code contract: {json}"
+    );
+}
+
+#[test]
+fn e2e_robot_docs_guide_text_is_concise() {
+    let _log = common::test_log("e2e_robot_docs_guide_text_is_concise");
+    let workspace = BrWorkspace::new();
+
+    let run = run_br(&workspace, ["robot-docs", "guide"], "robot_docs_guide_text");
+    assert!(
+        run.status.success(),
+        "robot-docs guide failed: {}",
+        run.stderr
+    );
+
+    let lines = run.stdout.lines().count();
+    assert!(lines <= 80, "guide should stay concise, got {lines} lines");
+    assert!(run.stdout.contains("br capabilities --format json"));
+    assert!(run.stdout.contains("br ready --json"));
+    assert!(run.stdout.contains("br never runs git"));
+}
+
+#[test]
+fn e2e_robot_docs_guide_json_no_workspace() {
+    let _log = common::test_log("e2e_robot_docs_guide_json_no_workspace");
+    let workspace = BrWorkspace::new();
+
+    let run = run_br(
+        &workspace,
+        ["robot-docs", "guide", "--format", "json"],
+        "robot_docs_guide_json",
+    );
+    assert!(
+        run.status.success(),
+        "robot-docs guide json failed: {}",
+        run.stderr
+    );
+
+    let payload = extract_json_payload(&run.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("valid JSON output");
+
+    assert_eq!(json["tool"], "br");
+    assert_eq!(json["contract_version"], "br.robot_docs.v1");
+    assert!(
+        json["line_count"].as_u64().is_some_and(|count| count <= 80),
+        "guide should report <=80 lines: {json}"
+    );
+    assert!(
+        json["canonical_commands"]
+            .as_array()
+            .is_some_and(|commands| {
+                commands
+                    .iter()
+                    .any(|command| command["command"] == "br coordination status --json")
+            }),
+        "missing canonical coordination command: {json}"
     );
 }
 
@@ -299,8 +406,14 @@ fn compare_text_baseline(relative_path: &str, actual: &str) {
 fn compare_json_baseline(relative_path: &str, actual: &str, normalize: fn(&mut Value)) {
     let path = baseline_path(relative_path);
     let actual_payload = extract_json_payload(actual);
+    let mut actual: Value =
+        serde_json::from_str(&actual_payload).expect("valid generated JSON for agent baseline");
+    normalize(&mut actual);
+
     if should_update_agent_baseline() {
-        fs::write(&path, with_trailing_newline(&actual_payload))
+        let pretty = serde_json::to_string_pretty(&actual)
+            .expect("serialize normalized agent baseline JSON snapshot");
+        fs::write(&path, with_trailing_newline(&pretty))
             .expect("update agent baseline JSON snapshot");
         return;
     }
@@ -308,10 +421,7 @@ fn compare_json_baseline(relative_path: &str, actual: &str, normalize: fn(&mut V
     let expected_raw = fs::read_to_string(&path).expect("read agent baseline JSON snapshot");
     let mut expected: Value =
         serde_json::from_str(&expected_raw).expect("valid agent baseline JSON snapshot");
-    let mut actual: Value =
-        serde_json::from_str(&actual_payload).expect("valid generated JSON for agent baseline");
     normalize(&mut expected);
-    normalize(&mut actual);
 
     assert_eq!(
         expected, actual,
@@ -329,12 +439,10 @@ fn compare_toon_baseline(relative_path: &str, actual: &str) {
     }
 
     let expected_raw = fs::read_to_string(&path).expect("read agent baseline TOON snapshot");
-    let mut expected = Value::from(
-        toon_rust::try_decode(&expected_raw, None).expect("valid agent baseline TOON snapshot"),
-    );
-    let mut actual = Value::from(
-        toon_rust::try_decode(&actual, None).expect("valid generated TOON for agent baseline"),
-    );
+    let mut expected =
+        Value::from(parse_toon(&expected_raw, None).expect("valid agent baseline TOON snapshot"));
+    let mut actual =
+        Value::from(parse_toon(&actual, None).expect("valid generated TOON for agent baseline"));
     normalize_issue_example_snapshot(&mut expected);
     normalize_issue_example_snapshot(&mut actual);
 
@@ -409,6 +517,9 @@ fn normalize_issue_example_snapshot(value: &mut Value) {
                     }
                     "created_by" => {
                         *child = Value::String("<ACTOR>".to_string());
+                    }
+                    "source_repo" => {
+                        *child = Value::String("<SOURCE_REPO>".to_string());
                     }
                     "depends_on_id" | "id" | "issue_id" => {
                         *child = Value::String("<ISSUE_ID>".to_string());

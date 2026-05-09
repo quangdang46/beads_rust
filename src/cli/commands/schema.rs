@@ -413,6 +413,32 @@ fn insert_aggregate_command_shapes(commands: &mut BTreeMap<&'static str, Command
         },
     );
     commands.insert(
+        "capabilities",
+        CommandShape {
+            shape: "object",
+            jq_filter: ".",
+            items_at: None,
+            item_schema: None,
+            error_envelope_on_stderr: false,
+            notes: Some(
+                "Machine-readable command, feature, safety, exit-code, and env-var inventory.",
+            ),
+        },
+    );
+    commands.insert(
+        "robot-docs guide",
+        CommandShape {
+            shape: "object",
+            jq_filter: ".",
+            items_at: None,
+            item_schema: None,
+            error_envelope_on_stderr: false,
+            notes: Some(
+                "JSON/TOON modes wrap the concise agent guide; text mode prints the guide directly.",
+            ),
+        },
+    );
+    commands.insert(
         "coordination status",
         CommandShape {
             shape: "object",

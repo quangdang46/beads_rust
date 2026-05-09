@@ -1,6 +1,6 @@
 {
   "tool": "br",
-  "generated_at": "2026-04-25T00:17:56.050349701Z",
+  "generated_at": "2026-05-09T04:24:50.050411552Z",
   "schemas": {
     "BlockedIssue": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -412,6 +412,1348 @@
             "author",
             "text",
             "created_at"
+          ]
+        }
+      }
+    },
+    "CoordinationClaimRow": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "CoordinationClaimRow",
+      "description": "One in-progress issue plus its deterministic coordination assessment.",
+      "type": "object",
+      "properties": {
+        "issue": {
+          "$ref": "#/$defs/CoordinationIssueRow"
+        },
+        "agent": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentMailAgentSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "assessment": {
+          "$ref": "#/$defs/ClaimAssessment"
+        },
+        "reclaim_allowed_by_policy": {
+          "type": "boolean"
+        },
+        "required_human_confirmation": {
+          "type": "boolean"
+        },
+        "evidence_summary": {
+          "type": "string"
+        },
+        "suggested_commands": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CoordinationSuggestedCommand"
+          }
+        }
+      },
+      "required": [
+        "issue",
+        "assessment",
+        "reclaim_allowed_by_policy",
+        "required_human_confirmation",
+        "evidence_summary",
+        "suggested_commands"
+      ],
+      "$defs": {
+        "CoordinationIssueRow": {
+          "description": "Issue context attached to one coordination claim row.",
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "title": {
+              "type": "string"
+            },
+            "status": {
+              "$ref": "#/$defs/Status"
+            },
+            "priority": {
+              "$ref": "#/$defs/Priority"
+            },
+            "issue_type": {
+              "$ref": "#/$defs/IssueType"
+            },
+            "labels": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "dependency_count": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "dependent_count": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "latest_comments": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/CoordinationComment"
+              }
+            }
+          },
+          "required": [
+            "id",
+            "title",
+            "status",
+            "priority",
+            "issue_type",
+            "labels",
+            "dependency_count",
+            "dependent_count",
+            "latest_comments"
+          ]
+        },
+        "Status": {
+          "description": "Issue lifecycle status.",
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "open",
+                "in_progress",
+                "blocked",
+                "deferred",
+                "draft",
+                "closed",
+                "tombstone",
+                "pinned"
+              ]
+            },
+            {
+              "type": "string"
+            }
+          ]
+        },
+        "Priority": {
+          "description": "Issue priority (0=Critical, 4=Backlog).",
+          "type": "integer",
+          "format": "int32"
+        },
+        "IssueType": {
+          "description": "Issue type category.",
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "task",
+                "bug",
+                "feature",
+                "epic",
+                "chore",
+                "docs",
+                "question"
+              ]
+            },
+            {
+              "type": "string"
+            }
+          ]
+        },
+        "CoordinationComment": {
+          "description": "Bounded comment excerpt included with a coordination claim row.",
+          "type": "object",
+          "properties": {
+            "author": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "created_at": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          "required": [
+            "author",
+            "text",
+            "created_at"
+          ]
+        },
+        "AgentMailAgentSnapshot": {
+          "description": "Minimal offline agent-liveness snapshot row exported from Agent Mail.",
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "task_description": {
+              "type": "string"
+            },
+            "last_active_ts": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "contact_policy": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "task_description",
+            "last_active_ts",
+            "contact_policy"
+          ]
+        },
+        "ClaimAssessment": {
+          "description": "Deterministic assessment for one in-progress claim.",
+          "type": "object",
+          "properties": {
+            "assignee": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "owner_kind": {
+              "$ref": "#/$defs/ClaimOwnerKind"
+            },
+            "updated_at": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "updated_age_minutes": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "stale_threshold_minutes": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "abandoned_threshold_minutes": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "reservation": {
+              "$ref": "#/$defs/ReservationEvidence"
+            },
+            "classification": {
+              "$ref": "#/$defs/ClaimClassification"
+            },
+            "recommended_action": {
+              "$ref": "#/$defs/RecommendedAction"
+            },
+            "evidence_sources": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/CoordinationEvidenceSource"
+              }
+            }
+          },
+          "required": [
+            "owner_kind",
+            "updated_at",
+            "updated_age_minutes",
+            "stale_threshold_minutes",
+            "abandoned_threshold_minutes",
+            "reservation",
+            "classification",
+            "recommended_action",
+            "evidence_sources"
+          ]
+        },
+        "ClaimOwnerKind": {
+          "description": "Who appears to own the current claim.",
+          "oneOf": [
+            {
+              "description": "A named coding-agent swarm participant.",
+              "type": "string",
+              "const": "swarm_agent"
+            },
+            {
+              "description": "A human assignee or operator-owned claim.",
+              "type": "string",
+              "const": "human"
+            },
+            {
+              "description": "Ownership cannot be confidently classified.",
+              "type": "string",
+              "const": "unknown"
+            }
+          ]
+        },
+        "ReservationEvidence": {
+          "description": "Optional Agent Mail reservation evidence supplied by the caller.",
+          "oneOf": [
+            {
+              "description": "No Agent Mail snapshot was supplied, so absence of reservations is not\nevidence of abandonment.",
+              "type": "object",
+              "properties": {
+                "state": {
+                  "type": "string",
+                  "const": "no_snapshot"
+                }
+              },
+              "required": [
+                "state"
+              ]
+            },
+            {
+              "description": "A snapshot was supplied and no matching reservation was found.",
+              "type": "object",
+              "properties": {
+                "state": {
+                  "type": "string",
+                  "const": "no_reservation"
+                }
+              },
+              "required": [
+                "state"
+              ]
+            },
+            {
+              "description": "A matching active reservation exists.",
+              "type": "object",
+              "properties": {
+                "state": {
+                  "type": "string",
+                  "const": "active"
+                },
+                "detail": {
+                  "type": "object",
+                  "properties": {
+                    "holder": {
+                      "type": "string"
+                    },
+                    "expires_at": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "format": "date-time"
+                    },
+                    "provenance": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/ReservationEvidenceProvenance"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    }
+                  },
+                  "required": [
+                    "holder"
+                  ]
+                }
+              },
+              "required": [
+                "state",
+                "detail"
+              ]
+            },
+            {
+              "description": "A matching reservation exists but is no longer active.",
+              "type": "object",
+              "properties": {
+                "state": {
+                  "type": "string",
+                  "const": "expired"
+                },
+                "detail": {
+                  "type": "object",
+                  "properties": {
+                    "holder": {
+                      "type": "string"
+                    },
+                    "released_at": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "format": "date-time"
+                    },
+                    "provenance": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/ReservationEvidenceProvenance"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    }
+                  },
+                  "required": [
+                    "holder"
+                  ]
+                }
+              },
+              "required": [
+                "state",
+                "detail"
+              ]
+            },
+            {
+              "description": "Snapshot data was supplied but could not be trusted.",
+              "type": "object",
+              "properties": {
+                "state": {
+                  "type": "string",
+                  "const": "invalid_snapshot"
+                },
+                "detail": {
+                  "type": "object",
+                  "properties": {
+                    "reason": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "reason"
+                  ]
+                }
+              },
+              "required": [
+                "state",
+                "detail"
+              ]
+            }
+          ]
+        },
+        "ReservationEvidenceProvenance": {
+          "description": "Provenance copied from a matching reservation snapshot.",
+          "type": "object",
+          "properties": {
+            "path_pattern": {
+              "type": "string"
+            },
+            "exclusive": {
+              "type": "boolean"
+            },
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "expires_ts": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "released_ts": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "date-time"
+            },
+            "thread_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "matched_on": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/ReservationSnapshotMatchReason"
+              }
+            }
+          },
+          "required": [
+            "path_pattern",
+            "exclusive",
+            "expires_ts",
+            "matched_on"
+          ]
+        },
+        "ReservationSnapshotMatchReason": {
+          "description": "Why an Agent Mail reservation snapshot was associated with an issue.",
+          "oneOf": [
+            {
+              "description": "Reservation holder matches the issue assignee.",
+              "type": "string",
+              "const": "holder_matches_assignee"
+            },
+            {
+              "description": "Reservation reason or thread id names the issue id.",
+              "type": "string",
+              "const": "issue_id"
+            },
+            {
+              "description": "A recent issue comment names the reservation path pattern.",
+              "type": "string",
+              "const": "comment_path"
+            }
+          ]
+        },
+        "ClaimClassification": {
+          "description": "Stable claim classifications used by coordination-aware surfaces.",
+          "oneOf": [
+            {
+              "description": "The issue is in progress but has no meaningful assignee.",
+              "type": "string",
+              "const": "unassigned"
+            },
+            {
+              "description": "The claim is still within the owner-specific freshness window.",
+              "type": "string",
+              "const": "fresh"
+            },
+            {
+              "description": "A live reservation exists, so the claim must not be treated as abandoned.",
+              "type": "string",
+              "const": "blocked_by_active_reservation"
+            },
+            {
+              "description": "The claim has crossed the stale threshold and no active reservation was\nfound in a supplied snapshot.",
+              "type": "string",
+              "const": "stale_candidate"
+            },
+            {
+              "description": "The claim has crossed a more conservative abandoned threshold.",
+              "type": "string",
+              "const": "abandoned_likely"
+            },
+            {
+              "description": "The claim is old enough to inspect, but no Agent Mail snapshot was\nsupplied.",
+              "type": "string",
+              "const": "no_mail_snapshot"
+            },
+            {
+              "description": "Evidence conflicts or cannot be trusted.",
+              "type": "string",
+              "const": "ambiguous"
+            }
+          ]
+        },
+        "RecommendedAction": {
+          "description": "Suggested next action for an operator or agent.",
+          "oneOf": [
+            {
+              "description": "Do nothing except continue normal observation.",
+              "type": "string",
+              "const": "observe"
+            },
+            {
+              "description": "Ask the assignee or human operator before touching the claim.",
+              "type": "string",
+              "const": "ask_owner"
+            },
+            {
+              "description": "Inspect Agent Mail reservations or capture a fresh snapshot.",
+              "type": "string",
+              "const": "inspect_mail"
+            },
+            {
+              "description": "The issue is a candidate for the documented audit-comment plus claim\nsequence. This is still advisory, not an automatic mutation.",
+              "type": "string",
+              "const": "reclaim_candidate"
+            },
+            {
+              "description": "Leave the claim alone because evidence says work may still be active.",
+              "type": "string",
+              "const": "leave_active"
+            }
+          ]
+        },
+        "CoordinationEvidenceSource": {
+          "description": "Evidence categories present in a claim assessment.",
+          "oneOf": [
+            {
+              "description": "Issue status, assignee, and updated timestamp.",
+              "type": "string",
+              "const": "issue_metadata"
+            },
+            {
+              "description": "Owner-specific stale and abandoned thresholds.",
+              "type": "string",
+              "const": "policy_threshold"
+            },
+            {
+              "description": "A caller-supplied Agent Mail snapshot.",
+              "type": "string",
+              "const": "agent_mail_snapshot"
+            },
+            {
+              "description": "Explicit absence of an Agent Mail snapshot.",
+              "type": "string",
+              "const": "no_agent_mail_snapshot"
+            }
+          ]
+        },
+        "CoordinationSuggestedCommand": {
+          "description": "A command suggestion emitted for an operator to review and run manually.",
+          "type": "object",
+          "properties": {
+            "purpose": {
+              "$ref": "#/$defs/CoordinationSuggestedCommandPurpose"
+            },
+            "command": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "purpose",
+            "command"
+          ]
+        },
+        "CoordinationSuggestedCommandPurpose": {
+          "description": "Role for a suggested coordination command.",
+          "oneOf": [
+            {
+              "description": "Record the reclaim evidence before touching ownership.",
+              "type": "string",
+              "const": "add_reclaim_audit_comment"
+            },
+            {
+              "description": "Claim the issue after the audit comment is recorded.",
+              "type": "string",
+              "const": "claim_issue"
+            }
+          ]
+        }
+      }
+    },
+    "CoordinationStatusOutput": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "CoordinationStatusOutput",
+      "description": "Top-level machine-readable coordination status shape.",
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "type": "string"
+        },
+        "generated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "summary": {
+          "$ref": "#/$defs/CoordinationSummary"
+        },
+        "claims": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CoordinationClaimRow"
+          }
+        }
+      },
+      "required": [
+        "schema_version",
+        "generated_at",
+        "summary",
+        "claims"
+      ],
+      "$defs": {
+        "CoordinationSummary": {
+          "description": "Count summary for coordination status output.",
+          "type": "object",
+          "properties": {
+            "total_claims": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "workspace": {
+              "$ref": "#/$defs/CoordinationWorkspaceCounts"
+            },
+            "unassigned": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "fresh": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "blocked_by_active_reservation": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "stale_candidate": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "abandoned_likely": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "no_mail_snapshot": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "ambiguous": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "total_claims",
+            "workspace",
+            "unassigned",
+            "fresh",
+            "blocked_by_active_reservation",
+            "stale_candidate",
+            "abandoned_likely",
+            "no_mail_snapshot",
+            "ambiguous"
+          ]
+        },
+        "CoordinationWorkspaceCounts": {
+          "description": "Workspace context counts shown next to hidden-claim diagnosis.",
+          "type": "object",
+          "properties": {
+            "open": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "ready": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "blocked": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "in_progress": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "deferred": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "closed": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "open",
+            "ready",
+            "blocked",
+            "in_progress",
+            "deferred",
+            "closed"
+          ]
+        },
+        "CoordinationClaimRow": {
+          "description": "One in-progress issue plus its deterministic coordination assessment.",
+          "type": "object",
+          "properties": {
+            "issue": {
+              "$ref": "#/$defs/CoordinationIssueRow"
+            },
+            "agent": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/AgentMailAgentSnapshot"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "assessment": {
+              "$ref": "#/$defs/ClaimAssessment"
+            },
+            "reclaim_allowed_by_policy": {
+              "type": "boolean"
+            },
+            "required_human_confirmation": {
+              "type": "boolean"
+            },
+            "evidence_summary": {
+              "type": "string"
+            },
+            "suggested_commands": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/CoordinationSuggestedCommand"
+              }
+            }
+          },
+          "required": [
+            "issue",
+            "assessment",
+            "reclaim_allowed_by_policy",
+            "required_human_confirmation",
+            "evidence_summary",
+            "suggested_commands"
+          ]
+        },
+        "CoordinationIssueRow": {
+          "description": "Issue context attached to one coordination claim row.",
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "title": {
+              "type": "string"
+            },
+            "status": {
+              "$ref": "#/$defs/Status"
+            },
+            "priority": {
+              "$ref": "#/$defs/Priority"
+            },
+            "issue_type": {
+              "$ref": "#/$defs/IssueType"
+            },
+            "labels": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "dependency_count": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "dependent_count": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "latest_comments": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/CoordinationComment"
+              }
+            }
+          },
+          "required": [
+            "id",
+            "title",
+            "status",
+            "priority",
+            "issue_type",
+            "labels",
+            "dependency_count",
+            "dependent_count",
+            "latest_comments"
+          ]
+        },
+        "Status": {
+          "description": "Issue lifecycle status.",
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "open",
+                "in_progress",
+                "blocked",
+                "deferred",
+                "draft",
+                "closed",
+                "tombstone",
+                "pinned"
+              ]
+            },
+            {
+              "type": "string"
+            }
+          ]
+        },
+        "Priority": {
+          "description": "Issue priority (0=Critical, 4=Backlog).",
+          "type": "integer",
+          "format": "int32"
+        },
+        "IssueType": {
+          "description": "Issue type category.",
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "task",
+                "bug",
+                "feature",
+                "epic",
+                "chore",
+                "docs",
+                "question"
+              ]
+            },
+            {
+              "type": "string"
+            }
+          ]
+        },
+        "CoordinationComment": {
+          "description": "Bounded comment excerpt included with a coordination claim row.",
+          "type": "object",
+          "properties": {
+            "author": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "created_at": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          "required": [
+            "author",
+            "text",
+            "created_at"
+          ]
+        },
+        "AgentMailAgentSnapshot": {
+          "description": "Minimal offline agent-liveness snapshot row exported from Agent Mail.",
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "task_description": {
+              "type": "string"
+            },
+            "last_active_ts": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "contact_policy": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "task_description",
+            "last_active_ts",
+            "contact_policy"
+          ]
+        },
+        "ClaimAssessment": {
+          "description": "Deterministic assessment for one in-progress claim.",
+          "type": "object",
+          "properties": {
+            "assignee": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "owner_kind": {
+              "$ref": "#/$defs/ClaimOwnerKind"
+            },
+            "updated_at": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "updated_age_minutes": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "stale_threshold_minutes": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "abandoned_threshold_minutes": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "reservation": {
+              "$ref": "#/$defs/ReservationEvidence"
+            },
+            "classification": {
+              "$ref": "#/$defs/ClaimClassification"
+            },
+            "recommended_action": {
+              "$ref": "#/$defs/RecommendedAction"
+            },
+            "evidence_sources": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/CoordinationEvidenceSource"
+              }
+            }
+          },
+          "required": [
+            "owner_kind",
+            "updated_at",
+            "updated_age_minutes",
+            "stale_threshold_minutes",
+            "abandoned_threshold_minutes",
+            "reservation",
+            "classification",
+            "recommended_action",
+            "evidence_sources"
+          ]
+        },
+        "ClaimOwnerKind": {
+          "description": "Who appears to own the current claim.",
+          "oneOf": [
+            {
+              "description": "A named coding-agent swarm participant.",
+              "type": "string",
+              "const": "swarm_agent"
+            },
+            {
+              "description": "A human assignee or operator-owned claim.",
+              "type": "string",
+              "const": "human"
+            },
+            {
+              "description": "Ownership cannot be confidently classified.",
+              "type": "string",
+              "const": "unknown"
+            }
+          ]
+        },
+        "ReservationEvidence": {
+          "description": "Optional Agent Mail reservation evidence supplied by the caller.",
+          "oneOf": [
+            {
+              "description": "No Agent Mail snapshot was supplied, so absence of reservations is not\nevidence of abandonment.",
+              "type": "object",
+              "properties": {
+                "state": {
+                  "type": "string",
+                  "const": "no_snapshot"
+                }
+              },
+              "required": [
+                "state"
+              ]
+            },
+            {
+              "description": "A snapshot was supplied and no matching reservation was found.",
+              "type": "object",
+              "properties": {
+                "state": {
+                  "type": "string",
+                  "const": "no_reservation"
+                }
+              },
+              "required": [
+                "state"
+              ]
+            },
+            {
+              "description": "A matching active reservation exists.",
+              "type": "object",
+              "properties": {
+                "state": {
+                  "type": "string",
+                  "const": "active"
+                },
+                "detail": {
+                  "type": "object",
+                  "properties": {
+                    "holder": {
+                      "type": "string"
+                    },
+                    "expires_at": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "format": "date-time"
+                    },
+                    "provenance": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/ReservationEvidenceProvenance"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    }
+                  },
+                  "required": [
+                    "holder"
+                  ]
+                }
+              },
+              "required": [
+                "state",
+                "detail"
+              ]
+            },
+            {
+              "description": "A matching reservation exists but is no longer active.",
+              "type": "object",
+              "properties": {
+                "state": {
+                  "type": "string",
+                  "const": "expired"
+                },
+                "detail": {
+                  "type": "object",
+                  "properties": {
+                    "holder": {
+                      "type": "string"
+                    },
+                    "released_at": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "format": "date-time"
+                    },
+                    "provenance": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/ReservationEvidenceProvenance"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    }
+                  },
+                  "required": [
+                    "holder"
+                  ]
+                }
+              },
+              "required": [
+                "state",
+                "detail"
+              ]
+            },
+            {
+              "description": "Snapshot data was supplied but could not be trusted.",
+              "type": "object",
+              "properties": {
+                "state": {
+                  "type": "string",
+                  "const": "invalid_snapshot"
+                },
+                "detail": {
+                  "type": "object",
+                  "properties": {
+                    "reason": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "reason"
+                  ]
+                }
+              },
+              "required": [
+                "state",
+                "detail"
+              ]
+            }
+          ]
+        },
+        "ReservationEvidenceProvenance": {
+          "description": "Provenance copied from a matching reservation snapshot.",
+          "type": "object",
+          "properties": {
+            "path_pattern": {
+              "type": "string"
+            },
+            "exclusive": {
+              "type": "boolean"
+            },
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "expires_ts": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "released_ts": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "date-time"
+            },
+            "thread_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "matched_on": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/ReservationSnapshotMatchReason"
+              }
+            }
+          },
+          "required": [
+            "path_pattern",
+            "exclusive",
+            "expires_ts",
+            "matched_on"
+          ]
+        },
+        "ReservationSnapshotMatchReason": {
+          "description": "Why an Agent Mail reservation snapshot was associated with an issue.",
+          "oneOf": [
+            {
+              "description": "Reservation holder matches the issue assignee.",
+              "type": "string",
+              "const": "holder_matches_assignee"
+            },
+            {
+              "description": "Reservation reason or thread id names the issue id.",
+              "type": "string",
+              "const": "issue_id"
+            },
+            {
+              "description": "A recent issue comment names the reservation path pattern.",
+              "type": "string",
+              "const": "comment_path"
+            }
+          ]
+        },
+        "ClaimClassification": {
+          "description": "Stable claim classifications used by coordination-aware surfaces.",
+          "oneOf": [
+            {
+              "description": "The issue is in progress but has no meaningful assignee.",
+              "type": "string",
+              "const": "unassigned"
+            },
+            {
+              "description": "The claim is still within the owner-specific freshness window.",
+              "type": "string",
+              "const": "fresh"
+            },
+            {
+              "description": "A live reservation exists, so the claim must not be treated as abandoned.",
+              "type": "string",
+              "const": "blocked_by_active_reservation"
+            },
+            {
+              "description": "The claim has crossed the stale threshold and no active reservation was\nfound in a supplied snapshot.",
+              "type": "string",
+              "const": "stale_candidate"
+            },
+            {
+              "description": "The claim has crossed a more conservative abandoned threshold.",
+              "type": "string",
+              "const": "abandoned_likely"
+            },
+            {
+              "description": "The claim is old enough to inspect, but no Agent Mail snapshot was\nsupplied.",
+              "type": "string",
+              "const": "no_mail_snapshot"
+            },
+            {
+              "description": "Evidence conflicts or cannot be trusted.",
+              "type": "string",
+              "const": "ambiguous"
+            }
+          ]
+        },
+        "RecommendedAction": {
+          "description": "Suggested next action for an operator or agent.",
+          "oneOf": [
+            {
+              "description": "Do nothing except continue normal observation.",
+              "type": "string",
+              "const": "observe"
+            },
+            {
+              "description": "Ask the assignee or human operator before touching the claim.",
+              "type": "string",
+              "const": "ask_owner"
+            },
+            {
+              "description": "Inspect Agent Mail reservations or capture a fresh snapshot.",
+              "type": "string",
+              "const": "inspect_mail"
+            },
+            {
+              "description": "The issue is a candidate for the documented audit-comment plus claim\nsequence. This is still advisory, not an automatic mutation.",
+              "type": "string",
+              "const": "reclaim_candidate"
+            },
+            {
+              "description": "Leave the claim alone because evidence says work may still be active.",
+              "type": "string",
+              "const": "leave_active"
+            }
+          ]
+        },
+        "CoordinationEvidenceSource": {
+          "description": "Evidence categories present in a claim assessment.",
+          "oneOf": [
+            {
+              "description": "Issue status, assignee, and updated timestamp.",
+              "type": "string",
+              "const": "issue_metadata"
+            },
+            {
+              "description": "Owner-specific stale and abandoned thresholds.",
+              "type": "string",
+              "const": "policy_threshold"
+            },
+            {
+              "description": "A caller-supplied Agent Mail snapshot.",
+              "type": "string",
+              "const": "agent_mail_snapshot"
+            },
+            {
+              "description": "Explicit absence of an Agent Mail snapshot.",
+              "type": "string",
+              "const": "no_agent_mail_snapshot"
+            }
+          ]
+        },
+        "CoordinationSuggestedCommand": {
+          "description": "A command suggestion emitted for an operator to review and run manually.",
+          "type": "object",
+          "properties": {
+            "purpose": {
+              "$ref": "#/$defs/CoordinationSuggestedCommandPurpose"
+            },
+            "command": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "purpose",
+            "command"
+          ]
+        },
+        "CoordinationSuggestedCommandPurpose": {
+          "description": "Role for a suggested coordination command.",
+          "oneOf": [
+            {
+              "description": "Record the reclaim evidence before touching ownership.",
+              "type": "string",
+              "const": "add_reclaim_audit_comment"
+            },
+            {
+              "description": "Claim the issue after the audit comment is recorded.",
+              "type": "string",
+              "const": "claim_issue"
+            }
           ]
         }
       }
@@ -2203,419 +3545,52 @@
     "TreeNode": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "TreeNode",
-      "description": "Tree node for dependency tree view.",
+      "description": "Row emitted by `br dep tree --json`.\n\nKeep this in sync with `cli::commands::dep::TreeNode`. The command emits a\ncompact traversal node, not the older `format::output::TreeNode` shape that\nflattened a full `Issue`.",
       "type": "object",
       "properties": {
         "id": {
-          "description": "Unique ID (e.g., \"bd-abc123\").",
+          "description": "Stable issue ID, external dependency ID, or missing-issue placeholder ID.",
           "type": "string"
         },
         "title": {
-          "description": "Title (1-500 chars).",
+          "description": "Human-readable title used in text/tree output.",
           "type": "string"
         },
-        "description": {
-          "description": "Detailed description.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "design": {
-          "description": "Technical design notes.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "acceptance_criteria": {
-          "description": "Acceptance criteria.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "notes": {
-          "description": "Additional notes.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "status": {
-          "description": "Workflow status.",
-          "$ref": "#/$defs/Status",
-          "default": "open"
-        },
-        "priority": {
-          "description": "Priority (0=Critical, 4=Backlog).",
-          "$ref": "#/$defs/Priority",
-          "default": 2
-        },
-        "issue_type": {
-          "description": "Issue type (bug, feature, etc.).",
-          "$ref": "#/$defs/IssueType",
-          "default": "task"
-        },
-        "assignee": {
-          "description": "Assigned user.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "owner": {
-          "description": "Issue owner.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "estimated_minutes": {
-          "description": "Estimated effort in minutes.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "int32"
-        },
-        "created_at": {
-          "description": "Creation timestamp.",
-          "type": "string",
-          "format": "date-time"
-        },
-        "created_by": {
-          "description": "Creator username.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "updated_at": {
-          "description": "Last update timestamp.",
-          "type": "string",
-          "format": "date-time"
-        },
-        "closed_at": {
-          "description": "Closure timestamp.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "format": "date-time"
-        },
-        "close_reason": {
-          "description": "Reason for closure.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "closed_by_session": {
-          "description": "Session ID that closed this issue.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "due_at": {
-          "description": "Due date.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "format": "date-time"
-        },
-        "defer_until": {
-          "description": "Defer until date.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "format": "date-time"
-        },
-        "external_ref": {
-          "description": "External reference (e.g., JIRA-123).",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "source_system": {
-          "description": "Source system for imported issues.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "source_repo": {
-          "description": "Source repository for multi-repo support.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "deleted_at": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "format": "date-time"
-        },
-        "deleted_by": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "delete_reason": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "original_type": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "compaction_level": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "int32",
-          "default": 0
-        },
-        "compacted_at": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "format": "date-time"
-        },
-        "compacted_at_commit": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "original_size": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "int32"
-        },
-        "sender": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "ephemeral": {
-          "type": "boolean"
-        },
-        "pinned": {
-          "type": "boolean"
-        },
-        "is_template": {
-          "type": "boolean"
-        },
-        "labels": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "dependencies": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/Dependency"
-          }
-        },
-        "comments": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/Comment"
-          }
-        },
         "depth": {
+          "description": "Depth from the requested root issue. The root is depth 0.",
           "type": "integer",
           "format": "uint",
           "minimum": 0
         },
         "parent_id": {
+          "description": "Parent node issue ID, or null for the root.",
           "type": [
             "string",
             "null"
           ]
         },
+        "priority": {
+          "description": "Numeric issue priority used for sibling sorting.",
+          "type": "integer",
+          "format": "int32"
+        },
+        "status": {
+          "description": "Issue status string, or synthesized status for external/missing nodes.",
+          "type": "string"
+        },
         "truncated": {
+          "description": "True when the node has children omitted by `--max-depth`.",
           "type": "boolean"
         }
       },
       "required": [
         "id",
         "title",
-        "created_at",
-        "updated_at",
         "depth",
+        "priority",
+        "status",
         "truncated"
-      ],
-      "$defs": {
-        "Status": {
-          "description": "Issue lifecycle status.",
-          "anyOf": [
-            {
-              "type": "string",
-              "enum": [
-                "open",
-                "in_progress",
-                "blocked",
-                "deferred",
-                "draft",
-                "closed",
-                "tombstone",
-                "pinned"
-              ]
-            },
-            {
-              "type": "string"
-            }
-          ]
-        },
-        "Priority": {
-          "description": "Issue priority (0=Critical, 4=Backlog).",
-          "type": "integer",
-          "format": "int32"
-        },
-        "IssueType": {
-          "description": "Issue type category.",
-          "anyOf": [
-            {
-              "type": "string",
-              "enum": [
-                "task",
-                "bug",
-                "feature",
-                "epic",
-                "chore",
-                "docs",
-                "question"
-              ]
-            },
-            {
-              "type": "string"
-            }
-          ]
-        },
-        "Dependency": {
-          "description": "Relationship between two issues.",
-          "type": "object",
-          "properties": {
-            "issue_id": {
-              "description": "The issue that has the dependency (source).",
-              "type": "string"
-            },
-            "depends_on_id": {
-              "description": "The issue being depended on (target).",
-              "type": "string"
-            },
-            "type": {
-              "description": "Type of dependency.",
-              "$ref": "#/$defs/DependencyType"
-            },
-            "created_at": {
-              "description": "Creation timestamp.",
-              "type": "string",
-              "format": "date-time"
-            },
-            "created_by": {
-              "description": "Creator.",
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "metadata": {
-              "description": "Optional metadata (JSON).",
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "thread_id": {
-              "description": "Thread ID for conversation linking.",
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          },
-          "required": [
-            "issue_id",
-            "depends_on_id",
-            "type",
-            "created_at"
-          ]
-        },
-        "DependencyType": {
-          "description": "Dependency relationship type.",
-          "anyOf": [
-            {
-              "type": "string",
-              "enum": [
-                "blocks",
-                "parent-child",
-                "conditional-blocks",
-                "waits-for",
-                "related",
-                "discovered-from",
-                "replies-to",
-                "relates-to",
-                "duplicates",
-                "supersedes",
-                "caused-by"
-              ]
-            },
-            {
-              "type": "string"
-            }
-          ]
-        },
-        "Comment": {
-          "description": "A comment on an issue.",
-          "type": "object",
-          "properties": {
-            "id": {
-              "type": "integer",
-              "format": "int64"
-            },
-            "issue_id": {
-              "type": "string"
-            },
-            "author": {
-              "type": "string"
-            },
-            "text": {
-              "type": "string"
-            },
-            "created_at": {
-              "type": "string",
-              "format": "date-time"
-            }
-          },
-          "required": [
-            "id",
-            "issue_id",
-            "author",
-            "text",
-            "created_at"
-          ]
-        }
-      }
+      ]
     }
   },
   "commands": {
@@ -2626,12 +3601,26 @@
       "item_schema": "BlockedIssue",
       "error_envelope_on_stderr": false
     },
+    "capabilities": {
+      "shape": "object",
+      "jq_filter": ".",
+      "error_envelope_on_stderr": false,
+      "notes": "Machine-readable command, feature, safety, exit-code, and env-var inventory."
+    },
     "comments list": {
       "shape": "array",
       "jq_filter": ".[]",
       "items_at": ".",
       "error_envelope_on_stderr": true,
       "notes": "Empty array if no comments. ErrorEnvelope on stderr if the issue id cannot be resolved."
+    },
+    "coordination status": {
+      "shape": "object",
+      "jq_filter": ".claims[]",
+      "items_at": ".claims",
+      "item_schema": "CoordinationClaimRow",
+      "error_envelope_on_stderr": false,
+      "notes": "Read-only object with workspace summary and `claims[]` rows. The full envelope schema is `CoordinationStatusOutput`."
     },
     "count": {
       "shape": "object",
@@ -2679,6 +3668,12 @@
       "items_at": ".",
       "item_schema": "ReadyIssue",
       "error_envelope_on_stderr": false
+    },
+    "robot-docs guide": {
+      "shape": "object",
+      "jq_filter": ".",
+      "error_envelope_on_stderr": false,
+      "notes": "JSON/TOON modes wrap the concise agent guide; text mode prints the guide directly."
     },
     "search": {
       "shape": "array",

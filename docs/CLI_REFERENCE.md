@@ -38,6 +38,8 @@ Comprehensive reference for all `br` (beads_rust) commands.
   - [sync](#sync)
   - [config](#config)
 - [Agent Integration](#agent-integration)
+  - [capabilities](#capabilities)
+  - [robot-docs](#robot-docs)
   - [serve](#serve)
 - [Diagnostics & Info](#diagnostics--info)
   - [agents](#agents)
@@ -1006,6 +1008,59 @@ br config edit
 ---
 
 ## Agent Integration
+
+### capabilities
+
+Describe br's machine-readable command contracts, safety guarantees, supported
+output formats, exit-code categories, and environment variables.
+
+```bash
+br capabilities [OPTIONS]
+```
+
+Use this as the first discovery call in automation:
+
+```bash
+br capabilities --format json
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--format <FMT>` | Output format: text, json, toon |
+| `--stats` | Show token savings stats when using TOON output |
+
+JSON and TOON output include `contract_version`,
+`recommended_entrypoints`, `features`, `commands`, `global_flags`,
+`exit_codes`, `env_vars`, and `safety`.
+
+---
+
+### robot-docs
+
+Print concise in-tool documentation for automation agents.
+
+```bash
+br robot-docs guide [OPTIONS]
+```
+
+Text mode prints a short handbook under 80 lines. JSON and TOON modes wrap the
+same guide with `contract_version`, `line_count`, and canonical commands.
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--format <FMT>` | Output format: text, json, toon |
+| `--stats` | Show token savings stats when using TOON output |
+
+**Example:**
+
+```bash
+br robot-docs guide
+br robot-docs guide --format json
+```
+
+---
 
 ### serve
 

@@ -371,6 +371,7 @@ fn main() {
                 commands::count::execute(&args, cli.json, &overrides, &output_ctx)
             }
         }
+        Commands::Capabilities(args) => commands::capabilities::execute(&args, &output_ctx),
         Commands::Stale(args) => storage_result.as_ref().map_or_else(
             || commands::stale::execute(&args, &overrides, &output_ctx),
             |res| commands::stale::execute_with_storage(&args, &output_ctx, &res.storage),
@@ -400,6 +401,7 @@ fn main() {
                 commands::ready::execute(&args, cli.json, &overrides, &output_ctx)
             }
         }
+        Commands::RobotDocs { command } => commands::robot_docs::execute(&command, &output_ctx),
         Commands::Scheduler(args) => {
             if let (Some(res), Some(beads_dir)) = (storage_result.as_ref(), ctx.beads_dir.as_ref())
             {
@@ -870,6 +872,8 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Sync(_)
         | Commands::Doctor(_)
         | Commands::Info(_)
+        | Commands::Capabilities(_)
+        | Commands::RobotDocs { .. }
         | Commands::Schema(_)
         | Commands::Where
         | Commands::Version(_)
@@ -989,6 +993,10 @@ fn command_requested_output_format(cmd: &Commands) -> Option<OutputFormat> {
         Commands::Show(args) => args.format.map(Into::into),
         Commands::Coordination { command } => match command {
             beads_rust::cli::CoordinationCommands::Status(args) => args.format.map(Into::into),
+        },
+        Commands::Capabilities(args) => args.format.map(Into::into),
+        Commands::RobotDocs { command } => match command {
+            beads_rust::cli::RobotDocsCommands::Guide(args) => args.format.map(Into::into),
         },
         Commands::Ready(args) => args.format.map(Into::into),
         Commands::Scheduler(args) => args.format.map(Into::into),
@@ -1686,6 +1694,8 @@ mod tests {
     fn diagnostic_and_config_commands_skip_auto_import() {
         let cases: &[&[&str]] = &[
             &["br", "doctor"],
+            &["br", "capabilities"],
+            &["br", "robot-docs", "guide"],
             &["br", "where"],
             &["br", "schema"],
             &["br", "config", "path"],
@@ -1738,7 +1748,12 @@ mod tests {
 
     #[test]
     fn config_path_and_edit_do_not_require_db_write_lock() {
-        let cases: &[&[&str]] = &[&["br", "config", "path"], &["br", "config", "edit"]];
+        let cases: &[&[&str]] = &[
+            &["br", "config", "path"],
+            &["br", "config", "edit"],
+            &["br", "capabilities"],
+            &["br", "robot-docs", "guide"],
+        ];
 
         for argv in cases {
             let command = Cli::parse_from(*argv).command;

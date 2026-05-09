@@ -742,6 +742,9 @@ pub enum Commands {
     /// List blocked issues
     Blocked(BlockedArgs),
 
+    /// Describe br's machine-readable contracts and safety guarantees
+    Capabilities(CapabilitiesArgs),
+
     /// Generate changelog from closed issues
     Changelog(ChangelogArgs),
 
@@ -849,6 +852,13 @@ pub enum Commands {
 
     /// Reopen an issue
     Reopen(ReopenArgs),
+
+    /// Print concise in-tool docs for automation agents
+    #[command(name = "robot-docs", alias = "robot_docs")]
+    RobotDocs {
+        #[command(subcommand)]
+        command: RobotDocsCommands,
+    },
 
     /// Rank ready work for agent swarms with explainable evidence
     #[command(alias = "schedule")]
@@ -1339,6 +1349,37 @@ pub enum SchemaTarget {
     Error,
     /// Per-command JSON output envelope map (top-level shape + jq filter per command)
     Commands,
+}
+
+/// Arguments for the capabilities command.
+#[derive(Args, Debug, Default, Clone)]
+pub struct CapabilitiesArgs {
+    /// Output format (text, json, toon). Env: BR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT.
+    #[arg(long, value_enum)]
+    pub format: Option<OutputFormatBasic>,
+
+    /// Show token savings stats when using TOON output
+    #[arg(long)]
+    pub stats: bool,
+}
+
+/// Subcommands for robot-oriented in-tool documentation.
+#[derive(Subcommand, Debug, Clone)]
+pub enum RobotDocsCommands {
+    /// Print the concise agent guide
+    Guide(RobotDocsGuideArgs),
+}
+
+/// Arguments for `br robot-docs guide`.
+#[derive(Args, Debug, Default, Clone)]
+pub struct RobotDocsGuideArgs {
+    /// Output format (text, json, toon). Env: BR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT.
+    #[arg(long, value_enum)]
+    pub format: Option<OutputFormatBasic>,
+
+    /// Show token savings stats when using TOON output
+    #[arg(long)]
+    pub stats: bool,
 }
 
 /// Output format for list command.
