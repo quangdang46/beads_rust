@@ -292,6 +292,107 @@ fn e2e_capabilities_command_detail_group_contracts_json() {
     );
 }
 
+fn capabilities_command_detail_output(workspace: &BrWorkspace, command: &str) -> Value {
+    let label = format!(
+        "capabilities_command_detail_{}_json",
+        command.replace(' ', "_")
+    );
+    let run = run_br(
+        workspace,
+        ["capabilities", "--format", "json", "--command", command],
+        &label,
+    );
+    assert!(
+        run.status.success(),
+        "capabilities {command} detail failed: {}",
+        run.stderr
+    );
+    let payload = extract_json_payload(&run.stdout);
+    serde_json::from_str(&payload).expect("valid JSON output")
+}
+
+fn assert_array_text_contains(detail: &Value, field: &str, needle: &str, context: &str) {
+    assert!(
+        detail
+            .get(field)
+            .and_then(Value::as_array)
+            .is_some_and(|values| values
+                .iter()
+                .any(|value| value.as_str().is_some_and(|text| text.contains(needle)))),
+        "missing {context}: {detail}"
+    );
+}
+
+#[test]
+fn e2e_capabilities_command_detail_high_traffic_safety_notes_json() {
+    let _log = common::test_log("e2e_capabilities_command_detail_high_traffic_safety_notes_json");
+    let workspace = BrWorkspace::new();
+
+    let cases = [
+        (
+            "update",
+            "write",
+            "examples",
+            "--add-label",
+            "update task recipe examples",
+        ),
+        (
+            "update",
+            "write",
+            "safety_notes",
+            "last-touched",
+            "update last-touched safety note",
+        ),
+        (
+            "close",
+            "write",
+            "safety_notes",
+            "--force",
+            "close --force safety note",
+        ),
+        (
+            "scheduler",
+            "read",
+            "examples",
+            "--candidate-limit",
+            "scheduler task recipe examples",
+        ),
+        (
+            "scheduler",
+            "read",
+            "safety_notes",
+            "does not claim",
+            "scheduler read-only safety note",
+        ),
+        (
+            "count",
+            "read",
+            "examples",
+            "--by-label",
+            "count grouped examples",
+        ),
+        (
+            "search",
+            "read",
+            "safety_notes",
+            "read-only",
+            "search read-only safety note",
+        ),
+    ];
+
+    for (command, operation, field, needle, context) in cases {
+        let output = capabilities_command_detail_output(&workspace, command);
+        let detail = output
+            .get("command_detail")
+            .expect("capabilities output should include command_detail");
+        assert_eq!(
+            detail.get("operation").and_then(Value::as_str),
+            Some(operation)
+        );
+        assert_array_text_contains(detail, field, needle, context);
+    }
+}
+
 #[test]
 fn e2e_robot_docs_guide_text_is_concise() {
     let _log = common::test_log("e2e_robot_docs_guide_text_is_concise");

@@ -1024,6 +1024,7 @@ Use this as the first discovery call in automation:
 br capabilities --format json
 br capabilities --format json --command "create"
 br capabilities --format json --command "comments add"
+br capabilities --format json --command "update"
 ```
 
 **Options:**
@@ -1037,8 +1038,8 @@ JSON and TOON output include `contract_version`,
 `recommended_entrypoints`, `features`, `commands`, `global_flags`,
 `exit_codes`, `env_vars`, and `safety`. When `--command` is supplied, output
 also includes `command_detail` with canonical path, aliases, subcommands,
-positionals, options, defaults, possible values, examples, and workspace/safety
-contract metadata.
+positionals, options, defaults, possible values, examples, command-specific
+safety notes, and workspace/safety contract metadata.
 
 ---
 

@@ -79,6 +79,7 @@ struct CommandDetail {
     workspace: &'static str,
     machine_output: &'static [&'static str],
     examples: &'static [&'static str],
+    safety_notes: &'static [&'static str],
     arguments: Vec<ArgumentCapability>,
     subcommands: Vec<SubcommandCapability>,
 }
@@ -389,6 +390,7 @@ fn command_matches_path_segment(command: &ClapCommand, segment: &str) -> bool {
 fn command_detail(command: &ClapCommand, canonical_path: &[String]) -> CommandDetail {
     let contract_path = canonical_path.join(" ");
     let contract = command_contract(&contract_path);
+    let safety_notes = command_safety_notes(&contract_path);
     CommandDetail {
         path: contract_path,
         name: command.get_name().to_string(),
@@ -404,6 +406,7 @@ fn command_detail(command: &ClapCommand, canonical_path: &[String]) -> CommandDe
         workspace: contract.workspace,
         machine_output: contract.machine_output,
         examples: contract.examples,
+        safety_notes,
         arguments: command
             .get_arguments()
             .filter(|argument| !argument.is_hide_set())
@@ -494,6 +497,46 @@ fn parent_examples(name: &str) -> &'static [&'static str] {
         ],
         "config" => &["br config get output.format --json"],
         "history" => &["br history list --json"],
+        _ => &[],
+    }
+}
+
+fn command_safety_notes(name: &str) -> &'static [&'static str] {
+    match name {
+        "update" => &[
+            "Pass explicit IDs in automation; without IDs, update uses the last-touched issue.",
+            "`--claim` refuses blocked issues unless `--force` is supplied.",
+            "Use `--assignee \"\"`, `--owner \"\"`, `--due \"\"`, `--defer \"\"`, or `--parent \"\"` to clear those fields.",
+        ],
+        "close" => &[
+            "Pass explicit IDs in automation; without IDs, close uses the last-touched issue.",
+            "`--force` closes even when open dependencies still block the issue.",
+            "Use `--suggest-next` only when closing one issue and you want newly unblocked work returned.",
+        ],
+        "delete" => &[
+            "Delete creates tombstones by default; use `--dry-run` before bulk deletes.",
+            "`--hard` prunes tombstones from JSONL immediately and should be rare.",
+        ],
+        "sync" => &[
+            "br sync never runs git operations.",
+            "External JSONL paths require both `BEADS_JSONL` and `--allow-external-jsonl`.",
+            "Use `--status --json` or `--witness` for read-only diagnostics.",
+        ],
+        "search" => &[
+            "Search is read-only; prefer `--format json` or `--format toon` for parsing.",
+            "Use list-style filters after the query to narrow result sets.",
+        ],
+        "count" => &[
+            "Count is read-only; grouped output is selected with `--by` or `--by-*` aliases.",
+            "Use filters such as `--status`, `--priority`, `--type`, and `--assignee` to match list/search scope.",
+        ],
+        "scheduler" => &[
+            "Scheduler is read-only and ranks already-ready issues; it does not claim work.",
+            "Use `--limit` for returned recommendations and `--candidate-limit` for the scoring window.",
+        ],
+        "upgrade" => {
+            &["Use `--check` to inspect availability before changing the installed binary."]
+        }
         _ => &[],
     }
 }
@@ -658,13 +701,21 @@ fn command_contract(name: &str) -> CommandContract {
             operation: "write",
             workspace: "required",
             machine_output: &["json", "text"],
-            examples: &["br update br-abc --claim --json"],
+            examples: &[
+                "br update br-abc --claim --json",
+                "br update br-abc --status in_progress --assignee agent-name --json",
+                "br update br-abc --add-label needs-review --json",
+            ],
         },
         "close" => CommandContract {
             operation: "write",
             workspace: "required",
             machine_output: &["json", "text"],
-            examples: &["br close br-abc --reason \"Done\" --json"],
+            examples: &[
+                "br close br-abc --reason \"Completed\" --json",
+                "br close br-abc --reason \"Completed\" --suggest-next --json",
+                "br close br-abc --agent-name Codex --model gpt-5 --harness local --json",
+            ],
         },
         "reopen" => CommandContract {
             operation: "write",
@@ -706,7 +757,10 @@ fn command_contract(name: &str) -> CommandContract {
             operation: "read",
             workspace: "required",
             machine_output: &["json", "toon", "text"],
-            examples: &["br scheduler --json"],
+            examples: &[
+                "br scheduler --json",
+                "br scheduler --limit 5 --candidate-limit 100 --format json",
+            ],
         },
         "coordination" => CommandContract {
             operation: "read",
@@ -730,13 +784,19 @@ fn command_contract(name: &str) -> CommandContract {
             operation: "read",
             workspace: "required",
             machine_output: &["json", "toon", "csv", "text"],
-            examples: &["br search \"auth\" --format json"],
+            examples: &[
+                "br search \"auth\" --format json",
+                "br search \"auth\" --status open --priority 0 --format toon",
+            ],
         },
         "count" => CommandContract {
             operation: "read",
             workspace: "required",
             machine_output: &["json", "text"],
-            examples: &["br count --by status --json"],
+            examples: &[
+                "br count --by status --json",
+                "br count --by-label --status open --json",
+            ],
         },
         "stale" => CommandContract {
             operation: "read",
@@ -829,6 +889,18 @@ fn render_text(output: &CapabilitiesOutput, requested_command: Option<&str>) {
             "  canonical: {}  operation: {}  workspace: {}",
             detail.path, detail.operation, detail.workspace
         );
+        if !detail.examples.is_empty() {
+            println!("  examples:");
+            for example in detail.examples {
+                println!("    {example}");
+            }
+        }
+        if !detail.safety_notes.is_empty() {
+            println!("  safety notes:");
+            for note in detail.safety_notes {
+                println!("    {note}");
+            }
+        }
         if !detail.arguments.is_empty() {
             println!("  arguments:");
             for argument in &detail.arguments {
