@@ -983,8 +983,8 @@ fn command_contract(name: &str) -> CommandContract {
         "upgrade" => CommandContract {
             operation: "write",
             workspace: "none",
-            machine_output: &["text"],
-            examples: &["br upgrade --check"],
+            machine_output: &["json", "text"],
+            examples: &["br upgrade --check --json"],
         },
         _ => CommandContract {
             operation: "unknown",

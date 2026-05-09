@@ -519,6 +519,13 @@ fn e2e_capabilities_command_detail_machine_output_contracts_json() {
         .expect("capabilities output should include command_detail");
     assert_array_text_contains(detail, "machine_output", "json", "config");
     assert_array_text_excludes(detail, "machine_output", "toon", "config");
+
+    let output = capabilities_command_detail_output(&workspace, "upgrade");
+    let detail = output
+        .get("command_detail")
+        .expect("capabilities output should include command_detail");
+    assert_array_text_contains(detail, "machine_output", "json", "upgrade");
+    assert_array_text_excludes(detail, "machine_output", "toon", "upgrade");
 }
 
 #[test]
