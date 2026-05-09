@@ -1354,6 +1354,10 @@ pub enum SchemaTarget {
 /// Arguments for the capabilities command.
 #[derive(Args, Debug, Default, Clone)]
 pub struct CapabilitiesArgs {
+    /// Include detailed metadata for one command path, e.g. "create" or "comments add"
+    #[arg(long, visible_alias = "for", value_name = "COMMAND_PATH")]
+    pub command: Option<String>,
+
     /// Output format (text, json, toon). Env: BR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT.
     #[arg(long, value_enum)]
     pub format: Option<OutputFormatBasic>,

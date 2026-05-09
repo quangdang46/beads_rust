@@ -3,9 +3,9 @@
 use crate::cli::{
     CapabilitiesArgs, Cli, OutputFormat, resolve_output_format_basic_with_outer_mode,
 };
-use crate::error::Result;
+use crate::error::{BeadsError, Result};
 use crate::output::{OutputContext, OutputMode};
-use clap::CommandFactory;
+use clap::{Arg, Command as ClapCommand, CommandFactory};
 use serde::Serialize;
 
 const CONTRACT_VERSION: &str = "br.capabilities.v1";
@@ -23,6 +23,8 @@ struct CapabilitiesOutput {
     env_vars: &'static [EnvVarCapability],
     safety: &'static [SafetyCapability],
     recommended_entrypoints: &'static [&'static str],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command_detail: Option<CommandDetail>,
 }
 
 #[derive(Debug, Serialize)]
@@ -64,6 +66,43 @@ struct EnvVarCapability {
 struct SafetyCapability {
     name: &'static str,
     guarantee: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct CommandDetail {
+    path: String,
+    name: String,
+    summary: String,
+    long_about: Option<String>,
+    aliases: Vec<String>,
+    operation: &'static str,
+    workspace: &'static str,
+    machine_output: &'static [&'static str],
+    examples: &'static [&'static str],
+    arguments: Vec<ArgumentCapability>,
+    subcommands: Vec<SubcommandCapability>,
+}
+
+#[derive(Debug, Serialize)]
+struct ArgumentCapability {
+    id: String,
+    kind: &'static str,
+    long: Option<String>,
+    short: Option<String>,
+    aliases: Vec<String>,
+    help: Option<String>,
+    required: bool,
+    action: String,
+    value_names: Vec<String>,
+    default_values: Vec<String>,
+    possible_values: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SubcommandCapability {
+    name: String,
+    summary: String,
+    aliases: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -241,6 +280,12 @@ pub fn execute(args: &CapabilitiesArgs, outer_ctx: &OutputContext) -> Result<()>
         return Ok(());
     }
 
+    let command_detail = args
+        .command
+        .as_deref()
+        .map(command_detail_for_path)
+        .transpose()?;
+
     let payload = CapabilitiesOutput {
         tool: "br",
         version: env!("CARGO_PKG_VERSION"),
@@ -253,12 +298,13 @@ pub fn execute(args: &CapabilitiesArgs, outer_ctx: &OutputContext) -> Result<()>
         env_vars: ENV_VARS,
         safety: SAFETY,
         recommended_entrypoints: RECOMMENDED_ENTRYPOINTS,
+        command_detail,
     };
 
     match output_format {
         OutputFormat::Json => ctx.json_pretty(&payload),
         OutputFormat::Toon => ctx.toon_with_stats(&payload, args.stats),
-        OutputFormat::Text | OutputFormat::Csv => render_text(&payload),
+        OutputFormat::Text | OutputFormat::Csv => render_text(&payload, args.command.as_deref()),
     }
 
     Ok(())
@@ -283,6 +329,148 @@ fn command_capabilities() -> Vec<CommandCapability> {
             }
         })
         .collect()
+}
+
+fn command_detail_for_path(path: &str) -> Result<CommandDetail> {
+    let segments = command_path_segments(path)?;
+    let root = Cli::command();
+    let (canonical_path, command) = find_command_path(&root, &segments).ok_or_else(|| {
+        BeadsError::validation(
+            "command",
+            format!(
+                "unknown command path '{path}'. Try one of: {}",
+                root.get_subcommands()
+                    .map(ClapCommand::get_name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )
+    })?;
+
+    Ok(command_detail(command, &canonical_path))
+}
+
+fn command_path_segments(path: &str) -> Result<Vec<&str>> {
+    let mut segments = path.split_whitespace().collect::<Vec<_>>();
+    if segments.first().is_some_and(|segment| *segment == "br") {
+        segments.remove(0);
+    }
+    if segments.is_empty() {
+        return Err(BeadsError::validation(
+            "command",
+            "command path cannot be empty",
+        ));
+    }
+    Ok(segments)
+}
+
+fn find_command_path<'a>(
+    root: &'a ClapCommand,
+    segments: &[&str],
+) -> Option<(Vec<String>, &'a ClapCommand)> {
+    let mut current = root;
+    let mut canonical_path = Vec::with_capacity(segments.len());
+
+    for segment in segments {
+        let next = current
+            .get_subcommands()
+            .find(|command| command_matches_path_segment(command, segment))?;
+        canonical_path.push(next.get_name().to_string());
+        current = next;
+    }
+
+    Some((canonical_path, current))
+}
+
+fn command_matches_path_segment(command: &ClapCommand, segment: &str) -> bool {
+    command.get_name() == segment || command.get_all_aliases().any(|alias| alias == segment)
+}
+
+fn command_detail(command: &ClapCommand, canonical_path: &[String]) -> CommandDetail {
+    let contract = command_contract(
+        canonical_path
+            .first()
+            .map_or(command.get_name(), String::as_str),
+    );
+    CommandDetail {
+        path: canonical_path.join(" "),
+        name: command.get_name().to_string(),
+        summary: command
+            .get_about()
+            .map(std::string::ToString::to_string)
+            .unwrap_or_default(),
+        long_about: command
+            .get_long_about()
+            .map(std::string::ToString::to_string),
+        aliases: command.get_visible_aliases().map(str::to_string).collect(),
+        operation: contract.operation,
+        workspace: contract.workspace,
+        machine_output: contract.machine_output,
+        examples: contract.examples,
+        arguments: command
+            .get_arguments()
+            .filter(|argument| !argument.is_hide_set())
+            .map(argument_capability)
+            .collect(),
+        subcommands: command
+            .get_subcommands()
+            .filter(|subcommand| subcommand.get_name() != "help")
+            .map(subcommand_capability)
+            .collect(),
+    }
+}
+
+fn argument_capability(argument: &Arg) -> ArgumentCapability {
+    let long = argument.get_long().map(|long| format!("--{long}"));
+    let short = argument.get_short().map(|short| format!("-{short}"));
+    let kind = if long.is_some() || short.is_some() {
+        "option"
+    } else {
+        "positional"
+    };
+
+    ArgumentCapability {
+        id: argument.get_id().to_string(),
+        kind,
+        long,
+        short,
+        aliases: argument
+            .get_visible_aliases()
+            .unwrap_or_default()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        help: argument.get_help().map(std::string::ToString::to_string),
+        required: argument.is_required_set(),
+        action: format!("{:?}", argument.get_action()),
+        value_names: argument
+            .get_value_names()
+            .unwrap_or_default()
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect(),
+        default_values: argument
+            .get_default_values()
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect(),
+        possible_values: argument
+            .get_possible_values()
+            .into_iter()
+            .map(|value| value.get_name().to_string())
+            .collect(),
+    }
+}
+
+fn subcommand_capability(command: &ClapCommand) -> SubcommandCapability {
+    SubcommandCapability {
+        name: command.get_name().to_string(),
+        summary: command
+            .get_about()
+            .map(std::string::ToString::to_string)
+            .unwrap_or_default(),
+        aliases: command.get_visible_aliases().map(str::to_string).collect(),
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -483,7 +671,7 @@ fn command_contract(name: &str) -> CommandContract {
     }
 }
 
-fn render_text(output: &CapabilitiesOutput) {
+fn render_text(output: &CapabilitiesOutput, requested_command: Option<&str>) {
     println!(
         "{} {} ({})",
         output.tool, output.version, output.contract_version
@@ -500,6 +688,45 @@ fn render_text(output: &CapabilitiesOutput) {
             "  {:<16} {:<5} {:<8} {}",
             command.name, command.operation, command.workspace, command.summary
         );
+    }
+    if let Some(detail) = output.command_detail.as_ref() {
+        println!();
+        println!(
+            "Command detail: {}",
+            requested_command.unwrap_or(detail.path.as_str())
+        );
+        println!(
+            "  canonical: {}  operation: {}  workspace: {}",
+            detail.path, detail.operation, detail.workspace
+        );
+        if !detail.arguments.is_empty() {
+            println!("  arguments:");
+            for argument in &detail.arguments {
+                let spellings = [argument.short.as_deref(), argument.long.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let name = if spellings.is_empty() {
+                    argument.id.as_str()
+                } else {
+                    spellings.as_str()
+                };
+                println!(
+                    "    {:<22} {:<10} required={} {}",
+                    name,
+                    argument.kind,
+                    argument.required,
+                    argument.help.as_deref().unwrap_or_default()
+                );
+            }
+        }
+        if !detail.subcommands.is_empty() {
+            println!("  subcommands:");
+            for subcommand in &detail.subcommands {
+                println!("    {:<22} {}", subcommand.name, subcommand.summary);
+            }
+        }
     }
     println!();
     println!("Safety:");
