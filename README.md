@@ -191,6 +191,7 @@ br list --json | jq '.issues[] | select(.priority <= 1)'
 br ready --json  # Structured output for agents
 br show br-abc123 --json
 br capabilities --format json
+br capabilities --format json --command "create"
 br robot-docs guide
 ```
 
@@ -772,6 +773,7 @@ br ready --json
 br show br-abc123 --json
 br coordination status --json
 br capabilities --format json
+br capabilities --format json --command "comments add"
 br robot-docs guide
 
 # Create issues programmatically

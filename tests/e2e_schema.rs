@@ -132,6 +132,82 @@ fn e2e_capabilities_json_no_workspace() {
 }
 
 #[test]
+fn e2e_capabilities_command_detail_create_json() {
+    let _log = common::test_log("e2e_capabilities_command_detail_create_json");
+    let workspace = BrWorkspace::new();
+
+    let run = run_br(
+        &workspace,
+        ["capabilities", "--format", "json", "--command", "create"],
+        "capabilities_command_detail_create_json",
+    );
+    assert!(
+        run.status.success(),
+        "capabilities create detail failed: {}",
+        run.stderr
+    );
+
+    let payload = extract_json_payload(&run.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("valid JSON output");
+    let detail = &json["command_detail"];
+
+    assert_eq!(detail["path"], "create");
+    assert_eq!(detail["operation"], "write");
+    assert_eq!(detail["workspace"], "required");
+    assert!(
+        detail["arguments"].as_array().is_some_and(|arguments| {
+            arguments
+                .iter()
+                .any(|argument| argument["long"] == "--slug")
+                && arguments
+                    .iter()
+                    .any(|argument| argument["kind"] == "positional" && argument["id"] == "title")
+        }),
+        "missing create argument metadata: {detail}"
+    );
+}
+
+#[test]
+fn e2e_capabilities_command_detail_nested_alias_json() {
+    let _log = common::test_log("e2e_capabilities_command_detail_nested_alias_json");
+    let workspace = BrWorkspace::new();
+
+    let run = run_br(
+        &workspace,
+        [
+            "capabilities",
+            "--format",
+            "json",
+            "--command",
+            "comment add",
+        ],
+        "capabilities_command_detail_nested_alias_json",
+    );
+    assert!(
+        run.status.success(),
+        "capabilities nested detail failed: {}",
+        run.stderr
+    );
+
+    let payload = extract_json_payload(&run.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("valid JSON output");
+    let detail = &json["command_detail"];
+
+    assert_eq!(detail["path"], "comments add");
+    assert!(
+        detail["arguments"].as_array().is_some_and(|arguments| {
+            arguments
+                .iter()
+                .any(|argument| argument["long"] == "--author")
+                && arguments
+                    .iter()
+                    .any(|argument| argument["kind"] == "positional" && argument["id"] == "id")
+        }),
+        "missing nested command argument metadata: {detail}"
+    );
+}
+
+#[test]
 fn e2e_robot_docs_guide_text_is_concise() {
     let _log = common::test_log("e2e_robot_docs_guide_text_is_concise");
     let workspace = BrWorkspace::new();

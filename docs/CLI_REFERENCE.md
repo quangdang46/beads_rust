@@ -1022,17 +1022,23 @@ Use this as the first discovery call in automation:
 
 ```bash
 br capabilities --format json
+br capabilities --format json --command "create"
+br capabilities --format json --command "comments add"
 ```
 
 **Options:**
 | Option | Description |
 |--------|-------------|
+| `--command <COMMAND_PATH>` | Include detailed metadata for one command path, e.g. `create` or `comments add` |
 | `--format <FMT>` | Output format: text, json, toon |
 | `--stats` | Show token savings stats when using TOON output |
 
 JSON and TOON output include `contract_version`,
 `recommended_entrypoints`, `features`, `commands`, `global_flags`,
-`exit_codes`, `env_vars`, and `safety`.
+`exit_codes`, `env_vars`, and `safety`. When `--command` is supplied, output
+also includes `command_detail` with canonical path, aliases, subcommands,
+positionals, options, defaults, possible values, examples, and workspace/safety
+contract metadata.
 
 ---
 

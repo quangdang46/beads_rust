@@ -390,7 +390,7 @@ fn command_detail(command: &ClapCommand, canonical_path: &[String]) -> CommandDe
     let contract = command_contract(
         canonical_path
             .first()
-            .map_or(command.get_name(), String::as_str),
+            .map_or_else(|| command.get_name(), String::as_str),
     );
     CommandDetail {
         path: canonical_path.join(" "),
