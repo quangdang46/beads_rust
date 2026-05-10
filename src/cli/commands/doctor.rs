@@ -3660,10 +3660,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     // the repair flow falls back to its legacy in-place writes. This
     // matches the project's no-regression rule for WP1→WP3.
     let mut session: Option<DoctorRepairSession> = if args.repair {
-        match DoctorRepairSession::new(
-            &beads_dir.parent().unwrap_or(&beads_dir).to_path_buf(),
-            args.dry_run,
-        ) {
+        match DoctorRepairSession::new(beads_dir.parent().unwrap_or(&beads_dir), args.dry_run) {
             Ok(sess) => Some(sess),
             Err(err) => {
                 tracing::warn!(
@@ -6283,5 +6280,194 @@ mod tests {
             "allowlist entry must NOT trigger warn; got {:?}",
             check.status
         );
+    }
+
+    // ---------------------------------------------------------------
+    // WP3 chokepoint integration tests (Task E)
+    //
+    // These tests cover the four invariants the WP3 spec requires once
+    // the doctor's WP1 chokepoint becomes load-bearing:
+    //
+    //   1. `--dry-run` writes nothing to disk — neither the target file
+    //      nor an `actions.jsonl` line.
+    //   2. A real (non-dry-run) repair appends to `actions.jsonl` and
+    //      the line parses as JSON with the WP1 schema.
+    //   3. `write_undo_sh` produces an executable bash script.
+    //   4. The "no delete" invariant: when the doctor would otherwise
+    //      remove a file, it instead renames it into the per-run
+    //      quarantine area.
+    //
+    // We exercise these via the gitignore fixer (the only path WP3
+    // wires through `mutate()` end-to-end without touching the
+    // config-crate boundary), plus a direct chokepoint call for the
+    // quarantine-not-delete invariant. The other repair phases (DB
+    // rebuild, sidecar quarantine, REINDEX/VACUUM) are deferred to WP4.
+    // ---------------------------------------------------------------
+
+    /// Build a minimal doctor fixture: a repo root containing `.beads/`
+    /// and a root `.gitignore` containing an offending pattern that
+    /// `fix_root_gitignore_if_warned` will rewrite.
+    fn make_doctor_fixture(tmp: &Path) -> (PathBuf, PathBuf, DoctorReport) {
+        let beads_dir = tmp.join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let gitignore = tmp.join(".gitignore");
+        fs::write(&gitignore, b"keep-me\n.beads/\n").unwrap();
+
+        // Synthesise the warning the fixer keys off of.
+        let report = DoctorReport {
+            ok: false,
+            workspace_health: None,
+            reliability_audit: None,
+            checks: vec![CheckResult {
+                name: "gitignore.beads_inner".to_string(),
+                status: CheckStatus::Warn,
+                message: Some("offending pattern".to_string()),
+                details: None,
+            }],
+        };
+        (beads_dir, gitignore, report)
+    }
+
+    fn quiet_ctx() -> OutputContext {
+        OutputContext::from_output_format(crate::cli::OutputFormat::Json, false, true)
+    }
+
+    #[test]
+    fn wp3_repair_dry_run_writes_no_files() {
+        let tmp = TempDir::new().unwrap();
+        let (beads_dir, gitignore, report) = make_doctor_fixture(tmp.path());
+
+        // Build the session first — `create_run_dir` may append a
+        // `.doctor/` line to `.gitignore` (this is an idempotent,
+        // documented setup write that happens once per repair run, not
+        // a fixer mutation). Snapshot AFTER session construction so we
+        // measure only what the dry-run fixer attempts.
+        let mut session =
+            DoctorRepairSession::new(tmp.path(), /* dry_run = */ true).expect("session must build");
+        let post_session_baseline = fs::read(&gitignore).unwrap();
+        let actions_path = session.run.actions_file.clone();
+
+        let result =
+            fix_root_gitignore_if_warned(&beads_dir, &report, &quiet_ctx(), Some(&mut session));
+        assert!(result, "fixer must report success even in dry-run");
+
+        // The fixer must not touch the file in dry-run.
+        assert_eq!(
+            fs::read(&gitignore).unwrap(),
+            post_session_baseline,
+            "dry-run must not mutate the target file"
+        );
+
+        // No actions.jsonl line should have been appended by the fixer.
+        let actions = fs::read(&actions_path).unwrap_or_default();
+        assert!(
+            actions.is_empty(),
+            "dry-run must not append to actions.jsonl; got {} bytes",
+            actions.len()
+        );
+    }
+
+    #[test]
+    fn wp3_repair_writes_actions_jsonl() {
+        let tmp = TempDir::new().unwrap();
+        let (beads_dir, _gitignore, report) = make_doctor_fixture(tmp.path());
+
+        let mut session = DoctorRepairSession::new(tmp.path(), /* dry_run = */ false)
+            .expect("session must build");
+        let actions_path = session.run.actions_file.clone();
+        let result =
+            fix_root_gitignore_if_warned(&beads_dir, &report, &quiet_ctx(), Some(&mut session));
+        assert!(result, "fixer must report success");
+
+        let actions = fs::read_to_string(&actions_path).expect("actions.jsonl readable");
+        let lines: Vec<&str> = actions.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "exactly one action recorded; got {actions:?}"
+        );
+
+        let value: serde_json::Value = serde_json::from_str(lines[0]).expect("valid JSON line");
+        assert_eq!(value["op"], "write_file");
+        assert_eq!(value["fixer_id"], "doctor.gitignore_repair");
+        assert_eq!(value["ok"], true);
+        assert!(
+            value["before_hash"]
+                .as_str()
+                .unwrap()
+                .starts_with("sha256:"),
+            "before_hash present"
+        );
+        assert!(
+            value["after_hash"].as_str().unwrap().starts_with("sha256:"),
+            "after_hash present"
+        );
+    }
+
+    #[test]
+    fn wp3_repair_creates_undo_sh() {
+        let tmp = TempDir::new().unwrap();
+        let session = DoctorRepairSession::new(tmp.path(), /* dry_run = */ false)
+            .expect("session must build");
+        run_dir::write_undo_sh(&session.run).expect("undo.sh write");
+
+        let undo = &session.run.undo_script;
+        assert!(undo.is_file(), "undo.sh exists at {}", undo.display());
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(undo).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o755,
+            "undo.sh must be world-executable; got {mode:o}"
+        );
+        let body = fs::read_to_string(undo).unwrap();
+        assert!(body.starts_with("#!/usr/bin/env bash"));
+    }
+
+    #[test]
+    fn wp3_quarantine_renames_not_deletes() {
+        // The "no delete" invariant: when the doctor wants to remove a
+        // file, it must instead `Op::Rename` it into the per-run
+        // quarantine area. We exercise this via a direct chokepoint
+        // call against an orphan `.wal` sidecar — the same kind of file
+        // the legacy sidecar repair targets.
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let orphan_wal = beads_dir.join("beads.db-wal");
+        fs::write(&orphan_wal, b"orphan-wal-bytes").unwrap();
+
+        let mut session = DoctorRepairSession::new(tmp.path(), /* dry_run = */ false)
+            .expect("session must build");
+        session.set_fixer("doctor.test.quarantine");
+        let quarantine_dst = session.run.root.join("quarantine/.beads/beads.db-wal");
+        let result = chokepoint::mutate(
+            &session.ctx,
+            &orphan_wal,
+            Op::Rename {
+                to: quarantine_dst.clone(),
+            },
+        )
+        .expect("rename into quarantine must succeed");
+        assert!(result.ok);
+
+        // The orphan must be moved, not deleted.
+        assert!(!orphan_wal.exists(), "source must be moved out of .beads/");
+        assert!(
+            quarantine_dst.exists(),
+            "destination must exist at {}",
+            quarantine_dst.display()
+        );
+        assert_eq!(fs::read(&quarantine_dst).unwrap(), b"orphan-wal-bytes");
+
+        // The actions.jsonl line records the rename target so
+        // `doctor undo` and the bash fallback can reverse it.
+        let actions = fs::read_to_string(&session.run.actions_file).unwrap();
+        let line = actions
+            .lines()
+            .find(|l| !l.is_empty())
+            .expect("actions.jsonl has a line");
+        let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(value["op"], "rename");
+        assert!(value.get("rename_to").is_some(), "rename_to recorded");
     }
 }
