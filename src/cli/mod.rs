@@ -2658,6 +2658,13 @@ pub struct DoctorArgs {
     /// Allow another JSONL rebuild after prior failed recovery evidence
     #[arg(long)]
     pub allow_repeated_repair: bool,
+
+    /// With `--repair`, print the planned mutations to stderr without
+    /// writing anything. Without `--repair` this is a no-op (doctor is
+    /// already read-only). Wired through the WP1 `mutate()` chokepoint
+    /// in `cli::commands::doctor_subsystems::mutate`.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 /// Arguments for the upgrade command.
