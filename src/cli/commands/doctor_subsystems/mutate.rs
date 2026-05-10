@@ -997,9 +997,29 @@ fn execute_atomic(path: &Path, op: Op) -> std::io::Result<()> {
                 .map_err(|e| std::io::Error::other(e.error.to_string()))?;
         }
         Op::AppendFile { content } => {
-            let mut f = OpenOptions::new().append(true).create(true).open(path)?;
-            f.write_all(&content)?;
-            f.sync_data()?;
+            // Crash-safety: a raw `O_APPEND` write leaves a torn line
+            // on the file if we crash mid-write. The chokepoint
+            // contract is "atomic or not at all", so we materialize
+            // the new contents (existing + new) in a tmpfile, fsync,
+            // and rename(2). This costs an extra read but matches
+            // the WriteFile guarantee.
+            let existing = read_or_empty(path)?;
+            let mut buf = Vec::with_capacity(existing.len().saturating_add(content.len()));
+            buf.extend_from_slice(&existing);
+            buf.extend_from_slice(&content);
+            let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+            tmp.write_all(&buf)?;
+            tmp.as_file().sync_data()?;
+            // Preserve the existing file's mode if any; default to
+            // 0o644 for fresh files.
+            let mode = match fs::metadata(path) {
+                Ok(m) => m.permissions().mode(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0o644,
+                Err(e) => return Err(e),
+            };
+            fs::set_permissions(tmp.path(), fs::Permissions::from_mode(mode))?;
+            tmp.persist(path)
+                .map_err(|e| std::io::Error::other(e.error.to_string()))?;
         }
         Op::Rename { to } => {
             if let Some(p) = to.parent() {
