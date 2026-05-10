@@ -15,6 +15,10 @@
 {"workflow":".github/workflows/conformance.yml","action":"actions/upload-artifact","sha":"043fb46d1a93c77aae656e7c1c64a875d1fc6a0a","tag":"v7.0.1","source":"current workflow ref; inline tag comment"}
 {"workflow":".github/workflows/conformance.yml","action":"dtolnay/rust-toolchain","sha":"3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9","tag":"default-branch-head-2026-05-08","source":"current workflow ref; git ls-remote HEAD"}
 {"workflow":".github/workflows/conformance.yml","action":"Swatinem/rust-cache","sha":"e18b497796c12c097a38f9edb9d0641fb99eee32","tag":"v2.9.1","source":"current workflow ref; inline tag comment"}
+{"workflow":".github/workflows/doctor.yml","action":"actions/checkout","sha":"de0fac2e4500dabe0009e67214ff5f5447ce83dd","tag":"v6.0.2","source":"current workflow ref; inline tag comment"}
+{"workflow":".github/workflows/doctor.yml","action":"actions/upload-artifact","sha":"043fb46d1a93c77aae656e7c1c64a875d1fc6a0a","tag":"v7.0.1","source":"current workflow ref; inline tag comment"}
+{"workflow":".github/workflows/doctor.yml","action":"dtolnay/rust-toolchain","sha":"3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9","tag":"default-branch-head-2026-05-08","source":"current workflow ref; git ls-remote HEAD"}
+{"workflow":".github/workflows/doctor.yml","action":"Swatinem/rust-cache","sha":"e18b497796c12c097a38f9edb9d0641fb99eee32","tag":"v2.9.1","source":"current workflow ref; inline tag comment"}
 {"workflow":".github/workflows/e2e-full.yml","action":"actions/cache/restore","sha":"27d5ce7f107fe9357f9df03efb73ab90386fccae","tag":"v5.0.5","source":"current workflow ref; inline tag comment"}
 {"workflow":".github/workflows/e2e-full.yml","action":"actions/cache/save","sha":"27d5ce7f107fe9357f9df03efb73ab90386fccae","tag":"v5.0.5","source":"current workflow ref; inline tag comment"}
 {"workflow":".github/workflows/e2e-full.yml","action":"actions/checkout","sha":"de0fac2e4500dabe0009e67214ff5f5447ce83dd","tag":"v6.0.2","source":"current workflow ref; inline tag comment"}

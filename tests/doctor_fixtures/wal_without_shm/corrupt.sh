@@ -18,6 +18,9 @@ cd "$target_dir"
 # Ensure SHM is absent (frankensqlite's default state after a clean exit).
 rm -f .beads/beads.db-shm
 
-rm -rf .fixture_baseline
+if [ -e .fixture_baseline ]; then
+  echo "fixture baseline already exists; expected a fresh workspace" >&2
+  exit 1
+fi
 mkdir -p .fixture_baseline
 tar --exclude=.fixture_baseline -cf .fixture_baseline/state.tar .

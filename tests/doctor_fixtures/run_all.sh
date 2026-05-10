@@ -170,8 +170,7 @@ run_fixture() {
         return 1
     fi
 
-    echo "[PASS] $name"
-    rm -rf "$tmp"
+    echo "[PASS] $name (workspace retained: $tmp)"
     return 0
 }
 

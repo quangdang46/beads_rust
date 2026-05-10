@@ -25,6 +25,9 @@ cd "$target_dir"
 : > .beads/beads.db
 [ -f .beads/beads.db-wal ] && : > .beads/beads.db-wal || true
 
-rm -rf .fixture_baseline
+if [ -e .fixture_baseline ]; then
+  echo "fixture baseline already exists; expected a fresh workspace" >&2
+  exit 1
+fi
 mkdir -p .fixture_baseline
 tar --exclude=.fixture_baseline -cf .fixture_baseline/state.tar .

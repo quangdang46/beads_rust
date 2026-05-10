@@ -76,6 +76,12 @@ struct DoctorRun {
     jsonl_path: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoctorInspectionMode {
+    Full,
+    Quick,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 struct LocalRepairResult {
     blocked_cache_rebuilt: bool,
@@ -209,6 +215,18 @@ const ROOT_GITIGNORE_REPAIR_MESSAGE: &str =
     "Removed offending .beads ignore pattern(s) from root .gitignore";
 const NO_OP_REPAIR_MESSAGE: &str = "No errors detected; nothing to repair.";
 const REINDEX_INCOMPLETE_MESSAGE: &str = "REINDEX was attempted but did not complete.";
+
+fn is_quick_suppressed_doctor_check(name: &str) -> bool {
+    matches!(
+        name,
+        "db.recoverable_anomalies"
+            | "counts.db_vs_jsonl"
+            | "sync.metadata"
+            | "sqlite.cli_integrity"
+            | "sqlite3.integrity_check"
+            | "db.write_probe"
+    )
+}
 
 #[derive(Debug, Default)]
 struct SidecarInspection {
@@ -473,6 +491,12 @@ fn has_error(checks: &[CheckResult]) -> bool {
     checks
         .iter()
         .any(|check| matches!(check.status, CheckStatus::Error))
+}
+
+fn has_non_ok(checks: &[CheckResult]) -> bool {
+    checks
+        .iter()
+        .any(|check| !matches!(check.status, CheckStatus::Ok))
 }
 
 fn push_anomaly(anomalies: &mut Vec<AnomalyClass>, anomaly: AnomalyClass) {
@@ -3541,6 +3565,14 @@ fn check_sync_metadata(
 }
 
 fn collect_doctor_report(beads_dir: &Path, paths: &config::ConfigPaths) -> Result<DoctorRun> {
+    collect_doctor_report_with_mode(beads_dir, paths, DoctorInspectionMode::Full)
+}
+
+fn collect_doctor_report_with_mode(
+    beads_dir: &Path,
+    paths: &config::ConfigPaths,
+    mode: DoctorInspectionMode,
+) -> Result<DoctorRun> {
     let mut checks = Vec::new();
     check_merge_artifacts(beads_dir, &mut checks)?;
     check_root_gitignore(beads_dir, &mut checks);
@@ -3551,12 +3583,16 @@ fn collect_doctor_report(beads_dir: &Path, paths: &config::ConfigPaths) -> Resul
         &paths.db_path,
         jsonl_path.as_deref(),
         jsonl_count,
+        mode,
         &mut checks,
     );
 
     let classification = classify_doctor_checks(&paths.db_path, &paths.jsonl_path, &checks);
     let reliability_audit = classification.audit_record("doctor.inspect");
-    let ok = !has_error(&checks);
+    let ok = match mode {
+        DoctorInspectionMode::Full => !has_error(&checks),
+        DoctorInspectionMode::Quick => !has_non_ok(&checks),
+    };
     emit_doctor_reliability_audit("inspect", ok, &reliability_audit, &checks);
 
     Ok(DoctorRun {
@@ -3612,6 +3648,7 @@ fn inspect_doctor_database(
     db_path: &Path,
     jsonl_path: Option<&Path>,
     jsonl_count: JsonlCountState,
+    mode: DoctorInspectionMode,
     checks: &mut Vec<CheckResult>,
 ) {
     if let Err(err) = check_recovery_artifacts(beads_dir, db_path, checks) {
@@ -3632,7 +3669,7 @@ fn inspect_doctor_database(
     }
 
     if db_path.exists() {
-        inspect_existing_doctor_database(db_path, jsonl_path, jsonl_count, checks);
+        inspect_existing_doctor_database(db_path, jsonl_path, jsonl_count, mode, checks);
     } else {
         push_check(
             checks,
@@ -3648,6 +3685,7 @@ fn inspect_existing_doctor_database(
     db_path: &Path,
     jsonl_path: Option<&Path>,
     jsonl_count: JsonlCountState,
+    mode: DoctorInspectionMode,
     checks: &mut Vec<CheckResult>,
 ) {
     match config::with_database_family_snapshot(db_path, |snapshot_db_path| {
@@ -3661,7 +3699,9 @@ fn inspect_existing_doctor_database(
                 &err,
             );
         }
-        if let Err(err) = check_recoverable_anomalies(&conn, checks) {
+        if mode == DoctorInspectionMode::Full
+            && let Err(err) = check_recoverable_anomalies(&conn, checks)
+        {
             push_inspection_error(
                 checks,
                 "db.recoverable_anomalies",
@@ -3673,21 +3713,25 @@ fn inspect_existing_doctor_database(
         check_integrity(&conn, checks);
         // beads_rust-m3mi: audit-suspect close_reasons (warn level)
         check_suspect_close_reasons(&conn, checks);
-        if let Err(err) = check_db_count(&conn, jsonl_count, checks) {
-            push_inspection_error(
-                checks,
-                "counts.db_vs_jsonl",
-                "Failed to compare database and JSONL counts",
-                &err,
-            );
+        if mode == DoctorInspectionMode::Full {
+            if let Err(err) = check_db_count(&conn, jsonl_count, checks) {
+                push_inspection_error(
+                    checks,
+                    "counts.db_vs_jsonl",
+                    "Failed to compare database and JSONL counts",
+                    &err,
+                );
+            }
+            check_sync_metadata(&conn, snapshot_db_path, jsonl_path, checks);
+            check_issue_write_probe(&conn, checks);
         }
-        check_sync_metadata(&conn, snapshot_db_path, jsonl_path, checks);
-        check_issue_write_probe(&conn, checks);
         conn.close()?;
         Ok(())
     }) {
         Ok(()) => {
-            check_sqlite_cli_integrity(db_path, checks);
+            if mode == DoctorInspectionMode::Full {
+                check_sqlite_cli_integrity(db_path, checks);
+            }
         }
         Err(err) => {
             push_check(
@@ -3697,7 +3741,9 @@ fn inspect_existing_doctor_database(
                 Some(format!("Failed to open DB snapshot for inspection: {err}")),
                 Some(serde_json::json!({ "path": db_path.display().to_string() })),
             );
-            check_sqlite_cli_integrity(db_path, checks);
+            if mode == DoctorInspectionMode::Full {
+                check_sqlite_cli_integrity(db_path, checks);
+            }
         }
     }
 }
@@ -3834,7 +3880,12 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         }
     }
 
-    let mut initial = collect_doctor_report(&beads_dir, &paths)?;
+    let inspection_mode = if args.quick && !args.repair && !args.robot_triage {
+        DoctorInspectionMode::Quick
+    } else {
+        DoctorInspectionMode::Full
+    };
+    let mut initial = collect_doctor_report_with_mode(&beads_dir, &paths, inspection_mode)?;
 
     // WP6: --robot-triage short-circuits the flat run with a single
     // `br.doctor.triage.v1` envelope. Read-only; no further dispatch.
@@ -3881,23 +3932,16 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             // Phase 8: drop the slow detectors so pre-commit / CI can
             // gate on a sub-second `br doctor --quick --json`. The
             // dropped detectors are: db.recoverable_anomalies,
-            // counts.db_vs_jsonl, sync.metadata, sqlite.cli_integrity,
+            // counts.db_vs_jsonl, sync.metadata, sqlite3.integrity_check,
             // db.write_probe. The remaining checks are all O(file
             // existence) or single PRAGMA so they stay cheap.
-            initial.report.checks.retain(|c| {
-                !matches!(
-                    c.name.as_str(),
-                    "db.recoverable_anomalies"
-                        | "counts.db_vs_jsonl"
-                        | "sync.metadata"
-                        | "sqlite.cli_integrity"
-                        | "sqlite3.integrity_check"
-                        | "db.write_probe"
-                )
-            });
+            initial
+                .report
+                .checks
+                .retain(|c| !is_quick_suppressed_doctor_check(&c.name));
             // Recompute `ok` from the filtered set so the exit code
             // reflects only the cheap checks the caller asked for.
-            initial.report.ok = !has_error(&initial.report.checks);
+            initial.report.ok = !has_non_ok(&initial.report.checks);
         }
         print_report(&initial.report, ctx)?;
         if !initial.report.ok {
@@ -5167,6 +5211,7 @@ mod tests {
             ",
         )
         .unwrap();
+        conn.close().unwrap();
         fs::write(&jsonl_path, "{\"id\":\"bd-test\"}\n").unwrap();
 
         let paths = config::ConfigPaths {
@@ -5188,6 +5233,91 @@ mod tests {
                 .is_some_and(|message| message.contains("Failed to inspect recoverable anomalies")),
             "unexpected check message: {:?}",
             anomaly_check.message
+        );
+    }
+
+    #[test]
+    fn test_collect_doctor_report_quick_skips_slow_detectors_before_execution() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        conn.execute(
+            r"
+            CREATE TABLE issues (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                status TEXT NOT NULL,
+                priority INTEGER NOT NULL,
+                issue_type TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            ",
+        )
+        .unwrap();
+        fs::write(&jsonl_path, "{\"id\":\"bd-test\"}\n").unwrap();
+
+        let paths = config::ConfigPaths {
+            beads_dir: beads_dir.clone(),
+            db_path,
+            jsonl_path,
+            metadata: config::Metadata::default(),
+        };
+
+        let quick =
+            collect_doctor_report_with_mode(&beads_dir, &paths, DoctorInspectionMode::Quick)
+                .expect("quick doctor report");
+
+        assert!(
+            find_check(&quick.report.checks, "schema.tables").is_some(),
+            "quick mode should still run cheap schema checks"
+        );
+        for skipped in [
+            "db.recoverable_anomalies",
+            "counts.db_vs_jsonl",
+            "sync.metadata",
+            "sqlite3.integrity_check",
+            "db.write_probe",
+        ] {
+            assert!(
+                find_check(&quick.report.checks, skipped).is_none(),
+                "quick mode should not execute slow detector {skipped}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_collect_doctor_report_quick_treats_warnings_as_findings() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let db_path = beads_dir.join("beads.db");
+        {
+            let _storage = SqliteStorage::open(&db_path).unwrap();
+        }
+
+        let paths = config::ConfigPaths {
+            beads_dir: beads_dir.clone(),
+            db_path,
+            jsonl_path: beads_dir.join("issues.jsonl"),
+            metadata: config::Metadata::default(),
+        };
+
+        let quick =
+            collect_doctor_report_with_mode(&beads_dir, &paths, DoctorInspectionMode::Quick)
+                .expect("quick doctor report");
+
+        let jsonl_check = find_check(&quick.report.checks, "jsonl.parse").expect("jsonl warning");
+        assert!(matches!(jsonl_check.status, CheckStatus::Warn));
+        assert!(
+            !quick.report.ok,
+            "quick mode should fail its gate when a warning-level finding remains"
         );
     }
 
@@ -5801,7 +5931,13 @@ mod tests {
         lock_conn.execute("BEGIN IMMEDIATE").unwrap();
 
         let mut checks = Vec::new();
-        inspect_existing_doctor_database(&db_path, None, JsonlCountState::Missing, &mut checks);
+        inspect_existing_doctor_database(
+            &db_path,
+            None,
+            JsonlCountState::Missing,
+            DoctorInspectionMode::Full,
+            &mut checks,
+        );
 
         let check = find_check(&checks, "db.write_probe").expect("check present");
         assert!(

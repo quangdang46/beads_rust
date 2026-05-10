@@ -19,6 +19,9 @@ mkdir -p .beads/.br_recovery
 : > .beads/.br_recovery/beads.db.20250101_000001_bbbbb.bak
 : > .beads/.br_recovery/rebuild-failed-20250102.json
 
-rm -rf .fixture_baseline
+if [ -e .fixture_baseline ]; then
+  echo "fixture baseline already exists; expected a fresh workspace" >&2
+  exit 1
+fi
 mkdir -p .fixture_baseline
 tar --exclude=.fixture_baseline -cf .fixture_baseline/state.tar .
