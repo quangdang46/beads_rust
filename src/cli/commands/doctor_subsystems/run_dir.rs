@@ -14,7 +14,7 @@
 //! ## Run identifier
 //!
 //! `run_id` = `<UTC ISO 8601 seconds>__<short-hex>` where `short-hex` is
-//! a SHA-256 truncation of `repo_root || iso8601_seconds || pid`. The
+//! a SHA-256 truncation of repo identity plus per-process entropy. The
 //! shape is human-sortable and unique-per-run.
 //!
 //! ## Escape hatch
@@ -42,6 +42,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::Utc;
 use sha2::{Digest, Sha256};
@@ -50,6 +51,8 @@ use crate::error::BeadsError;
 
 /// Environment variable that overrides the `.doctor/runs/` location.
 pub const ENV_RUNS_DIR: &str = "BR_DOCTOR_RUNS_DIR";
+
+static RUN_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Concrete handles for the artifact directory of a single run.
 #[derive(Debug, Clone)]
@@ -159,10 +162,14 @@ fn runs_root_with_override(repo_root: &Path, env_override: Option<PathBuf>) -> P
 fn generate_run_id(repo_root: &Path) -> String {
     let now = Utc::now();
     let iso = now.format("%Y%m%dT%H%M%SZ").to_string();
+    let nanos = now.timestamp_nanos_opt().unwrap_or_default();
+    let ordinal = RUN_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
     let mut hasher = Sha256::new();
     hasher.update(repo_root.to_string_lossy().as_bytes());
     hasher.update(iso.as_bytes());
+    hasher.update(nanos.to_le_bytes());
     hasher.update(std::process::id().to_le_bytes());
+    hasher.update(ordinal.to_le_bytes());
     let mut short = String::with_capacity(6);
     for byte in hasher.finalize().iter().take(3) {
         write!(&mut short, "{byte:02x}").expect("writing to a String cannot fail");
@@ -317,6 +324,7 @@ echo "undo complete for run {run_id}" >&2
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::os::unix::fs::PermissionsExt;
 
     fn unique_temp_root(label: &str) -> tempfile::TempDir {
@@ -381,6 +389,16 @@ mod tests {
         assert!(target.to_string_lossy().contains(&run2.run_id));
         // The first run's directory still exists — we don't delete it.
         assert!(run1.root.is_dir());
+    }
+
+    #[test]
+    fn generated_run_ids_are_unique_inside_one_process_second() {
+        let tmp = unique_temp_root("same-second-ids");
+        let mut seen = HashSet::new();
+        for _ in 0..8 {
+            let run_id = generate_run_id(tmp.path());
+            assert!(seen.insert(run_id), "run_id collision inside one process");
+        }
     }
 
     #[test]

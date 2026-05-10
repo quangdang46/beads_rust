@@ -39,8 +39,8 @@ use crate::cli::commands::doctor_subsystems::mutate::{
 };
 use crate::cli::commands::doctor_subsystems::run_dir;
 use crate::cli::{
-    DoctorCapabilitiesArgs, DoctorExplainArgs, DoctorHealthArgs, DoctorLsArgs,
-    DoctorRobotDocsArgs, DoctorSubcommand, DoctorUndoArgs, OutputFormatBasic,
+    DoctorCapabilitiesArgs, DoctorExplainArgs, DoctorHealthArgs, DoctorLsArgs, DoctorRobotDocsArgs,
+    DoctorSubcommand, DoctorUndoArgs, OutputFormatBasic,
 };
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -114,10 +114,7 @@ pub struct CapabilitiesEnvelope<'a> {
 ///
 /// Returns [`BeadsError`] if JSON serialization fails (effectively
 /// never with the data shapes used here).
-pub fn execute_capabilities(
-    args: &DoctorCapabilitiesArgs,
-    _ctx: &OutputContext,
-) -> Result<()> {
+pub fn execute_capabilities(args: &DoctorCapabilitiesArgs, _ctx: &OutputContext) -> Result<()> {
     let caps = DoctorCapabilities::build();
     let envelope = CapabilitiesEnvelope {
         schema_version: CAPABILITIES_SCHEMA,
@@ -135,8 +132,7 @@ pub fn execute_capabilities(
             // The capabilities subcommand is a pure machine-readable
             // surface — emit pretty JSON to stdout regardless of the
             // outer OutputContext (which may be Quiet for CI runs).
-            let json =
-                serde_json::to_string_pretty(&envelope).map_err(BeadsError::Json)?;
+            let json = serde_json::to_string_pretty(&envelope).map_err(BeadsError::Json)?;
             println!("{json}");
         }
         OutputFormatBasic::Text => render_capabilities_text(&envelope),
@@ -318,8 +314,7 @@ pub fn execute_robot_docs(args: &DoctorRobotDocsArgs, _ctx: &OutputContext) -> R
                 line_count: ROBOT_HANDBOOK_BODY.lines().count(),
                 handbook: ROBOT_HANDBOOK_BODY,
             };
-            let json =
-                serde_json::to_string_pretty(&envelope).map_err(BeadsError::Json)?;
+            let json = serde_json::to_string_pretty(&envelope).map_err(BeadsError::Json)?;
             println!("{json}");
         }
         OutputFormatBasic::Text => {
@@ -383,8 +378,7 @@ pub fn execute_health(args: &DoctorHealthArgs, repo_root: &Path) -> Result<i32> 
 
     let db = beads.join("beads.db");
     let db_present = db.is_file();
-    let jsonl_present = beads.join("issues.jsonl").is_file()
-        || beads.join("beads.jsonl").is_file();
+    let jsonl_present = beads.join("issues.jsonl").is_file() || beads.join("beads.jsonl").is_file();
 
     // MERGE_* artifacts indicate a torn previous merge.
     let merge_artifacts_present = match fs::read_dir(&beads) {
@@ -400,27 +394,15 @@ pub fn execute_health(args: &DoctorHealthArgs, repo_root: &Path) -> Result<i32> 
     let orphan_write_lock = beads.join(".write.lock").exists();
     let orphan_sync_lock = beads.join(".sync.lock").exists();
 
-    let problems_present = !db_present
-        || merge_artifacts_present
-        || (!jsonl_present);
+    let findings_present = !db_present || !jsonl_present || merge_artifacts_present;
 
-    // Cheap warnings (lock files exist routinely; only escalate to a
-    // finding when there are also missing primaries).
-    let advisory_warning = orphan_write_lock || orphan_sync_lock;
-
-    let (status, exit_code) = if !db_present || !jsonl_present {
+    let (status, exit_code) = if findings_present {
         ("findings_present", DoctorExitCode::FindingsPresent.as_i32())
-    } else if merge_artifacts_present {
-        ("findings_present", DoctorExitCode::FindingsPresent.as_i32())
-    } else if advisory_warning {
-        // Lock files alone are advisory only — keep status healthy but
-        // tag the line so agents can see them.
-        ("healthy", DoctorExitCode::Healthy.as_i32())
     } else {
+        // Lock files alone are advisory only; keep status healthy but
+        // tag the line below so agents can see them.
         ("healthy", DoctorExitCode::Healthy.as_i32())
     };
-
-    let _ = problems_present; // doc-only: explains the branch above.
 
     let mut line = format!(
         "{status}  br={ver} doctor=1 db={db} jsonl={jsonl}",
@@ -583,7 +565,10 @@ fn count_lines(path: &Path) -> usize {
     let Ok(f) = std::fs::File::open(path) else {
         return 0;
     };
-    BufReader::new(f).lines().filter_map(|l| l.ok()).count()
+    BufReader::new(f)
+        .lines()
+        .map_while(std::io::Result::ok)
+        .count()
 }
 
 fn read_exit_code_from_report(path: &Path) -> Option<i32> {
@@ -593,7 +578,7 @@ fn read_exit_code_from_report(path: &Path) -> Option<i32> {
     }
     let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     v.get("exit_code")
-        .and_then(|n| n.as_i64())
+        .and_then(serde_json::Value::as_i64)
         .and_then(|n| i32::try_from(n).ok())
 }
 
@@ -689,10 +674,39 @@ pub fn execute_undo(args: &DoctorUndoArgs, repo_root: &Path) -> Result<()> {
             .append(true)
             .open(&undo.actions_file)
             .map_err(BeadsError::Io)?;
+        // Undo writes target whatever paths the original repair touched.
+        // The forward `--repair` run extended write_scopes (e.g. to a
+        // root `.gitignore` for the `doctor.gitignore_repair` fixer); the
+        // undo must permit the same paths or `mutate()` will refuse the
+        // restore with `outside write_scopes`. We trust the recorded
+        // actions because the run-dir is created and owned by the
+        // doctor; the verbatim backup hash is still verified inside
+        // `mutate()` itself.
+        let mut capabilities = MutateCapabilities::for_repo(repo_root);
+        for record in &actions {
+            let target = repo_root.join(&record.path);
+            if !capabilities
+                .write_scopes
+                .iter()
+                .any(|scope| target.starts_with(scope))
+            {
+                capabilities.write_scopes.push(target.clone());
+            }
+            if let Some(rt) = &record.rename_to {
+                let rt_path = PathBuf::from(rt);
+                if !capabilities
+                    .write_scopes
+                    .iter()
+                    .any(|scope| rt_path.starts_with(scope))
+                {
+                    capabilities.write_scopes.push(rt_path);
+                }
+            }
+        }
         let ctx = MutateContext {
             run_id: undo.run_id.clone(),
             run_dir: undo.root.clone(),
-            capabilities: MutateCapabilities::for_repo(repo_root),
+            capabilities,
             actions_file: Mutex::new(actions_file),
             fixer_id: format!("doctor_undo[{run_id}]"),
             repo_root: repo_root.to_path_buf(),
@@ -728,8 +742,13 @@ pub fn execute_undo(args: &DoctorUndoArgs, repo_root: &Path) -> Result<()> {
         skipped,
         failed,
     };
-    if args.json {
-        if let Ok(json) = serde_json::to_string_pretty(&envelope) {
+    emit_undo_result(&envelope, args.json);
+    Ok(())
+}
+
+fn emit_undo_result(envelope: &UndoEnvelope, json: bool) {
+    if json {
+        if let Ok(json) = serde_json::to_string_pretty(envelope) {
             println!("{json}");
         }
     } else {
@@ -741,7 +760,6 @@ pub fn execute_undo(args: &DoctorUndoArgs, repo_root: &Path) -> Result<()> {
             failed = envelope.failed,
         );
     }
-    Ok(())
 }
 
 fn update_counts(step: &UndoStep, restored: &mut usize, skipped: &mut usize, failed: &mut usize) {
@@ -763,13 +781,8 @@ fn read_actions_reverse(path: &Path) -> Result<Vec<StoredActionRecord>> {
         if line.is_empty() {
             continue;
         }
-        match serde_json::from_slice::<StoredActionRecord>(line) {
-            Ok(rec) => out.push(rec),
-            Err(_) => {
-                // Skip malformed lines — undo must be best-effort and
-                // forward-compatible with new fields.
-                continue;
-            }
+        if let Ok(rec) = serde_json::from_slice::<StoredActionRecord>(line) {
+            out.push(rec);
         }
     }
     out.reverse();
@@ -788,49 +801,7 @@ fn restore_one(
     // For Rename ops we recorded an empty after-hash; the recovery is
     // to move the renamed file back from its destination.
     if record.op == "rename" {
-        if let Some(rt) = &record.rename_to {
-            let from = PathBuf::from(rt);
-            if from.exists() {
-                if let Err(e) = std::fs::create_dir_all(target.parent().unwrap_or(Path::new("."))) {
-                    return UndoStep {
-                        path: record.path.clone(),
-                        op: record.op.clone(),
-                        status: format!("failed_mkdir:{e}"),
-                        backup_used: None,
-                    };
-                }
-                match std::fs::rename(&from, &target) {
-                    Ok(()) => {
-                        return UndoStep {
-                            path: record.path.clone(),
-                            op: record.op.clone(),
-                            status: "restored".to_string(),
-                            backup_used: Some(rt.clone()),
-                        };
-                    }
-                    Err(e) => {
-                        return UndoStep {
-                            path: record.path.clone(),
-                            op: record.op.clone(),
-                            status: format!("failed_rename:{e}"),
-                            backup_used: Some(rt.clone()),
-                        };
-                    }
-                }
-            }
-            return UndoStep {
-                path: record.path.clone(),
-                op: record.op.clone(),
-                status: "skipped_idempotent".to_string(),
-                backup_used: Some(rt.clone()),
-            };
-        }
-        return UndoStep {
-            path: record.path.clone(),
-            op: record.op.clone(),
-            status: "skipped_no_op".to_string(),
-            backup_used: None,
-        };
+        return restore_rename(ctx, record, target);
     }
 
     if !backup.exists() {
@@ -857,15 +828,15 @@ fn restore_one(
 
     // Idempotence: if the live file already matches the backup byte-for-
     // byte, we've already restored this action.
-    if let Ok(live) = fs::read(&target) {
-        if live == backup_bytes {
-            return UndoStep {
-                path: record.path.clone(),
-                op: record.op.clone(),
-                status: "skipped_idempotent".to_string(),
-                backup_used: Some(backup.to_string_lossy().into_owned()),
-            };
-        }
+    if let Ok(live) = fs::read(&target)
+        && live == backup_bytes
+    {
+        return UndoStep {
+            path: record.path.clone(),
+            op: record.op.clone(),
+            status: "skipped_idempotent".to_string(),
+            backup_used: Some(backup.to_string_lossy().into_owned()),
+        };
     }
 
     // Verify the backup's hash matches the recorded `before_hash`.
@@ -905,22 +876,67 @@ fn restore_one(
     }
 }
 
+fn restore_rename(ctx: &MutateContext, record: &StoredActionRecord, target: PathBuf) -> UndoStep {
+    let Some(rt) = &record.rename_to else {
+        return UndoStep {
+            path: record.path.clone(),
+            op: record.op.clone(),
+            status: "skipped_no_op".to_string(),
+            backup_used: None,
+        };
+    };
+
+    let from = PathBuf::from(rt);
+    if !from.exists() {
+        return UndoStep {
+            path: record.path.clone(),
+            op: record.op.clone(),
+            status: "skipped_idempotent".to_string(),
+            backup_used: Some(rt.clone()),
+        };
+    }
+
+    match chokepoint::mutate(ctx, &from, Op::Rename { to: target }) {
+        Ok(result) if result.ok => UndoStep {
+            path: record.path.clone(),
+            op: record.op.clone(),
+            status: "restored".to_string(),
+            backup_used: Some(rt.clone()),
+        },
+        Ok(result) => UndoStep {
+            path: record.path.clone(),
+            op: record.op.clone(),
+            status: format!(
+                "failed_mutate:{}",
+                result.error.unwrap_or_else(|| "unknown".to_string())
+            ),
+            backup_used: Some(rt.clone()),
+        },
+        Err(e) => UndoStep {
+            path: record.path.clone(),
+            op: record.op.clone(),
+            status: format!("failed_mutate:{e}"),
+            backup_used: Some(rt.clone()),
+        },
+    }
+}
+
 fn plan_one(repo_root: &Path, backups_dir: &Path, record: &StoredActionRecord) -> UndoStep {
     let target = repo_root.join(&record.path);
     let backup = backups_dir.join(&record.path);
-    if record.op == "rename" {
-        if let Some(rt) = &record.rename_to {
-            return UndoStep {
-                path: record.path.clone(),
-                op: record.op.clone(),
-                status: if PathBuf::from(rt).exists() {
-                    "would_restore".to_string()
-                } else {
-                    "skipped_idempotent".to_string()
-                },
-                backup_used: Some(rt.clone()),
-            };
-        }
+    if record.op == "rename"
+        && let Some(rt) = &record.rename_to
+    {
+        return UndoStep {
+            path: record.path.clone(),
+            op: record.op.clone(),
+            status: if PathBuf::from(rt).exists() {
+                "would_restore".to_string()
+            } else {
+                "skipped_idempotent".to_string()
+            },
+            backup_used: Some(rt.clone()),
+        };
     }
     if !backup.exists() {
         return UndoStep {
@@ -930,15 +946,15 @@ fn plan_one(repo_root: &Path, backups_dir: &Path, record: &StoredActionRecord) -
             backup_used: None,
         };
     }
-    if let (Ok(live), Ok(b)) = (fs::read(&target), fs::read(&backup)) {
-        if live == b {
-            return UndoStep {
-                path: record.path.clone(),
-                op: record.op.clone(),
-                status: "skipped_idempotent".to_string(),
-                backup_used: Some(backup.to_string_lossy().into_owned()),
-            };
-        }
+    if let (Ok(live), Ok(b)) = (fs::read(&target), fs::read(&backup))
+        && live == b
+    {
+        return UndoStep {
+            path: record.path.clone(),
+            op: record.op.clone(),
+            status: "skipped_idempotent".to_string(),
+            backup_used: Some(backup.to_string_lossy().into_owned()),
+        };
     }
     UndoStep {
         path: record.path.clone(),
@@ -983,9 +999,7 @@ fn find_latest_run(runs_root: &Path) -> Result<Option<String>> {
 fn mark_report_undone(run_dir_path: &Path, run_id: &str) -> Result<()> {
     let report = run_dir_path.join("report.json");
     let mut map: HashMap<String, serde_json::Value> = match fs::read(&report) {
-        Ok(b) if !b.is_empty() => {
-            serde_json::from_slice(&b).unwrap_or_else(|_| HashMap::new())
-        }
+        Ok(b) if !b.is_empty() => serde_json::from_slice(&b).unwrap_or_else(|_| HashMap::new()),
         _ => HashMap::new(),
     };
     map.insert("run_id".into(), serde_json::Value::String(run_id.into()));
@@ -1035,11 +1049,10 @@ pub fn execute_explain(args: &DoctorExplainArgs, _repo_root: &Path) -> Result<()
         schema_version: EXPLAIN_SCHEMA,
         finding_id: &args.finding_id,
         title: "doctor explain — WP6 stub",
-        evidence:
-            "The full evidence-expansion path is implemented in a later pass; \
+        evidence: "The full evidence-expansion path is implemented in a later pass; \
              this envelope pins the contract surface so agents can rely on it.",
         remediation: Remediation {
-            command: format!("br doctor --repair --dry-run"),
+            command: "br doctor --repair --dry-run".to_string(),
             explain_command: format!("br doctor explain {}", args.finding_id),
             capabilities_url: "br doctor capabilities --format json",
         },
@@ -1278,13 +1291,87 @@ mod tests {
     }
 
     #[test]
+    fn test_doctor_undo_rename_routes_through_mutate() {
+        let tmp = unique_temp_root("undo-rename");
+        let repo = tmp.path();
+        let beads = repo.join(".beads");
+        fs::create_dir_all(&beads).unwrap();
+        let target = beads.join("renamed.txt");
+        fs::write(&target, b"payload").unwrap();
+
+        let initial_run = run_dir::create_run_dir(repo).expect("create run");
+        let actions_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&initial_run.actions_file)
+            .unwrap();
+        let ctx = MutateContext {
+            run_id: initial_run.run_id.clone(),
+            run_dir: initial_run.root.clone(),
+            capabilities: MutateCapabilities::for_repo(repo),
+            actions_file: Mutex::new(actions_file),
+            fixer_id: "test".into(),
+            repo_root: repo.to_path_buf(),
+            dry_run: false,
+            start_ns: now_ns(),
+        };
+        let quarantine_path = initial_run.root.join("quarantine/renamed.txt");
+        chokepoint::mutate(
+            &ctx,
+            &target,
+            Op::Rename {
+                to: quarantine_path.clone(),
+            },
+        )
+        .expect("rename into quarantine");
+        assert!(!target.exists());
+        assert_eq!(fs::read(&quarantine_path).unwrap(), b"payload");
+
+        let args = DoctorUndoArgs {
+            run_id: initial_run.run_id.clone(),
+            dry_run: false,
+            json: true,
+        };
+        execute_undo(&args, repo).expect("undo rename");
+        assert_eq!(fs::read(&target).unwrap(), b"payload");
+        assert!(!quarantine_path.exists());
+
+        let runs_root = repo.join(".doctor/runs");
+        let undo_run_id = fs::read_dir(&runs_root)
+            .unwrap()
+            .find_map(|entry| {
+                let entry = entry.ok()?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                (name != initial_run.run_id).then_some(name)
+            })
+            .expect("undo run id");
+        let undo_actions = fs::read_to_string(runs_root.join(undo_run_id).join("actions.jsonl"))
+            .expect("undo actions");
+        let line = undo_actions
+            .lines()
+            .next()
+            .expect("undo action should be logged");
+        let action: serde_json::Value = serde_json::from_str(line).expect("undo action json");
+        assert_eq!(action["op"], "rename");
+        assert_eq!(
+            action["fixer_id"],
+            format!("doctor_undo[{}]", initial_run.run_id)
+        );
+        assert_eq!(action["rename_to"], target.to_string_lossy().as_ref());
+    }
+
+    #[test]
     fn test_doctor_undo_latest_resolves_to_most_recent() {
         let tmp = unique_temp_root("undo-latest");
         let repo = tmp.path();
         let runs_root = repo.join(".doctor").join("runs");
         fs::create_dir_all(&runs_root).unwrap();
         // Three subdirs with sortable names; latest is the largest.
-        for name in ["20260101T000000Z__a", "20260301T000000Z__b", "20260201T000000Z__c"] {
+        for name in [
+            "20260101T000000Z__a",
+            "20260301T000000Z__b",
+            "20260201T000000Z__c",
+        ] {
             fs::create_dir_all(runs_root.join(name).join("backups")).unwrap();
             fs::write(runs_root.join(name).join("actions.jsonl"), b"").unwrap();
         }
@@ -1311,9 +1398,11 @@ mod tests {
         assert_eq!(v["quick_ref"]["error"], 1);
         assert_eq!(v["quick_ref"]["warn"], 2);
         assert_eq!(v["quick_ref"]["healthy"], 5);
-        assert!(v["recommended_command"]
-            .as_str()
-            .unwrap()
-            .starts_with("br doctor"));
+        assert!(
+            v["recommended_command"]
+                .as_str()
+                .unwrap()
+                .starts_with("br doctor")
+        );
     }
 }
