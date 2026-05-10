@@ -727,7 +727,7 @@ pub fn execute_undo(args: &DoctorUndoArgs, repo_root: &Path) -> Result<()> {
         }
     }
 
-    if !args.dry_run {
+    if !args.dry_run && failed == 0 {
         let _ = mark_report_undone(&run_dir_path, &run_id);
     }
 
@@ -975,6 +975,9 @@ fn find_latest_run(runs_root: &Path) -> Result<Option<String>> {
     if !runs_root.is_dir() {
         return Ok(None);
     }
+    if let Some(run_id) = latest_run_from_symlink(runs_root)? {
+        return Ok(Some(run_id));
+    }
     let mut best: Option<String> = None;
     for entry in fs::read_dir(runs_root).map_err(BeadsError::Io)? {
         let entry = entry.map_err(BeadsError::Io)?;
@@ -982,11 +985,9 @@ fn find_latest_run(runs_root: &Path) -> Result<Option<String>> {
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
-        let key = name.split("__").next().unwrap_or("").to_string();
         match &best {
             Some(curr) => {
-                let curr_key = curr.split("__").next().unwrap_or("");
-                if key.as_str() > curr_key {
+                if name.as_str() > curr.as_str() {
                     best = Some(name);
                 }
             }
@@ -994,6 +995,29 @@ fn find_latest_run(runs_root: &Path) -> Result<Option<String>> {
         }
     }
     Ok(best)
+}
+
+fn latest_run_from_symlink(runs_root: &Path) -> Result<Option<String>> {
+    let latest_link = runs_root.parent().unwrap_or(runs_root).join("latest");
+    let link_target = match fs::read_link(&latest_link) {
+        Ok(target) => target,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => return Ok(None),
+        Err(e) => return Err(BeadsError::Io(e)),
+    };
+    let base = latest_link.parent().unwrap_or(runs_root);
+    let target = if link_target.is_absolute() {
+        link_target
+    } else {
+        base.join(link_target)
+    };
+    if !target.is_dir() || !target.starts_with(runs_root) {
+        return Ok(None);
+    }
+    Ok(target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(ToString::to_string))
 }
 
 fn mark_report_undone(run_dir_path: &Path, run_id: &str) -> Result<()> {
@@ -1291,6 +1315,39 @@ mod tests {
     }
 
     #[test]
+    fn test_doctor_undo_failure_does_not_mark_original_run_undone() {
+        let tmp = unique_temp_root("undo-failure");
+        let repo = tmp.path();
+        let beads = repo.join(".beads");
+        fs::create_dir_all(&beads).unwrap();
+        fs::write(beads.join("foo.txt"), b"updated").unwrap();
+
+        let initial_run = run_dir::create_run_dir(repo).expect("create run");
+        let backup = initial_run.backups.join(".beads/foo.txt");
+        fs::create_dir_all(backup.parent().unwrap()).unwrap();
+        fs::write(&backup, b"original").unwrap();
+        let action = serde_json::json!({
+            "path": ".beads/foo.txt",
+            "op": "write_file",
+            "before_hash": "sha256:not-the-backup-hash"
+        });
+        fs::write(&initial_run.actions_file, format!("{action}\n")).unwrap();
+
+        let args = DoctorUndoArgs {
+            run_id: initial_run.run_id.clone(),
+            dry_run: false,
+            json: true,
+        };
+        execute_undo(&args, repo).expect("undo returns envelope even when a step fails");
+
+        let report = fs::read_to_string(&initial_run.report_file).unwrap_or_default();
+        assert!(
+            !report.contains("undone_at"),
+            "failed undo attempt must not stamp original report as undone: {report}"
+        );
+    }
+
+    #[test]
     fn test_doctor_undo_rename_routes_through_mutate() {
         let tmp = unique_temp_root("undo-rename");
         let repo = tmp.path();
@@ -1377,6 +1434,24 @@ mod tests {
         }
         let latest = find_latest_run(&runs_root).unwrap().unwrap();
         assert_eq!(latest, "20260301T000000Z__b");
+    }
+
+    #[test]
+    fn test_doctor_undo_latest_prefers_latest_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = unique_temp_root("undo-latest-link");
+        let repo = tmp.path();
+        let runs_root = repo.join(".doctor").join("runs");
+        fs::create_dir_all(&runs_root).unwrap();
+        for name in ["20260102T000000Z__newer", "20260101T000000Z__linked"] {
+            fs::create_dir_all(runs_root.join(name).join("backups")).unwrap();
+            fs::write(runs_root.join(name).join("actions.jsonl"), b"").unwrap();
+        }
+        symlink("runs/20260101T000000Z__linked", repo.join(".doctor/latest")).unwrap();
+
+        let latest = find_latest_run(&runs_root).unwrap().unwrap();
+        assert_eq!(latest, "20260101T000000Z__linked");
     }
 
     #[test]
