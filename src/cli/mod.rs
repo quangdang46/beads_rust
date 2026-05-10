@@ -2649,6 +2649,13 @@ pub struct VersionArgs {
 }
 
 /// Arguments for the doctor command.
+///
+/// `br doctor` is dual-shaped: when no `subcommand` is supplied, the
+/// flat command runs the legacy diagnostic+repair flow honoring
+/// `--repair`, `--dry-run`, `--allow-repeated-repair`, and `--robot-triage`.
+/// When a `subcommand` is supplied, dispatch is routed to the WP6
+/// agent-ergonomics surface (`capabilities`, `robot-docs`, `health`,
+/// `ls`, `undo`, `explain`).
 #[derive(Args, Debug, Clone, Default)]
 pub struct DoctorArgs {
     /// Attempt to repair detected issues (rebuilds DB from JSONL)
@@ -2665,6 +2672,106 @@ pub struct DoctorArgs {
     /// in `cli::commands::doctor_subsystems::mutate`.
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Emit the `br.doctor.triage.v1` mega-envelope (summary + findings +
+    /// planned actions + recommended command) and exit. Read-only; ignores
+    /// `--repair`. Designed for AI agents that want every triage signal
+    /// in a single JSON read.
+    #[arg(long = "robot-triage")]
+    pub robot_triage: bool,
+
+    /// Optional WP6 subcommand. When `None`, the flat doctor handler
+    /// (above) runs as it always has.
+    #[command(subcommand)]
+    pub subcommand: Option<DoctorSubcommand>,
+}
+
+/// WP6 agent-ergonomics surface — pure additions, none of these
+/// duplicate or shadow the flat-command flags.
+#[derive(Subcommand, Debug, Clone)]
+pub enum DoctorSubcommand {
+    /// Print the machine-readable `br.doctor.capabilities.v1` envelope
+    /// (exit codes, write scopes, env vars, fixers, detectors).
+    Capabilities(DoctorCapabilitiesArgs),
+    /// Print the paste-ready agent handbook for `br doctor`.
+    #[command(name = "robot-docs", alias = "robot_docs")]
+    RobotDocs(DoctorRobotDocsArgs),
+    /// Cheap (<200 ms) one-line liveness summary; exit-code = liveness.
+    Health(DoctorHealthArgs),
+    /// List runs in `.doctor/runs/` with run-id, start time, exit code,
+    /// and action count.
+    Ls(DoctorLsArgs),
+    /// Restore from `.doctor/runs/<run-id>/backups/` (or `latest`).
+    Undo(DoctorUndoArgs),
+    /// Expand a single finding (stub in WP6; full evidence later).
+    Explain(DoctorExplainArgs),
+}
+
+/// Arguments for `br doctor capabilities`.
+#[derive(Args, Debug, Clone, Default)]
+pub struct DoctorCapabilitiesArgs {
+    /// Output format: `json` (default for machine readers) or `text`.
+    #[arg(long, value_enum, default_value_t = OutputFormatBasic::Text)]
+    pub format: OutputFormatBasic,
+
+    /// Optional fixer/detector id filter — reserved for future
+    /// extension; currently a passthrough. Stable surface so agents can
+    /// pin invocations.
+    #[arg(long)]
+    pub command: Option<String>,
+}
+
+/// Arguments for `br doctor robot-docs`.
+#[derive(Args, Debug, Clone, Default)]
+pub struct DoctorRobotDocsArgs {
+    /// Output format: `text` (Markdown) is default; `json` wraps the
+    /// handbook in an envelope for token-budgeted agents.
+    #[arg(long, value_enum, default_value_t = OutputFormatBasic::Text)]
+    pub format: OutputFormatBasic,
+}
+
+/// Arguments for `br doctor health`.
+#[derive(Args, Debug, Clone, Default)]
+pub struct DoctorHealthArgs {
+    /// Emit JSON instead of the one-line text summary.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `br doctor ls`.
+#[derive(Args, Debug, Clone, Default)]
+pub struct DoctorLsArgs {
+    /// Emit a JSON array (`br.doctor.runs_list.v1`) instead of a text
+    /// table.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `br doctor undo`.
+#[derive(Args, Debug, Clone)]
+pub struct DoctorUndoArgs {
+    /// Run identifier to restore. Use the literal `latest` to resolve to
+    /// the most recent run by ISO-8601 timestamp.
+    pub run_id: String,
+
+    /// Print the restore plan; do not touch disk.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Emit a JSON envelope describing the restore.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `br doctor explain`.
+#[derive(Args, Debug, Clone)]
+pub struct DoctorExplainArgs {
+    /// Finding id (e.g. `fm-jsonl-tombstone-drift`).
+    pub finding_id: String,
+
+    /// Emit JSON instead of text.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Arguments for the upgrade command.

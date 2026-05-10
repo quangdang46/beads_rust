@@ -3610,6 +3610,13 @@ fn inspect_existing_doctor_database(
 /// Returns an error if report serialization fails or if IO operations fail.
 #[allow(clippy::too_many_lines)]
 pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
+    // WP6: dispatch to the agent-ergonomics surface when a subcommand is
+    // present. The flat handler below stays untouched.
+    if let Some(sub) = &args.subcommand {
+        return crate::cli::commands::doctor_subsystems::surface::dispatch_subcommand(
+            sub, cli, ctx,
+        );
+    }
     let Some(beads_dir) = config::discover_optional_beads_dir_with_cli(cli)? else {
         let mut checks = Vec::new();
         push_check(
@@ -3652,6 +3659,13 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     };
 
     let mut initial = collect_doctor_report(&beads_dir, &paths)?;
+
+    // WP6: --robot-triage short-circuits the flat run with a single
+    // `br.doctor.triage.v1` envelope. Read-only; no further dispatch.
+    if args.robot_triage {
+        emit_flat_robot_triage(&initial.report);
+        return Ok(());
+    }
 
     // Build the per-run session once, lazily, when --repair is requested.
     // Every WP3-rewired fixer threads its writes through `session.ctx`.
@@ -4025,6 +4039,42 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     }
 
     Ok(())
+}
+
+/// Build and emit the `br.doctor.triage.v1` envelope from a flat
+/// `DoctorReport`. Used by `--robot-triage` to short-circuit the flat
+/// run with a single JSON read.
+fn emit_flat_robot_triage(report: &DoctorReport) {
+    use crate::cli::commands::doctor_subsystems::surface::{
+        TriageFinding, build_triage_envelope, emit_robot_triage,
+    };
+    let mut healthy = 0usize;
+    let mut warn = 0usize;
+    let mut error = 0usize;
+    let mut findings: Vec<TriageFinding> = Vec::new();
+    for c in &report.checks {
+        match c.status {
+            CheckStatus::Ok => healthy += 1,
+            CheckStatus::Warn => {
+                warn += 1;
+                findings.push(TriageFinding {
+                    id: c.name.clone(),
+                    severity: "P2".to_string(),
+                    message: c.message.clone().unwrap_or_default(),
+                });
+            }
+            CheckStatus::Error => {
+                error += 1;
+                findings.push(TriageFinding {
+                    id: c.name.clone(),
+                    severity: "P0".to_string(),
+                    message: c.message.clone().unwrap_or_default(),
+                });
+            }
+        }
+    }
+    let envelope = build_triage_envelope(healthy, warn, error, findings);
+    emit_robot_triage(&envelope);
 }
 
 #[cfg(test)]

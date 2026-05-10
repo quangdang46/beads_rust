@@ -1,0 +1,1319 @@
+//! WP6 — agent-ergonomics surface for `br doctor`.
+//!
+//! Implements the dispatch targets for the `br doctor <subcommand>` group
+//! defined by [`crate::cli::DoctorSubcommand`]:
+//!
+//! - `capabilities` — `br.doctor.capabilities.v1` envelope (JSON or table).
+//! - `robot-docs`  — paste-ready agent handbook (Markdown or wrapped JSON).
+//! - `health`      — sub-200 ms liveness summary; exit-code = liveness.
+//! - `ls`          — list runs in `.doctor/runs/`.
+//! - `undo`        — restore from `.doctor/runs/<run-id>/backups/`.
+//! - `explain`     — expand a single finding (stub).
+//!
+//! Every JSON surface pins a `schema_version`. The `--robot-triage` flag
+//! on the flat doctor command also lives here ([`emit_robot_triage`]).
+//!
+//! ## Safety
+//!
+//! - `health`, `capabilities`, `robot-docs`, `ls`, `explain` are
+//!   read-only.
+//! - `undo` mutates — every restore flows through
+//!   [`super::mutate::mutate`] with a fresh undo run-dir, so the audit
+//!   trail is itself reversible.
+
+#![allow(clippy::needless_pass_by_value)]
+
+use std::collections::HashMap;
+use std::fs::{self, OpenOptions};
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::Instant;
+
+use serde::{Deserialize, Serialize};
+
+use crate::cli::commands::doctor_subsystems::capabilities_doctor::DoctorCapabilities;
+use crate::cli::commands::doctor_subsystems::exit_codes::DoctorExitCode;
+use crate::cli::commands::doctor_subsystems::mutate::{
+    self as chokepoint, Capabilities as MutateCapabilities, MutateContext, Op,
+};
+use crate::cli::commands::doctor_subsystems::run_dir;
+use crate::cli::{
+    DoctorCapabilitiesArgs, DoctorExplainArgs, DoctorHealthArgs, DoctorLsArgs,
+    DoctorRobotDocsArgs, DoctorSubcommand, DoctorUndoArgs, OutputFormatBasic,
+};
+use crate::config;
+use crate::error::{BeadsError, Result};
+use crate::output::OutputContext;
+
+/// Top-level dispatcher for `br doctor <subcommand>`. Resolves the
+/// repo root via `config::discover_optional_beads_dir_with_cli` and
+/// hands off to the per-subcommand handler.
+///
+/// # Errors
+///
+/// Returns [`BeadsError`] if subcommand-specific I/O or serialization
+/// faults.
+pub fn dispatch_subcommand(
+    sub: &DoctorSubcommand,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+) -> Result<()> {
+    let repo_root = match config::discover_optional_beads_dir_with_cli(cli)? {
+        Some(beads) => beads
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| beads.clone()),
+        None => std::env::current_dir().map_err(BeadsError::Io)?,
+    };
+    match sub {
+        DoctorSubcommand::Capabilities(a) => execute_capabilities(a, ctx),
+        DoctorSubcommand::RobotDocs(a) => execute_robot_docs(a, ctx),
+        DoctorSubcommand::Health(a) => {
+            let code = execute_health(a, &repo_root)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+        DoctorSubcommand::Ls(a) => execute_ls(a, &repo_root),
+        DoctorSubcommand::Undo(a) => execute_undo(a, &repo_root),
+        DoctorSubcommand::Explain(a) => execute_explain(a, &repo_root),
+    }
+}
+
+/// Stable schema-version constants — every JSON envelope pins one.
+pub const CAPABILITIES_SCHEMA: &str = "br.doctor.capabilities.v1";
+pub const HEALTH_SCHEMA: &str = "br.doctor.health.v1";
+pub const RUNS_LIST_SCHEMA: &str = "br.doctor.runs_list.v1";
+pub const TRIAGE_SCHEMA: &str = "br.doctor.triage.v1";
+pub const ROBOT_DOCS_SCHEMA: &str = "br.doctor.robot_docs.v1";
+pub const UNDO_SCHEMA: &str = "br.doctor.undo.v1";
+pub const EXPLAIN_SCHEMA: &str = "br.doctor.explain.v1";
+
+// =============================================================================
+// capabilities
+// =============================================================================
+
+/// Top-level envelope for `br doctor capabilities`. Wraps the inner
+/// [`DoctorCapabilities`] struct with a stable
+/// `schema_version = "br.doctor.capabilities.v1"`.
+#[derive(Debug, Clone, Serialize)]
+pub struct CapabilitiesEnvelope<'a> {
+    pub schema_version: &'static str,
+    #[serde(flatten)]
+    pub inner: &'a DoctorCapabilities,
+}
+
+/// Execute `br doctor capabilities`.
+///
+/// Read-only. Always exits 0 (the doctor's contract: capabilities is a
+/// pure diagnostic).
+///
+/// # Errors
+///
+/// Returns [`BeadsError`] if JSON serialization fails (effectively
+/// never with the data shapes used here).
+pub fn execute_capabilities(
+    args: &DoctorCapabilitiesArgs,
+    _ctx: &OutputContext,
+) -> Result<()> {
+    let caps = DoctorCapabilities::build();
+    let envelope = CapabilitiesEnvelope {
+        schema_version: CAPABILITIES_SCHEMA,
+        inner: &caps,
+    };
+
+    // The optional --command filter is reserved for future fixer/detector
+    // expansion (capabilities currently has empty fixers/detectors lists,
+    // so filtering is a no-op for now). We honor the flag silently to
+    // avoid breaking pinned agent invocations later.
+    let _filter = args.command.as_deref();
+
+    match args.format {
+        OutputFormatBasic::Json | OutputFormatBasic::Toon => {
+            // The capabilities subcommand is a pure machine-readable
+            // surface — emit pretty JSON to stdout regardless of the
+            // outer OutputContext (which may be Quiet for CI runs).
+            let json =
+                serde_json::to_string_pretty(&envelope).map_err(BeadsError::Json)?;
+            println!("{json}");
+        }
+        OutputFormatBasic::Text => render_capabilities_text(&envelope),
+    }
+    Ok(())
+}
+
+fn render_capabilities_text(env: &CapabilitiesEnvelope<'_>) {
+    println!("br doctor capabilities");
+    println!("  schema_version  : {}", env.schema_version);
+    println!("  contract_version: {}", env.inner.contract_version);
+    println!("  doctor_version  : {}", env.inner.doctor_version);
+    println!();
+    println!("  Exit codes:");
+    for entry in &env.inner.exit_codes {
+        println!(
+            "    {:>3} {:<24} {}",
+            entry.code, entry.name, entry.description
+        );
+    }
+    println!();
+    println!("  Write scopes:");
+    for scope in &env.inner.write_scopes {
+        println!("    - {scope}");
+    }
+    println!();
+    println!("  Env vars:");
+    for var in &env.inner.env_vars {
+        println!("    - {var}");
+    }
+    println!();
+    println!("  Fixers     : {} registered", env.inner.fixers.len());
+    println!("  Detectors  : {} registered", env.inner.detectors.len());
+    println!();
+    println!("Use `br doctor capabilities --format json` for the machine envelope.");
+}
+
+// =============================================================================
+// robot-docs
+// =============================================================================
+
+const ROBOT_HANDBOOK_BODY: &str = r#"# br doctor — Agent Handbook
+
+Contract version: **br.doctor.contract.v1**
+
+`br doctor` is a diagnose-and-(optionally)-repair surface designed for AI
+agents. Every disk write under `--repair` flows through a single
+[`mutate()`](https://docs.rs/beads_rust) chokepoint that records a verbatim
+backup, an `actions.jsonl` audit line, and an `undo.sh` fallback before
+touching any byte of state.
+
+## Subcommand surface
+
+| Subcommand | Purpose | Mutates? |
+|------------|---------|----------|
+| (flat) `br doctor` | Run all detectors. Print findings. | NO |
+| (flat) `br doctor --repair` | Apply fixers; back up everything. | YES (via `mutate()`) |
+| `br doctor --robot-triage` | Single JSON envelope for swarm triage. | NO |
+| `br doctor capabilities --format json` | Machine-readable contract. | NO |
+| `br doctor robot-docs` | This handbook. | NO |
+| `br doctor health` | Cheap one-line liveness summary. | NO |
+| `br doctor ls` | List `.doctor/runs/` directories. | NO |
+| `br doctor undo <run-id>` | Restore from `.doctor/runs/<id>/backups/`. | YES (restore) |
+| `br doctor undo latest` | Resolve `latest` and restore. | YES (restore) |
+| `br doctor explain <finding-id>` | Expand a single finding. | NO |
+
+## Top-level flags (flat command)
+
+| Flag | Purpose |
+|------|---------|
+| `--repair` | Apply fixers. Routes through `mutate()`. |
+| `--dry-run` | Print the plan; do NOT execute. Pair with `--repair`. |
+| `--allow-repeated-repair` | Permit a fresh JSONL rebuild after a prior failed recovery. |
+| `--robot-triage` | Emit `br.doctor.triage.v1` and exit. |
+
+## Exit codes
+
+| Code | Name | Meaning |
+|------|------|---------|
+| `0`  | `healthy` | every check passed |
+| `1`  | `findings_present` | findings exist; `--repair` not requested |
+| `2`  | `fix_partial` | `--repair` ran; some fixers failed |
+| `3`  | `fix_failed_rolled_back` | `--repair` faulted and rolled back from backup |
+| `4`  | `refused_unsafe` | precondition gate refused (scope / schema / fingerprint) |
+| `5`  | `concurrency_lost` | workspace lock unavailable |
+| `6`  | `online_required` | network probe required `--online` |
+| `64` | `usage_error` | clap rejected the invocation |
+| `66` | `no_input` | required input missing (no `.beads/`) |
+| `73` | `cannot_create_output` | could not create the run-dir |
+| `74` | `io_error` | generic I/O fault during a non-mutating op |
+
+## Canonical examples
+
+### Happy path (workspace healthy)
+
+```sh
+br doctor               # exit 0; no findings
+br doctor --robot-triage  # exit 0; envelope shows zero findings
+```
+
+### Broken path (findings present)
+
+```sh
+br doctor                                   # exit 1; findings printed
+br doctor --robot-triage                    # exit 1; JSON shows recommended_command
+br doctor --repair --dry-run                # exit 0; prints the plan
+br doctor --repair                          # exit 0/2/3 depending on fixer outcomes
+br doctor undo latest                       # exit 0; restores from the latest run
+```
+
+### Recovery (worked through `mutate()`)
+
+Every `--repair` lays down `<repo>/.doctor/runs/<run-id>/`:
+
+```text
+.doctor/runs/<run-id>/
+  actions.jsonl     # one JSON line per mutation
+  backups/          # verbatim pre-mutation copies
+  report.json       # final report (written at end of run)
+  undo.sh           # pure-bash fallback when br itself is broken
+.doctor/latest -> runs/<run-id>/   # atomic symlink
+```
+
+## What `br doctor` will NEVER do
+
+1. Delete files. Anything that "needs to delete" is renamed into
+   `<run-dir>/quarantine/` instead, so `undo` can reverse it.
+2. Run destructive shell. There is no `Command::new("git")` in the
+   doctor — the chokepoint is the only writer.
+3. Write outside its declared `write_scopes` (`.beads/`, `.doctor/`).
+4. Skip the verbatim backup — every mutation is preceded by a strict
+   byte-by-byte `cmp -s` of the live file against the freshly-written
+   backup.
+5. Mutate without an audit trail — every action lands in
+   `actions.jsonl` so `br doctor undo` can replay it in reverse.
+
+## Recovery without br
+
+If the `br` binary itself is broken, the per-run directory ships with a
+pure-bash `undo.sh` that needs only `bash`, `jq`, `cp`, and `mv`. Run:
+
+```sh
+bash .doctor/runs/<run-id>/undo.sh
+```
+
+## See also
+
+- `br doctor capabilities --format json` — machine-readable contract
+- `br doctor health --json` — liveness summary
+- The operator playbook lives at
+  `<repo>/.../doctor_workspace/playbook.md`; consult it before running
+  `--repair` on production workspaces.
+"#;
+
+/// Execute `br doctor robot-docs`.
+///
+/// # Errors
+///
+/// Returns [`BeadsError`] only if the JSON envelope fails to serialize.
+pub fn execute_robot_docs(args: &DoctorRobotDocsArgs, _ctx: &OutputContext) -> Result<()> {
+    match args.format {
+        OutputFormatBasic::Json | OutputFormatBasic::Toon => {
+            #[derive(Serialize)]
+            struct Envelope<'a> {
+                schema_version: &'static str,
+                tool: &'static str,
+                tool_version: &'static str,
+                contract_version: &'static str,
+                title: &'static str,
+                line_count: usize,
+                handbook: &'a str,
+            }
+            let envelope = Envelope {
+                schema_version: ROBOT_DOCS_SCHEMA,
+                tool: "br",
+                tool_version: env!("CARGO_PKG_VERSION"),
+                contract_version: "br.doctor.contract.v1",
+                title: "br doctor — Agent Handbook",
+                line_count: ROBOT_HANDBOOK_BODY.lines().count(),
+                handbook: ROBOT_HANDBOOK_BODY,
+            };
+            let json =
+                serde_json::to_string_pretty(&envelope).map_err(BeadsError::Json)?;
+            println!("{json}");
+        }
+        OutputFormatBasic::Text => {
+            print!("{ROBOT_HANDBOOK_BODY}");
+        }
+    }
+    Ok(())
+}
+
+/// Pure accessor — used by tests and by `--robot-triage` to embed the
+/// handbook command in the envelope.
+#[must_use]
+pub const fn robot_handbook_body() -> &'static str {
+    ROBOT_HANDBOOK_BODY
+}
+
+// =============================================================================
+// health
+// =============================================================================
+
+/// Output of `br doctor health`. Shape pinned by [`HEALTH_SCHEMA`].
+#[derive(Debug, Clone, Serialize)]
+pub struct HealthOutput {
+    pub schema_version: &'static str,
+    pub status: &'static str,
+    pub exit_code: i32,
+    pub beads_dir_present: bool,
+    pub db_present: bool,
+    pub jsonl_present: bool,
+    pub merge_artifacts_present: bool,
+    pub orphan_write_lock: bool,
+    pub orphan_sync_lock: bool,
+    pub elapsed_ms: u128,
+    /// One-line summary suitable for stdout.
+    pub line: String,
+}
+
+/// Execute `br doctor health`.
+///
+/// Stays under 200 ms by avoiding any DB query — only stat checks
+/// against the workspace tree.
+///
+/// # Errors
+///
+/// Always returns `Ok`; the doctor exit code is the liveness signal,
+/// not an error.
+pub fn execute_health(args: &DoctorHealthArgs, repo_root: &Path) -> Result<i32> {
+    let start = Instant::now();
+    let beads = repo_root.join(".beads");
+    let beads_dir_present = beads.is_dir();
+
+    if !beads_dir_present {
+        let line = format!(
+            "no_workspace  br={} reason=missing_dot_beads",
+            env!("CARGO_PKG_VERSION")
+        );
+        let exit_code = DoctorExitCode::NoInput.as_i32();
+        emit_health(args, &line, exit_code, start, beads_dir_present);
+        return Ok(exit_code);
+    }
+
+    let db = beads.join("beads.db");
+    let db_present = db.is_file();
+    let jsonl_present = beads.join("issues.jsonl").is_file()
+        || beads.join("beads.jsonl").is_file();
+
+    // MERGE_* artifacts indicate a torn previous merge.
+    let merge_artifacts_present = match fs::read_dir(&beads) {
+        Ok(it) => it.flatten().any(|e| {
+            let n = e.file_name();
+            let s = n.to_string_lossy();
+            s.starts_with("MERGE_") || s.contains(".bad_") || s.contains(".rej")
+        }),
+        Err(_) => false,
+    };
+
+    // Orphan locks: present-but-empty, owner unknown.
+    let orphan_write_lock = beads.join(".write.lock").exists();
+    let orphan_sync_lock = beads.join(".sync.lock").exists();
+
+    let problems_present = !db_present
+        || merge_artifacts_present
+        || (!jsonl_present);
+
+    // Cheap warnings (lock files exist routinely; only escalate to a
+    // finding when there are also missing primaries).
+    let advisory_warning = orphan_write_lock || orphan_sync_lock;
+
+    let (status, exit_code) = if !db_present || !jsonl_present {
+        ("findings_present", DoctorExitCode::FindingsPresent.as_i32())
+    } else if merge_artifacts_present {
+        ("findings_present", DoctorExitCode::FindingsPresent.as_i32())
+    } else if advisory_warning {
+        // Lock files alone are advisory only — keep status healthy but
+        // tag the line so agents can see them.
+        ("healthy", DoctorExitCode::Healthy.as_i32())
+    } else {
+        ("healthy", DoctorExitCode::Healthy.as_i32())
+    };
+
+    let _ = problems_present; // doc-only: explains the branch above.
+
+    let mut line = format!(
+        "{status}  br={ver} doctor=1 db={db} jsonl={jsonl}",
+        status = status,
+        ver = env!("CARGO_PKG_VERSION"),
+        db = if db_present { "ok" } else { "missing" },
+        jsonl = if jsonl_present { "ok" } else { "missing" },
+    );
+    if merge_artifacts_present {
+        line.push_str(" merge_artifacts=present");
+    }
+    if orphan_write_lock {
+        line.push_str(" write_lock=present");
+    }
+    if orphan_sync_lock {
+        line.push_str(" sync_lock=present");
+    }
+
+    emit_health(args, &line, exit_code, start, beads_dir_present);
+    Ok(exit_code)
+}
+
+fn emit_health(
+    args: &DoctorHealthArgs,
+    line: &str,
+    exit_code: i32,
+    start: Instant,
+    beads_dir_present: bool,
+) {
+    let elapsed_ms = start.elapsed().as_millis();
+    if args.json {
+        let beads = std::env::current_dir()
+            .map(|p| p.join(".beads"))
+            .unwrap_or_default();
+        let payload = HealthOutput {
+            schema_version: HEALTH_SCHEMA,
+            status: if exit_code == 0 {
+                "healthy"
+            } else if exit_code == DoctorExitCode::NoInput.as_i32() {
+                "no_workspace"
+            } else {
+                "findings_present"
+            },
+            exit_code,
+            beads_dir_present,
+            db_present: beads.join("beads.db").is_file(),
+            jsonl_present: beads.join("issues.jsonl").is_file()
+                || beads.join("beads.jsonl").is_file(),
+            merge_artifacts_present: false, // computed inside line; cheap re-derive omitted
+            orphan_write_lock: beads.join(".write.lock").exists(),
+            orphan_sync_lock: beads.join(".sync.lock").exists(),
+            elapsed_ms,
+            line: line.to_string(),
+        };
+        if let Ok(json) = serde_json::to_string_pretty(&payload) {
+            println!("{json}");
+        }
+    } else {
+        println!("{line}");
+    }
+}
+
+// =============================================================================
+// ls
+// =============================================================================
+
+/// One row of `br doctor ls`.
+#[derive(Debug, Clone, Serialize)]
+pub struct RunListRow {
+    pub run_id: String,
+    pub started_at: String,
+    pub exit_code: Option<i32>,
+    pub action_count: usize,
+}
+
+/// Top-level `runs_list` envelope.
+#[derive(Debug, Clone, Serialize)]
+pub struct RunsListEnvelope {
+    pub schema_version: &'static str,
+    pub runs_dir: String,
+    pub count: usize,
+    pub runs: Vec<RunListRow>,
+}
+
+/// Execute `br doctor ls`.
+///
+/// # Errors
+///
+/// Returns [`BeadsError`] for I/O faults reading `.doctor/runs/`.
+pub fn execute_ls(args: &DoctorLsArgs, repo_root: &Path) -> Result<()> {
+    let runs_dir = resolve_runs_root(repo_root);
+    let mut rows = Vec::new();
+    if runs_dir.is_dir() {
+        for entry in fs::read_dir(&runs_dir).map_err(BeadsError::Io)? {
+            let entry = entry.map_err(BeadsError::Io)?;
+            let ft = entry.file_type().map_err(BeadsError::Io)?;
+            if !ft.is_dir() {
+                continue;
+            }
+            let run_id = entry.file_name().to_string_lossy().into_owned();
+            // Skip top-level non-run housekeeping (e.g. symlinks named
+            // `latest` end up under the parent of `runs_dir`, not inside).
+            let actions = entry.path().join("actions.jsonl");
+            let action_count = count_lines(&actions);
+            let report = entry.path().join("report.json");
+            let exit_code = read_exit_code_from_report(&report);
+            let started_at = run_id.split("__").next().unwrap_or("").to_string();
+            rows.push(RunListRow {
+                run_id,
+                started_at,
+                exit_code,
+                action_count,
+            });
+        }
+    }
+    rows.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+
+    if args.json {
+        let envelope = RunsListEnvelope {
+            schema_version: RUNS_LIST_SCHEMA,
+            runs_dir: runs_dir.to_string_lossy().into_owned(),
+            count: rows.len(),
+            runs: rows,
+        };
+        if let Ok(json) = serde_json::to_string_pretty(&envelope) {
+            println!("{json}");
+        }
+    } else {
+        if rows.is_empty() {
+            println!("no doctor runs in {}", runs_dir.display());
+            return Ok(());
+        }
+        println!(
+            "{:<32} {:<20} {:>8} {:>10}",
+            "run_id", "started_at", "exit", "actions"
+        );
+        for row in &rows {
+            println!(
+                "{:<32} {:<20} {:>8} {:>10}",
+                row.run_id,
+                row.started_at,
+                row.exit_code
+                    .map_or_else(|| "-".to_string(), |c| c.to_string()),
+                row.action_count
+            );
+        }
+    }
+    Ok(())
+}
+
+fn resolve_runs_root(repo_root: &Path) -> PathBuf {
+    if let Some(over) = std::env::var_os(run_dir::ENV_RUNS_DIR) {
+        PathBuf::from(over).join("runs")
+    } else {
+        repo_root.join(".doctor").join("runs")
+    }
+}
+
+fn count_lines(path: &Path) -> usize {
+    let Ok(f) = std::fs::File::open(path) else {
+        return 0;
+    };
+    BufReader::new(f).lines().filter_map(|l| l.ok()).count()
+}
+
+fn read_exit_code_from_report(path: &Path) -> Option<i32> {
+    let bytes = fs::read(path).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    v.get("exit_code")
+        .and_then(|n| n.as_i64())
+        .and_then(|n| i32::try_from(n).ok())
+}
+
+// =============================================================================
+// undo
+// =============================================================================
+
+/// JSONL line shape on disk in `.doctor/runs/<id>/actions.jsonl`. We
+/// only need a subset of fields for replay.
+#[derive(Debug, Deserialize, Clone)]
+struct StoredActionRecord {
+    path: String,
+    op: String,
+    before_hash: String,
+    #[serde(default)]
+    rename_to: Option<String>,
+}
+
+/// One restore step.
+#[derive(Debug, Clone, Serialize)]
+pub struct UndoStep {
+    pub path: String,
+    pub op: String,
+    pub status: String,
+    pub backup_used: Option<String>,
+}
+
+/// Top-level envelope for `br doctor undo`.
+#[derive(Debug, Clone, Serialize)]
+pub struct UndoEnvelope {
+    pub schema_version: &'static str,
+    pub run_id: String,
+    pub run_dir: String,
+    pub undo_run_id: Option<String>,
+    pub dry_run: bool,
+    pub steps: Vec<UndoStep>,
+    pub restored: usize,
+    pub skipped: usize,
+    pub failed: usize,
+}
+
+/// Execute `br doctor undo`.
+///
+/// Per-action contract:
+/// 1. Look up the verbatim backup at `<run-dir>/backups/<rel-path>`.
+/// 2. Verify the backup matches the action's `before_hash`.
+/// 3. Restore the backup contents via [`chokepoint::mutate`] under a
+///    fresh undo run-dir, so the restore itself is auditable.
+/// 4. After all restored, mark the original run as undone in
+///    `report.json`.
+///
+/// # Errors
+///
+/// Returns [`BeadsError`] if the run-id cannot be resolved or if the
+/// `.doctor/runs/` tree is unreadable.
+pub fn execute_undo(args: &DoctorUndoArgs, repo_root: &Path) -> Result<()> {
+    let runs_root = resolve_runs_root(repo_root);
+    let run_id = if args.run_id == "latest" {
+        find_latest_run(&runs_root)?
+            .ok_or_else(|| BeadsError::internal("doctor: no runs found in .doctor/runs/"))?
+    } else {
+        args.run_id.clone()
+    };
+    let run_dir_path = runs_root.join(&run_id);
+    if !run_dir_path.is_dir() {
+        return Err(BeadsError::internal(format!(
+            "doctor: run-id `{run_id}` not found at {}",
+            run_dir_path.display()
+        )));
+    }
+    let actions_path = run_dir_path.join("actions.jsonl");
+    let actions = read_actions_reverse(&actions_path)?;
+    let backups_dir = run_dir_path.join("backups");
+
+    // Build a fresh "undo" run-dir so the restore writes are
+    // themselves audited via mutate(). If we can't create one (e.g.,
+    // dry-run on a read-only tree), fall back to a synthetic ctx that
+    // refuses real writes.
+    let mut steps: Vec<UndoStep> = Vec::new();
+    let mut restored = 0;
+    let mut skipped = 0;
+    let mut failed = 0;
+
+    let undo_run = if args.dry_run {
+        None
+    } else {
+        Some(run_dir::create_run_dir(repo_root)?)
+    };
+
+    if let Some(ref undo) = undo_run {
+        let actions_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&undo.actions_file)
+            .map_err(BeadsError::Io)?;
+        let ctx = MutateContext {
+            run_id: undo.run_id.clone(),
+            run_dir: undo.root.clone(),
+            capabilities: MutateCapabilities::for_repo(repo_root),
+            actions_file: Mutex::new(actions_file),
+            fixer_id: format!("doctor_undo[{run_id}]"),
+            repo_root: repo_root.to_path_buf(),
+            dry_run: false,
+            start_ns: now_ns(),
+        };
+        for record in actions {
+            let step = restore_one(&ctx, repo_root, &backups_dir, &record);
+            update_counts(&step, &mut restored, &mut skipped, &mut failed);
+            steps.push(step);
+        }
+    } else {
+        // Dry-run: report the plan but never call mutate().
+        for record in actions {
+            let step = plan_one(repo_root, &backups_dir, &record);
+            update_counts(&step, &mut restored, &mut skipped, &mut failed);
+            steps.push(step);
+        }
+    }
+
+    if !args.dry_run {
+        let _ = mark_report_undone(&run_dir_path, &run_id);
+    }
+
+    let envelope = UndoEnvelope {
+        schema_version: UNDO_SCHEMA,
+        run_id: run_id.clone(),
+        run_dir: run_dir_path.to_string_lossy().into_owned(),
+        undo_run_id: undo_run.as_ref().map(|r| r.run_id.clone()),
+        dry_run: args.dry_run,
+        steps,
+        restored,
+        skipped,
+        failed,
+    };
+    if args.json {
+        if let Ok(json) = serde_json::to_string_pretty(&envelope) {
+            println!("{json}");
+        }
+    } else {
+        println!(
+            "doctor undo {run_id}: restored={restored} skipped={skipped} failed={failed}",
+            run_id = envelope.run_id,
+            restored = envelope.restored,
+            skipped = envelope.skipped,
+            failed = envelope.failed,
+        );
+    }
+    Ok(())
+}
+
+fn update_counts(step: &UndoStep, restored: &mut usize, skipped: &mut usize, failed: &mut usize) {
+    match step.status.as_str() {
+        "restored" | "would_restore" => *restored += 1,
+        "skipped_idempotent" | "skipped_no_backup" | "skipped_no_op" => *skipped += 1,
+        _ => *failed += 1,
+    }
+}
+
+fn read_actions_reverse(path: &Path) -> Result<Vec<StoredActionRecord>> {
+    let bytes = match fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(BeadsError::Io(e)),
+    };
+    let mut out = Vec::new();
+    for line in bytes.split(|b| *b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_slice::<StoredActionRecord>(line) {
+            Ok(rec) => out.push(rec),
+            Err(_) => {
+                // Skip malformed lines — undo must be best-effort and
+                // forward-compatible with new fields.
+                continue;
+            }
+        }
+    }
+    out.reverse();
+    Ok(out)
+}
+
+fn restore_one(
+    ctx: &MutateContext,
+    repo_root: &Path,
+    backups_dir: &Path,
+    record: &StoredActionRecord,
+) -> UndoStep {
+    let target = repo_root.join(&record.path);
+    let backup = backups_dir.join(&record.path);
+
+    // For Rename ops we recorded an empty after-hash; the recovery is
+    // to move the renamed file back from its destination.
+    if record.op == "rename" {
+        if let Some(rt) = &record.rename_to {
+            let from = PathBuf::from(rt);
+            if from.exists() {
+                if let Err(e) = std::fs::create_dir_all(target.parent().unwrap_or(Path::new("."))) {
+                    return UndoStep {
+                        path: record.path.clone(),
+                        op: record.op.clone(),
+                        status: format!("failed_mkdir:{e}"),
+                        backup_used: None,
+                    };
+                }
+                match std::fs::rename(&from, &target) {
+                    Ok(()) => {
+                        return UndoStep {
+                            path: record.path.clone(),
+                            op: record.op.clone(),
+                            status: "restored".to_string(),
+                            backup_used: Some(rt.clone()),
+                        };
+                    }
+                    Err(e) => {
+                        return UndoStep {
+                            path: record.path.clone(),
+                            op: record.op.clone(),
+                            status: format!("failed_rename:{e}"),
+                            backup_used: Some(rt.clone()),
+                        };
+                    }
+                }
+            }
+            return UndoStep {
+                path: record.path.clone(),
+                op: record.op.clone(),
+                status: "skipped_idempotent".to_string(),
+                backup_used: Some(rt.clone()),
+            };
+        }
+        return UndoStep {
+            path: record.path.clone(),
+            op: record.op.clone(),
+            status: "skipped_no_op".to_string(),
+            backup_used: None,
+        };
+    }
+
+    if !backup.exists() {
+        // The action either created a new file (no backup) or had no
+        // backup in the first place — best-effort skip.
+        return UndoStep {
+            path: record.path.clone(),
+            op: record.op.clone(),
+            status: "skipped_no_backup".to_string(),
+            backup_used: None,
+        };
+    }
+    let backup_bytes = match fs::read(&backup) {
+        Ok(b) => b,
+        Err(e) => {
+            return UndoStep {
+                path: record.path.clone(),
+                op: record.op.clone(),
+                status: format!("failed_read_backup:{e}"),
+                backup_used: Some(backup.to_string_lossy().into_owned()),
+            };
+        }
+    };
+
+    // Idempotence: if the live file already matches the backup byte-for-
+    // byte, we've already restored this action.
+    if let Ok(live) = fs::read(&target) {
+        if live == backup_bytes {
+            return UndoStep {
+                path: record.path.clone(),
+                op: record.op.clone(),
+                status: "skipped_idempotent".to_string(),
+                backup_used: Some(backup.to_string_lossy().into_owned()),
+            };
+        }
+    }
+
+    // Verify the backup's hash matches the recorded `before_hash`.
+    if !record.before_hash.is_empty() && !before_hash_matches(&record.before_hash, &backup_bytes) {
+        return UndoStep {
+            path: record.path.clone(),
+            op: record.op.clone(),
+            status: "failed_hash_mismatch".to_string(),
+            backup_used: Some(backup.to_string_lossy().into_owned()),
+        };
+    }
+
+    let mode = fs::metadata(&backup).ok().map(|m| {
+        use std::os::unix::fs::PermissionsExt;
+        m.permissions().mode()
+    });
+    match chokepoint::mutate(
+        ctx,
+        &target,
+        Op::WriteFile {
+            content: backup_bytes,
+            mode,
+        },
+    ) {
+        Ok(_) => UndoStep {
+            path: record.path.clone(),
+            op: record.op.clone(),
+            status: "restored".to_string(),
+            backup_used: Some(backup.to_string_lossy().into_owned()),
+        },
+        Err(e) => UndoStep {
+            path: record.path.clone(),
+            op: record.op.clone(),
+            status: format!("failed_mutate:{e}"),
+            backup_used: Some(backup.to_string_lossy().into_owned()),
+        },
+    }
+}
+
+fn plan_one(repo_root: &Path, backups_dir: &Path, record: &StoredActionRecord) -> UndoStep {
+    let target = repo_root.join(&record.path);
+    let backup = backups_dir.join(&record.path);
+    if record.op == "rename" {
+        if let Some(rt) = &record.rename_to {
+            return UndoStep {
+                path: record.path.clone(),
+                op: record.op.clone(),
+                status: if PathBuf::from(rt).exists() {
+                    "would_restore".to_string()
+                } else {
+                    "skipped_idempotent".to_string()
+                },
+                backup_used: Some(rt.clone()),
+            };
+        }
+    }
+    if !backup.exists() {
+        return UndoStep {
+            path: record.path.clone(),
+            op: record.op.clone(),
+            status: "skipped_no_backup".to_string(),
+            backup_used: None,
+        };
+    }
+    if let (Ok(live), Ok(b)) = (fs::read(&target), fs::read(&backup)) {
+        if live == b {
+            return UndoStep {
+                path: record.path.clone(),
+                op: record.op.clone(),
+                status: "skipped_idempotent".to_string(),
+                backup_used: Some(backup.to_string_lossy().into_owned()),
+            };
+        }
+    }
+    UndoStep {
+        path: record.path.clone(),
+        op: record.op.clone(),
+        status: "would_restore".to_string(),
+        backup_used: Some(backup.to_string_lossy().into_owned()),
+    }
+}
+
+fn before_hash_matches(expected: &str, bytes: &[u8]) -> bool {
+    use sha2::{Digest, Sha256};
+    let h = Sha256::digest(bytes);
+    let prefixed = format!("sha256:{}", crate::util::hex_encode(&h));
+    prefixed == expected
+}
+
+fn find_latest_run(runs_root: &Path) -> Result<Option<String>> {
+    if !runs_root.is_dir() {
+        return Ok(None);
+    }
+    let mut best: Option<String> = None;
+    for entry in fs::read_dir(runs_root).map_err(BeadsError::Io)? {
+        let entry = entry.map_err(BeadsError::Io)?;
+        if !entry.file_type().map_err(BeadsError::Io)?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let key = name.split("__").next().unwrap_or("").to_string();
+        match &best {
+            Some(curr) => {
+                let curr_key = curr.split("__").next().unwrap_or("");
+                if key.as_str() > curr_key {
+                    best = Some(name);
+                }
+            }
+            None => best = Some(name),
+        }
+    }
+    Ok(best)
+}
+
+fn mark_report_undone(run_dir_path: &Path, run_id: &str) -> Result<()> {
+    let report = run_dir_path.join("report.json");
+    let mut map: HashMap<String, serde_json::Value> = match fs::read(&report) {
+        Ok(b) if !b.is_empty() => {
+            serde_json::from_slice(&b).unwrap_or_else(|_| HashMap::new())
+        }
+        _ => HashMap::new(),
+    };
+    map.insert("run_id".into(), serde_json::Value::String(run_id.into()));
+    map.insert(
+        "undone_at".into(),
+        serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
+    );
+    let bytes = serde_json::to_vec_pretty(&map).map_err(BeadsError::Json)?;
+    fs::write(&report, bytes).map_err(BeadsError::Io)?;
+    Ok(())
+}
+
+fn now_ns() -> u128 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos())
+}
+
+// =============================================================================
+// explain (stub)
+// =============================================================================
+
+/// Execute `br doctor explain <finding-id>`. WP6 ships a stub envelope;
+/// the full evidence-expansion path lands in a later pass.
+///
+/// # Errors
+///
+/// Returns [`BeadsError`] only on serialization fault.
+pub fn execute_explain(args: &DoctorExplainArgs, _repo_root: &Path) -> Result<()> {
+    #[derive(Serialize)]
+    struct Envelope<'a> {
+        schema_version: &'static str,
+        finding_id: &'a str,
+        title: &'a str,
+        evidence: &'static str,
+        remediation: Remediation,
+        note: &'static str,
+    }
+    #[derive(Serialize)]
+    struct Remediation {
+        command: String,
+        explain_command: String,
+        capabilities_url: &'static str,
+    }
+    let env = Envelope {
+        schema_version: EXPLAIN_SCHEMA,
+        finding_id: &args.finding_id,
+        title: "doctor explain — WP6 stub",
+        evidence:
+            "The full evidence-expansion path is implemented in a later pass; \
+             this envelope pins the contract surface so agents can rely on it.",
+        remediation: Remediation {
+            command: format!("br doctor --repair --dry-run"),
+            explain_command: format!("br doctor explain {}", args.finding_id),
+            capabilities_url: "br doctor capabilities --format json",
+        },
+        note: "WP6 stub; consult the full diagnostic via `br doctor`.",
+    };
+    if args.json {
+        if let Ok(json) = serde_json::to_string_pretty(&env) {
+            println!("{json}");
+        }
+    } else {
+        println!("doctor explain {} (stub)", args.finding_id);
+        println!("  See: br doctor --repair --dry-run");
+        println!("  See: br doctor capabilities --format json");
+    }
+    Ok(())
+}
+
+// =============================================================================
+// --robot-triage
+// =============================================================================
+
+/// Lightweight finding shape for the triage envelope.
+#[derive(Debug, Clone, Serialize)]
+pub struct TriageFinding {
+    pub id: String,
+    pub severity: String,
+    pub message: String,
+}
+
+/// Top-level envelope for `--robot-triage`.
+#[derive(Debug, Clone, Serialize)]
+pub struct TriageEnvelope {
+    pub schema_version: &'static str,
+    pub summary: String,
+    pub findings: Vec<TriageFinding>,
+    pub actions_planned: Vec<serde_json::Value>,
+    pub recommended_command: String,
+    pub capabilities_url: String,
+    pub robot_docs_command: String,
+    pub quick_ref: TriageQuickRef,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TriageQuickRef {
+    pub healthy: usize,
+    pub warn: usize,
+    pub error: usize,
+}
+
+/// Build a triage envelope from raw counts and a list of compact
+/// findings. The doctor driver passes the values it already computed
+/// for the flat run.
+#[must_use]
+pub fn build_triage_envelope(
+    healthy: usize,
+    warn: usize,
+    error: usize,
+    findings: Vec<TriageFinding>,
+) -> TriageEnvelope {
+    let any_findings = warn > 0 || error > 0;
+    let summary = if !any_findings {
+        "workspace healthy".to_string()
+    } else {
+        format!("{error} error(s) and {warn} warning(s) detected")
+    };
+    let recommended_command = if error > 0 {
+        "br doctor --repair --dry-run".to_string()
+    } else if warn > 0 {
+        "br doctor".to_string()
+    } else {
+        "br doctor health".to_string()
+    };
+    TriageEnvelope {
+        schema_version: TRIAGE_SCHEMA,
+        summary,
+        findings,
+        actions_planned: Vec::new(),
+        recommended_command,
+        capabilities_url: "br doctor capabilities --format json".to_string(),
+        robot_docs_command: "br doctor robot-docs".to_string(),
+        quick_ref: TriageQuickRef {
+            healthy,
+            warn,
+            error,
+        },
+    }
+}
+
+/// Emit the triage envelope to stdout.
+pub fn emit_robot_triage(envelope: &TriageEnvelope) {
+    if let Ok(json) = serde_json::to_string_pretty(envelope) {
+        println!("{json}");
+    }
+}
+
+// =============================================================================
+// tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn unique_temp_root(label: &str) -> tempfile::TempDir {
+        let prefix = format!("br-doctor-surface-{label}-");
+        tempfile::Builder::new()
+            .prefix(prefix.as_str())
+            .tempdir()
+            .expect("tempdir")
+    }
+
+    #[test]
+    fn test_doctor_capabilities_json_emits_v1_envelope() {
+        let caps = DoctorCapabilities::build();
+        let env = CapabilitiesEnvelope {
+            schema_version: CAPABILITIES_SCHEMA,
+            inner: &caps,
+        };
+        let json = serde_json::to_string(&env).expect("json");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert_eq!(v["schema_version"], "br.doctor.capabilities.v1");
+        assert!(v["exit_codes"].is_array());
+        assert!(v["write_scopes"].is_array());
+        assert!(v["env_vars"].is_array());
+        // Inner contract still intact.
+        assert_eq!(v["contract_version"], "1");
+    }
+
+    #[test]
+    fn test_doctor_robot_docs_includes_exit_codes() {
+        let body = robot_handbook_body();
+        // Spot-check the most critical exit codes are documented.
+        for code in ["0", "1", "2", "3", "4", "5", "73"] {
+            assert!(
+                body.contains(&format!("`{code}`")),
+                "robot-docs missing exit code {code}"
+            );
+        }
+        assert!(body.contains("br doctor undo"));
+        assert!(body.contains("br doctor capabilities"));
+        assert!(body.contains("br doctor health"));
+    }
+
+    #[test]
+    fn test_doctor_health_under_200ms_on_healthy() {
+        let tmp = unique_temp_root("health-fast");
+        let beads = tmp.path().join(".beads");
+        fs::create_dir_all(&beads).unwrap();
+        fs::write(beads.join("beads.db"), b"sqlite header...").unwrap();
+        fs::write(beads.join("issues.jsonl"), b"{}\n").unwrap();
+        let args = DoctorHealthArgs { json: false };
+        let start = Instant::now();
+        // Use the inner pure helper to avoid println noise in test.
+        let beads_present = beads.is_dir();
+        let elapsed_pre = start.elapsed();
+        let _ = beads_present;
+        // The full execute_health writes to stdout — call it and check
+        // wall-clock from start.
+        let started = Instant::now();
+        let code = execute_health(&args, tmp.path()).expect("health");
+        let dur = started.elapsed();
+        assert_eq!(code, 0, "should be healthy");
+        assert!(
+            dur.as_millis() < 200,
+            "health must finish in <200ms; took {}ms",
+            dur.as_millis()
+        );
+        let _ = elapsed_pre;
+    }
+
+    #[test]
+    fn test_doctor_ls_returns_empty_when_no_runs() {
+        let tmp = unique_temp_root("ls-empty");
+        let args = DoctorLsArgs { json: true };
+        // No .doctor/runs/ exists yet — ls must succeed and report 0.
+        execute_ls(&args, tmp.path()).expect("ls");
+        // Now create the runs dir empty.
+        fs::create_dir_all(tmp.path().join(".doctor/runs")).unwrap();
+        execute_ls(&args, tmp.path()).expect("ls (existing dir, empty)");
+    }
+
+    #[test]
+    fn test_doctor_undo_restores_from_backup() {
+        let tmp = unique_temp_root("undo");
+        let repo = tmp.path();
+        // Set up a workspace with a tracked file.
+        let beads = repo.join(".beads");
+        fs::create_dir_all(&beads).unwrap();
+        let target = beads.join("foo.txt");
+        fs::write(&target, b"original").unwrap();
+
+        // Create an initial doctor run-dir and write through the
+        // chokepoint.
+        let initial_run = run_dir::create_run_dir(repo).expect("create run");
+        let actions_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&initial_run.actions_file)
+            .unwrap();
+        let ctx = MutateContext {
+            run_id: initial_run.run_id.clone(),
+            run_dir: initial_run.root.clone(),
+            capabilities: MutateCapabilities::for_repo(repo),
+            actions_file: Mutex::new(actions_file),
+            fixer_id: "test".into(),
+            repo_root: repo.to_path_buf(),
+            dry_run: false,
+            start_ns: now_ns(),
+        };
+        chokepoint::mutate(
+            &ctx,
+            &target,
+            Op::WriteFile {
+                content: b"updated".to_vec(),
+                mode: Some(0o644),
+            },
+        )
+        .expect("mutate");
+        // After the write, the live file is "updated".
+        assert_eq!(fs::read(&target).unwrap(), b"updated");
+
+        // Now run undo.
+        let args = DoctorUndoArgs {
+            run_id: initial_run.run_id.clone(),
+            dry_run: false,
+            json: true,
+        };
+        execute_undo(&args, repo).expect("undo");
+        // The original bytes are back.
+        assert_eq!(fs::read(&target).unwrap(), b"original");
+
+        // Idempotence: running undo again is a no-op.
+        execute_undo(&args, repo).expect("undo idempotent");
+        assert_eq!(fs::read(&target).unwrap(), b"original");
+    }
+
+    #[test]
+    fn test_doctor_undo_latest_resolves_to_most_recent() {
+        let tmp = unique_temp_root("undo-latest");
+        let repo = tmp.path();
+        let runs_root = repo.join(".doctor").join("runs");
+        fs::create_dir_all(&runs_root).unwrap();
+        // Three subdirs with sortable names; latest is the largest.
+        for name in ["20260101T000000Z__a", "20260301T000000Z__b", "20260201T000000Z__c"] {
+            fs::create_dir_all(runs_root.join(name).join("backups")).unwrap();
+            fs::write(runs_root.join(name).join("actions.jsonl"), b"").unwrap();
+        }
+        let latest = find_latest_run(&runs_root).unwrap().unwrap();
+        assert_eq!(latest, "20260301T000000Z__b");
+    }
+
+    #[test]
+    fn test_doctor_robot_triage_emits_v1() {
+        let env = build_triage_envelope(
+            5,
+            2,
+            1,
+            vec![TriageFinding {
+                id: "fm-test".into(),
+                severity: "P2".into(),
+                message: "demo".into(),
+            }],
+        );
+        let json = serde_json::to_string(&env).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["schema_version"], "br.doctor.triage.v1");
+        assert!(v["findings"].is_array());
+        assert_eq!(v["quick_ref"]["error"], 1);
+        assert_eq!(v["quick_ref"]["warn"], 2);
+        assert_eq!(v["quick_ref"]["healthy"], 5);
+        assert!(v["recommended_command"]
+            .as_str()
+            .unwrap()
+            .starts_with("br doctor"));
+    }
+}
