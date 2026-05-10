@@ -528,8 +528,23 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
     //     a non-doctor writer touches the file *after* our read; if the
     //     backup we just wrote no longer matches the live file we
     //     refuse rather than commit to a stale before_hash.
+    //
+    //     We also capture the live file's mode here so an Op::AppendFile
+    //     can stamp the temp file with the same mode without performing
+    //     a third stat(2) inside execute_atomic — that third stat opened
+    //     a TOCTOU window between cmp_strict and execute_atomic where a
+    //     concurrent writer could swap the file (and its mode) under us.
     let rel = path.strip_prefix(&ctx.repo_root).unwrap_or(path);
     let backup = ctx.run_dir.join("backups").join(rel);
+    let existing_mode = if before_bytes_or_missing.is_some() {
+        match fs::metadata(path) {
+            Ok(meta) => Some(meta.permissions().mode()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(BeadsError::Io(e)),
+        }
+    } else {
+        None
+    };
     if !ctx.dry_run
         && let Some(bytes) = before_bytes_or_missing.as_ref()
     {
@@ -548,7 +563,15 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
             error: None,
         });
     }
-    execute_atomic(path, op).map_err(BeadsError::Io)?;
+    // Hand the captured `before_bytes` and `existing_mode` to
+    // `execute_atomic` so Op::AppendFile can compute the merged contents
+    // from the *hashed-and-backed-up* bytes rather than re-reading the
+    // live file — closing the TOCTOU window where a concurrent writer
+    // could change the live file between cmp_strict and the append's
+    // own read(). The bytes are exactly what we already wrote to the
+    // verbatim backup, so undo can still recover the original file.
+    execute_atomic(path, op, before_bytes_or_missing.as_deref(), existing_mode)
+        .map_err(BeadsError::Io)?;
 
     // (7) after_hash.
     let after_bytes = read_or_empty(path).map_err(BeadsError::Io)?;
@@ -812,80 +835,13 @@ fn run_db_exec(
     // in this loop must ROLLBACK + scrub the partial snapshot files we
     // already wrote — they have no actions.jsonl entry referencing them.
     for table in affected_tables {
-        let predicate = affected_predicate.unwrap_or("").trim();
-        let select_sql = if predicate.is_empty() {
-            format!("SELECT * FROM {table}")
-        } else {
-            format!("SELECT * FROM {table} WHERE {predicate}")
-        };
-
-        let column_names = match collect_column_names(&conn, table) {
-            Ok(names) => names,
-            Err(e) => {
-                let _ = conn.execute("ROLLBACK");
-                let _ = conn.close();
-                scrub_orphan_snapshots(&snapshot_paths);
-                return Err(e);
-            }
-        };
-        let stmt = match conn.prepare(&select_sql) {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = conn.execute("ROLLBACK");
-                let _ = conn.close();
-                scrub_orphan_snapshots(&snapshot_paths);
-                return Err(e.into());
-            }
-        };
-        let rows = match stmt.query() {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = conn.execute("ROLLBACK");
-                let _ = conn.close();
-                scrub_orphan_snapshots(&snapshot_paths);
-                return Err(e.into());
-            }
-        };
-
-        let mut json_rows: Vec<serde_json::Value> = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let mut obj = serde_json::Map::new();
-            for (i, name) in column_names.iter().enumerate() {
-                let val = row
-                    .get(i)
-                    .cloned()
-                    .unwrap_or(fsqlite_types::value::SqliteValue::Null);
-                obj.insert(name.clone(), sqlite_value_to_json(&val));
-            }
-            json_rows.push(serde_json::Value::Object(obj));
-        }
-
-        let mut hasher = Sha256::new();
-        hasher.update(predicate.as_bytes());
-        let predicate_hash = &hex_encode(&hasher.finalize())[..8];
-        let snapshot_envelope = serde_json::json!({
-            "schema_version": "br.doctor.db_snapshot.v1",
-            "table": table,
-            "predicate": affected_predicate,
-            "columns": column_names,
-            "rows": json_rows,
-        });
-        let body = match serde_json::to_vec_pretty(&snapshot_envelope) {
-            Ok(b) => b,
-            Err(e) => {
-                let _ = conn.execute("ROLLBACK");
-                let _ = conn.close();
-                scrub_orphan_snapshots(&snapshot_paths);
-                return Err(BeadsError::Json(e));
-            }
-        };
-        let snap_path = match write_unique_db_snapshot(backups_db, table, predicate_hash, &body) {
+        let snap_path = match snapshot_db_table(&conn, backups_db, table, affected_predicate) {
             Ok(p) => p,
             Err(e) => {
                 let _ = conn.execute("ROLLBACK");
                 let _ = conn.close();
                 scrub_orphan_snapshots(&snapshot_paths);
-                return Err(BeadsError::Io(e));
+                return Err(e);
             }
         };
         snapshot_paths.push(snap_path);
@@ -919,6 +875,49 @@ fn run_db_exec(
     }
     let _ = conn.close();
     Ok(snapshot_paths)
+}
+
+fn snapshot_db_table(
+    conn: &fsqlite::Connection,
+    backups_db: &Path,
+    table: &str,
+    affected_predicate: Option<&str>,
+) -> Result<PathBuf, BeadsError> {
+    let predicate = affected_predicate.unwrap_or("").trim();
+    let select_sql = if predicate.is_empty() {
+        format!("SELECT * FROM {table}")
+    } else {
+        format!("SELECT * FROM {table} WHERE {predicate}")
+    };
+
+    let column_names = collect_column_names(conn, table)?;
+    let stmt = conn.prepare(&select_sql)?;
+    let rows = stmt.query()?;
+    let mut json_rows: Vec<serde_json::Value> = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let mut obj = serde_json::Map::new();
+        for (i, name) in column_names.iter().enumerate() {
+            let val = row
+                .get(i)
+                .cloned()
+                .unwrap_or(fsqlite_types::value::SqliteValue::Null);
+            obj.insert(name.clone(), sqlite_value_to_json(&val));
+        }
+        json_rows.push(serde_json::Value::Object(obj));
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(predicate.as_bytes());
+    let predicate_hash = &hex_encode(&hasher.finalize())[..8];
+    let snapshot_envelope = serde_json::json!({
+        "schema_version": "br.doctor.db_snapshot.v1",
+        "table": table,
+        "predicate": affected_predicate,
+        "columns": column_names,
+        "rows": json_rows,
+    });
+    let body = serde_json::to_vec_pretty(&snapshot_envelope).map_err(BeadsError::Json)?;
+    write_unique_db_snapshot(backups_db, table, predicate_hash, &body).map_err(BeadsError::Io)
 }
 
 /// Best-effort removal of snapshot files that were written before a
@@ -1115,7 +1114,21 @@ fn run_db_migrate(
 /// the containing directory so the rename itself is durable across
 /// power loss — POSIX does not guarantee directory updates land just
 /// because the file's contents were synced.
-fn execute_atomic(path: &Path, op: Op) -> std::io::Result<()> {
+///
+/// `existing_bytes` / `existing_mode` are supplied by the caller from
+/// the snapshot captured at step 2 of the chokepoint contract. They
+/// must reflect the bytes that were just hashed for `before_hash` and
+/// just written to the verbatim backup — never a fresh read of the
+/// live file. Re-reading the live file here would re-open the TOCTOU
+/// window the chokepoint exists to close (a concurrent writer could
+/// commit a change between cmp_strict and the re-read, leaving the
+/// merged contents based on data that was never backed up).
+fn execute_atomic(
+    path: &Path,
+    op: Op,
+    existing_bytes: Option<&[u8]>,
+    existing_mode: Option<u32>,
+) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
     match op {
@@ -1136,20 +1149,25 @@ fn execute_atomic(path: &Path, op: Op) -> std::io::Result<()> {
             // the new contents (existing + new) in a tmpfile, fsync,
             // and rename(2). This costs an extra read but matches
             // the WriteFile guarantee.
-            let existing = read_or_empty(path)?;
+            //
+            // TOCTOU-fix: use the in-memory bytes the chokepoint
+            // already hashed and backed up at step 2. Re-reading the
+            // live file here would let a concurrent writer's commit
+            // become invisible — we'd write `<backed-up-bytes>
+            // + content` over their fresh write, with no record in
+            // the verbatim backup that their bytes ever existed.
+            let existing: &[u8] = existing_bytes.unwrap_or(&[]);
             let mut buf = Vec::with_capacity(existing.len().saturating_add(content.len()));
-            buf.extend_from_slice(&existing);
+            buf.extend_from_slice(existing);
             buf.extend_from_slice(&content);
             let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
             tmp.write_all(&buf)?;
             tmp.as_file().sync_data()?;
-            // Preserve the existing file's mode if any; default to
-            // 0o644 for fresh files.
-            let mode = match fs::metadata(path) {
-                Ok(m) => m.permissions().mode(),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0o644,
-                Err(e) => return Err(e),
-            };
+            // Preserve the file's mode captured at step 2. A fresh
+            // metadata() call here would re-open the same TOCTOU
+            // window; default to 0o644 if the file did not exist
+            // at backup time.
+            let mode = existing_mode.unwrap_or(0o644);
             fs::set_permissions(tmp.path(), fs::Permissions::from_mode(mode))?;
             tmp.persist(path)
                 .map_err(|e| std::io::Error::other(e.error.to_string()))?;
@@ -1353,6 +1371,42 @@ mod tests {
     }
 
     #[test]
+    fn append_file_preserves_backed_up_bytes_and_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let target = beads_dir.join("append.log");
+        fs::write(&target, b"before").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let (ctx, actions_path) = make_ctx(tmp.path(), false);
+        let result = mutate(
+            &ctx,
+            &target,
+            Op::AppendFile {
+                content: b"-after".to_vec(),
+            },
+        )
+        .expect("append should succeed");
+
+        assert!(result.ok);
+        assert_eq!(fs::read(&target).unwrap(), b"before-after");
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::read(ctx.run_dir.join("backups/.beads/append.log")).unwrap(),
+            b"before"
+        );
+
+        let lines = fs::read_to_string(actions_path).unwrap();
+        let action: serde_json::Value = serde_json::from_str(lines.trim()).unwrap();
+        assert_eq!(action["op"], "append_file");
+        assert_eq!(action["ok"], true);
+    }
+
+    #[test]
     fn out_of_scope_path_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
         let beads_dir = tmp.path().join(".beads");
@@ -1411,6 +1465,37 @@ mod tests {
         assert_eq!(fs::metadata(&actions_path).unwrap().len(), 0);
         let backup = ctx.run_dir.join("backups/.beads/keep-inside.txt");
         assert!(!backup.exists());
+    }
+
+    /// Regression for the round-3 fresh-eyes TOCTOU fix:
+    /// `execute_atomic(Op::AppendFile)` must merge against the bytes
+    /// supplied by the chokepoint, not against a fresh read of the live
+    /// file. The caller has already hashed and backed up those supplied
+    /// bytes; a later live read could include data that undo cannot
+    /// restore.
+    #[test]
+    fn append_file_anchors_to_supplied_bytes_not_live_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let target = beads_dir.join("append.log");
+        fs::write(&target, b"hijacked\n").unwrap();
+
+        execute_atomic(
+            &target,
+            Op::AppendFile {
+                content: b"new\n".to_vec(),
+            },
+            Some(b"original\n"),
+            Some(0o600),
+        )
+        .expect("append should use supplied bytes");
+
+        assert_eq!(fs::read(&target).unwrap(), b"original\nnew\n");
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     // ========================================================================
