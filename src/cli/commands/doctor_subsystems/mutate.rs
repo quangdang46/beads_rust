@@ -776,9 +776,21 @@ fn run_db_exec(
     }
 
     // Now run the SQL inside a BEGIN IMMEDIATE / COMMIT transaction.
-    // Any error inside rolls back.
-    let conn = Connection::open(db_path.to_string_lossy().into_owned())?;
-    conn.execute("BEGIN IMMEDIATE")?;
+    // Any error inside rolls back AND scrubs the orphan snapshots —
+    // a snapshot with no corresponding actions.jsonl entry is dead
+    // weight that would only confuse forensic tooling.
+    let conn = match Connection::open(db_path.to_string_lossy().into_owned()) {
+        Ok(c) => c,
+        Err(e) => {
+            scrub_orphan_snapshots(&snapshot_paths);
+            return Err(e.into());
+        }
+    };
+    if let Err(e) = conn.execute("BEGIN IMMEDIATE") {
+        let _ = conn.close();
+        scrub_orphan_snapshots(&snapshot_paths);
+        return Err(e.into());
+    }
 
     let exec_outcome = if args.is_empty() {
         conn.execute(sql).map(|_| ())
@@ -791,17 +803,31 @@ fn run_db_exec(
             if let Err(e) = conn.execute("COMMIT") {
                 let _ = conn.execute("ROLLBACK");
                 let _ = conn.close();
+                scrub_orphan_snapshots(&snapshot_paths);
                 return Err(e.into());
             }
         }
         Err(e) => {
             let _ = conn.execute("ROLLBACK");
             let _ = conn.close();
+            scrub_orphan_snapshots(&snapshot_paths);
             return Err(e.into());
         }
     }
     let _ = conn.close();
     Ok(snapshot_paths)
+}
+
+/// Best-effort removal of snapshot files that were written before a
+/// failing SQL statement aborted the chokepoint. The chokepoint never
+/// records an `actions.jsonl` line for a rolled-back DbExec, so leaving
+/// the snapshots on disk would create dangling artifacts that the undo
+/// path cannot reach. Failures here are intentionally swallowed: the
+/// caller is already returning the underlying SQL error.
+fn scrub_orphan_snapshots(snapshot_paths: &[PathBuf]) {
+    for path in snapshot_paths {
+        let _ = fs::remove_file(path);
+    }
 }
 
 fn write_unique_db_snapshot(
@@ -1436,6 +1462,24 @@ mod tests {
             "rollback must leave only the seed row in the table"
         );
         let _ = conn.close();
+
+        // Orphan snapshot scrub: the chokepoint snapshotted the table
+        // before the SQL fired, but the SQL rolled back. There must be
+        // NO snapshot files left under backups/db/ — otherwise the
+        // workspace carries a dangling artifact with no actions.jsonl
+        // entry referencing it.
+        let snapshot_dir = ctx.run_dir.join("backups/db");
+        if snapshot_dir.exists() {
+            let leftover: Vec<_> = fs::read_dir(&snapshot_dir)
+                .unwrap()
+                .filter_map(std::result::Result::ok)
+                .map(|e| e.path())
+                .collect();
+            assert!(
+                leftover.is_empty(),
+                "rollback must scrub orphan snapshots; found {leftover:?}",
+            );
+        }
     }
 
     #[test]
