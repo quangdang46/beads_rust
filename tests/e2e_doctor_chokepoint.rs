@@ -655,11 +655,9 @@ fn chokepoint_robot_triage_envelope_v1() {
 //     (capabilities advertises it; mutate() executes it; backups land
 //     in `<run-dir>/backups/db/`; actions.jsonl records the op).
 //
-// The undo path for `Op::DbExec` is **not** yet wired in WP4 — it
-// requires a new replay handler that reads the JSON snapshots and
-// re-INSERTs them. The "undo verifies forward path" portion of the
-// contract is therefore captured as `chokepoint_db_exec_undo_replay`
-// (`#[ignore]` + a follow-up bead).
+// The companion `chokepoint_db_exec_undo_replay` test below exercises
+// the reverse path: `doctor undo` reads those JSON snapshots and
+// restores the table state in reverse action order.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -835,18 +833,164 @@ fn chokepoint_db_exec_round_trip() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 8 — WP4 follow-up: undo of `Op::DbExec` re-inserts JSON snapshots
+// Test 8 — undo of `Op::DbExec` re-inserts JSON snapshots
 //
-// IGNORED: undo for DB ops is a follow-up bead. The forward path
-// (Test 7) is sufficient as a WP4 deliverable; a full replay handler
-// that reads `<run-dir>/backups/db/<table>__<sha8>__<ns>[__<collision>].json`
-// and re-INSERTs rows belongs in WP5.
+// Drives the same DELETE+INSERT shape Test 7 uses to PROVE the forward
+// path; then invokes `br doctor undo <run-id>` and asserts the cache
+// table is byte-equivalent to the pre-DELETE state (the corrupt row
+// reappears, the corrected row is gone). This proves the chokepoint
+// round-trip works for DB ops, not just file ops.
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "WP4 follow-up: undo replay for Op::DbExec snapshots not yet wired (filed as a P1 bead)"]
 fn chokepoint_db_exec_undo_replay() {
-    // Placeholder so the test name shows up in `cargo test --list`
-    // and the bead has a concrete failing target to attach to.
-    panic!("WP5 will land the snapshot-driven undo replay for Op::DbExec");
+    use beads_rust::cli::commands::doctor_subsystems::mutate::{
+        Capabilities, DbArg, MutateContext, Op, mutate,
+    };
+    use fsqlite::Connection;
+    use std::sync::Mutex;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let root = tmp.path().to_path_buf();
+    let beads_dir = root.join(".beads");
+    fs::create_dir_all(&beads_dir).expect("mkdir .beads");
+    let db_path = beads_dir.join("beads.db");
+
+    // Build the DB with a corrupt cache row.
+    {
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        conn.execute(
+            "CREATE TABLE blocked_issues_cache (
+                issue_id TEXT PRIMARY KEY,
+                blocked_by TEXT NOT NULL,
+                blocked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blocked_issues_cache(issue_id, blocked_by, blocked_at) \
+             VALUES ('bd-1', '[\"WRONG\"]', '2026-05-01 00:00:00')",
+        )
+        .unwrap();
+        let _ = conn.close();
+    }
+
+    // Build a chokepoint context rooted at `root`.
+    let run_id = "wp4-db-exec-undo-replay".to_string();
+    let run_dir = root.join(".doctor").join("runs").join(&run_id);
+    fs::create_dir_all(run_dir.join("backups")).unwrap();
+    let actions_path = run_dir.join("actions.jsonl");
+    let actions_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&actions_path)
+        .unwrap();
+    let ctx = MutateContext {
+        run_id: run_id.clone(),
+        run_dir: run_dir.clone(),
+        capabilities: Capabilities::for_repo(&root),
+        actions_file: Mutex::new(actions_file),
+        fixer_id: "wp4-cache-rebuild".to_string(),
+        repo_root: root.clone(),
+        dry_run: false,
+        start_ns: 0,
+    };
+
+    // Forward: DELETE then INSERT a corrected row (mirroring Test 7).
+    mutate(
+        &ctx,
+        &db_path,
+        Op::DbExec {
+            sql: "DELETE FROM blocked_issues_cache".into(),
+            args: vec![],
+            affected_tables: vec!["blocked_issues_cache".into()],
+            affected_predicate: None,
+        },
+    )
+    .expect("DELETE via chokepoint should succeed");
+
+    mutate(
+        &ctx,
+        &db_path,
+        Op::DbExec {
+            sql: "INSERT INTO blocked_issues_cache(issue_id, blocked_by, blocked_at) \
+                  VALUES (?, ?, ?)"
+                .into(),
+            args: vec![
+                DbArg::Text("bd-1".into()),
+                DbArg::Text("[\"bd-2\"]".into()),
+                DbArg::Text("2026-05-09 00:00:00".into()),
+            ],
+            affected_tables: vec!["blocked_issues_cache".into()],
+            affected_predicate: None,
+        },
+    )
+    .expect("INSERT via chokepoint should succeed");
+
+    // Sanity: post-forward DB has the corrected row, not the corrupt one.
+    {
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let rows = conn
+            .query("SELECT issue_id, blocked_by FROM blocked_issues_cache")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let blocked_by = match rows[0].get(1) {
+            Some(fsqlite_types::value::SqliteValue::Text(s)) => s.to_string(),
+            other => panic!("unexpected blocked_by value: {other:?}"),
+        };
+        assert_eq!(blocked_by, "[\"bd-2\"]");
+        let _ = conn.close();
+    }
+
+    // Drop the actions file so the chokepoint flushes to disk and the
+    // undo path can re-open it for read.
+    drop(ctx);
+
+    // Now invoke `br doctor undo <run-id>` against the workspace.
+    let bin_path = env!("CARGO_BIN_EXE_br");
+    let output = std::process::Command::new(bin_path)
+        .args(["doctor", "undo", &run_id, "--json"])
+        .current_dir(&root)
+        .env("RUST_LOG", "error")
+        .env("BR_NO_AUTOFLUSH", "1")
+        .output()
+        .expect("invoke br doctor undo");
+    assert!(
+        output.status.success(),
+        "br doctor undo failed: status={:?} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The undo replays actions in REVERSE: the INSERT action's
+    // snapshot (empty pre-INSERT state) is replayed first, leaving an
+    // empty table; then the DELETE action's snapshot (containing the
+    // pre-DELETE corrupt row) is replayed, restoring it. Net effect:
+    // only the original corrupt row is present.
+    {
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let rows = conn
+            .query("SELECT issue_id, blocked_by FROM blocked_issues_cache")
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "expected exactly one row after undo, got {}",
+            rows.len()
+        );
+        let issue_id = match rows[0].get(0) {
+            Some(fsqlite_types::value::SqliteValue::Text(s)) => s.to_string(),
+            other => panic!("unexpected issue_id value: {other:?}"),
+        };
+        let blocked_by = match rows[0].get(1) {
+            Some(fsqlite_types::value::SqliteValue::Text(s)) => s.to_string(),
+            other => panic!("unexpected blocked_by value: {other:?}"),
+        };
+        assert_eq!(issue_id, "bd-1");
+        assert_eq!(
+            blocked_by, "[\"WRONG\"]",
+            "expected the pre-DELETE corrupt row to be restored"
+        );
+        let _ = conn.close();
+    }
 }

@@ -17,9 +17,9 @@
 //!
 //! - `health`, `capabilities`, `robot-docs`, `ls`, `explain` are
 //!   read-only.
-//! - `undo` mutates — every restore flows through
-//!   [`super::mutate::mutate`] with a fresh undo run-dir, so the audit
-//!   trail is itself reversible.
+//! - `undo` mutates. File restores flow through
+//!   [`super::mutate::mutate`] with a fresh undo run-dir; DB restores
+//!   replay the recorded JSON snapshots inside one SQLite transaction.
 
 #![allow(clippy::needless_pass_by_value)]
 
@@ -600,13 +600,13 @@ struct StoredActionRecord {
     #[serde(default)]
     db_snapshots: Vec<String>,
     /// Comma-separated list of affected table names recorded by the
-    /// DbExec forward path. Used by the undo replay to validate the
-    /// snapshot envelope shape before restoring.
+    /// DbExec forward path. The undo replay cross-checks this against
+    /// the table names inside `db_snapshots` before touching the DB.
     #[serde(default)]
     affected_tables: Option<String>,
     /// SQL predicate (WHERE clause body) used by the DbExec forward
-    /// path; `None` means "snapshot the whole table". Used by the undo
-    /// replay's DELETE step.
+    /// path; `None` means "snapshot the whole table". The undo replay
+    /// cross-checks this against every snapshot envelope predicate.
     #[serde(default)]
     affected_predicate: Option<String>,
 }
@@ -949,7 +949,17 @@ fn restore_db_exec(repo_root: &Path, record: &StoredActionRecord, target: PathBu
     // a writable DB connection.
     let mut envelopes: Vec<DbSnapshotEnvelope> = Vec::with_capacity(record.db_snapshots.len());
     for rel_snap in &record.db_snapshots {
-        let snap_path = repo_root.join(rel_snap);
+        let snap_path = match workspace_relative_path(repo_root, rel_snap) {
+            Ok(p) => p,
+            Err(e) => {
+                return UndoStep {
+                    path: record.path.clone(),
+                    op: record.op.clone(),
+                    status: format!("failed_invalid_snapshot_path:{e}"),
+                    backup_used: Some(rel_snap.clone()),
+                };
+            }
+        };
         let body = match fs::read(&snap_path) {
             Ok(b) => b,
             Err(e) => {
@@ -1003,6 +1013,14 @@ fn restore_db_exec(repo_root: &Path, record: &StoredActionRecord, target: PathBu
             }
         }
     }
+    if let Err(e) = validate_db_snapshot_contract(record, &envelopes) {
+        return UndoStep {
+            path: record.path.clone(),
+            op: record.op.clone(),
+            status: e,
+            backup_used: Some(record.db_snapshots.join(",")),
+        };
+    }
 
     // Replay every snapshot inside one BEGIN IMMEDIATE / COMMIT.
     let conn = match Connection::open(target.to_string_lossy().into_owned()) {
@@ -1033,10 +1051,11 @@ fn restore_db_exec(repo_root: &Path, record: &StoredActionRecord, target: PathBu
             // snapshotted the whole table, so we restore by clearing
             // the whole table first.
             let predicate = env.predicate.as_deref().unwrap_or("").trim();
+            let table_ident = quote_sql_ident(&env.table);
             let delete_sql = if predicate.is_empty() {
-                format!("DELETE FROM {}", env.table)
+                format!("DELETE FROM {table_ident}")
             } else {
-                format!("DELETE FROM {} WHERE {}", env.table, predicate)
+                format!("DELETE FROM {table_ident} WHERE {predicate}")
             };
             conn.execute(&delete_sql)
                 .map_err(|e| format!("delete:{e}"))?;
@@ -1046,11 +1065,15 @@ fn restore_db_exec(repo_root: &Path, record: &StoredActionRecord, target: PathBu
             if env.rows.is_empty() {
                 continue;
             }
-            let cols_csv = env.columns.join(", ");
+            let cols_csv = env
+                .columns
+                .iter()
+                .map(|c| quote_sql_ident(c))
+                .collect::<Vec<_>>()
+                .join(", ");
             let placeholders: Vec<&str> = vec!["?"; env.columns.len()];
             let insert_sql = format!(
-                "INSERT INTO {}({cols_csv}) VALUES ({})",
-                env.table,
+                "INSERT INTO {table_ident}({cols_csv}) VALUES ({})",
                 placeholders.join(", ")
             );
             for row in &env.rows {
@@ -1101,6 +1124,58 @@ fn restore_db_exec(repo_root: &Path, record: &StoredActionRecord, target: PathBu
     }
 }
 
+fn validate_db_snapshot_contract(
+    record: &StoredActionRecord,
+    envelopes: &[DbSnapshotEnvelope],
+) -> std::result::Result<(), String> {
+    let expected_tables = parse_affected_tables(record.affected_tables.as_deref())?;
+    let actual_tables: Vec<String> = envelopes.iter().map(|env| env.table.clone()).collect();
+    if expected_tables != actual_tables {
+        return Err(format!(
+            "failed_snapshot_table_mismatch:expected={} actual={}",
+            expected_tables.join(","),
+            actual_tables.join(",")
+        ));
+    }
+
+    let expected_predicate = normalize_predicate(record.affected_predicate.as_deref());
+    for env in envelopes {
+        let actual_predicate = normalize_predicate(env.predicate.as_deref());
+        if actual_predicate != expected_predicate {
+            return Err(format!(
+                "failed_snapshot_predicate_mismatch:table={}",
+                env.table
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parse_affected_tables(raw: Option<&str>) -> std::result::Result<Vec<String>, String> {
+    let Some(raw) = raw else {
+        return Err("failed_missing_affected_tables".to_string());
+    };
+    let tables: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    if tables.is_empty() {
+        return Err("failed_empty_affected_tables".to_string());
+    }
+    for table in &tables {
+        if !is_safe_sql_ident(table) {
+            return Err(format!("failed_invalid_record_table_ident:{table}"));
+        }
+    }
+    Ok(tables)
+}
+
+fn normalize_predicate(raw: Option<&str>) -> Option<&str> {
+    raw.map(str::trim).filter(|s| !s.is_empty())
+}
+
 /// In-memory shape of `br.doctor.db_snapshot.v1`. Mirrors the writer
 /// in `mutate.rs::run_db_exec`.
 #[derive(Debug, Clone, Deserialize)]
@@ -1118,6 +1193,29 @@ struct DbSnapshotEnvelope {
 /// no replay path can interpolate "" into SQL.
 fn is_safe_sql_ident(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn quote_sql_ident(s: &str) -> String {
+    debug_assert!(is_safe_sql_ident(s));
+    format!("\"{s}\"")
+}
+
+fn workspace_relative_path(repo_root: &Path, rel: &str) -> std::result::Result<PathBuf, String> {
+    let path = Path::new(rel);
+    if path.is_absolute() {
+        return Err("absolute".to_string());
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return Err("path_traversal".to_string());
+    }
+    Ok(repo_root.join(path))
 }
 
 /// Convert one JSON value back into an `SqliteValue` for re-binding.
@@ -1238,6 +1336,9 @@ fn plan_one(repo_root: &Path, backups_dir: &Path, record: &StoredActionRecord) -
             backup_used: Some(rt.clone()),
         };
     }
+    if record.op == "db_exec" {
+        return plan_db_exec(repo_root, record);
+    }
     if !backup.exists() {
         return UndoStep {
             path: record.path.clone(),
@@ -1261,6 +1362,44 @@ fn plan_one(repo_root: &Path, backups_dir: &Path, record: &StoredActionRecord) -
         op: record.op.clone(),
         status: "would_restore".to_string(),
         backup_used: Some(backup.to_string_lossy().into_owned()),
+    }
+}
+
+fn plan_db_exec(repo_root: &Path, record: &StoredActionRecord) -> UndoStep {
+    if record.db_snapshots.is_empty() {
+        return UndoStep {
+            path: record.path.clone(),
+            op: record.op.clone(),
+            status: "skipped_no_snapshots".to_string(),
+            backup_used: None,
+        };
+    }
+    for rel_snap in &record.db_snapshots {
+        let snap_path = match workspace_relative_path(repo_root, rel_snap) {
+            Ok(p) => p,
+            Err(e) => {
+                return UndoStep {
+                    path: record.path.clone(),
+                    op: record.op.clone(),
+                    status: format!("failed_invalid_snapshot_path:{e}"),
+                    backup_used: Some(rel_snap.clone()),
+                };
+            }
+        };
+        if !snap_path.exists() {
+            return UndoStep {
+                path: record.path.clone(),
+                op: record.op.clone(),
+                status: "failed_no_snapshot".to_string(),
+                backup_used: Some(snap_path.to_string_lossy().into_owned()),
+            };
+        }
+    }
+    UndoStep {
+        path: record.path.clone(),
+        op: record.op.clone(),
+        status: "would_restore".to_string(),
+        backup_used: Some(record.db_snapshots.join(",")),
     }
 }
 
@@ -1557,6 +1696,66 @@ mod tests {
         // Now create the runs dir empty.
         fs::create_dir_all(tmp.path().join(".doctor/runs")).unwrap();
         execute_ls(&args, tmp.path()).expect("ls (existing dir, empty)");
+    }
+
+    #[test]
+    fn db_snapshot_contract_rejects_tampered_table_metadata() {
+        let record = StoredActionRecord {
+            path: ".beads/beads.db".to_string(),
+            op: "db_exec".to_string(),
+            before_hash: "sha256:test".to_string(),
+            rename_to: None,
+            db_snapshots: vec![".doctor/runs/r/backups/db/cache.json".to_string()],
+            affected_tables: Some("blocked_issues_cache".to_string()),
+            affected_predicate: None,
+        };
+        let envelopes = vec![DbSnapshotEnvelope {
+            schema_version: "br.doctor.db_snapshot.v1".to_string(),
+            table: "other_cache".to_string(),
+            predicate: None,
+            columns: vec!["issue_id".to_string()],
+            rows: Vec::new(),
+        }];
+
+        let err = validate_db_snapshot_contract(&record, &envelopes).unwrap_err();
+
+        assert!(err.starts_with("failed_snapshot_table_mismatch"));
+    }
+
+    #[test]
+    fn db_snapshot_contract_rejects_tampered_predicate_metadata() {
+        let record = StoredActionRecord {
+            path: ".beads/beads.db".to_string(),
+            op: "db_exec".to_string(),
+            before_hash: "sha256:test".to_string(),
+            rename_to: None,
+            db_snapshots: vec![".doctor/runs/r/backups/db/cache.json".to_string()],
+            affected_tables: Some("blocked_issues_cache".to_string()),
+            affected_predicate: Some("issue_id = 'bd-1'".to_string()),
+        };
+        let envelopes = vec![DbSnapshotEnvelope {
+            schema_version: "br.doctor.db_snapshot.v1".to_string(),
+            table: "blocked_issues_cache".to_string(),
+            predicate: Some("issue_id = 'bd-2'".to_string()),
+            columns: vec!["issue_id".to_string()],
+            rows: Vec::new(),
+        }];
+
+        let err = validate_db_snapshot_contract(&record, &envelopes).unwrap_err();
+
+        assert_eq!(
+            err,
+            "failed_snapshot_predicate_mismatch:table=blocked_issues_cache"
+        );
+    }
+
+    #[test]
+    fn workspace_relative_snapshot_paths_cannot_escape_repo() {
+        let tmp = unique_temp_root("snapshot-paths");
+
+        assert!(workspace_relative_path(tmp.path(), ".doctor/runs/r/s.json").is_ok());
+        assert!(workspace_relative_path(tmp.path(), "../outside.json").is_err());
+        assert!(workspace_relative_path(tmp.path(), "/tmp/outside.json").is_err());
     }
 
     #[test]
