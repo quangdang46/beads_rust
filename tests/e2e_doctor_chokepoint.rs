@@ -784,18 +784,33 @@ fn chokepoint_db_exec_round_trip() {
         assert_eq!(v["affected_tables"], "blocked_issues_cache");
         assert!(v["before_hash"].as_str().unwrap().starts_with("sha256:"));
         assert!(v["after_hash"].as_str().unwrap().starts_with("sha256:"));
+        let db_snapshots = v["db_snapshots"]
+            .as_array()
+            .expect("db_snapshots should be an array");
+        assert_eq!(db_snapshots.len(), 1);
+        let snapshot_path = root.join(
+            db_snapshots[0]
+                .as_str()
+                .expect("db_snapshots entry should be a path"),
+        );
+        assert!(
+            snapshot_path.is_file(),
+            "recorded snapshot path should exist: {}",
+            snapshot_path.display()
+        );
     }
 
-    // Snapshots: at least one JSON snapshot in backups/db/ that
-    // captures the pre-DELETE state (a row with blocked_by="[\"WRONG\"]").
+    // Snapshots: both DbExec calls get their own JSON snapshot, and
+    // one captures the pre-DELETE state (blocked_by="[\"WRONG\"]").
     let snap_dir = run_dir.join("backups/db");
     let snap_files: Vec<PathBuf> = fs::read_dir(&snap_dir)
         .expect("read backups/db")
         .filter_map(|e| e.ok().map(|e| e.path()))
         .collect();
-    assert!(
-        !snap_files.is_empty(),
-        "expected at least one snapshot under {}",
+    assert_eq!(
+        snap_files.len(),
+        2,
+        "expected one snapshot per DbExec call under {}",
         snap_dir.display()
     );
 
@@ -824,8 +839,8 @@ fn chokepoint_db_exec_round_trip() {
 //
 // IGNORED: undo for DB ops is a follow-up bead. The forward path
 // (Test 7) is sufficient as a WP4 deliverable; a full replay handler
-// that reads `<run-dir>/backups/db/<table>__<sha8>__<ns>.json` and
-// re-INSERTs rows belongs in WP5.
+// that reads `<run-dir>/backups/db/<table>__<sha8>__<ns>[__<collision>].json`
+// and re-INSERTs rows belongs in WP5.
 // ---------------------------------------------------------------------------
 
 #[test]

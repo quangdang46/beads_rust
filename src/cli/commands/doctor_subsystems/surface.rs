@@ -595,6 +595,20 @@ struct StoredActionRecord {
     before_hash: String,
     #[serde(default)]
     rename_to: Option<String>,
+    /// Workspace-relative paths of the JSON snapshot files written by
+    /// the corresponding DbExec call. Empty for non-DbExec ops.
+    #[serde(default)]
+    db_snapshots: Vec<String>,
+    /// Comma-separated list of affected table names recorded by the
+    /// DbExec forward path. Used by the undo replay to validate the
+    /// snapshot envelope shape before restoring.
+    #[serde(default)]
+    affected_tables: Option<String>,
+    /// SQL predicate (WHERE clause body) used by the DbExec forward
+    /// path; `None` means "snapshot the whole table". Used by the undo
+    /// replay's DELETE step.
+    #[serde(default)]
+    affected_predicate: Option<String>,
 }
 
 /// One restore step.
@@ -813,6 +827,16 @@ fn restore_one(
         return restore_rename(ctx, record, target);
     }
 
+    // For DbExec we replay the JSON snapshot back into the live DB
+    // inside a single BEGIN IMMEDIATE / COMMIT. The chokepoint
+    // recorded snapshot file paths under `db_snapshots`; each snapshot
+    // is a `br.doctor.db_snapshot.v1` envelope with the table, the
+    // predicate, the column list, and the row vector taken before the
+    // forward DbExec ran.
+    if record.op == "db_exec" {
+        return restore_db_exec(repo_root, record, target);
+    }
+
     if !backup.exists() {
         return UndoStep {
             path: record.path.clone(),
@@ -880,6 +904,275 @@ fn restore_one(
             status: format!("failed_mutate:{e}"),
             backup_used: Some(backup.to_string_lossy().into_owned()),
         },
+    }
+}
+
+/// Replay a `db_exec` action by restoring the rows captured in the
+/// snapshot envelope back into the live DB. We expect each entry in
+/// `record.db_snapshots` to be a workspace-relative path to a
+/// `br.doctor.db_snapshot.v1` JSON file. The snapshot envelope carries
+/// the table name, predicate, column list, and pre-mutation rows.
+///
+/// Replay shape (per snapshot):
+/// 1. `BEGIN IMMEDIATE`.
+/// 2. `DELETE FROM <table>` (whole table) or `DELETE ... WHERE
+///    <predicate>` if the forward path used a predicate.
+/// 3. `INSERT INTO <table>(<cols>) VALUES (?, ?, ...)` for every
+///    snapshot row.
+/// 4. `COMMIT`, or `ROLLBACK` on any error.
+///
+/// All snapshots inside ONE record are replayed inside ONE transaction
+/// so the restore is atomic across tables.
+fn restore_db_exec(repo_root: &Path, record: &StoredActionRecord, target: PathBuf) -> UndoStep {
+    use fsqlite::Connection;
+    use fsqlite_types::value::SqliteValue;
+
+    if record.db_snapshots.is_empty() {
+        return UndoStep {
+            path: record.path.clone(),
+            op: record.op.clone(),
+            status: "skipped_no_snapshots".to_string(),
+            backup_used: None,
+        };
+    }
+
+    if !target.is_file() {
+        return UndoStep {
+            path: record.path.clone(),
+            op: record.op.clone(),
+            status: "failed_db_missing".to_string(),
+            backup_used: None,
+        };
+    }
+
+    // Read every snapshot envelope first so we fail-fast before opening
+    // a writable DB connection.
+    let mut envelopes: Vec<DbSnapshotEnvelope> = Vec::with_capacity(record.db_snapshots.len());
+    for rel_snap in &record.db_snapshots {
+        let snap_path = repo_root.join(rel_snap);
+        let body = match fs::read(&snap_path) {
+            Ok(b) => b,
+            Err(e) => {
+                return UndoStep {
+                    path: record.path.clone(),
+                    op: record.op.clone(),
+                    status: format!("failed_read_snapshot:{e}"),
+                    backup_used: Some(snap_path.to_string_lossy().into_owned()),
+                };
+            }
+        };
+        match serde_json::from_slice::<DbSnapshotEnvelope>(&body) {
+            Ok(env) => envelopes.push(env),
+            Err(e) => {
+                return UndoStep {
+                    path: record.path.clone(),
+                    op: record.op.clone(),
+                    status: format!("failed_parse_snapshot:{e}"),
+                    backup_used: Some(snap_path.to_string_lossy().into_owned()),
+                };
+            }
+        }
+    }
+
+    // Validate every envelope before touching the DB.
+    for env in &envelopes {
+        if env.schema_version != "br.doctor.db_snapshot.v1" {
+            return UndoStep {
+                path: record.path.clone(),
+                op: record.op.clone(),
+                status: format!("failed_unknown_snapshot_schema:{}", env.schema_version),
+                backup_used: None,
+            };
+        }
+        if !is_safe_sql_ident(&env.table) {
+            return UndoStep {
+                path: record.path.clone(),
+                op: record.op.clone(),
+                status: format!("failed_invalid_table_ident:{}", env.table),
+                backup_used: None,
+            };
+        }
+        for col in &env.columns {
+            if !is_safe_sql_ident(col) {
+                return UndoStep {
+                    path: record.path.clone(),
+                    op: record.op.clone(),
+                    status: format!("failed_invalid_column_ident:{col}"),
+                    backup_used: None,
+                };
+            }
+        }
+    }
+
+    // Replay every snapshot inside one BEGIN IMMEDIATE / COMMIT.
+    let conn = match Connection::open(target.to_string_lossy().into_owned()) {
+        Ok(c) => c,
+        Err(e) => {
+            return UndoStep {
+                path: record.path.clone(),
+                op: record.op.clone(),
+                status: format!("failed_open_db:{e}"),
+                backup_used: None,
+            };
+        }
+    };
+    if let Err(e) = conn.execute("BEGIN IMMEDIATE") {
+        let _ = conn.close();
+        return UndoStep {
+            path: record.path.clone(),
+            op: record.op.clone(),
+            status: format!("failed_begin:{e}"),
+            backup_used: None,
+        };
+    }
+
+    let replay_result: std::result::Result<(), String> = (|| {
+        for env in &envelopes {
+            // Step 1: DELETE the rows the forward call would have
+            // touched. For predicate-less DbExec the forward path
+            // snapshotted the whole table, so we restore by clearing
+            // the whole table first.
+            let predicate = env.predicate.as_deref().unwrap_or("").trim();
+            let delete_sql = if predicate.is_empty() {
+                format!("DELETE FROM {}", env.table)
+            } else {
+                format!("DELETE FROM {} WHERE {}", env.table, predicate)
+            };
+            conn.execute(&delete_sql)
+                .map_err(|e| format!("delete:{e}"))?;
+
+            // Step 2: INSERT each snapshot row. We bind via
+            // execute_with_params to keep the SQL injection-free.
+            if env.rows.is_empty() {
+                continue;
+            }
+            let cols_csv = env.columns.join(", ");
+            let placeholders: Vec<&str> = vec!["?"; env.columns.len()];
+            let insert_sql = format!(
+                "INSERT INTO {}({cols_csv}) VALUES ({})",
+                env.table,
+                placeholders.join(", ")
+            );
+            for row in &env.rows {
+                let mut bound: Vec<SqliteValue> = Vec::with_capacity(env.columns.len());
+                for col in &env.columns {
+                    let val = row.get(col).cloned().unwrap_or(serde_json::Value::Null);
+                    bound.push(json_to_sqlite_value(&val).map_err(|e| format!("bind:{e}"))?);
+                }
+                conn.execute_with_params(&insert_sql, &bound)
+                    .map_err(|e| format!("insert:{e}"))?;
+            }
+        }
+        Ok(())
+    })();
+
+    match replay_result {
+        Ok(()) => match conn.execute("COMMIT") {
+            Ok(_) => {
+                let _ = conn.close();
+                UndoStep {
+                    path: record.path.clone(),
+                    op: record.op.clone(),
+                    status: "restored".to_string(),
+                    backup_used: Some(record.db_snapshots.join(",")),
+                }
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK");
+                let _ = conn.close();
+                UndoStep {
+                    path: record.path.clone(),
+                    op: record.op.clone(),
+                    status: format!("failed_commit:{e}"),
+                    backup_used: Some(record.db_snapshots.join(",")),
+                }
+            }
+        },
+        Err(e) => {
+            let _ = conn.execute("ROLLBACK");
+            let _ = conn.close();
+            UndoStep {
+                path: record.path.clone(),
+                op: record.op.clone(),
+                status: format!("failed_replay:{e}"),
+                backup_used: Some(record.db_snapshots.join(",")),
+            }
+        }
+    }
+}
+
+/// In-memory shape of `br.doctor.db_snapshot.v1`. Mirrors the writer
+/// in `mutate.rs::run_db_exec`.
+#[derive(Debug, Clone, Deserialize)]
+struct DbSnapshotEnvelope {
+    schema_version: String,
+    table: String,
+    #[serde(default)]
+    predicate: Option<String>,
+    columns: Vec<String>,
+    rows: Vec<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// Defensive ASCII-alphanumeric+underscore identifier check; mirrors
+/// the chokepoint's `validate_identifier`. Empty input is rejected so
+/// no replay path can interpolate "" into SQL.
+fn is_safe_sql_ident(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Convert one JSON value back into an `SqliteValue` for re-binding.
+/// Mirrors the inverse of `mutate.rs::sqlite_value_to_json`.
+fn json_to_sqlite_value(
+    val: &serde_json::Value,
+) -> std::result::Result<fsqlite_types::value::SqliteValue, String> {
+    use fsqlite_types::value::SqliteValue;
+    match val {
+        serde_json::Value::Null => Ok(SqliteValue::Null),
+        serde_json::Value::Bool(b) => Ok(SqliteValue::Integer(i64::from(*b))),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Ok(SqliteValue::Integer(i))
+            } else if let Some(f) = n.as_f64() {
+                Ok(SqliteValue::Float(f))
+            } else {
+                Err(format!("non-finite number {n}"))
+            }
+        }
+        serde_json::Value::String(s) => Ok(SqliteValue::Text(s.clone().into())),
+        serde_json::Value::Object(map) => {
+            // {"$blob_hex": "..."} encoding from the snapshot writer.
+            if let Some(serde_json::Value::String(hex)) = map.get("$blob_hex") {
+                let bytes = decode_hex(hex).map_err(|e| format!("blob hex decode: {e}"))?;
+                return Ok(SqliteValue::Blob(bytes.into()));
+            }
+            Err(format!("unsupported object shape in snapshot: {map:?}"))
+        }
+        serde_json::Value::Array(_) => Err("unsupported array value in snapshot".to_string()),
+    }
+}
+
+/// Hex decoder for the `$blob_hex` envelope. Lowercase / uppercase
+/// both accepted; whitespace not tolerated.
+fn decode_hex(s: &str) -> std::result::Result<Vec<u8>, String> {
+    if s.len() % 2 != 0 {
+        return Err("odd hex length".to_string());
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let bytes = s.as_bytes();
+    for pair in bytes.chunks(2) {
+        let hi = hex_nibble(pair[0])?;
+        let lo = hex_nibble(pair[1])?;
+        out.push((hi << 4) | lo);
+    }
+    Ok(out)
+}
+
+fn hex_nibble(b: u8) -> std::result::Result<u8, String> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        other => Err(format!("non-hex byte 0x{other:02x}")),
     }
 }
 

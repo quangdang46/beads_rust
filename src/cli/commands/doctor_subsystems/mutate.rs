@@ -42,11 +42,13 @@
 //! `<repo>/.beads/beads.db` inside a `BEGIN IMMEDIATE` transaction.
 //! Before the SQL fires, every row of every table named in
 //! `affected_tables` is snapshotted as JSON to
-//! `<run-dir>/backups/db/<table>__<sha8>__<ns>.json` (where `sha8` is
-//! the first 8 hex chars of `sha256(<predicate>)` and `<ns>` is a
-//! zero-padded wall-clock nanosecond counter so multiple calls within
-//! a single run do not collide). On any error the transaction is
-//! rolled back and **no** `actions.jsonl` line is written.
+//! `<run-dir>/backups/db/<table>__<sha8>__<ns>[__<collision>].json`
+//! (where `sha8` is the first 8 hex chars of `sha256(<predicate>)`,
+//! `<ns>` is a zero-padded wall-clock nanosecond counter, and the
+//! collision suffix is added only if needed). Snapshot files are opened
+//! with `create_new` so multiple calls within a single run cannot
+//! clobber each other. On any error the transaction is rolled back and
+//! **no** `actions.jsonl` line is written.
 //!
 //! [`Op::DbMigrate`] runs a versioned schema migration. WP4 ships the
 //! safety scaffolding — `from` / `to` precondition gate plus a verbatim
@@ -308,6 +310,12 @@ struct DbActionRecord<'a> {
     affected_tables: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     affected_predicate: Option<String>,
+    /// Workspace-relative paths of the JSON snapshot files written by
+    /// this DbExec, one per `affected_tables` entry. Empty for
+    /// non-DbExec ops. Recorded so `br doctor undo` can replay the
+    /// exact snapshots that were taken before the SQL fired.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    db_snapshots: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     migrate_from: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -320,6 +328,7 @@ struct DbMutationOutcome {
     after_hash: String,
     affected_tables: Option<String>,
     affected_predicate: Option<String>,
+    db_snapshots: Vec<String>,
 }
 
 /// Compute `sha256:<hex>` of `bytes`.
@@ -543,7 +552,8 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
 /// 1. Refuse if `path` is outside the configured write scopes (already
 ///    checked by the caller).
 /// 2. For `DbExec`: snapshot affected rows as JSON to
-///    `<run-dir>/backups/db/<table>__<sha8>__<ns>.json` before any SQL runs.
+///    `<run-dir>/backups/db/<table>__<sha8>__<ns>[__<collision>].json`
+///    before any SQL runs.
 ///    For `DbMigrate`: snapshot the entire DB file verbatim to
 ///    `<run-dir>/backups/db/beads.db.pre-migrate`.
 /// 3. Open a writable `fsqlite::Connection`, run the work inside
@@ -602,17 +612,27 @@ fn mutate_db(
                 &tables_for_snapshot,
                 predicate_for_snapshot.as_deref(),
             )
-            .map(|()| {
+            .map(|snapshots| {
                 let table_summary = if tables_for_snapshot.is_empty() {
                     None
                 } else {
                     Some(tables_for_snapshot.join(","))
                 };
+                let snapshot_strs: Vec<String> = snapshots
+                    .into_iter()
+                    .map(|p| {
+                        p.strip_prefix(&ctx.repo_root)
+                            .unwrap_or(&p)
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .collect();
                 DbMutationOutcome {
                     after_hash: sha256_file_hex_prefixed(path)
                         .unwrap_or_else(|_| SHA256_EMPTY_PREFIXED.to_string()),
                     affected_tables: table_summary,
                     affected_predicate: predicate_for_snapshot,
+                    db_snapshots: snapshot_strs,
                 }
             })
         }
@@ -623,6 +643,7 @@ fn mutate_db(
                     .unwrap_or_else(|_| SHA256_EMPTY_PREFIXED.to_string()),
                 affected_tables: None,
                 affected_predicate: None,
+                db_snapshots: Vec::new(),
             })
         }
         _ => unreachable!("mutate_db only handles DB ops"),
@@ -632,6 +653,7 @@ fn mutate_db(
         after_hash,
         affected_tables: db_affected_tables,
         affected_predicate: db_predicate,
+        db_snapshots,
     } = exec_result?;
     let finished_at_ns = now_ns().saturating_sub(ctx.start_ns);
 
@@ -656,6 +678,7 @@ fn mutate_db(
         ok: true,
         affected_tables: db_affected_tables,
         affected_predicate: db_predicate,
+        db_snapshots,
         migrate_from,
         migrate_to,
         warning,
@@ -689,7 +712,9 @@ fn sha256_file_hex_prefixed(path: &Path) -> std::io::Result<String> {
 
 /// Snapshot every row of every table in `tables`, write the JSON, then
 /// run `sql` with `args` inside a `BEGIN IMMEDIATE` transaction. On any
-/// error, `ROLLBACK` and propagate.
+/// error, `ROLLBACK` and propagate. Returns the absolute paths of the
+/// snapshot files written (one per `affected_tables` entry, in order),
+/// so the caller can record them in `actions.jsonl` for `doctor undo`.
 fn run_db_exec(
     db_path: &Path,
     backups_db: &Path,
@@ -697,8 +722,10 @@ fn run_db_exec(
     args: &[fsqlite_types::value::SqliteValue],
     affected_tables: &[String],
     affected_predicate: Option<&str>,
-) -> Result<(), BeadsError> {
+) -> Result<Vec<PathBuf>, BeadsError> {
     use fsqlite::Connection;
+
+    let mut snapshot_paths: Vec<PathBuf> = Vec::with_capacity(affected_tables.len());
 
     // Snapshot first. If snapshotting faults, we have not touched the
     // DB so the workspace is unchanged.
@@ -733,12 +760,6 @@ fn run_db_exec(
         let mut hasher = Sha256::new();
         hasher.update(predicate.as_bytes());
         let predicate_hash = &hex_encode(&hasher.finalize())[..8];
-        // Include the wall-clock-nanosecond marker so successive
-        // DbExec calls against the same (table, predicate) within a
-        // single doctor run do not clobber each other's snapshots.
-        let stamp = now_ns();
-        let snapshot_path = backups_db.join(format!("{table}__{predicate_hash}__{stamp:020}.json"));
-
         let snapshot_envelope = serde_json::json!({
             "schema_version": "br.doctor.db_snapshot.v1",
             "table": table,
@@ -747,7 +768,9 @@ fn run_db_exec(
             "rows": json_rows,
         });
         let body = serde_json::to_vec_pretty(&snapshot_envelope).map_err(BeadsError::Json)?;
-        fs::write(&snapshot_path, &body).map_err(BeadsError::Io)?;
+        let snap_path = write_unique_db_snapshot(backups_db, table, predicate_hash, &body)
+            .map_err(BeadsError::Io)?;
+        snapshot_paths.push(snap_path);
 
         let _ = read_conn.close();
     }
@@ -778,7 +801,50 @@ fn run_db_exec(
         }
     }
     let _ = conn.close();
-    Ok(())
+    Ok(snapshot_paths)
+}
+
+fn write_unique_db_snapshot(
+    backups_db: &Path,
+    table: &str,
+    predicate_hash: &str,
+    body: &[u8],
+) -> std::io::Result<PathBuf> {
+    write_unique_db_snapshot_with_stamp(backups_db, table, predicate_hash, now_ns(), body)
+}
+
+fn write_unique_db_snapshot_with_stamp(
+    backups_db: &Path,
+    table: &str,
+    predicate_hash: &str,
+    stamp: u128,
+    body: &[u8],
+) -> std::io::Result<PathBuf> {
+    for collision in 0..=999_u16 {
+        let suffix = if collision == 0 {
+            String::new()
+        } else {
+            format!("__{collision:03}")
+        };
+        let path = backups_db.join(format!(
+            "{table}__{predicate_hash}__{stamp:020}{suffix}.json"
+        ));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                file.write_all(body)?;
+                file.sync_data()?;
+                return Ok(path);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "doctor: exhausted DB snapshot collision suffixes for {table}__{predicate_hash}__{stamp:020}"
+        ),
+    ))
 }
 
 /// Validate that an identifier consists only of `[A-Za-z0-9_]` so it
@@ -1195,6 +1261,40 @@ mod tests {
         .unwrap();
         let _ = conn.close();
         db
+    }
+
+    #[test]
+    fn db_snapshot_writer_never_overwrites_same_stamp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backups_db = tmp.path();
+        let first = write_unique_db_snapshot_with_stamp(
+            backups_db,
+            "sample_widgets",
+            "abcdef12",
+            42,
+            b"first",
+        )
+        .expect("first snapshot");
+        let second = write_unique_db_snapshot_with_stamp(
+            backups_db,
+            "sample_widgets",
+            "abcdef12",
+            42,
+            b"second",
+        )
+        .expect("second snapshot");
+
+        assert_ne!(first, second);
+        assert_eq!(fs::read(&first).unwrap(), b"first");
+        assert_eq!(fs::read(&second).unwrap(), b"second");
+        assert!(
+            second
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with("__001.json")),
+            "collision suffix should be visible in second filename: {}",
+            second.display()
+        );
     }
 
     #[test]
