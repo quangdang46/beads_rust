@@ -1495,15 +1495,13 @@ fn latest_run_from_symlink(runs_root: &Path) -> Result<Option<String>> {
     // If canonicalization fails (target missing, broken link, …) we
     // fall through to "no symlinked run available" rather than handing
     // back a path we can't reason about.
-    let canonical_target = match target.canonicalize() {
-        Ok(p) => p,
-        Err(_) => return Ok(None),
+    let Ok(canonical_target) = target.canonicalize() else {
+        return Ok(None);
     };
-    let canonical_root = match runs_root.canonicalize() {
-        Ok(p) => p,
+    let Ok(canonical_root) = runs_root.canonicalize() else {
         // If runs_root itself does not exist we can't have a valid
         // latest symlink under it.
-        Err(_) => return Ok(None),
+        return Ok(None);
     };
     if !canonical_target.is_dir() || !canonical_target.starts_with(&canonical_root) {
         return Ok(None);
@@ -1526,8 +1524,33 @@ fn mark_report_undone(run_dir_path: &Path, run_id: &str) -> Result<()> {
         serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
     );
     let bytes = serde_json::to_vec_pretty(&map).map_err(BeadsError::Json)?;
-    fs::write(&report, bytes).map_err(BeadsError::Io)?;
+
+    // Atomic write: tmp + rename. A raw fs::write truncates the file
+    // first, so a crash mid-write would leave report.json either empty
+    // or torn — exactly the failure mode the chokepoint's execute_atomic
+    // exists to prevent. Use the same tmp-then-rename pattern here so
+    // undo bookkeeping is itself crash-safe.
+    let parent = report.parent().unwrap_or_else(|| Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(parent).map_err(BeadsError::Io)?;
+    use std::io::Write as IoWrite;
+    tmp.write_all(&bytes).map_err(BeadsError::Io)?;
+    tmp.as_file().sync_data().map_err(BeadsError::Io)?;
+    tmp.persist(&report).map_err(|e| BeadsError::Io(e.error))?;
+    fsync_report_dir(parent)?;
     Ok(())
+}
+
+/// Fsync a directory entry so a freshly-renamed file is durable across
+/// power loss. Best-effort: filesystems that reject directory fsync
+/// (some tmpfs variants) are tolerated by treating InvalidInput as
+/// success.
+fn fsync_report_dir(dir: &Path) -> Result<()> {
+    let file = fs::File::open(dir).map_err(BeadsError::Io)?;
+    match file.sync_all() {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
+        Err(e) => Err(BeadsError::Io(e)),
+    }
 }
 
 fn now_ns() -> u128 {
@@ -1830,6 +1853,26 @@ mod tests {
         let step = plan_one(tmp.path(), &backups, &record);
 
         assert_eq!(step.status, "failed_invalid_action_path:path_traversal");
+    }
+
+    #[test]
+    fn mark_report_undone_preserves_report_fields() {
+        let tmp = unique_temp_root("mark-report-undone");
+        let run_dir = tmp.path().join(".doctor/runs/run-a");
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::write(
+            run_dir.join("report.json"),
+            br#"{"run_id":"old","kept":true}"#,
+        )
+        .unwrap();
+
+        mark_report_undone(&run_dir, "run-a").expect("mark undone");
+
+        let report = fs::read_to_string(run_dir.join("report.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&report).unwrap();
+        assert_eq!(value["run_id"], "run-a");
+        assert_eq!(value["kept"], true);
+        assert!(value["undone_at"].as_str().is_some_and(|s| !s.is_empty()));
     }
 
     #[test]
