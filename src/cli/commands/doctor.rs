@@ -1671,6 +1671,23 @@ fn repair_partial_indexes(db_path: &Path, repair: &mut LocalRepairResult) {
     }
 }
 
+// WP3 NOTE: the underlying file ops here are already non-destructive —
+// `config::quarantine_database_artifacts` calls
+// `rename_existing_paths_with_backup_verification`, which moves orphaned
+// `.wal`/`.shm`/`.journal` files into `.beads/.recovery/` rather than
+// deleting them. So this path already satisfies the AGENTS.md no-delete
+// invariant.
+//
+// What it doesn't yet do is record the quarantine moves in the per-run
+// `actions.jsonl`. Routing through `chokepoint::mutate()` requires
+// threading a `MutateContext` through the config-crate boundary and
+// refactoring `rename_existing_paths_with_backup_verification` to call
+// the chokepoint per-rename. That's a config-layer surgery beyond the
+// WP3 scope budget; deferred to WP4 alongside the SQL-routed
+// `Op::DbExec`/`Op::DbMigrate` migration. The quarantined paths still
+// surface to the operator via `LocalRepairResult::quarantined_artifacts`
+// and the `recovery_audit` JSON, so this is purely an
+// observability-completeness gap, not a correctness one.
 fn repair_database_sidecars(beads_dir: &Path, db_path: &Path, repair: &mut LocalRepairResult) {
     match inspect_database_sidecars(db_path) {
         Ok(_) => quarantine_anomalous_sidecars(beads_dir, db_path, repair),
@@ -3643,7 +3660,10 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     // the repair flow falls back to its legacy in-place writes. This
     // matches the project's no-regression rule for WP1→WP3.
     let mut session: Option<DoctorRepairSession> = if args.repair {
-        match DoctorRepairSession::new(&beads_dir.parent().unwrap_or(&beads_dir).to_path_buf(), args.dry_run) {
+        match DoctorRepairSession::new(
+            &beads_dir.parent().unwrap_or(&beads_dir).to_path_buf(),
+            args.dry_run,
+        ) {
             Ok(sess) => Some(sess),
             Err(err) => {
                 tracing::warn!(
@@ -4737,7 +4757,9 @@ mod tests {
         };
         let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Json, false, true);
 
-        assert!(!fix_root_gitignore_if_warned(&beads_dir, &report, &ctx, None));
+        assert!(!fix_root_gitignore_if_warned(
+            &beads_dir, &report, &ctx, None
+        ));
         assert_eq!(fs::read_to_string(&outside_gitignore).unwrap(), original);
         assert!(
             fs::symlink_metadata(&root_gitignore)
