@@ -200,9 +200,15 @@ fn update_latest_symlink(latest_link: &Path, target: &Path) -> Result<(), BeadsE
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
     ));
 
-    // Clear stale tmp from a crashed run, if any.
-    if tmp.symlink_metadata().is_ok() {
-        fs::remove_file(&tmp).map_err(BeadsError::Io)?;
+    // Clear stale tmp from a crashed run unconditionally — using
+    // `is_ok()` then `remove_file` opens a TOCTOU window where a
+    // concurrent process could delete the symlink between our check
+    // and our remove, turning NotFound into a hard error. Treat
+    // NotFound as success.
+    match fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(BeadsError::Io(e)),
     }
     symlink(&rel_target, &tmp).map_err(BeadsError::Io)?;
     // `fs::rename` over an existing symlink atomically replaces it on
