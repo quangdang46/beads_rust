@@ -143,6 +143,72 @@ jobs:
           path: target/test-artifacts/
           if-no-files-found: ignore
 
+  audit-gates:
+    name: Audit Guardrails (2026-05-09)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: check
+    # Gates added by beads_rust-6jmq for the audit-driven cleanup EPIC
+    # (beads_rust-ebzi). Each step corresponds to a sibling bead's harness:
+    #   - Snapshot freshness    (l6xl)
+    #   - ID-pinning lint       (s5se) — runs as part of `cargo test`
+    #   - Forced-cycle-close audit (30ci)
+    #   - Sync-safety witness   (yyxo) — Linux only
+    #   - Concurrency witness   (mjmk)
+    # Documented in docs/TESTING_GUIDELINES.md and the per-bead specs.
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: nightly
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2.9.1
+
+      - name: Install cargo-insta
+        run: cargo install cargo-insta --locked --version 1.46.1
+
+      - name: Build release br binary (used by shell harnesses)
+        run: cargo build --release
+
+      # l6xl: snapshot freshness — fails CI on any *.snap.new alongside *.snap
+      - name: Snapshot freshness gate (beads_rust-l6xl)
+        run: cargo insta test --check --workspace
+        env:
+          RUST_LOG: error
+
+      # 30ci: regression check that no closed bead has audit-suspect close_reason
+      # without an audit-historical-cycle-close-* escape-hatch label
+      - name: Audit suspect close_reasons gate (beads_rust-30ci)
+        run: bash tests/e2e_scripts/forced_cycle_close_audit.sh
+
+      # yyxo: filesystem-witness regression for sync allowlist (PC-1 / PC-RECOVERY)
+      - name: Sync safety witness (beads_rust-yyxo)
+        run: |
+          export BR_BIN="$(pwd)/target/release/br"
+          bash tests/e2e_scripts/sync_safety_witness.sh
+
+      # mjmk: 50-iter concurrency no-flake harness — readers race writer.
+      # Smoke-run 5 iters in CI to keep wall time bounded; full 50-iter
+      # is a local pre-merge check.
+      - name: Concurrency witness 5-iter smoke (beads_rust-mjmk)
+        run: |
+          export BR_BIN="$(pwd)/target/release/br"
+          ITER_OVERRIDE=5 bash tests/e2e_scripts/concurrency_witness_logged.sh
+
+      - name: Upload audit-gate event logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: audit-gate-event-logs
+          path: |
+            /tmp/sync_safety_witness_*.jsonl
+            /tmp/concurrency_witness_*.jsonl
+            /tmp/forced_cycle_close_audit_*.summary.txt
+          if-no-files-found: ignore
+
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest

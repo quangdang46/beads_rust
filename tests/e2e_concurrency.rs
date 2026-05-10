@@ -718,6 +718,17 @@ fn e2e_read_command_witness_refresh_waits_for_write_lock() {
         .expect("delete jsonl_size witness");
     conn.execute("INSERT INTO metadata (key, value) VALUES ('jsonl_size', '0')")
         .expect("write stale jsonl_size witness");
+    // beads_rust-mjmk: also corrupt jsonl_content_hash so the staleness probe
+    // actually concludes the JSONL is newer. compute_jsonl_newer_impl falls
+    // back to hash comparison when size mismatches; if the hash still matches
+    // the actual JSONL, the probe returns "not newer" and the read command
+    // never tries to refresh witnesses, making this test a no-op.
+    conn.execute("DELETE FROM metadata WHERE key = 'jsonl_content_hash'")
+        .expect("delete jsonl_content_hash witness");
+    conn.execute(
+        "INSERT INTO metadata (key, value) VALUES ('jsonl_content_hash', 'stale_witness_hash_mjmk')",
+    )
+    .expect("write stale jsonl_content_hash witness");
     drop(conn);
 
     let lock_path = beads_dir.join(".write.lock");

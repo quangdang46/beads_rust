@@ -15,6 +15,7 @@ pub mod dataset_registry;
 pub mod fixtures;
 pub mod harness;
 pub mod json_baseline;
+pub mod ordering;
 pub mod report_indexer;
 pub mod scenarios;
 

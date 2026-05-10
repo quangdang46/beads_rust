@@ -1617,4 +1617,148 @@ mod tests {
         let parsed = parse_id(&id).expect("fallback ID should stay parseable");
         assert_eq!(parsed.prefix, prefix);
     }
+
+    // ========================================================================
+    // beads_rust-l6xl: post-`--slug` audit unit tests (added 2026-05-09)
+    // Per the bead's required NEW unit tests.
+    // ========================================================================
+
+    /// l6xl AC: `--slug "Hello World!"` → `<prefix>-hello-world-<hash>`.
+    /// Asserts case-folding, single-hyphen collapsing, leading/trailing
+    /// non-ASCII strip, and that the hash suffix is always present.
+    #[test]
+    fn create_with_slug_normalizes_to_ascii_lowercase_hyphenated() {
+        let id_gen = IdGenerator::new(IdConfig::default());
+        let input = IdGenerationInput {
+            title: "Whatever",
+            description: None,
+            creator: None,
+            created_at: Utc::now(),
+            issue_count: 10,
+        };
+
+        // Mixed-case + spaces + punctuation → lowercased, single-hyphenated
+        let id = id_gen.generate_with_slug(input, "Hello World!", |_| false);
+        assert!(
+            id.starts_with("br-hello-world-"),
+            "expected prefix 'br-hello-world-', got {id}"
+        );
+        let parsed = parse_id(&id).expect("must parse");
+        assert_eq!(parsed.prefix, "br-hello-world");
+        assert!(!parsed.hash.is_empty(), "hash suffix must be present");
+
+        // Multiple non-alphanumeric runs collapse to a single hyphen
+        let id2 = id_gen.generate_with_slug(input, "a   b/c.d!!e", |_| false);
+        assert!(
+            id2.starts_with("br-a-b-c-d-e-"),
+            "expected b-c-d-e collapsed; got {id2}"
+        );
+
+        // Pure-Unicode (non-ASCII) characters strip out
+        let id3 = id_gen.generate_with_slug(input, "café-résumé", |_| false);
+        // After normalize_slug: "caf-r-sum" (drops é, kept letters around hyphens)
+        assert!(id3.starts_with("br-caf-r-sum-"), "got {id3}");
+    }
+
+    /// l6xl AC: a slug longer than `MAX_SLUG_LEN` (48 chars after
+    /// normalization) is truncated, then any trailing hyphen is trimmed.
+    #[test]
+    fn create_with_slug_caps_at_48_chars_after_normalization() {
+        let id_gen = IdGenerator::new(IdConfig::default());
+        let input = IdGenerationInput {
+            title: "Whatever",
+            description: None,
+            creator: None,
+            created_at: Utc::now(),
+            issue_count: 10,
+        };
+
+        // 60-char input → 48-char normalized cap (not counting prefix/hash)
+        let long_slug = "a".repeat(60);
+        let id = id_gen.generate_with_slug(input, &long_slug, |_| false);
+        let parsed = parse_id(&id).expect("must parse");
+        let slug_part = parsed.prefix.strip_prefix("br-").unwrap_or(&parsed.prefix);
+        assert!(
+            slug_part.len() <= MAX_SLUG_LEN,
+            "slug {slug_part} exceeded MAX_SLUG_LEN ({MAX_SLUG_LEN}); got len={}",
+            slug_part.len()
+        );
+
+        // Slug that ends with a hyphen due to truncation must have it stripped
+        let trailing_hyphen_slug = format!("{}!!!", "x".repeat(MAX_SLUG_LEN - 2)); // becomes 48 chars then trailing hyphen risk
+        let id2 = id_gen.generate_with_slug(input, &trailing_hyphen_slug, |_| false);
+        assert!(!id2.starts_with("br--"), "double-hyphen leak in {id2}");
+        // Find the slug portion: between "br-" and the last "-<hash>" segment
+        let parsed2 = parse_id(&id2).expect("must parse");
+        let slug2 = parsed2
+            .prefix
+            .strip_prefix("br-")
+            .unwrap_or(&parsed2.prefix);
+        assert!(
+            !slug2.ends_with('-'),
+            "slug retained trailing hyphen: {slug2}"
+        );
+    }
+
+    /// l6xl AC: the configured prefix is preserved AND the hash suffix is
+    /// always appended. Round-trips through `parse_id`.
+    #[test]
+    fn create_with_slug_preserves_configured_prefix_and_hash_suffix() {
+        let id_gen = IdGenerator::new(IdConfig {
+            prefix: "myproj".to_string(),
+            ..IdConfig::default()
+        });
+        let input = IdGenerationInput {
+            title: "Whatever",
+            description: None,
+            creator: None,
+            created_at: Utc::now(),
+            issue_count: 5,
+        };
+
+        let id = id_gen.generate_with_slug(input, "feature-x", |_| false);
+        assert!(
+            id.starts_with("myproj-feature-x-"),
+            "expected configured prefix preserved; got {id}"
+        );
+        let parsed = parse_id(&id).expect("must parse");
+        assert_eq!(parsed.prefix, "myproj-feature-x");
+        assert!(!parsed.hash.is_empty(), "hash suffix must be present");
+        // Hash suffix grows with issue_count; at least 3 chars at issue_count=5
+        // (per IdGenerator::optimal_length)
+        assert!(
+            parsed.hash.len() >= 3,
+            "hash suffix too short: {} (expected >= 3)",
+            parsed.hash.len()
+        );
+    }
+
+    /// l6xl AC: a slug like "!!!" or "...." that normalizes to empty
+    /// MUST fall back to the hash-only ID path; it must NOT panic, error,
+    /// or produce a malformed ID.
+    #[test]
+    fn create_with_slug_rejects_empty_after_normalization() {
+        let id_gen = IdGenerator::new(IdConfig::default());
+        let input = IdGenerationInput {
+            title: "Title from fallback",
+            description: None,
+            creator: None,
+            created_at: Utc::now(),
+            issue_count: 10,
+        };
+
+        // Various inputs that all normalize to empty
+        for empty_yielding in ["!!!", "...", "   ", "$%^&*()", "", "/\\/\\"] {
+            let id = id_gen.generate_with_slug(input, empty_yielding, |_| false);
+            let parsed = parse_id(&id).expect("must parse hash-only fallback");
+            assert_eq!(
+                parsed.prefix, "br",
+                "empty-normalizing slug {empty_yielding:?} should fall back to hash-only; got {id}"
+            );
+            assert!(
+                !parsed.hash.is_empty(),
+                "hash-only fallback must include hash; got {id}"
+            );
+        }
+    }
 }

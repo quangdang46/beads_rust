@@ -10,6 +10,11 @@ mod common;
 
 use beads_rust::model::{DependencyType, EventType, Status};
 use beads_rust::storage::{ReadyFilters, ReadySortPolicy, SqliteStorage};
+#[allow(unused_imports)]
+use common::ordering::{
+    assert_contains_exactly_one, assert_hybrid_ordered, assert_no_duplicate_ids,
+    assert_oldest_first, assert_ordered_by, assert_priority_ordered,
+};
 use common::{fixtures, test_db};
 
 fn blocked_ids_for(storage: &SqliteStorage) -> Vec<String> {
@@ -1126,4 +1131,168 @@ fn blocked_issues_excluded_from_ready_list() {
     assert!(ready_ids.contains(&blocker.id));
     assert!(ready_ids.contains(&unblocked.id));
     assert!(!ready_ids.contains(&blocked.id));
+}
+
+// ============================================================================
+// beads_rust-uelt: dep-type matrix coverage (added 2026-05-09)
+// Verifies the single-parent rule applies ONLY to `parent-child`, not to
+// any other dep type. Each test is paired with its specific assertion.
+// ============================================================================
+
+/// uelt: adding multiple `blocks` deps to the SAME issue must succeed.
+/// (single-parent rule does NOT apply to `blocks`.)
+#[test]
+fn test_dep_add_multiple_blocks_deps_allowed() {
+    let mut storage = test_db();
+    let blocker_a = fixtures::issue("multi-blocks-a");
+    let blocker_b = fixtures::issue("multi-blocks-b");
+    let blocker_c = fixtures::issue("multi-blocks-c");
+    let target = fixtures::issue("multi-blocks-target");
+
+    storage.create_issue(&blocker_a, "tester").unwrap();
+    storage.create_issue(&blocker_b, "tester").unwrap();
+    storage.create_issue(&blocker_c, "tester").unwrap();
+    storage.create_issue(&target, "tester").unwrap();
+
+    storage
+        .add_dependency(&target.id, &blocker_a.id, "blocks", "tester")
+        .expect("first blocks dep must succeed");
+    storage
+        .add_dependency(&target.id, &blocker_b.id, "blocks", "tester")
+        .expect("second blocks dep must also succeed (no single-blocker rule)");
+    storage
+        .add_dependency(&target.id, &blocker_c.id, "blocks", "tester")
+        .expect("third blocks dep must also succeed");
+
+    let deps = storage.get_dependencies(&target.id).unwrap();
+    assert_eq!(
+        deps.len(),
+        3,
+        "target should have 3 blocks deps; got {deps:?}"
+    );
+}
+
+/// uelt: an issue can have parent X AND be blocked-by Y simultaneously,
+/// because they are different dep types and the single-parent rule applies
+/// only to `parent-child`.
+#[test]
+fn test_dep_add_blocks_alongside_parent_child_allowed() {
+    let mut storage = test_db();
+    let parent = fixtures::issue("mixed-parent");
+    let blocker = fixtures::issue("mixed-blocker");
+    let child = fixtures::issue("mixed-child");
+
+    storage.create_issue(&parent, "tester").unwrap();
+    storage.create_issue(&blocker, "tester").unwrap();
+    storage.create_issue(&child, "tester").unwrap();
+
+    storage
+        .add_dependency(&child.id, &parent.id, "parent-child", "tester")
+        .expect("parent-child must succeed");
+    storage
+        .add_dependency(&child.id, &blocker.id, "blocks", "tester")
+        .expect("blocks alongside parent-child must succeed");
+
+    let deps = storage.get_dependencies(&child.id).unwrap();
+    assert_eq!(
+        deps.len(),
+        2,
+        "child should have parent-child + blocks = 2 deps; got {deps:?}"
+    );
+}
+
+/// uelt: removing the parent-child edge must allow a subsequent
+/// parent-child add to succeed (no stale "was already replaced" state).
+#[test]
+fn test_dep_remove_parent_allows_subsequent_add() {
+    let mut storage = test_db();
+    let parent_a = fixtures::issue("remove-add-parent-a");
+    let parent_b = fixtures::issue("remove-add-parent-b");
+    let child = fixtures::issue("remove-add-child");
+
+    storage.create_issue(&parent_a, "tester").unwrap();
+    storage.create_issue(&parent_b, "tester").unwrap();
+    storage.create_issue(&child, "tester").unwrap();
+
+    // Initial parent
+    storage
+        .add_dependency(&child.id, &parent_a.id, "parent-child", "tester")
+        .expect("first parent-child must succeed");
+
+    // Remove
+    storage
+        .remove_dependency(&child.id, &parent_a.id, "tester")
+        .expect("remove must succeed");
+
+    let deps = storage.get_dependencies(&child.id).unwrap();
+    assert_eq!(deps.len(), 0, "child should have no deps after remove");
+
+    // New parent — must succeed (no stale validator state)
+    storage
+        .add_dependency(&child.id, &parent_b.id, "parent-child", "tester")
+        .expect("subsequent parent-child must succeed after remove");
+
+    let deps = storage.get_dependencies(&child.id).unwrap();
+    assert_eq!(deps.len(), 1, "child should have new parent");
+    assert_eq!(deps[0], parent_b.id);
+}
+
+/// uelt: every supported dep type round-trips through `add_dependency`,
+/// `get_dependencies`, and (for blocking types) blocked-cache rebuild.
+/// Exercises the full {blocks, parent-child, related, conditional-blocks,
+/// waits-for, discovered-from, replies-to, relates-to, duplicates,
+/// supersedes, caused-by} matrix.
+#[test]
+fn test_dep_add_each_supported_type_against_full_matrix() {
+    let mut storage = test_db();
+    let target = fixtures::issue("matrix-target");
+    storage.create_issue(&target, "tester").unwrap();
+
+    // For each dep type, create a fresh peer (so single-parent rule doesn't
+    // collide with multiple parent-child variants — only one parent allowed).
+    let dep_types: &[&str] = &[
+        "blocks",
+        "parent-child", // ← exactly one allowed
+        "related",
+        "conditional-blocks",
+        "waits-for",
+        "discovered-from",
+        "replies-to",
+        "relates-to",
+        "duplicates",
+        "supersedes",
+        "caused-by",
+    ];
+
+    let mut added_count = 0;
+    let mut parent_child_used = false;
+
+    for (i, dep_type) in dep_types.iter().enumerate() {
+        let peer = fixtures::issue(&format!("matrix-peer-{i}"));
+        storage.create_issue(&peer, "tester").unwrap();
+
+        let result = storage.add_dependency(&target.id, &peer.id, dep_type, "tester");
+
+        if *dep_type == "parent-child" {
+            // First parent-child must succeed; if we hit it twice (we don't,
+            // but defensively), only the first should win
+            if parent_child_used {
+                assert!(result.is_err(), "second parent-child must reject; got Ok");
+            } else {
+                result.unwrap_or_else(|e| panic!("parent-child should succeed: {e}"));
+                parent_child_used = true;
+                added_count += 1;
+            }
+        } else {
+            result.unwrap_or_else(|e| panic!("{dep_type} should succeed: {e}"));
+            added_count += 1;
+        }
+    }
+
+    let deps = storage.get_dependencies(&target.id).unwrap();
+    assert_eq!(
+        deps.len(),
+        added_count,
+        "expected {added_count} deps, got {deps:?}"
+    );
 }

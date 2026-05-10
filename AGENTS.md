@@ -492,6 +492,24 @@ Beads provides a lightweight, dependency-aware issue database and CLI (`br` - be
 
 **Important:** `br` is non-invasive—it NEVER runs git commands automatically. You must manually commit changes after `br sync --flush-only`.
 
+### Bead-graph hygiene policy (added 2026-05-09 by `beads_rust-30ci`)
+
+**Don't close beads with `Forced close due to cycle` or similar hedge text in the `close_reason`.** If a dependency cycle is in the way, resolve it first via:
+
+- `br dep remove <issue> <depends-on>` — drop a single edge.
+- `br update <issue> --parent ''` — clear a parent-child edge.
+- Refactor the bead graph itself (split / merge / restructure).
+
+Closing a bead under an unresolved cycle hides architectural debt and produces an audit-suspect close trail.
+
+The doctor check `audit.suspect_close_reasons` (sibling bead `beads_rust-m3mi`) flags this pattern. The only legitimate close-under-cycle is when accompanied by the `audit-historical-cycle-close-<YYYY>-<MM>-<DD>` label, applied via:
+
+```bash
+br update <id> --add-label audit-historical-cycle-close-<DATE>
+```
+
+The label tells the doctor check + future audits that the closure has been triaged. Past triage decisions live in `docs/audit_forced_cycle_close_<DATE>.md`.
+
 ### Conventions
 
 - **Single source of truth:** Beads for task status/priority/dependencies; Agent Mail for conversation and audit

@@ -1008,3 +1008,122 @@ fn ready_cli_priority_p_format() {
     assert_eq!(issues.len(), 1);
     assert_eq!(issues[0]["priority"].as_u64().unwrap(), 0);
 }
+
+// ============================================================================
+// beads_rust-jsgu: invariant-based e2e ordering tests (added 2026-05-09)
+// Pairs with the unit-level rewrite in tests/storage_ready.rs::ready_sort_*
+// (those exercise the storage API directly; these exercise the full CLI).
+// ============================================================================
+
+/// jsgu AC: full CLI round-trip for the priority-ordering contract. Creates
+/// issues at P0/P1/P2/P3 in REVERSE priority order, runs `br ready --json`,
+/// asserts hybrid ordering invariant (high-tier P0/P1 before low-tier P2+).
+#[test]
+fn e2e_ready_with_mixed_priority_high_tier_first() {
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    eprintln!("[jsgu TEST] e2e_ready_with_mixed_priority_high_tier_first");
+
+    // Create issues in REVERSE priority order to guard against accidental
+    // creation-order pass-through.
+    for (title, prio) in [
+        ("Low", "3"),
+        ("Critical", "0"),
+        ("Medium", "2"),
+        ("High", "1"),
+    ] {
+        let create = run_br(
+            &workspace,
+            ["create", title, "-t", "task", "-p", prio, "--no-auto-flush"],
+            &format!("create_{title}"),
+        );
+        assert!(
+            create.status.success(),
+            "create {title} failed: {}",
+            create.stderr
+        );
+    }
+
+    let out = run_br(&workspace, ["ready", "--json"], "ready");
+    assert!(out.status.success(), "br ready failed: {}", out.stderr);
+    let issues: Vec<Value> =
+        serde_json::from_str(out.stdout.trim()).expect("ready json must parse");
+
+    eprintln!(
+        "  ready order: {:?}",
+        issues
+            .iter()
+            .map(|i| (
+                i["title"].as_str().unwrap_or(""),
+                i["priority"].as_u64().unwrap_or(99)
+            ))
+            .collect::<Vec<_>>()
+    );
+
+    assert_eq!(issues.len(), 4, "expected 4 ready issues");
+
+    // Hybrid invariant: no high-tier (priority ≤ 1) issue appears AFTER any
+    // low-tier (priority > 1) issue.
+    let mut low_seen = false;
+    for issue in &issues {
+        let prio = issue["priority"].as_u64().unwrap_or(99);
+        let title = issue["title"].as_str().unwrap_or("");
+        if prio <= 1 {
+            assert!(
+                !low_seen,
+                "P{prio} issue '{title}' appears after low-tier; full order: {:?}",
+                issues
+                    .iter()
+                    .map(|i| (
+                        i["title"].as_str().unwrap_or(""),
+                        i["priority"].as_u64().unwrap_or(99)
+                    ))
+                    .collect::<Vec<_>>()
+            );
+        } else {
+            low_seen = true;
+        }
+    }
+
+    eprintln!("  [PASS] hybrid ordering invariant holds via CLI");
+}
+
+/// jsgu AC: invariant — `br ready --json` MUST NEVER return duplicate IDs,
+/// regardless of how many fixtures share priority/created_at.
+#[test]
+fn e2e_ready_returns_no_duplicate_ids() {
+    let workspace = BrWorkspace::new();
+    run_br(&workspace, ["init"], "init");
+
+    eprintln!("[jsgu TEST] e2e_ready_returns_no_duplicate_ids");
+
+    // Create 6 issues all at the same priority — id-tiebreak path is exercised
+    for i in 0..6 {
+        let title = format!("issue {i}");
+        let create = run_br(
+            &workspace,
+            ["create", &title, "-t", "task", "-p", "2", "--no-auto-flush"],
+            &format!("c_{i}"),
+        );
+        assert!(create.status.success(), "create failed");
+    }
+
+    let out = run_br(&workspace, ["ready", "--json"], "ready");
+    assert!(out.status.success(), "br ready failed");
+    let issues: Vec<Value> = serde_json::from_str(out.stdout.trim()).expect("must parse");
+    assert_eq!(issues.len(), 6, "all 6 should be ready");
+
+    let mut seen = std::collections::HashSet::new();
+    for issue in &issues {
+        let id = issue["id"].as_str().expect("id field present");
+        assert!(
+            seen.insert(id.to_string()),
+            "duplicate ID {id} in ready output; got: {:?}",
+            issues.iter().map(|i| i["id"].as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    eprintln!("  [PASS] all 6 IDs unique");
+}

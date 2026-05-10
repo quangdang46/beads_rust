@@ -1,5 +1,6 @@
 mod common;
 use common::cli::{BrWorkspace, extract_json_payload, parse_list_issues, run_br};
+use serde_json::Value;
 use std::fs;
 
 #[test]
@@ -53,14 +54,45 @@ feature
     assert!(output.stdout.contains("Second Issue"));
     assert!(output.stdout.contains("P1]")); // Priority 1 (format: [● P1])
 
-    // Verify labels on First Issue using JSON output
+    // Verify labels on First Issue using JSON output.
+    //
+    // beads_rust-44rc rewrite (2026-05-09): originally pinned the
+    // pretty-printed JSON format `"title": "First Issue"` (with a space
+    // after `:`). After commit `f26bf73f fix(output): fail on stdout
+    // serialization errors` and the streaming-perf migration in
+    // `src/output/context.rs::json` (`serde_json::to_writer`, compact
+    // format), the JSON has no whitespace between key and value. Switched
+    // to semantic JSON parse + invariant checks so the test is robust to
+    // format changes.
     let output = run_br(&workspace, ["list", "--json"], "list_json");
     assert!(output.status.success());
 
-    assert!(output.stdout.contains(r#""title": "First Issue"#));
-    assert!(output.stdout.contains(r#""labels": ["#));
-    assert!(output.stdout.contains(r#""bug"#));
-    assert!(output.stdout.contains(r#""frontend"#));
+    let payload: Value = serde_json::from_str(output.stdout.trim())
+        .expect("br list --json output must be valid JSON");
+    let issues = payload
+        .get("issues")
+        .and_then(Value::as_array)
+        .expect("expected `issues` array in br list --json output");
+
+    let first = issues
+        .iter()
+        .find(|issue| issue.get("title").and_then(Value::as_str) == Some("First Issue"))
+        .expect("expected an issue with title \"First Issue\" in br list --json output");
+
+    let labels: Vec<&str> = first
+        .get("labels")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+
+    assert!(
+        labels.contains(&"bug"),
+        "expected `bug` label on First Issue; got labels={labels:?}"
+    );
+    assert!(
+        labels.contains(&"frontend"),
+        "expected `frontend` label on First Issue; got labels={labels:?}"
+    );
 }
 
 #[test]
