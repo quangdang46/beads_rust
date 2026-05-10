@@ -1833,6 +1833,9 @@ pub struct DepCyclesArgs {
     /// Only check blocking dependency types
     #[arg(long)]
     pub blocking_only: bool,
+    /// Include archived cycles where every issue is closed or tombstoned
+    #[arg(long)]
+    pub include_closed: bool,
 }
 
 #[derive(Subcommand, Debug)]

@@ -11,6 +11,7 @@ use common::isolated_workspace_failure_fixture;
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
 use std::process::{Command as StdCommand, Stdio};
 use std::thread::sleep;
 use std::time::Duration;
@@ -192,6 +193,7 @@ fn assert_issue_description(workspace: &BrWorkspace, issue_id: &str, expected: &
     assert_eq!(issues[0]["description"].as_str(), Some(expected));
 }
 
+#[cfg(target_os = "linux")]
 fn clear_br_env_for_std_command(cmd: &mut StdCommand) {
     for (key, _) in std::env::vars_os() {
         let key = key.to_string_lossy();

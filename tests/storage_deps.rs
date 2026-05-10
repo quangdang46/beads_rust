@@ -618,6 +618,108 @@ fn detect_all_cycles_collapses_dense_component_to_witness() {
     }
 }
 
+#[test]
+fn dependency_cycle_report_separates_active_from_archived_and_filters_blocking() {
+    let mut storage = test_db();
+
+    let active_a = fixtures::issue("active-cycle-a");
+    let active_b = fixtures::issue("active-cycle-b");
+    let archived_a = fixtures::IssueBuilder::new("archived-cycle-a")
+        .with_status(Status::Closed)
+        .build();
+    let archived_b = fixtures::IssueBuilder::new("archived-cycle-b")
+        .with_status(Status::Closed)
+        .build();
+    let related_a = fixtures::issue("related-cycle-a");
+    let related_b = fixtures::issue("related-cycle-b");
+
+    for issue in [
+        &active_a,
+        &active_b,
+        &archived_a,
+        &archived_b,
+        &related_a,
+        &related_b,
+    ] {
+        storage.create_issue(issue, "tester").unwrap();
+    }
+
+    storage
+        .add_dependency(
+            &active_a.id,
+            &active_b.id,
+            DependencyType::Related.as_str(),
+            "tester",
+        )
+        .unwrap();
+    storage
+        .add_dependency(
+            &active_b.id,
+            &active_a.id,
+            DependencyType::Related.as_str(),
+            "tester",
+        )
+        .unwrap();
+    storage
+        .add_dependency(
+            &archived_a.id,
+            &archived_b.id,
+            DependencyType::Related.as_str(),
+            "tester",
+        )
+        .unwrap();
+    storage
+        .add_dependency(
+            &archived_b.id,
+            &archived_a.id,
+            DependencyType::Related.as_str(),
+            "tester",
+        )
+        .unwrap();
+    storage
+        .add_dependency(
+            &related_a.id,
+            &related_b.id,
+            DependencyType::Related.as_str(),
+            "tester",
+        )
+        .unwrap();
+    storage
+        .add_dependency(
+            &related_b.id,
+            &related_a.id,
+            DependencyType::Related.as_str(),
+            "tester",
+        )
+        .unwrap();
+
+    let all_report = storage.detect_dependency_cycle_report(false).unwrap();
+    assert_eq!(all_report.active_cycles.len(), 2);
+    assert_eq!(all_report.archived_closed_cycles.len(), 1);
+    assert!(
+        all_report
+            .active_cycles
+            .iter()
+            .any(|cycle| cycle.contains(&active_a.id) && cycle.contains(&active_b.id))
+    );
+    assert!(
+        all_report
+            .active_cycles
+            .iter()
+            .any(|cycle| cycle.contains(&related_a.id) && cycle.contains(&related_b.id))
+    );
+    assert!(
+        all_report
+            .archived_closed_cycles
+            .iter()
+            .any(|cycle| cycle.contains(&archived_a.id) && cycle.contains(&archived_b.id))
+    );
+
+    let blocking_report = storage.detect_dependency_cycle_report(true).unwrap();
+    assert!(blocking_report.active_cycles.is_empty());
+    assert!(blocking_report.archived_closed_cycles.is_empty());
+}
+
 // ============================================================================
 // DEEP HIERARCHY TESTS (5+ levels)
 // ============================================================================

@@ -353,6 +353,16 @@ struct TreeNode {
 struct CyclesResult {
     cycles: Vec<Vec<String>>,
     count: usize,
+    active_count: usize,
+    archived_closed_count: usize,
+    total_count: usize,
+    blocking_only: bool,
+    include_closed: bool,
+    scope: &'static str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    active_cycles: Vec<Vec<String>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    archived_closed_cycles: Vec<Vec<String>>,
 }
 
 fn dep_add(
@@ -1571,15 +1581,40 @@ fn dep_cycles(
     _json: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let cycles = if args.blocking_only {
-        storage.detect_blocking_cycles()?
-    } else {
-        storage.detect_all_cycles()?
-    };
+    let report = storage.detect_dependency_cycle_report(args.blocking_only)?;
+    let active_count = report.active_cycles.len();
+    let archived_closed_count = report.archived_closed_cycles.len();
+    let total_count = active_count + archived_closed_count;
+    let mut cycles = report.active_cycles.clone();
+    let mut active_cycles = Vec::new();
+    let mut archived_closed_cycles = Vec::new();
+
+    if args.include_closed {
+        active_cycles.clone_from(&report.active_cycles);
+        archived_closed_cycles.clone_from(&report.archived_closed_cycles);
+        cycles.extend(report.archived_closed_cycles.clone());
+        cycles.sort();
+    }
     let count = cycles.len();
+    let scope = if args.include_closed {
+        "active_and_archived"
+    } else {
+        "active"
+    };
 
     if ctx.is_json() || ctx.is_toon() {
-        let result = CyclesResult { cycles, count };
+        let result = CyclesResult {
+            cycles,
+            count,
+            active_count,
+            archived_closed_count,
+            total_count,
+            blocking_only: args.blocking_only,
+            include_closed: args.include_closed,
+            scope,
+            active_cycles,
+            archived_closed_cycles,
+        };
         if ctx.is_toon() {
             ctx.toon(&result);
         } else {
@@ -1594,7 +1629,13 @@ fn dep_cycles(
 
     let cycle_scope = cycle_scope_label(args.blocking_only);
     if count == 0 {
-        ctx.success(&format!("No {cycle_scope} cycles detected."));
+        if archived_closed_count > 0 && !args.include_closed {
+            ctx.success(&format!(
+                "No active {cycle_scope} cycles detected. {archived_closed_count} archived closed-only cycle(s) hidden; rerun with --include-closed to inspect them."
+            ));
+        } else {
+            ctx.success(&format!("No {cycle_scope} cycles detected."));
+        }
     } else if ctx.is_rich() {
         // Rich mode: Show cycles with red highlighting in a panel
         render_cycles_rich(ctx, &cycles, count, args.blocking_only);
@@ -2286,6 +2327,14 @@ mod tests {
                 ],
             ],
             count: 2,
+            active_count: 2,
+            archived_closed_count: 0,
+            total_count: 2,
+            blocking_only: false,
+            include_closed: false,
+            scope: "active",
+            active_cycles: Vec::new(),
+            archived_closed_cycles: Vec::new(),
         };
 
         let json = serde_json::to_string(&result).unwrap();

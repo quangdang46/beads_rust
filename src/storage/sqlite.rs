@@ -60,6 +60,12 @@ pub(crate) struct ChangelogIssueRow {
     pub(crate) closed_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DependencyCycleReport {
+    pub active_cycles: Vec<Vec<String>>,
+    pub archived_closed_cycles: Vec<Vec<String>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BlockedCacheProjectionHealth {
     pub(crate) parity_status: String,
@@ -10121,6 +10127,13 @@ fn cycle_endpoint(value: Option<&SqliteValue>) -> String {
         .to_string()
 }
 
+fn component_is_closed_only(component: &[String], statuses: &BTreeMap<String, Status>) -> bool {
+    !component.is_empty()
+        && component
+            .iter()
+            .all(|id| statuses.get(id).is_some_and(Status::is_terminal))
+}
+
 fn reverse_cycle_graph(graph: &BTreeMap<String, Vec<String>>) -> BTreeMap<String, Vec<String>> {
     let mut reverse_graph: BTreeMap<String, Vec<String>> = graph
         .keys()
@@ -10806,21 +10819,52 @@ impl SqliteStorage {
         Ok(Self::cycle_witnesses_from_graph(&graph))
     }
 
+    /// Detect dependency cycles split into active and closed-only archive buckets.
+    ///
+    /// Active cycles include any component with at least one non-terminal issue
+    /// or a dependency endpoint missing from the local issue table.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn detect_dependency_cycle_report(
+        &self,
+        blocking_only: bool,
+    ) -> Result<DependencyCycleReport> {
+        let graph = self.load_dependency_cycle_graph(blocking_only)?;
+        let statuses = self.load_dependency_cycle_issue_statuses()?;
+        let witnesses = Self::cycle_witnesses_with_components_from_graph(&graph);
+        let mut active_cycles = Vec::new();
+        let mut archived_closed_cycles = Vec::new();
+
+        for (component, cycle) in witnesses {
+            if component_is_closed_only(&component, &statuses) {
+                archived_closed_cycles.push(cycle);
+            } else {
+                active_cycles.push(cycle);
+            }
+        }
+
+        active_cycles.sort();
+        archived_closed_cycles.sort();
+        Ok(DependencyCycleReport {
+            active_cycles,
+            archived_closed_cycles,
+        })
+    }
+
     fn load_dependency_cycle_graph(
         &self,
         blocking_only: bool,
     ) -> Result<BTreeMap<String, Vec<String>>> {
         let mut graph: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        let rows1 = if blocking_only {
-            self.conn.query(
-                "SELECT issue_id, depends_on_id FROM dependencies \
-                 WHERE type IN ('blocks', 'conditional-blocks', 'waits-for')",
-            )?
+        let standard_edge_sql = if blocking_only {
+            "SELECT issue_id, depends_on_id FROM dependencies \
+             WHERE type IN ('blocks', 'conditional-blocks', 'waits-for')"
         } else {
-            self.conn.query(
-                "SELECT issue_id, depends_on_id FROM dependencies WHERE type != 'parent-child'",
-            )?
+            "SELECT issue_id, depends_on_id FROM dependencies WHERE type != 'parent-child'"
         };
+        let rows1 = self.conn.query(standard_edge_sql)?;
         for row in &rows1 {
             let from = cycle_endpoint(row.get(0));
             let to = cycle_endpoint(row.get(1));
@@ -10846,28 +10890,50 @@ impl SqliteStorage {
         Ok(graph)
     }
 
+    fn load_dependency_cycle_issue_statuses(&self) -> Result<BTreeMap<String, Status>> {
+        let rows = self.conn.query("SELECT id, status FROM issues")?;
+        let mut statuses = BTreeMap::new();
+        for row in &rows {
+            let Some(id) = row.get(0).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            let status = parse_status(row.get(1).and_then(SqliteValue::as_text));
+            statuses.insert(id.to_string(), status);
+        }
+        Ok(statuses)
+    }
+
     fn cycle_witnesses_from_graph(graph: &BTreeMap<String, Vec<String>>) -> Vec<Vec<String>> {
+        Self::cycle_witnesses_with_components_from_graph(graph)
+            .into_iter()
+            .map(|(_component, cycle)| cycle)
+            .collect()
+    }
+
+    fn cycle_witnesses_with_components_from_graph(
+        graph: &BTreeMap<String, Vec<String>>,
+    ) -> Vec<(Vec<String>, Vec<String>)> {
         let components = Self::strongly_connected_components(graph);
         let mut cycles = Vec::new();
 
         for component in components {
             if component.len() == 1 {
-                let node = &component[0];
+                let node = component[0].clone();
                 if graph
-                    .get(node)
-                    .is_some_and(|neighbors| neighbors.binary_search(node).is_ok())
+                    .get(&node)
+                    .is_some_and(|neighbors| neighbors.binary_search(&node).is_ok())
                 {
-                    cycles.push(vec![node.clone(), node.clone()]);
+                    cycles.push((component, vec![node.clone(), node]));
                 }
                 continue;
             }
 
             if let Some(cycle) = Self::cycle_witness_for_component(graph, &component) {
-                cycles.push(cycle);
+                cycles.push((component, cycle));
             }
         }
 
-        cycles.sort();
+        cycles.sort_by(|left, right| left.1.cmp(&right.1));
         cycles
     }
 

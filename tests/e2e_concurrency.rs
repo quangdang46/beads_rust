@@ -23,7 +23,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
+#[cfg(target_os = "linux")]
 const WRITE_LOCK_WAIT_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(target_os = "linux")]
 const WRITE_LOCK_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const CONTENTION_SUCCESS_LOCK_TIMEOUT_MS: &str = "1000";
 

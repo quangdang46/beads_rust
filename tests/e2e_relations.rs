@@ -19,6 +19,117 @@ fn parse_created_id(stdout: &str) -> String {
 }
 
 #[test]
+fn e2e_dep_cycles_default_hides_closed_archive_and_include_closed_exposes_it() {
+    common::init_test_logging();
+    info!("e2e_dep_cycles_default_hides_closed_archive_and_include_closed_exposes_it: starting");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_closed_archive_cycles");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let issue_a = run_br(&workspace, ["create", "Archived cycle A"], "create_a");
+    assert!(
+        issue_a.status.success(),
+        "create A failed: {}",
+        issue_a.stderr
+    );
+    let issue_a_id = parse_created_id(&issue_a.stdout);
+
+    let issue_b = run_br(&workspace, ["create", "Archived cycle B"], "create_b");
+    assert!(
+        issue_b.status.success(),
+        "create B failed: {}",
+        issue_b.stderr
+    );
+    let issue_b_id = parse_created_id(&issue_b.stdout);
+
+    let add_a_b = run_br(
+        &workspace,
+        ["dep", "add", &issue_a_id, &issue_b_id, "-t", "related"],
+        "add_a_b_related",
+    );
+    assert!(
+        add_a_b.status.success(),
+        "add A->B failed: {}",
+        add_a_b.stderr
+    );
+    let add_b_a = run_br(
+        &workspace,
+        ["dep", "add", &issue_b_id, &issue_a_id, "-t", "related"],
+        "add_b_a_related",
+    );
+    assert!(
+        add_b_a.status.success(),
+        "add B->A failed: {}",
+        add_b_a.stderr
+    );
+
+    let close_a = run_br(&workspace, ["close", &issue_a_id], "close_a");
+    assert!(
+        close_a.status.success(),
+        "close A failed: {}",
+        close_a.stderr
+    );
+    let close_b = run_br(&workspace, ["close", &issue_b_id], "close_b");
+    assert!(
+        close_b.status.success(),
+        "close B failed: {}",
+        close_b.stderr
+    );
+
+    let active_only = run_br(
+        &workspace,
+        ["dep", "cycles", "--json"],
+        "cycles_active_only",
+    );
+    assert!(
+        active_only.status.success(),
+        "dep cycles active-only failed: {}",
+        active_only.stderr
+    );
+    let active_payload: Value = serde_json::from_str(&extract_json_payload(&active_only.stdout))
+        .expect("active cycles json");
+    assert_eq!(active_payload["scope"], "active");
+    assert_eq!(active_payload["include_closed"], false);
+    assert_eq!(active_payload["count"], 0);
+    assert_eq!(active_payload["active_count"], 0);
+    assert_eq!(active_payload["archived_closed_count"], 1);
+    assert_eq!(active_payload["total_count"], 1);
+    assert_eq!(active_payload["cycles"].as_array().unwrap().len(), 0);
+    assert!(active_payload.get("archived_closed_cycles").is_none());
+
+    let with_archive = run_br(
+        &workspace,
+        ["dep", "cycles", "--json", "--include-closed"],
+        "cycles_include_closed",
+    );
+    assert!(
+        with_archive.status.success(),
+        "dep cycles --include-closed failed: {}",
+        with_archive.stderr
+    );
+    let archive_payload: Value = serde_json::from_str(&extract_json_payload(&with_archive.stdout))
+        .expect("include-closed cycles json");
+    assert_eq!(archive_payload["scope"], "active_and_archived");
+    assert_eq!(archive_payload["include_closed"], true);
+    assert_eq!(archive_payload["count"], 1);
+    assert_eq!(archive_payload["active_count"], 0);
+    assert_eq!(archive_payload["archived_closed_count"], 1);
+    assert_eq!(archive_payload["total_count"], 1);
+    assert_eq!(archive_payload["cycles"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        archive_payload["archived_closed_cycles"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    info!(
+        "e2e_dep_cycles_default_hides_closed_archive_and_include_closed_exposes_it: assertions passed"
+    );
+}
+
+#[test]
 fn e2e_relations_labels_comments() {
     common::init_test_logging();
     info!("e2e_relations_labels_comments: starting");
