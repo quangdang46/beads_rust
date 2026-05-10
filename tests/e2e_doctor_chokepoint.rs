@@ -29,11 +29,16 @@
 //! dragging the as-yet-unmigrated repair paths into the assertion.
 
 use assert_cmd::Command;
+use beads_rust::cli::commands::doctor_subsystems::mutate::{
+    Capabilities, DbArg, MutateContext, Op, mutate,
+};
+use fsqlite::Connection;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
@@ -159,6 +164,102 @@ fn parse_trailing_json(stdout: &str) -> Value {
         .unwrap_or_else(|| panic!("no JSON object in stdout: {stdout}"));
     serde_json::from_str(&trimmed[start..])
         .unwrap_or_else(|e| panic!("parse JSON failed ({e}): {}", &trimmed[start..]))
+}
+
+fn seed_blocked_cache_db(db_path: &Path, blocked_by: &str) {
+    let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+    conn.execute(
+        "CREATE TABLE blocked_issues_cache (
+            issue_id TEXT PRIMARY KEY,
+            blocked_by TEXT NOT NULL,
+            blocked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )",
+    )
+    .unwrap();
+    conn.execute(&format!(
+        "INSERT INTO blocked_issues_cache(issue_id, blocked_by, blocked_at) \
+         VALUES ('bd-1', '{blocked_by}', '2026-05-01 00:00:00')"
+    ))
+    .unwrap();
+    let _ = conn.close();
+}
+
+fn db_exec_context(root: &Path, run_id: &str) -> (PathBuf, MutateContext) {
+    let run_dir = root.join(".doctor").join("runs").join(run_id);
+    fs::create_dir_all(run_dir.join("backups")).unwrap();
+    let actions_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(run_dir.join("actions.jsonl"))
+        .unwrap();
+    let ctx = MutateContext {
+        run_id: run_id.to_string(),
+        run_dir: run_dir.clone(),
+        capabilities: Capabilities::for_repo(root),
+        actions_file: Mutex::new(actions_file),
+        fixer_id: "wp4-cache-rebuild".to_string(),
+        repo_root: root.to_path_buf(),
+        dry_run: false,
+        start_ns: 0,
+    };
+    (run_dir, ctx)
+}
+
+fn mutate_cache_rebuild(ctx: &MutateContext, db_path: &Path) {
+    let result_delete = mutate(
+        ctx,
+        db_path,
+        Op::DbExec {
+            sql: "DELETE FROM blocked_issues_cache".into(),
+            args: vec![],
+            affected_tables: vec!["blocked_issues_cache".into()],
+            affected_predicate: None,
+        },
+    )
+    .expect("DELETE via chokepoint should succeed");
+    assert!(result_delete.ok);
+
+    let result_insert = mutate(
+        ctx,
+        db_path,
+        Op::DbExec {
+            sql: "INSERT INTO blocked_issues_cache(issue_id, blocked_by, blocked_at) \
+                  VALUES (?, ?, ?)"
+                .into(),
+            args: vec![
+                DbArg::Text("bd-1".into()),
+                DbArg::Text("[\"bd-2\"]".into()),
+                DbArg::Text("2026-05-09 00:00:00".into()),
+            ],
+            affected_tables: vec!["blocked_issues_cache".into()],
+            affected_predicate: None,
+        },
+    )
+    .expect("INSERT via chokepoint should succeed");
+    assert!(result_insert.ok);
+}
+
+fn single_cache_row(db_path: &Path) -> (String, String) {
+    let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+    let rows = conn
+        .query("SELECT issue_id, blocked_by FROM blocked_issues_cache")
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "expected exactly one cache row, got {}",
+        rows.len()
+    );
+    let issue_id = match rows[0].get(0) {
+        Some(fsqlite_types::value::SqliteValue::Text(s)) => s.to_string(),
+        other => panic!("unexpected issue_id value: {other:?}"),
+    };
+    let blocked_by = match rows[0].get(1) {
+        Some(fsqlite_types::value::SqliteValue::Text(s)) => s.to_string(),
+        other => panic!("unexpected blocked_by value: {other:?}"),
+    };
+    let _ = conn.close();
+    (issue_id, blocked_by)
 }
 
 // ---------------------------------------------------------------------------
@@ -663,12 +764,6 @@ fn chokepoint_robot_triage_envelope_v1() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn chokepoint_db_exec_round_trip() {
-    use beads_rust::cli::commands::doctor_subsystems::mutate::{
-        Capabilities, DbArg, MutateContext, Op, mutate,
-    };
-    use fsqlite::Connection;
-    use std::sync::Mutex;
-
     let tmp = TempDir::new().expect("tempdir");
     let root = tmp.path().to_path_buf();
     let beads_dir = root.join(".beads");
@@ -677,94 +772,21 @@ fn chokepoint_db_exec_round_trip() {
 
     // Build a minimal DB with the cache table and intentionally-corrupt
     // contents (a row whose blocked_by is wrong on purpose).
-    {
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
-        conn.execute(
-            "CREATE TABLE blocked_issues_cache (
-                issue_id TEXT PRIMARY KEY,
-                blocked_by TEXT NOT NULL,
-                blocked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )",
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO blocked_issues_cache(issue_id, blocked_by, blocked_at) \
-             VALUES ('bd-1', '[\"WRONG\"]', '2026-05-01 00:00:00')",
-        )
-        .unwrap();
-        let _ = conn.close();
-    }
+    seed_blocked_cache_db(&db_path, "[\"WRONG\"]");
 
     // Build a chokepoint context rooted at `root`.
-    let run_id = "wp4-db-exec-roundtrip".to_string();
-    let run_dir = root.join(".doctor").join("runs").join(&run_id);
-    fs::create_dir_all(run_dir.join("backups")).unwrap();
+    let run_id = "wp4-db-exec-roundtrip";
+    let (run_dir, ctx) = db_exec_context(&root, run_id);
     let actions_path = run_dir.join("actions.jsonl");
-    let actions_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&actions_path)
-        .unwrap();
-    let ctx = MutateContext {
-        run_id: run_id.clone(),
-        run_dir: run_dir.clone(),
-        capabilities: Capabilities::for_repo(&root),
-        actions_file: Mutex::new(actions_file),
-        fixer_id: "wp4-cache-rebuild".to_string(),
-        repo_root: root.clone(),
-        dry_run: false,
-        start_ns: 0,
-    };
 
     // Forward path: rebuild the cache via DELETE + INSERT inside the
     // chokepoint. We do TWO DbExec ops because fsqlite's executor only
     // accepts one statement per call.
-    let result_delete = mutate(
-        &ctx,
-        &db_path,
-        Op::DbExec {
-            sql: "DELETE FROM blocked_issues_cache".into(),
-            args: vec![],
-            affected_tables: vec!["blocked_issues_cache".into()],
-            affected_predicate: None,
-        },
-    )
-    .expect("DELETE via chokepoint should succeed");
-    assert!(result_delete.ok);
-
-    let result_insert = mutate(
-        &ctx,
-        &db_path,
-        Op::DbExec {
-            sql: "INSERT INTO blocked_issues_cache(issue_id, blocked_by, blocked_at) \
-                  VALUES (?, ?, ?)"
-                .into(),
-            args: vec![
-                DbArg::Text("bd-1".into()),
-                DbArg::Text("[\"bd-2\"]".into()),
-                DbArg::Text("2026-05-09 00:00:00".into()),
-            ],
-            affected_tables: vec!["blocked_issues_cache".into()],
-            affected_predicate: None,
-        },
-    )
-    .expect("INSERT via chokepoint should succeed");
-    assert!(result_insert.ok);
+    mutate_cache_rebuild(&ctx, &db_path);
 
     // The cache now has the corrected row.
-    {
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
-        let rows = conn
-            .query("SELECT issue_id, blocked_by FROM blocked_issues_cache")
-            .unwrap();
-        assert_eq!(rows.len(), 1, "expected one cache row after rebuild");
-        let blocked_by = match rows[0].get(1) {
-            Some(fsqlite_types::value::SqliteValue::Text(s)) => s.to_string(),
-            other => panic!("unexpected blocked_by value: {other:?}"),
-        };
-        assert_eq!(blocked_by, "[\"bd-2\"]");
-        let _ = conn.close();
-    }
+    let (_issue_id, blocked_by) = single_cache_row(&db_path);
+    assert_eq!(blocked_by, "[\"bd-2\"]");
 
     // actions.jsonl: two `db_exec` lines, each with the snapshot
     // fingerprint we configured.
@@ -844,12 +866,6 @@ fn chokepoint_db_exec_round_trip() {
 
 #[test]
 fn chokepoint_db_exec_undo_replay() {
-    use beads_rust::cli::commands::doctor_subsystems::mutate::{
-        Capabilities, DbArg, MutateContext, Op, mutate,
-    };
-    use fsqlite::Connection;
-    use std::sync::Mutex;
-
     let tmp = TempDir::new().expect("tempdir");
     let root = tmp.path().to_path_buf();
     let beads_dir = root.join(".beads");
@@ -857,90 +873,18 @@ fn chokepoint_db_exec_undo_replay() {
     let db_path = beads_dir.join("beads.db");
 
     // Build the DB with a corrupt cache row.
-    {
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
-        conn.execute(
-            "CREATE TABLE blocked_issues_cache (
-                issue_id TEXT PRIMARY KEY,
-                blocked_by TEXT NOT NULL,
-                blocked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )",
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO blocked_issues_cache(issue_id, blocked_by, blocked_at) \
-             VALUES ('bd-1', '[\"WRONG\"]', '2026-05-01 00:00:00')",
-        )
-        .unwrap();
-        let _ = conn.close();
-    }
+    seed_blocked_cache_db(&db_path, "[\"WRONG\"]");
 
     // Build a chokepoint context rooted at `root`.
-    let run_id = "wp4-db-exec-undo-replay".to_string();
-    let run_dir = root.join(".doctor").join("runs").join(&run_id);
-    fs::create_dir_all(run_dir.join("backups")).unwrap();
-    let actions_path = run_dir.join("actions.jsonl");
-    let actions_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&actions_path)
-        .unwrap();
-    let ctx = MutateContext {
-        run_id: run_id.clone(),
-        run_dir: run_dir.clone(),
-        capabilities: Capabilities::for_repo(&root),
-        actions_file: Mutex::new(actions_file),
-        fixer_id: "wp4-cache-rebuild".to_string(),
-        repo_root: root.clone(),
-        dry_run: false,
-        start_ns: 0,
-    };
+    let run_id = "wp4-db-exec-undo-replay";
+    let (_run_dir, ctx) = db_exec_context(&root, run_id);
 
     // Forward: DELETE then INSERT a corrected row (mirroring Test 7).
-    mutate(
-        &ctx,
-        &db_path,
-        Op::DbExec {
-            sql: "DELETE FROM blocked_issues_cache".into(),
-            args: vec![],
-            affected_tables: vec!["blocked_issues_cache".into()],
-            affected_predicate: None,
-        },
-    )
-    .expect("DELETE via chokepoint should succeed");
-
-    mutate(
-        &ctx,
-        &db_path,
-        Op::DbExec {
-            sql: "INSERT INTO blocked_issues_cache(issue_id, blocked_by, blocked_at) \
-                  VALUES (?, ?, ?)"
-                .into(),
-            args: vec![
-                DbArg::Text("bd-1".into()),
-                DbArg::Text("[\"bd-2\"]".into()),
-                DbArg::Text("2026-05-09 00:00:00".into()),
-            ],
-            affected_tables: vec!["blocked_issues_cache".into()],
-            affected_predicate: None,
-        },
-    )
-    .expect("INSERT via chokepoint should succeed");
+    mutate_cache_rebuild(&ctx, &db_path);
 
     // Sanity: post-forward DB has the corrected row, not the corrupt one.
-    {
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
-        let rows = conn
-            .query("SELECT issue_id, blocked_by FROM blocked_issues_cache")
-            .unwrap();
-        assert_eq!(rows.len(), 1);
-        let blocked_by = match rows[0].get(1) {
-            Some(fsqlite_types::value::SqliteValue::Text(s)) => s.to_string(),
-            other => panic!("unexpected blocked_by value: {other:?}"),
-        };
-        assert_eq!(blocked_by, "[\"bd-2\"]");
-        let _ = conn.close();
-    }
+    let (_issue_id, blocked_by) = single_cache_row(&db_path);
+    assert_eq!(blocked_by, "[\"bd-2\"]");
 
     // Drop the actions file so the chokepoint flushes to disk and the
     // undo path can re-open it for read.
@@ -949,7 +893,7 @@ fn chokepoint_db_exec_undo_replay() {
     // Now invoke `br doctor undo <run-id>` against the workspace.
     let bin_path = env!("CARGO_BIN_EXE_br");
     let output = std::process::Command::new(bin_path)
-        .args(["doctor", "undo", &run_id, "--json"])
+        .args(["doctor", "undo", run_id, "--json"])
         .current_dir(&root)
         .env("RUST_LOG", "error")
         .env("BR_NO_AUTOFLUSH", "1")
@@ -967,30 +911,10 @@ fn chokepoint_db_exec_undo_replay() {
     // empty table; then the DELETE action's snapshot (containing the
     // pre-DELETE corrupt row) is replayed, restoring it. Net effect:
     // only the original corrupt row is present.
-    {
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
-        let rows = conn
-            .query("SELECT issue_id, blocked_by FROM blocked_issues_cache")
-            .unwrap();
-        assert_eq!(
-            rows.len(),
-            1,
-            "expected exactly one row after undo, got {}",
-            rows.len()
-        );
-        let issue_id = match rows[0].get(0) {
-            Some(fsqlite_types::value::SqliteValue::Text(s)) => s.to_string(),
-            other => panic!("unexpected issue_id value: {other:?}"),
-        };
-        let blocked_by = match rows[0].get(1) {
-            Some(fsqlite_types::value::SqliteValue::Text(s)) => s.to_string(),
-            other => panic!("unexpected blocked_by value: {other:?}"),
-        };
-        assert_eq!(issue_id, "bd-1");
-        assert_eq!(
-            blocked_by, "[\"WRONG\"]",
-            "expected the pre-DELETE corrupt row to be restored"
-        );
-        let _ = conn.close();
-    }
+    let (issue_id, blocked_by) = single_cache_row(&db_path);
+    assert_eq!(issue_id, "bd-1");
+    assert_eq!(
+        blocked_by, "[\"WRONG\"]",
+        "expected the pre-DELETE corrupt row to be restored"
+    );
 }

@@ -835,8 +835,11 @@ fn write_unique_db_snapshot_with_stamp(
                 file.sync_data()?;
                 return Ok(path);
             }
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(err),
+            Err(err) => {
+                if err.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(err);
+                }
+            }
         }
     }
     Err(std::io::Error::new(

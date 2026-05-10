@@ -925,7 +925,6 @@ fn restore_one(
 /// so the restore is atomic across tables.
 fn restore_db_exec(repo_root: &Path, record: &StoredActionRecord, target: PathBuf) -> UndoStep {
     use fsqlite::Connection;
-    use fsqlite_types::value::SqliteValue;
 
     if record.db_snapshots.is_empty() {
         return UndoStep {
@@ -945,75 +944,11 @@ fn restore_db_exec(repo_root: &Path, record: &StoredActionRecord, target: PathBu
         };
     }
 
-    // Read every snapshot envelope first so we fail-fast before opening
-    // a writable DB connection.
-    let mut envelopes: Vec<DbSnapshotEnvelope> = Vec::with_capacity(record.db_snapshots.len());
-    for rel_snap in &record.db_snapshots {
-        let snap_path = match workspace_relative_path(repo_root, rel_snap) {
-            Ok(p) => p,
-            Err(e) => {
-                return UndoStep {
-                    path: record.path.clone(),
-                    op: record.op.clone(),
-                    status: format!("failed_invalid_snapshot_path:{e}"),
-                    backup_used: Some(rel_snap.clone()),
-                };
-            }
-        };
-        let body = match fs::read(&snap_path) {
-            Ok(b) => b,
-            Err(e) => {
-                return UndoStep {
-                    path: record.path.clone(),
-                    op: record.op.clone(),
-                    status: format!("failed_read_snapshot:{e}"),
-                    backup_used: Some(snap_path.to_string_lossy().into_owned()),
-                };
-            }
-        };
-        match serde_json::from_slice::<DbSnapshotEnvelope>(&body) {
-            Ok(env) => envelopes.push(env),
-            Err(e) => {
-                return UndoStep {
-                    path: record.path.clone(),
-                    op: record.op.clone(),
-                    status: format!("failed_parse_snapshot:{e}"),
-                    backup_used: Some(snap_path.to_string_lossy().into_owned()),
-                };
-            }
-        }
-    }
-
-    // Validate every envelope before touching the DB.
-    for env in &envelopes {
-        if env.schema_version != "br.doctor.db_snapshot.v1" {
-            return UndoStep {
-                path: record.path.clone(),
-                op: record.op.clone(),
-                status: format!("failed_unknown_snapshot_schema:{}", env.schema_version),
-                backup_used: None,
-            };
-        }
-        if !is_safe_sql_ident(&env.table) {
-            return UndoStep {
-                path: record.path.clone(),
-                op: record.op.clone(),
-                status: format!("failed_invalid_table_ident:{}", env.table),
-                backup_used: None,
-            };
-        }
-        for col in &env.columns {
-            if !is_safe_sql_ident(col) {
-                return UndoStep {
-                    path: record.path.clone(),
-                    op: record.op.clone(),
-                    status: format!("failed_invalid_column_ident:{col}"),
-                    backup_used: None,
-                };
-            }
-        }
-    }
-    if let Err(e) = validate_db_snapshot_contract(record, &envelopes) {
+    let envelopes = match read_db_snapshot_envelopes(repo_root, record) {
+        Ok(envelopes) => envelopes,
+        Err(step) => return step,
+    };
+    if let Err(e) = validate_db_snapshot_envelopes(record, &envelopes) {
         return UndoStep {
             path: record.path.clone(),
             op: record.op.clone(),
@@ -1044,51 +979,127 @@ fn restore_db_exec(repo_root: &Path, record: &StoredActionRecord, target: PathBu
         };
     }
 
-    let replay_result: std::result::Result<(), String> = (|| {
-        for env in &envelopes {
-            // Step 1: DELETE the rows the forward call would have
-            // touched. For predicate-less DbExec the forward path
-            // snapshotted the whole table, so we restore by clearing
-            // the whole table first.
-            let predicate = env.predicate.as_deref().unwrap_or("").trim();
-            let table_ident = quote_sql_ident(&env.table);
-            let delete_sql = if predicate.is_empty() {
-                format!("DELETE FROM {table_ident}")
-            } else {
-                format!("DELETE FROM {table_ident} WHERE {predicate}")
-            };
-            conn.execute(&delete_sql)
-                .map_err(|e| format!("delete:{e}"))?;
+    let replay_result = replay_db_snapshot_envelopes(&conn, &envelopes);
+    finish_db_replay(conn, record, replay_result)
+}
 
-            // Step 2: INSERT each snapshot row. We bind via
-            // execute_with_params to keep the SQL injection-free.
-            if env.rows.is_empty() {
-                continue;
-            }
-            let cols_csv = env
-                .columns
-                .iter()
-                .map(|c| quote_sql_ident(c))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let placeholders: Vec<&str> = vec!["?"; env.columns.len()];
-            let insert_sql = format!(
-                "INSERT INTO {table_ident}({cols_csv}) VALUES ({})",
-                placeholders.join(", ")
-            );
-            for row in &env.rows {
-                let mut bound: Vec<SqliteValue> = Vec::with_capacity(env.columns.len());
-                for col in &env.columns {
-                    let val = row.get(col).cloned().unwrap_or(serde_json::Value::Null);
-                    bound.push(json_to_sqlite_value(&val).map_err(|e| format!("bind:{e}"))?);
-                }
-                conn.execute_with_params(&insert_sql, &bound)
-                    .map_err(|e| format!("insert:{e}"))?;
+fn read_db_snapshot_envelopes(
+    repo_root: &Path,
+    record: &StoredActionRecord,
+) -> std::result::Result<Vec<DbSnapshotEnvelope>, UndoStep> {
+    let mut envelopes = Vec::with_capacity(record.db_snapshots.len());
+    for rel_snap in &record.db_snapshots {
+        let snap_path = workspace_relative_path(repo_root, rel_snap).map_err(|e| UndoStep {
+            path: record.path.clone(),
+            op: record.op.clone(),
+            status: format!("failed_invalid_snapshot_path:{e}"),
+            backup_used: Some(rel_snap.clone()),
+        })?;
+        let body = fs::read(&snap_path).map_err(|e| UndoStep {
+            path: record.path.clone(),
+            op: record.op.clone(),
+            status: format!("failed_read_snapshot:{e}"),
+            backup_used: Some(snap_path.to_string_lossy().into_owned()),
+        })?;
+        let env = serde_json::from_slice(&body).map_err(|e| UndoStep {
+            path: record.path.clone(),
+            op: record.op.clone(),
+            status: format!("failed_parse_snapshot:{e}"),
+            backup_used: Some(snap_path.to_string_lossy().into_owned()),
+        })?;
+        envelopes.push(env);
+    }
+    Ok(envelopes)
+}
+
+fn validate_db_snapshot_envelopes(
+    record: &StoredActionRecord,
+    envelopes: &[DbSnapshotEnvelope],
+) -> std::result::Result<(), String> {
+    for env in envelopes {
+        if env.schema_version != "br.doctor.db_snapshot.v1" {
+            return Err(format!(
+                "failed_unknown_snapshot_schema:{}",
+                env.schema_version
+            ));
+        }
+        if !is_safe_sql_ident(&env.table) {
+            return Err(format!("failed_invalid_table_ident:{}", env.table));
+        }
+        for col in &env.columns {
+            if !is_safe_sql_ident(col) {
+                return Err(format!("failed_invalid_column_ident:{col}"));
             }
         }
-        Ok(())
-    })();
+    }
+    validate_db_snapshot_contract(record, envelopes)
+}
 
+fn replay_db_snapshot_envelopes(
+    conn: &fsqlite::Connection,
+    envelopes: &[DbSnapshotEnvelope],
+) -> std::result::Result<(), String> {
+    for env in envelopes {
+        delete_db_snapshot_region(conn, env)?;
+        insert_db_snapshot_rows(conn, env)?;
+    }
+    Ok(())
+}
+
+fn delete_db_snapshot_region(
+    conn: &fsqlite::Connection,
+    env: &DbSnapshotEnvelope,
+) -> std::result::Result<(), String> {
+    let predicate = env.predicate.as_deref().unwrap_or("").trim();
+    let table_ident = quote_sql_ident(&env.table);
+    let delete_sql = if predicate.is_empty() {
+        format!("DELETE FROM {table_ident}")
+    } else {
+        format!("DELETE FROM {table_ident} WHERE {predicate}")
+    };
+    conn.execute(&delete_sql)
+        .map(|_| ())
+        .map_err(|e| format!("delete:{e}"))
+}
+
+fn insert_db_snapshot_rows(
+    conn: &fsqlite::Connection,
+    env: &DbSnapshotEnvelope,
+) -> std::result::Result<(), String> {
+    use fsqlite_types::value::SqliteValue;
+
+    if env.rows.is_empty() {
+        return Ok(());
+    }
+    let cols_csv = env
+        .columns
+        .iter()
+        .map(|c| quote_sql_ident(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let placeholders: Vec<&str> = vec!["?"; env.columns.len()];
+    let insert_sql = format!(
+        "INSERT INTO {}({cols_csv}) VALUES ({})",
+        quote_sql_ident(&env.table),
+        placeholders.join(", ")
+    );
+    for row in &env.rows {
+        let mut bound: Vec<SqliteValue> = Vec::with_capacity(env.columns.len());
+        for col in &env.columns {
+            let val = row.get(col).cloned().unwrap_or(serde_json::Value::Null);
+            bound.push(json_to_sqlite_value(&val).map_err(|e| format!("bind:{e}"))?);
+        }
+        conn.execute_with_params(&insert_sql, &bound)
+            .map_err(|e| format!("insert:{e}"))?;
+    }
+    Ok(())
+}
+
+fn finish_db_replay(
+    conn: fsqlite::Connection,
+    record: &StoredActionRecord,
+    replay_result: std::result::Result<(), String>,
+) -> UndoStep {
     match replay_result {
         Ok(()) => match conn.execute("COMMIT") {
             Ok(_) => {
@@ -1252,7 +1263,7 @@ fn json_to_sqlite_value(
 /// Hex decoder for the `$blob_hex` envelope. Lowercase / uppercase
 /// both accepted; whitespace not tolerated.
 fn decode_hex(s: &str) -> std::result::Result<Vec<u8>, String> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err("odd hex length".to_string());
     }
     let mut out = Vec::with_capacity(s.len() / 2);
