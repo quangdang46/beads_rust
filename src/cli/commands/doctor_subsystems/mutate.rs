@@ -449,6 +449,23 @@ fn now_ns() -> u128 {
         .map_or(0, |d| d.as_nanos())
 }
 
+/// Fsync the given directory so a freshly-created entry is durable
+/// across power loss. POSIX guarantees `rename(2)` atomicity but not
+/// durability — the directory's data block must be flushed for the
+/// new entry to survive a crash. A minority of filesystems (e.g. some
+/// kernel-side tmpfs configurations) reject fsync on a directory; we
+/// treat `InvalidInput` as best-effort and only propagate genuine
+/// I/O faults so a perfectly successful mutate is not turned into a
+/// false negative.
+fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+    let d = fs::File::open(dir)?;
+    match d.sync_all() {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// The single disk-mutation chokepoint for `br doctor --repair`.
 ///
 /// See the module-level documentation for the 8-step contract.
@@ -1041,7 +1058,10 @@ fn run_db_migrate(
 /// Execute the planned op atomically. File-based ops use
 /// `tempfile::NamedTempFile::persist` (i.e., `rename(2)`); the temp
 /// file lives in the **same directory** as the target so cross-FS
-/// rename never breaks atomicity.
+/// rename never breaks atomicity. After every `rename(2)` we fsync
+/// the containing directory so the rename itself is durable across
+/// power loss — POSIX does not guarantee directory updates land just
+/// because the file's contents were synced.
 fn execute_atomic(path: &Path, op: Op) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
@@ -1054,6 +1074,7 @@ fn execute_atomic(path: &Path, op: Op) -> std::io::Result<()> {
             fs::set_permissions(tmp.path(), perms)?;
             tmp.persist(path)
                 .map_err(|e| std::io::Error::other(e.error.to_string()))?;
+            fsync_dir(parent)?;
         }
         Op::AppendFile { content } => {
             // Crash-safety: a raw `O_APPEND` write leaves a torn line
@@ -1079,12 +1100,24 @@ fn execute_atomic(path: &Path, op: Op) -> std::io::Result<()> {
             fs::set_permissions(tmp.path(), fs::Permissions::from_mode(mode))?;
             tmp.persist(path)
                 .map_err(|e| std::io::Error::other(e.error.to_string()))?;
+            fsync_dir(parent)?;
         }
         Op::Rename { to } => {
             if let Some(p) = to.parent() {
                 fs::create_dir_all(p)?;
             }
             fs::rename(path, &to)?;
+            // Fsync both the source and destination directories so
+            // the unlink-from-source and link-into-dest are both
+            // durable. POSIX rename atomicity guarantees the rename
+            // is observed atomically by other readers, but durability
+            // across power loss requires an explicit dirsync.
+            fsync_dir(parent)?;
+            if let Some(dest_parent) = to.parent()
+                && dest_parent != parent
+            {
+                fsync_dir(dest_parent)?;
+            }
         }
         Op::Chmod { mode } => {
             fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
@@ -1101,14 +1134,19 @@ fn execute_atomic(path: &Path, op: Op) -> std::io::Result<()> {
                 std::process::id(),
                 now_ns()
             ));
-            // If a stale tmp from a crashed run is sitting around, get
-            // rid of it (it is a symlink we own; this is the only place
-            // in the doctor that may unlink, and only the tmp file).
-            if tmp.symlink_metadata().is_ok() {
-                fs::remove_file(&tmp)?;
+            // Best-effort scrub of stale tmp from a crashed run.
+            // We can't `is_ok() then remove_file` because that opens a
+            // TOCTOU window where another process could delete the
+            // symlink between our check and our remove. Just attempt
+            // the remove unconditionally and ignore NotFound.
+            match fs::remove_file(&tmp) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
             }
             symlink(target, &tmp)?;
             fs::rename(&tmp, path)?;
+            fsync_dir(parent)?;
         }
         Op::DbExec { .. } | Op::DbMigrate { .. } => {
             // Unreachable — caller path returns BeadsError before this.
