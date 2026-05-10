@@ -412,6 +412,22 @@ fn copy_verbatim_with_perms(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Write the captured `bytes` (already read into memory by `mutate()`)
+/// to `dst` and stamp it with the source file's mode. Unlike
+/// `copy_verbatim_with_perms` this never re-reads the source — it uses
+/// the in-memory bytes the chokepoint already hashed for `before_hash`.
+/// `cmp_strict` is then run by the caller as a tripwire that fires if a
+/// non-doctor writer touched the live file between our read and now.
+fn write_verbatim_backup(src: &Path, dst: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(dst, bytes)?;
+    let meta = fs::metadata(src)?;
+    fs::set_permissions(dst, fs::Permissions::from_mode(meta.permissions().mode()))?;
+    Ok(())
+}
+
 /// Strict byte-by-byte comparison of two files. Used to verify the
 /// verbatim backup matches the live file before we proceed with the
 /// mutation.
@@ -451,13 +467,22 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
     // lockfile here; the workspace lock is already held when --repair
     // runs.
 
-    // (2) before_hash.
-    let before_bytes = read_or_empty(path).map_err(BeadsError::Io)?;
-    let before_existed = path.exists();
-    let before_hash = if before_existed {
-        sha256_hex_prefixed(&before_bytes)
-    } else {
-        SHA256_EMPTY_PREFIXED.to_string()
+    // (2) Read once and remember whether the file existed BEFORE we do
+    //     anything else. The chokepoint's whole reason to exist is
+    //     consistency between `before_hash`, `backup contents`, and the
+    //     pre-mutation live file; any subsequent step that re-reads the
+    //     live file opens a TOCTOU window. We compute `before_hash` from
+    //     the bytes we capture here, then write those exact bytes as
+    //     the verbatim backup so the audit log and the backup file
+    //     trivially agree.
+    let before_bytes_or_missing = match fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(BeadsError::Io(e)),
+    };
+    let before_hash = match &before_bytes_or_missing {
+        Some(bytes) => sha256_hex_prefixed(bytes),
+        None => SHA256_EMPTY_PREFIXED.to_string(),
     };
 
     // (3) Preconditions — write_scopes check.
@@ -479,11 +504,19 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
         _ => None,
     };
 
-    // (4) Verbatim backup — only meaningful if the file existed.
+    // (4) Verbatim backup — only meaningful if the file existed. Write
+    //     the exact bytes we hashed for `before_hash` so the audit log
+    //     and the on-disk backup are guaranteed consistent. The
+    //     belt-and-braces `cmp_strict` is preserved for the case where
+    //     a non-doctor writer touches the file *after* our read; if the
+    //     backup we just wrote no longer matches the live file we
+    //     refuse rather than commit to a stale before_hash.
     let rel = path.strip_prefix(&ctx.repo_root).unwrap_or(path);
     let backup = ctx.run_dir.join("backups").join(rel);
-    if !ctx.dry_run && before_existed {
-        copy_verbatim_with_perms(path, &backup).map_err(BeadsError::Io)?;
+    if !ctx.dry_run
+        && let Some(bytes) = before_bytes_or_missing.as_ref()
+    {
+        write_verbatim_backup(path, &backup, bytes).map_err(BeadsError::Io)?;
         cmp_strict(path, &backup).map_err(BeadsError::Io)?;
     }
 
