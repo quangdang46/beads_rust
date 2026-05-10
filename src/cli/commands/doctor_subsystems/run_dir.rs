@@ -95,6 +95,20 @@ pub fn create_run_dir(repo_root: &Path) -> Result<RunDir, BeadsError> {
         )));
     }
 
+    // Round-5 fresh-eyes follow-through (`beads_rust-dfjs`): when
+    // `BR_DOCTOR_RUNS_DIR` is set the run artifacts live OUTSIDE
+    // `<repo>/.doctor/`, so adding `.doctor/` to `<repo>/.gitignore`
+    // would be a surprise mutation against the parent tree without
+    // any benefit. Test fixtures, CI sandboxes, and `br doctor undo`
+    // (which builds a fresh run-dir purely to audit its own writes)
+    // are the primary callers of the env-override path. Skip the
+    // gitignore touch in that case so those callers cannot
+    // accidentally mutate a host repo's `.gitignore` outside the
+    // chokepoint.
+    if std::env::var_os(ENV_RUNS_DIR).is_none() {
+        ensure_doctor_in_gitignore(repo_root)?;
+    }
+
     let runs_root = runs_root_for(repo_root);
     fs::create_dir_all(&runs_root).map_err(BeadsError::Io)?;
 
@@ -126,20 +140,6 @@ pub fn create_run_dir(repo_root: &Path) -> Result<RunDir, BeadsError> {
     // it survives moves of the repo root).
     let latest_link = runs_root.parent().unwrap_or(&runs_root).join("latest");
     update_latest_symlink(&latest_link, &root)?;
-
-    // Round-5 fresh-eyes follow-through (`beads_rust-dfjs`): when
-    // `BR_DOCTOR_RUNS_DIR` is set the run artifacts live OUTSIDE
-    // `<repo>/.doctor/`, so adding `.doctor/` to `<repo>/.gitignore`
-    // would be a surprise mutation against the parent tree without
-    // any benefit. Test fixtures, CI sandboxes, and `br doctor undo`
-    // (which builds a fresh run-dir purely to audit its own writes)
-    // are the primary callers of the env-override path. Skip the
-    // gitignore touch in that case so those callers cannot
-    // accidentally mutate a host repo's `.gitignore` outside the
-    // chokepoint.
-    if std::env::var_os(ENV_RUNS_DIR).is_none() {
-        ensure_doctor_in_gitignore(repo_root)?;
-    }
 
     Ok(RunDir {
         run_id,
@@ -541,6 +541,27 @@ mod tests {
         assert!(
             err.to_string().contains(".gitignore") || err.to_string().contains("directory"),
             "error should name the invalid gitignore surface: {err}"
+        );
+    }
+
+    /// Fresh-eyes follow-up on `df923516`: propagating the
+    /// `.gitignore` error is necessary but not sufficient. The
+    /// pre-chokepoint write must happen before any `.doctor/` artifact
+    /// is created; otherwise a failed run-dir setup leaves exactly the
+    /// unignored skeleton it was trying to avoid.
+    #[test]
+    fn create_run_dir_fails_before_artifacts_when_gitignore_invalid() {
+        let tmp = unique_temp_root("bad-gitignore-order");
+        fs::create_dir(tmp.path().join(".gitignore")).expect("directory at .gitignore path");
+
+        let err = create_run_dir(tmp.path()).expect_err("invalid gitignore must fail run setup");
+        assert!(
+            err.to_string().contains(".gitignore") || err.to_string().contains("directory"),
+            "error should name the invalid gitignore surface: {err}"
+        );
+        assert!(
+            !tmp.path().join(".doctor").exists(),
+            "failed run-dir setup must not leave unignored .doctor artifacts"
         );
     }
 
