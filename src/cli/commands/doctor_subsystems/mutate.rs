@@ -765,6 +765,22 @@ fn sha256_file_hex_prefixed(path: &Path) -> std::io::Result<String> {
 /// error, `ROLLBACK` and propagate. Returns the absolute paths of the
 /// snapshot files written (one per `affected_tables` entry, in order),
 /// so the caller can record them in `actions.jsonl` for `doctor undo`.
+///
+/// ## Single-connection contract (round-2 fresh-eyes fix)
+///
+/// The snapshot SELECTs run on the **same** `fsqlite::Connection` and
+/// **inside** the same `BEGIN IMMEDIATE` transaction as the mutating
+/// SQL. This closes the dual-connection race window that existed when
+/// snapshotting used a separate connection: an external writer could
+/// have committed a change between `read_conn.close()` and the
+/// `BEGIN IMMEDIATE` on the writer connection, and the snapshot would
+/// have missed that data. Restoring such a snapshot during `br doctor
+/// undo` would silently destroy the concurrent writer's commit.
+///
+/// Holding the reserved/exclusive lock for the entire snapshot-then-
+/// mutate window guarantees: (a) the snapshot reflects exactly the
+/// rows the mutating SQL is about to operate on, and (b) no other
+/// writer can sneak in between snapshot and mutation.
 fn run_db_exec(
     db_path: &Path,
     backups_db: &Path,
@@ -775,24 +791,61 @@ fn run_db_exec(
 ) -> Result<Vec<PathBuf>, BeadsError> {
     use fsqlite::Connection;
 
-    let mut snapshot_paths: Vec<PathBuf> = Vec::with_capacity(affected_tables.len());
-
-    // Snapshot first. If snapshotting faults, we have not touched the
-    // DB so the workspace is unchanged.
+    // Pre-flight identifier validation so we fail fast before opening
+    // the DB connection. Mirrors the protection on the SELECT path.
     for table in affected_tables {
         validate_identifier(table)?;
+    }
+
+    let mut snapshot_paths: Vec<PathBuf> = Vec::with_capacity(affected_tables.len());
+
+    // Single connection for the entire snapshot+mutate transaction.
+    // Acquire BEGIN IMMEDIATE *before* the SELECTs so the writer lock
+    // is held for the snapshot read as well as the mutating SQL.
+    let conn = Connection::open(db_path.to_string_lossy().into_owned())?;
+    if let Err(e) = conn.execute("BEGIN IMMEDIATE") {
+        let _ = conn.close();
+        return Err(e.into());
+    }
+
+    // Snapshot every affected table inside the transaction. Any error
+    // in this loop must ROLLBACK + scrub the partial snapshot files we
+    // already wrote — they have no actions.jsonl entry referencing them.
+    for table in affected_tables {
         let predicate = affected_predicate.unwrap_or("").trim();
         let select_sql = if predicate.is_empty() {
             format!("SELECT * FROM {table}")
         } else {
             format!("SELECT * FROM {table} WHERE {predicate}")
         };
-        // Open a read-only connection just for the snapshot to avoid
-        // any chance of accidental mutation.
-        let read_conn = Connection::open(db_path.to_string_lossy().into_owned())?;
-        let column_names = collect_column_names(&read_conn, table)?;
-        let stmt = read_conn.prepare(&select_sql)?;
-        let rows = stmt.query()?;
+
+        let column_names = match collect_column_names(&conn, table) {
+            Ok(names) => names,
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK");
+                let _ = conn.close();
+                scrub_orphan_snapshots(&snapshot_paths);
+                return Err(e);
+            }
+        };
+        let stmt = match conn.prepare(&select_sql) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK");
+                let _ = conn.close();
+                scrub_orphan_snapshots(&snapshot_paths);
+                return Err(e.into());
+            }
+        };
+        let rows = match stmt.query() {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK");
+                let _ = conn.close();
+                scrub_orphan_snapshots(&snapshot_paths);
+                return Err(e.into());
+            }
+        };
 
         let mut json_rows: Vec<serde_json::Value> = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -817,31 +870,32 @@ fn run_db_exec(
             "columns": column_names,
             "rows": json_rows,
         });
-        let body = serde_json::to_vec_pretty(&snapshot_envelope).map_err(BeadsError::Json)?;
-        let snap_path = write_unique_db_snapshot(backups_db, table, predicate_hash, &body)
-            .map_err(BeadsError::Io)?;
+        let body = match serde_json::to_vec_pretty(&snapshot_envelope) {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK");
+                let _ = conn.close();
+                scrub_orphan_snapshots(&snapshot_paths);
+                return Err(BeadsError::Json(e));
+            }
+        };
+        let snap_path =
+            match write_unique_db_snapshot(backups_db, table, predicate_hash, &body) {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = conn.execute("ROLLBACK");
+                    let _ = conn.close();
+                    scrub_orphan_snapshots(&snapshot_paths);
+                    return Err(BeadsError::Io(e));
+                }
+            };
         snapshot_paths.push(snap_path);
-
-        let _ = read_conn.close();
     }
 
-    // Now run the SQL inside a BEGIN IMMEDIATE / COMMIT transaction.
-    // Any error inside rolls back AND scrubs the orphan snapshots —
-    // a snapshot with no corresponding actions.jsonl entry is dead
-    // weight that would only confuse forensic tooling.
-    let conn = match Connection::open(db_path.to_string_lossy().into_owned()) {
-        Ok(c) => c,
-        Err(e) => {
-            scrub_orphan_snapshots(&snapshot_paths);
-            return Err(e.into());
-        }
-    };
-    if let Err(e) = conn.execute("BEGIN IMMEDIATE") {
-        let _ = conn.close();
-        scrub_orphan_snapshots(&snapshot_paths);
-        return Err(e.into());
-    }
-
+    // Run the mutating SQL on the same connection, still inside
+    // BEGIN IMMEDIATE. Any error rolls back AND scrubs the orphan
+    // snapshots — a snapshot with no corresponding actions.jsonl entry
+    // is dead weight that would only confuse forensic tooling.
     let exec_outcome = if args.is_empty() {
         conn.execute(sql).map(|_| ())
     } else {
