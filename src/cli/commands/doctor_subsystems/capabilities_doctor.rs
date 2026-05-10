@@ -56,6 +56,29 @@ pub struct DoctorCapabilities {
     pub fixers: Vec<FixerEntry>,
     /// Detector registry. Empty in WP1.
     pub detectors: Vec<DetectorEntry>,
+    /// Names of every [`super::mutate::Op`] variant the chokepoint
+    /// supports plus the parameters each takes. Stable contract: the
+    /// names are kebab-case to match `actions.jsonl` `op` values, the
+    /// `params` array enumerates the field names a fixer must supply.
+    pub ops_supported: Vec<OpEntry>,
+}
+
+/// One row in the supported-ops list. Matches the variants in
+/// [`super::mutate::Op`] one-for-one so the capabilities envelope
+/// surfaces the exact contract a fixer can call into.
+#[derive(Debug, Clone, Serialize)]
+pub struct OpEntry {
+    /// Stable kebab-case name (matches `actions.jsonl` `op` values).
+    pub name: &'static str,
+    /// Human-readable summary.
+    pub summary: &'static str,
+    /// Field names the variant requires (informational; agents should
+    /// still read the Rust source for the authoritative shape).
+    pub params: Vec<&'static str>,
+    /// `true` when the op is wired all the way through the chokepoint;
+    /// `false` flags ops that ship with safety scaffolding only (e.g.
+    /// [`super::mutate::Op::DbMigrate`] until the schema.rs hook lands).
+    pub fully_routed: bool,
 }
 
 /// One row in the fixer registry. Stable shape.
@@ -106,6 +129,54 @@ impl DoctorCapabilities {
             ],
             fixers: Vec::new(),
             detectors: Vec::new(),
+            ops_supported: vec![
+                OpEntry {
+                    name: "write_file",
+                    summary: "Atomic create-or-overwrite via tmpfile + rename(2).",
+                    params: vec!["content", "mode"],
+                    fully_routed: true,
+                },
+                OpEntry {
+                    name: "append_file",
+                    summary: "Append-only write; creates the file if missing.",
+                    params: vec!["content"],
+                    fully_routed: true,
+                },
+                OpEntry {
+                    name: "rename",
+                    summary: "Move a path within write_scopes (no Op::Delete by design).",
+                    params: vec!["to"],
+                    fully_routed: true,
+                },
+                OpEntry {
+                    name: "chmod",
+                    summary: "Set the mode bits of a path.",
+                    params: vec!["mode"],
+                    fully_routed: true,
+                },
+                OpEntry {
+                    name: "symlink_atomic",
+                    summary: "Replace the symlink at path with one pointing at target.",
+                    params: vec!["target"],
+                    fully_routed: true,
+                },
+                OpEntry {
+                    name: "db_exec",
+                    summary: "Run a parameterized SQL statement inside BEGIN IMMEDIATE; \
+                              snapshots affected rows to backups/db/ before COMMIT.",
+                    params: vec!["sql", "args", "affected_tables", "affected_predicate"],
+                    fully_routed: true,
+                },
+                OpEntry {
+                    name: "db_migrate",
+                    summary: "Versioned schema migration. Verifies PRAGMA user_version \
+                              matches `from`, snapshots the DB file verbatim, then defers \
+                              the actual DDL to schema.rs (warning: \
+                              migration_logic_not_yet_routed).",
+                    params: vec!["from", "to"],
+                    fully_routed: false,
+                },
+            ],
         }
     }
 
@@ -163,5 +234,22 @@ mod tests {
         assert!(parsed["exit_codes"].is_array());
         assert!(parsed["fixers"].is_array());
         assert!(parsed["detectors"].is_array());
+        // WP4: ops_supported must enumerate the chokepoint contract.
+        let ops = parsed["ops_supported"]
+            .as_array()
+            .expect("ops_supported array");
+        assert!(
+            ops.iter()
+                .any(|o| o["name"] == "db_exec" && o["fully_routed"] == true),
+            "db_exec must be advertised as fully routed"
+        );
+        assert!(
+            ops.iter()
+                .any(|o| o["name"] == "db_migrate" && o["fully_routed"] == false),
+            "db_migrate must be advertised as scaffold-only"
+        );
+        for op in ops {
+            assert!(op["params"].is_array(), "op.params must be an array: {op}");
+        }
     }
 }

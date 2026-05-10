@@ -38,12 +38,23 @@
 //!
 //! ## DB ops
 //!
-//! [`Op::DbExec`] and [`Op::DbMigrate`] are **stubbed** in WP1 — they
-//! return [`BeadsError::internal`] with a message tagged
-//! `unimplemented_db_op`. WP4 wires them through the existing
-//! `fsqlite::Connection` + transaction primitives. Routing the whole
-//! 8-step contract for the file-based ops first ensures the chokepoint
-//! is the only place these get added later.
+//! [`Op::DbExec`] runs a parameterized SQL statement against
+//! `<repo>/.beads/beads.db` inside a `BEGIN IMMEDIATE` transaction.
+//! Before the SQL fires, every row of every table named in
+//! `affected_tables` is snapshotted as JSON to
+//! `<run-dir>/backups/db/<table>__<sha8>.json` (where `sha8` is the
+//! first 8 hex chars of `sha256(<predicate>)`). On any error the
+//! transaction is rolled back and **no** `actions.jsonl` line is
+//! written.
+//!
+//! [`Op::DbMigrate`] runs a versioned schema migration. WP4 ships the
+//! safety scaffolding — `from` / `to` precondition gate plus a verbatim
+//! `beads.db.pre-migrate` snapshot — and emits a
+//! `migration_logic_not_yet_routed` warning because schema.rs's
+//! `run_migrations()` is private and self-transactional. Wiring the
+//! actual DDL through the chokepoint is a follow-up: the safety net
+//! lands in WP4 so callers can route migrations through the chokepoint
+//! the moment the public hook lands.
 //!
 //! ## Crate-internal-only
 //!
@@ -102,22 +113,41 @@ pub enum Op {
     /// Set the mode of `path`.
     Chmod { mode: u32 },
     /// Execute `sql` against the project's `fsqlite` DB inside a
-    /// transaction; rolls back on error. **Stubbed in WP1.**
+    /// `BEGIN IMMEDIATE` transaction. Before the SQL fires, every row
+    /// of every table named in `affected_tables` is snapshotted as
+    /// JSON under `<run-dir>/backups/db/`; on any error the
+    /// transaction rolls back and no `actions.jsonl` line is written.
     DbExec {
         sql: String,
         #[serde(skip)]
         args: Vec<DbArg>,
+        /// Tables whose rows must be snapshotted before the SQL runs.
+        /// Empty list is allowed (no snapshot taken) — the chokepoint
+        /// still records the op, but undo will not be able to revert
+        /// the data change.
+        #[serde(default)]
+        affected_tables: Vec<String>,
+        /// Optional WHERE clause (without the `WHERE` keyword) used
+        /// when snapshotting. Applied to every table in
+        /// `affected_tables`. `None` means "snapshot the whole table".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        affected_predicate: Option<String>,
     },
-    /// Run a versioned schema migration. **Stubbed in WP1.**
+    /// Run a versioned schema migration. WP4 implements the safety
+    /// scaffolding (precondition gate + verbatim DB-file snapshot);
+    /// the actual DDL is currently driven by the legacy
+    /// `apply_runtime_compatible_schema` path so the chokepoint emits
+    /// a `migration_logic_not_yet_routed` warning.
     DbMigrate { from: u32, to: u32 },
     /// Replace the symlink at `path` with one pointing at `target`.
     /// Implemented atomically via tmp-symlink + rename.
     SymlinkAtomic { target: PathBuf },
 }
 
-/// Lightweight stand-in for a SQL bind value. The DB ops are stubbed in
-/// WP1, but having the public surface in place avoids a contract churn
-/// when WP4 wires it up.
+/// Lightweight stand-in for a SQL bind value. WP4 wires this through
+/// the chokepoint by converting to [`fsqlite_types::value::SqliteValue`]
+/// at the SQL boundary; callers can therefore stay independent of the
+/// fsqlite type stack.
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum DbArg {
@@ -131,6 +161,22 @@ pub enum DbArg {
     Text(String),
     /// Raw bytes.
     Blob(Vec<u8>),
+}
+
+impl DbArg {
+    /// Convert into the `fsqlite` type system. Used at the chokepoint's
+    /// SQL boundary; not exposed publicly because it leaks the
+    /// underlying engine type.
+    fn to_sqlite_value(&self) -> fsqlite_types::value::SqliteValue {
+        use fsqlite_types::value::SqliteValue;
+        match self {
+            Self::Null => SqliteValue::Null,
+            Self::I64(n) => SqliteValue::Integer(*n),
+            Self::F64(f) => SqliteValue::Float(*f),
+            Self::Text(s) => SqliteValue::Text(std::sync::Arc::from(s.as_str())),
+            Self::Blob(b) => SqliteValue::Blob(std::sync::Arc::from(b.as_slice())),
+        }
+    }
 }
 
 impl Op {
@@ -356,7 +402,7 @@ fn now_ns() -> u128 {
 /// Returns [`BeadsError`] for:
 /// - I/O faults during backup or atomic-write
 /// - Out-of-scope paths (refused per safety envelope)
-/// - DB ops in WP1 (stubbed; `Internal` with `unimplemented_db_op` tag)
+/// - DB ops that fail the precondition gate or the SQL transaction
 pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, BeadsError> {
     // (1) Per-path advisory lock — minimal in-process mutex via the
     // actions_file lock; cross-process locking is provided by the
@@ -380,13 +426,12 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
         ensure_in_scope(&ctx.capabilities, to)?;
     }
 
-    // For DB ops, scope-check the project DB path instead of the
-    // dummy-`path` callers will pass. WP4 will replace this stub.
+    // DB ops route through their dedicated handler. The chokepoint
+    // contract still applies — `path` must be in scope (it is the
+    // beads.db file), backups go to `<run-dir>/backups/`, and
+    // `actions.jsonl` records the op exactly once.
     if matches!(op, Op::DbExec { .. } | Op::DbMigrate { .. }) {
-        return Err(BeadsError::internal(format!(
-            "doctor: db op {} is unimplemented_db_op (WP4)",
-            op.name()
-        )));
+        return mutate_db(ctx, path, op, &before_hash);
     }
     let op_name = op.name();
     let rename_to = match &op {
@@ -457,6 +502,408 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
         after_hash,
         error: None,
     })
+}
+
+/// Routed handler for [`Op::DbExec`] and [`Op::DbMigrate`].
+///
+/// Implements the same 8-step contract as [`mutate`] but tailored to a
+/// SQLite database file:
+///
+/// 1. Refuse if `path` is outside the configured write scopes (already
+///    checked by the caller).
+/// 2. For `DbExec`: snapshot affected rows as JSON to
+///    `<run-dir>/backups/db/<table>__<sha8>.json` before any SQL runs.
+///    For `DbMigrate`: snapshot the entire DB file verbatim to
+///    `<run-dir>/backups/db/beads.db.pre-migrate`.
+/// 3. Open a writable `fsqlite::Connection`, run the work inside
+///    `BEGIN IMMEDIATE` / `COMMIT`. On any error, `ROLLBACK` and
+///    return without writing an `actions.jsonl` line.
+/// 4. Compute `after_hash` from the post-COMMIT DB file SHA-256.
+/// 5. Append a single `actions.jsonl` record describing the op.
+fn mutate_db(
+    ctx: &MutateContext,
+    path: &Path,
+    op: Op,
+    before_hash: &str,
+) -> Result<ActionResult, BeadsError> {
+    // Snapshot path under run-dir.
+    let backups_db = ctx.run_dir.join("backups").join("db");
+
+    // Pre-write inventory. We capture this before any disk write so a
+    // crash mid-snapshot is recoverable from the JSONL log + the
+    // pre-existing DB file.
+    let started_at_ns = now_ns().saturating_sub(ctx.start_ns);
+
+    if ctx.dry_run {
+        eprintln!("[dry-run] would mutate {}: {}", path.display(), op.name());
+        return Ok(ActionResult {
+            ok: true,
+            before_hash: before_hash.to_string(),
+            after_hash: before_hash.to_string(),
+            error: None,
+        });
+    }
+
+    let rel = path.strip_prefix(&ctx.repo_root).unwrap_or(path);
+    let op_name = op.name();
+
+    let exec_result: Result<(String, Option<String>, Option<String>, Option<u64>), BeadsError> =
+        match &op {
+            Op::DbExec {
+                sql,
+                args,
+                affected_tables,
+                affected_predicate,
+            } => {
+                fs::create_dir_all(&backups_db).map_err(BeadsError::Io)?;
+
+                let predicate_for_snapshot = affected_predicate.clone();
+                let tables_for_snapshot = affected_tables.clone();
+                let sql_owned = sql.clone();
+                let args_owned: Vec<fsqlite_types::value::SqliteValue> =
+                    args.iter().map(DbArg::to_sqlite_value).collect();
+
+                run_db_exec(
+                    path,
+                    &backups_db,
+                    &sql_owned,
+                    &args_owned,
+                    &tables_for_snapshot,
+                    predicate_for_snapshot.as_deref(),
+                )
+                .map(|()| {
+                    let table_summary =
+                        if tables_for_snapshot.is_empty() {
+                            None
+                        } else {
+                            Some(tables_for_snapshot.join(","))
+                        };
+                    (
+                        sha256_file_hex_prefixed(path).unwrap_or_else(|_| {
+                            SHA256_EMPTY_PREFIXED.to_string()
+                        }),
+                        table_summary,
+                        predicate_for_snapshot,
+                        None,
+                    )
+                })
+            }
+            Op::DbMigrate { from, to } => {
+                fs::create_dir_all(&backups_db).map_err(BeadsError::Io)?;
+                run_db_migrate(path, &backups_db, *from, *to).map(|warning| {
+                    (
+                        sha256_file_hex_prefixed(path).unwrap_or_else(|_| {
+                            SHA256_EMPTY_PREFIXED.to_string()
+                        }),
+                        None,
+                        None,
+                        warning.map(|_| u64::from(*to)),
+                    )
+                })
+            }
+            _ => unreachable!("mutate_db only handles DB ops"),
+        };
+
+    let (after_hash, db_affected_tables, db_predicate, _migrate_to) = exec_result?;
+    let finished_at_ns = now_ns().saturating_sub(ctx.start_ns);
+
+    // Build the per-op record. We append a few DB-specific fields so
+    // undo can replay (or warn-skip) the operation.
+    #[derive(Serialize)]
+    struct DbActionRecord<'a> {
+        path: String,
+        op: &'static str,
+        before_hash: &'a str,
+        after_hash: &'a str,
+        started_at_ns: u128,
+        finished_at_ns: u128,
+        run_id: &'a str,
+        fixer_id: &'a str,
+        ok: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        affected_tables: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        affected_predicate: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        migrate_from: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        migrate_to: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        warning: Option<&'static str>,
+    }
+
+    let (migrate_from, migrate_to, warning) = match &op {
+        Op::DbMigrate { from, to } => (
+            Some(*from),
+            Some(*to),
+            Some("migration_logic_not_yet_routed"),
+        ),
+        _ => (None, None, None),
+    };
+
+    let record = DbActionRecord {
+        path: rel.to_string_lossy().into_owned(),
+        op: op_name,
+        before_hash,
+        after_hash: &after_hash,
+        started_at_ns,
+        finished_at_ns,
+        run_id: &ctx.run_id,
+        fixer_id: &ctx.fixer_id,
+        ok: true,
+        affected_tables: db_affected_tables,
+        affected_predicate: db_predicate,
+        migrate_from,
+        migrate_to,
+        warning,
+    };
+    let line = serde_json::to_string(&record).map_err(BeadsError::Json)? + "\n";
+    {
+        let mut f = ctx.actions_file.lock().map_err(|e| {
+            BeadsError::internal(format!("doctor: actions_file mutex poisoned: {e}"))
+        })?;
+        f.write_all(line.as_bytes()).map_err(BeadsError::Io)?;
+        f.sync_data().map_err(BeadsError::Io)?;
+    }
+
+    Ok(ActionResult {
+        ok: true,
+        before_hash: before_hash.to_string(),
+        after_hash,
+        error: None,
+    })
+}
+
+/// Compute `sha256:<hex>` of the file at `path`. Returns the empty
+/// sentinel if the file does not exist.
+fn sha256_file_hex_prefixed(path: &Path) -> std::io::Result<String> {
+    let bytes = read_or_empty(path)?;
+    if bytes.is_empty() && !path.exists() {
+        return Ok(SHA256_EMPTY_PREFIXED.to_string());
+    }
+    Ok(sha256_hex_prefixed(&bytes))
+}
+
+/// Snapshot every row of every table in `tables`, write the JSON, then
+/// run `sql` with `args` inside a `BEGIN IMMEDIATE` transaction. On any
+/// error, `ROLLBACK` and propagate.
+fn run_db_exec(
+    db_path: &Path,
+    backups_db: &Path,
+    sql: &str,
+    args: &[fsqlite_types::value::SqliteValue],
+    affected_tables: &[String],
+    affected_predicate: Option<&str>,
+) -> Result<(), BeadsError> {
+    use fsqlite::Connection;
+
+    // Snapshot first. If snapshotting faults, we have not touched the
+    // DB so the workspace is unchanged.
+    for table in affected_tables {
+        validate_identifier(table)?;
+        let predicate = affected_predicate.unwrap_or("").trim();
+        let select_sql = if predicate.is_empty() {
+            format!("SELECT * FROM {table}")
+        } else {
+            format!("SELECT * FROM {table} WHERE {predicate}")
+        };
+        // Open a read-only connection just for the snapshot to avoid
+        // any chance of accidental mutation.
+        let read_conn = Connection::open(db_path.to_string_lossy().into_owned())?;
+        let column_names = collect_column_names(&read_conn, table)?;
+        let stmt = read_conn.prepare(&select_sql)?;
+        let rows = stmt.query()?;
+
+        let mut json_rows: Vec<serde_json::Value> = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let mut obj = serde_json::Map::new();
+            for (i, name) in column_names.iter().enumerate() {
+                let val = row.get(i).cloned().unwrap_or(
+                    fsqlite_types::value::SqliteValue::Null,
+                );
+                obj.insert(name.clone(), sqlite_value_to_json(&val));
+            }
+            json_rows.push(serde_json::Value::Object(obj));
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(predicate.as_bytes());
+        let predicate_hash = &hex_encode(&hasher.finalize())[..8];
+        let snapshot_path = backups_db.join(format!("{table}__{predicate_hash}.json"));
+
+        let snapshot_envelope = serde_json::json!({
+            "schema_version": "br.doctor.db_snapshot.v1",
+            "table": table,
+            "predicate": affected_predicate,
+            "columns": column_names,
+            "rows": json_rows,
+        });
+        let body = serde_json::to_vec_pretty(&snapshot_envelope).map_err(BeadsError::Json)?;
+        fs::write(&snapshot_path, &body).map_err(BeadsError::Io)?;
+
+        let _ = read_conn.close();
+    }
+
+    // Now run the SQL inside a BEGIN IMMEDIATE / COMMIT transaction.
+    // Any error inside rolls back.
+    let conn = Connection::open(db_path.to_string_lossy().into_owned())?;
+    conn.execute("BEGIN IMMEDIATE")?;
+
+    let exec_outcome = if args.is_empty() {
+        conn.execute(sql).map(|_| ())
+    } else {
+        conn.execute_with_params(sql, args).map(|_| ())
+    };
+
+    match exec_outcome {
+        Ok(()) => {
+            if let Err(e) = conn.execute("COMMIT") {
+                let _ = conn.execute("ROLLBACK");
+                let _ = conn.close();
+                return Err(e.into());
+            }
+        }
+        Err(e) => {
+            let _ = conn.execute("ROLLBACK");
+            let _ = conn.close();
+            return Err(e.into());
+        }
+    }
+    let _ = conn.close();
+    Ok(())
+}
+
+/// Validate that an identifier consists only of `[A-Za-z0-9_]` so it
+/// cannot be used to inject SQL when interpolated into a `SELECT * FROM`
+/// statement. Rejects empty strings.
+fn validate_identifier(ident: &str) -> Result<(), BeadsError> {
+    if ident.is_empty()
+        || !ident
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(BeadsError::internal(format!(
+            "doctor: invalid SQL identifier '{ident}' (must be ASCII alphanumeric + underscore)"
+        )));
+    }
+    Ok(())
+}
+
+/// Resolve the column-name vector for `table` via `PRAGMA
+/// table_info`. Returns an error if the table does not exist.
+fn collect_column_names(
+    conn: &fsqlite::Connection,
+    table: &str,
+) -> Result<Vec<String>, BeadsError> {
+    use fsqlite_types::value::SqliteValue;
+    validate_identifier(table)?;
+    let rows = conn.query(&format!("PRAGMA table_info({table})"))?;
+    if rows.is_empty() {
+        return Err(BeadsError::internal(format!(
+            "doctor: table '{table}' has no columns (does it exist?)"
+        )));
+    }
+    let mut names = Vec::with_capacity(rows.len());
+    // PRAGMA table_info: cid, name, type, notnull, dflt_value, pk
+    for row in &rows {
+        if let Some(SqliteValue::Text(name)) = row.get(1) {
+            names.push(name.to_string());
+        } else {
+            return Err(BeadsError::internal(format!(
+                "doctor: PRAGMA table_info({table}) returned non-text column name"
+            )));
+        }
+    }
+    Ok(names)
+}
+
+/// JSON-encode a single `SqliteValue`. NULL→null, Integer→number,
+/// Float→number, Text→string, Blob→`{"$blob_b64": "..."}` to keep the
+/// JSON faithful.
+fn sqlite_value_to_json(val: &fsqlite_types::value::SqliteValue) -> serde_json::Value {
+    use fsqlite_types::value::SqliteValue;
+    match val {
+        SqliteValue::Null => serde_json::Value::Null,
+        SqliteValue::Integer(n) => serde_json::Value::from(*n),
+        SqliteValue::Float(f) => serde_json::Number::from_f64(*f)
+            .map_or(serde_json::Value::Null, serde_json::Value::Number),
+        SqliteValue::Text(s) => serde_json::Value::String(s.to_string()),
+        SqliteValue::Blob(b) => {
+            // Hex-encode rather than base64 so the snapshot has no
+            // additional dependency on a base64 crate. Restore is via
+            // hex-decode → SqliteValue::Blob.
+            serde_json::json!({ "$blob_hex": hex_encode(b.as_ref()) })
+        }
+    }
+}
+
+/// Run the migration safety scaffolding for [`Op::DbMigrate`]. Verifies
+/// the precondition gate (`PRAGMA user_version == from`), snapshots the
+/// DB file verbatim, and returns `Ok(Some(()))` to flag the
+/// `migration_logic_not_yet_routed` warning so the caller can record
+/// it in `actions.jsonl`. Returning `Err` aborts before any state is
+/// changed.
+fn run_db_migrate(
+    db_path: &Path,
+    backups_db: &Path,
+    from: u32,
+    to: u32,
+) -> Result<Option<()>, BeadsError> {
+    use fsqlite::Connection;
+    use fsqlite_types::value::SqliteValue;
+
+    if to <= from {
+        return Err(BeadsError::internal(format!(
+            "doctor: db migrate refused — to ({to}) must be > from ({from})"
+        )));
+    }
+
+    // (1) Snapshot the DB file *before* we open any connection. Opening
+    //     a fsqlite connection can dirty header counters even on a
+    //     read-only PRAGMA query; snapshotting first keeps the
+    //     pre-migrate file byte-identical to the on-disk state callers
+    //     observed before invoking the chokepoint.
+    let snapshot_path = backups_db.join("beads.db.pre-migrate");
+    if let Some(parent) = snapshot_path.parent() {
+        fs::create_dir_all(parent).map_err(BeadsError::Io)?;
+    }
+    fs::copy(db_path, &snapshot_path).map_err(BeadsError::Io)?;
+    let meta = fs::metadata(db_path).map_err(BeadsError::Io)?;
+    fs::set_permissions(
+        &snapshot_path,
+        fs::Permissions::from_mode(meta.permissions().mode()),
+    )
+    .map_err(BeadsError::Io)?;
+
+    // (2) Verify PRAGMA user_version matches `from`. If the precondition
+    //     gate fails we discard the snapshot and refuse — leaving no
+    //     backup behind keeps undo from trying to "restore" a no-op.
+    let conn = Connection::open(db_path.to_string_lossy().into_owned())?;
+    let row = conn.query_row("PRAGMA user_version")?;
+    let current = row
+        .get(0)
+        .and_then(|v| match v {
+            SqliteValue::Integer(n) => u32::try_from(*n).ok(),
+            _ => None,
+        })
+        .unwrap_or(0);
+    let _ = conn.close();
+    if current != from {
+        // Discard the now-orphan snapshot so it can't masquerade as a
+        // recoverable backup of a never-mutated DB.
+        let _ = fs::remove_file(&snapshot_path);
+        return Err(BeadsError::internal(format!(
+            "doctor: db migrate refused — user_version mismatch (expected {from}, got {current})"
+        )));
+    }
+
+    // (3) The actual DDL is currently encapsulated in
+    //     `crate::storage::schema::run_migrations`, which is private
+    //     and self-transactional. Wiring its body through this
+    //     chokepoint is a follow-up; WP4 lands the safety net only.
+    //     Returning `Some(())` flags the warning for actions.jsonl.
+    let _ = to; // reserved for the future "actually migrate" path
+    Ok(Some(()))
 }
 
 /// Execute the planned op atomically. File-based ops use
@@ -722,28 +1169,233 @@ mod tests {
         assert!(!backup.exists());
     }
 
-    #[test]
-    fn db_ops_are_unimplemented_in_wp1() {
-        let tmp = tempfile::tempdir().unwrap();
-        let beads_dir = tmp.path().join(".beads");
-        fs::create_dir_all(&beads_dir).unwrap();
-        let target = beads_dir.join("beads.db");
-        fs::write(&target, b"sqlite header...").unwrap();
+    // ========================================================================
+    // WP4 — DB ops (DbExec / DbMigrate)
+    // ========================================================================
 
-        let (ctx, _) = make_ctx(tmp.path(), false);
+    /// Set up a fresh `.beads/beads.db` with a single sample table for
+    /// the DB-op tests. Returns the absolute path to the DB.
+    fn setup_test_db(tmp: &Path) -> PathBuf {
+        use fsqlite::Connection;
+        let beads_dir = tmp.join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db = beads_dir.join("beads.db");
+        let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS sample_widgets (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                value INTEGER NOT NULL DEFAULT 0
+            )",
+        )
+        .unwrap();
+        let _ = conn.close();
+        db
+    }
+
+    #[test]
+    fn test_db_exec_snapshots_affected_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = setup_test_db(tmp.path());
+        let (ctx, actions_path) = make_ctx(tmp.path(), false);
+
+        // Pre-state: empty table → snapshot must reflect that.
+        let before_sha_path = sha256_file_hex_prefixed(&db).unwrap();
+        assert!(before_sha_path.starts_with("sha256:"));
+
+        let result = mutate(
+            &ctx,
+            &db,
+            Op::DbExec {
+                sql: "INSERT INTO sample_widgets(name, value) VALUES (?, ?)".into(),
+                args: vec![DbArg::Text("alpha".into()), DbArg::I64(7)],
+                affected_tables: vec!["sample_widgets".into()],
+                affected_predicate: None,
+            },
+        )
+        .expect("DbExec should succeed");
+        assert!(result.ok);
+        assert_ne!(
+            result.before_hash, result.after_hash,
+            "after_hash must differ from before_hash because the DB grew"
+        );
+
+        // Snapshot file exists, captures empty pre-state.
+        let snapshot_dir = ctx.run_dir.join("backups/db");
+        let entries: Vec<_> = fs::read_dir(&snapshot_dir)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .collect();
+        assert_eq!(entries.len(), 1, "expected exactly one snapshot file");
+        let body = fs::read_to_string(entries[0].path()).unwrap();
+        let snap: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(snap["table"], "sample_widgets");
+        assert_eq!(snap["rows"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            snap["columns"].as_array().unwrap(),
+            &vec![
+                serde_json::Value::String("id".into()),
+                serde_json::Value::String("name".into()),
+                serde_json::Value::String("value".into()),
+            ]
+        );
+
+        // Post-state: row is in the DB.
+        use fsqlite::Connection;
+        let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+        let rows = conn.query("SELECT name, value FROM sample_widgets").unwrap();
+        assert_eq!(rows.len(), 1);
+        let _ = conn.close();
+
+        // actions.jsonl carries one DbExec line.
+        let log = fs::read_to_string(&actions_path).unwrap();
+        let line = log.lines().next().expect("at least one action line");
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(v["op"], "db_exec");
+        assert_eq!(v["affected_tables"], "sample_widgets");
+    }
+
+    #[test]
+    fn test_db_exec_rollback_on_constraint_violation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = setup_test_db(tmp.path());
+
+        // Seed an existing row so a duplicate INSERT trips UNIQUE.
+        {
+            use fsqlite::Connection;
+            let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+            conn.execute("INSERT INTO sample_widgets(name, value) VALUES ('dup', 1)")
+                .unwrap();
+            let _ = conn.close();
+        }
+
+        let pre_bytes = fs::read(&db).unwrap();
+        let pre_hash = sha256_hex_prefixed(&pre_bytes);
+
+        let (ctx, actions_path) = make_ctx(tmp.path(), false);
 
         let err = mutate(
             &ctx,
-            &target,
+            &db,
             Op::DbExec {
-                sql: "SELECT 1".into(),
-                args: vec![],
+                sql: "INSERT INTO sample_widgets(name, value) VALUES (?, ?)".into(),
+                args: vec![DbArg::Text("dup".into()), DbArg::I64(2)],
+                affected_tables: vec!["sample_widgets".into()],
+                affected_predicate: None,
             },
         )
-        .expect_err("db ops should be unimplemented in WP1");
+        .expect_err("UNIQUE violation should propagate");
+
+        // Error mentions a database / constraint failure.
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("unimplemented_db_op"),
-            "error should be tagged unimplemented_db_op: {err}"
+            msg.to_lowercase().contains("unique") || msg.to_lowercase().contains("constraint"),
+            "expected unique/constraint failure; got {msg}"
         );
+
+        // No actions.jsonl line was written.
+        let log_len = fs::metadata(&actions_path).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(log_len, 0, "actions.jsonl must remain empty on rollback");
+
+        // Database row count is unchanged (still exactly the seeded row).
+        use fsqlite::Connection;
+        let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+        let rows = conn.query("SELECT COUNT(*) FROM sample_widgets").unwrap();
+        assert_eq!(
+            rows[0].get(0).and_then(|v| match v {
+                fsqlite_types::value::SqliteValue::Integer(n) => Some(*n),
+                _ => None,
+            }),
+            Some(1)
+        );
+        let _ = conn.close();
+
+        // SHA-256 of the DB file is unchanged (modulo SQLite header
+        // counters that fsqlite does NOT bump on a rolled-back tx).
+        let post_bytes = fs::read(&db).unwrap();
+        assert_eq!(
+            sha256_hex_prefixed(&post_bytes),
+            pre_hash,
+            "rollback must leave the DB byte-identical"
+        );
+    }
+
+    #[test]
+    fn test_db_migrate_user_version_mismatch_refuses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = setup_test_db(tmp.path());
+
+        // Stamp user_version = 5 directly.
+        {
+            use fsqlite::Connection;
+            let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+            conn.execute("PRAGMA user_version = 5").unwrap();
+            let _ = conn.close();
+        }
+        let pre_bytes = fs::read(&db).unwrap();
+        let pre_hash = sha256_hex_prefixed(&pre_bytes);
+
+        let (ctx, actions_path) = make_ctx(tmp.path(), false);
+
+        let err = mutate(&ctx, &db, Op::DbMigrate { from: 4, to: 6 })
+            .expect_err("user_version mismatch must refuse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("user_version mismatch"),
+            "error should reference user_version mismatch; got {msg}"
+        );
+
+        // PRAGMA user_version unchanged.
+        use fsqlite::Connection;
+        let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+        let row = conn.query_row("PRAGMA user_version").unwrap();
+        let v = match row.get(0) {
+            Some(fsqlite_types::value::SqliteValue::Integer(n)) => *n,
+            _ => -1,
+        };
+        assert_eq!(v, 5);
+        let _ = conn.close();
+
+        // No actions.jsonl line, no DB file change.
+        let log_len = fs::metadata(&actions_path).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(log_len, 0);
+        let post_bytes = fs::read(&db).unwrap();
+        assert_eq!(sha256_hex_prefixed(&post_bytes), pre_hash);
+    }
+
+    #[test]
+    fn test_db_migrate_happy_path_writes_backup_and_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = setup_test_db(tmp.path());
+
+        // Stamp user_version = 4 so we can migrate 4 → 5.
+        {
+            use fsqlite::Connection;
+            let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+            conn.execute("PRAGMA user_version = 4").unwrap();
+            let _ = conn.close();
+        }
+
+        let pre_bytes = fs::read(&db).unwrap();
+        let (ctx, actions_path) = make_ctx(tmp.path(), false);
+
+        let result = mutate(&ctx, &db, Op::DbMigrate { from: 4, to: 5 })
+            .expect("DbMigrate safety scaffold should succeed");
+        assert!(result.ok);
+
+        // Backup of the DB file exists and matches pre-state byte-for-byte.
+        let snap = ctx.run_dir.join("backups/db/beads.db.pre-migrate");
+        assert!(snap.exists(), "pre-migrate snapshot missing: {}", snap.display());
+        let snap_bytes = fs::read(&snap).unwrap();
+        assert_eq!(snap_bytes, pre_bytes, "snapshot must be verbatim");
+
+        // actions.jsonl has the migration warning recorded.
+        let log = fs::read_to_string(&actions_path).unwrap();
+        let line = log.lines().next().expect("expected one action line");
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(v["op"], "db_migrate");
+        assert_eq!(v["migrate_from"], 4);
+        assert_eq!(v["migrate_to"], 5);
+        assert_eq!(v["warning"], "migration_logic_not_yet_routed");
     }
 }

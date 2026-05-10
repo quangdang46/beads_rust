@@ -13,7 +13,7 @@ expression: normalize_json(&json)
       "created_at": "TIMESTAMP",
       "created_by": "ACTOR",
       "updated_at": "TIMESTAMP",
-      "source_repo": ".",
+      "source_repo": "SOURCE_REPO",
       "compaction_level": 0,
       "original_size": 0,
       "dependency_count": 0,

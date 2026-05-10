@@ -12,6 +12,7 @@ Arguments:
 Options:
       --title <TITLE_FLAG>           Issue title (alternative to positional argument)
   -t, --type <TYPE>                  Issue type (task, bug, feature, etc.)
+      --slug <SLUG>                  ID-REDACTED slug embedded in the generated ID. Example: `--slug ID-REDACTED` produces an ID of the form `ID-REDACTED-<hash>`, keeping the configured prefix and the uniquifying hash suffix. The slug is normalized to lowercase ASCII alphanumeric + single hyphens (runs of other characters collapse to one hyphen, leading/trailing hyphens are stripped, length is capped at 48 characters after normalization)
   -p, --priority <PRIORITY>          Priority (0-4 or P0-P4)
   -d, --description <DESCRIPTION>    Description [aliases: --body]
   -a, --assignee <ASSIGNEE>          Assign to person

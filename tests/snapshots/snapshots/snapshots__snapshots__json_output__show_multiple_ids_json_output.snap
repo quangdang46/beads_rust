@@ -12,7 +12,7 @@ expression: normalized
     "created_at": "TIMESTAMP",
     "created_by": "ACTOR",
     "updated_at": "TIMESTAMP",
-    "source_repo": ".",
+    "source_repo": "SOURCE_REPO",
     "compaction_level": 0,
     "original_size": 0
   },
@@ -25,7 +25,7 @@ expression: normalized
     "created_at": "TIMESTAMP",
     "created_by": "ACTOR",
     "updated_at": "TIMESTAMP",
-    "source_repo": ".",
+    "source_repo": "SOURCE_REPO",
     "compaction_level": 0,
     "original_size": 0
   }

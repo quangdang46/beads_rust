@@ -1,6 +1,5 @@
 ---
 source: tests/snapshots/cli_output.rs
-assertion_line: 137
 expression: normalize_output(&output.stdout)
 ---
 br doctor
@@ -16,6 +15,7 @@ OK schema.columns
 OK db.recoverable_anomalies
 OK db.null_defaults
 OK sqlite.integrity_check
+OK audit.suspect_close_reasons
 OK counts.db_vs_jsonl: Both have 0 records
 OK sync.metadata: External changes pending import
 OK db.write_probe: No issues available for ID-REDACTED write probe

@@ -181,6 +181,7 @@ br create [OPTIONS] [TITLE]
 | `-t, --type <TYPE>` | Issue type (task, bug, feature, epic, chore, docs, question) |
 | `-p, --priority <PRIORITY>` | Priority (0-4 or P0-P4, where 0=critical) |
 | `-d, --description <TEXT>` | Issue description |
+| `--slug <SLUG>` | Human-readable slug embedded in the generated ID (lowercase ASCII alphanumerics + single hyphens, capped at 48 chars; see [Slug normalization](#slug-normalization)) |
 | `-a, --assignee <NAME>` | Assign to person |
 | `--owner <EMAIL>` | Set owner email |
 | `-l, --labels <LABELS>` | Labels (comma-separated) |
@@ -212,7 +213,44 @@ br create "Deploy to production" --due "+3d"
 
 # Bulk import from markdown
 br create -f issues.md
+
+# Human-readable slug embedded in the ID
+br create "Fix login bug on mobile" --slug "fix-login-mobile"
+# → Created: <prefix>-fix-login-mobile-<hash>  (e.g., br-fix-login-mobile-8cda)
 ```
+
+#### Slug normalization
+
+The `--slug` flag embeds a normalized slug between the configured prefix and
+the uniquifying hash suffix. Normalization rules (implemented in
+`src/util/id.rs::normalize_slug`):
+
+- Lowercased ASCII alphanumeric characters are kept.
+- Runs of any other character (whitespace, punctuation, Unicode) collapse to a
+  single hyphen.
+- Leading and trailing hyphens are stripped.
+- Length is capped at **48 characters** after normalization; if the cap leaves
+  a trailing hyphen, that hyphen is also stripped.
+- A slug that normalizes to an empty string falls back to the standard
+  hash-only ID (no slug embedded).
+
+Examples:
+
+| Input | Normalized output | Resulting ID shape |
+|-------|-------------------|--------------------|
+| `"Fix Login Bug"` | `fix-login-bug` | `<prefix>-fix-login-bug-<hash>` |
+| `"a/b/c"` | `a-b-c` | `<prefix>-a-b-c-<hash>` |
+| `"café-résumé"` | `caf-r-sum` (Unicode dropped) | `<prefix>-caf-r-sum-<hash>` |
+| `"!!!"` | `` (empty → fallback) | `<prefix>-<hash>` |
+
+#### Downstream `--slug` integration
+
+Three commits made `--slug` end-to-end:
+- [`5c0af3d4`](https://github.com/Dicklesworthstone/beads_rust/commit/5c0af3d4) `feat(create): --slug for human-readable issue IDs (#283)` — the feature itself.
+- [`f454486f`](https://github.com/Dicklesworthstone/beads_rust/commit/f454486f) `fix(sync): accept slugged IDs in prefix guard` — sync's prefix guard now tolerates slugged IDs during import/export.
+- [`52ff1722`](https://github.com/Dicklesworthstone/beads_rust/commit/52ff1722) `feat(orphans): scan all candidate-issue prefixes when finding commit refs` — `br orphans` finds commit references to slugged IDs.
+
+The full lifecycle round-trip (create with slug → show → update → close → orphans references) is verified by `tests/e2e_scripts/slug_round_trip.sh` (added by `beads_rust-l6xl`).
 
 ---
 

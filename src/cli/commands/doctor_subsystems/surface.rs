@@ -650,17 +650,17 @@ pub fn execute_undo(args: &DoctorUndoArgs, repo_root: &Path) -> Result<()> {
         )));
     }
     let actions_path = run_dir_path.join("actions.jsonl");
-    let actions = read_actions_reverse(&actions_path)?;
+    let (actions, parse_failures) = read_actions_reverse(&actions_path)?;
     let backups_dir = run_dir_path.join("backups");
 
     // Build a fresh "undo" run-dir so the restore writes are
     // themselves audited via mutate(). If we can't create one (e.g.,
     // dry-run on a read-only tree), fall back to a synthetic ctx that
     // refuses real writes.
-    let mut steps: Vec<UndoStep> = Vec::new();
+    let mut steps = parse_failures;
     let mut restored = 0;
     let mut skipped = 0;
-    let mut failed = 0;
+    let mut failed = steps.len();
 
     let undo_run = if args.dry_run {
         None
@@ -765,28 +765,37 @@ fn emit_undo_result(envelope: &UndoEnvelope, json: bool) {
 fn update_counts(step: &UndoStep, restored: &mut usize, skipped: &mut usize, failed: &mut usize) {
     match step.status.as_str() {
         "restored" | "would_restore" => *restored += 1,
-        "skipped_idempotent" | "skipped_no_backup" | "skipped_no_op" => *skipped += 1,
+        "skipped_idempotent" | "skipped_no_op" => *skipped += 1,
         _ => *failed += 1,
     }
 }
 
-fn read_actions_reverse(path: &Path) -> Result<Vec<StoredActionRecord>> {
+fn read_actions_reverse(path: &Path) -> Result<(Vec<StoredActionRecord>, Vec<UndoStep>)> {
     let bytes = match fs::read(path) {
         Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), Vec::new()));
+        }
         Err(e) => return Err(BeadsError::Io(e)),
     };
-    let mut out = Vec::new();
-    for line in bytes.split(|b| *b == b'\n') {
+    let mut actions = Vec::new();
+    let mut parse_failures = Vec::new();
+    for (line_number, line) in bytes.split(|b| *b == b'\n').enumerate() {
         if line.is_empty() {
             continue;
         }
-        if let Ok(rec) = serde_json::from_slice::<StoredActionRecord>(line) {
-            out.push(rec);
+        match serde_json::from_slice::<StoredActionRecord>(line) {
+            Ok(rec) => actions.push(rec),
+            Err(err) => parse_failures.push(UndoStep {
+                path: format!("actions.jsonl:{}", line_number + 1),
+                op: "parse_action".to_string(),
+                status: format!("failed_parse_action:{err}"),
+                backup_used: Some(path.to_string_lossy().into_owned()),
+            }),
         }
     }
-    out.reverse();
-    Ok(out)
+    actions.reverse();
+    Ok((actions, parse_failures))
 }
 
 fn restore_one(
@@ -805,12 +814,10 @@ fn restore_one(
     }
 
     if !backup.exists() {
-        // The action either created a new file (no backup) or had no
-        // backup in the first place — best-effort skip.
         return UndoStep {
             path: record.path.clone(),
             op: record.op.clone(),
-            status: "skipped_no_backup".to_string(),
+            status: "failed_no_backup".to_string(),
             backup_used: None,
         };
     }
@@ -942,7 +949,7 @@ fn plan_one(repo_root: &Path, backups_dir: &Path, record: &StoredActionRecord) -
         return UndoStep {
             path: record.path.clone(),
             op: record.op.clone(),
-            status: "skipped_no_backup".to_string(),
+            status: "failed_no_backup".to_string(),
             backup_used: None,
         };
     }
@@ -1344,6 +1351,69 @@ mod tests {
         assert!(
             !report.contains("undone_at"),
             "failed undo attempt must not stamp original report as undone: {report}"
+        );
+    }
+
+    #[test]
+    fn test_doctor_undo_malformed_action_does_not_mark_original_run_undone() {
+        let tmp = unique_temp_root("undo-malformed-action");
+        let repo = tmp.path();
+        fs::create_dir_all(repo.join(".beads")).unwrap();
+
+        let initial_run = run_dir::create_run_dir(repo).expect("create run");
+        fs::write(&initial_run.actions_file, b"{ not valid json }\n").unwrap();
+
+        let (actions, parse_failures) = read_actions_reverse(&initial_run.actions_file).unwrap();
+        assert!(
+            actions.is_empty(),
+            "malformed line must not produce an action"
+        );
+        assert_eq!(parse_failures.len(), 1);
+        assert_eq!(parse_failures[0].path, "actions.jsonl:1");
+        assert_eq!(parse_failures[0].op, "parse_action");
+        assert!(parse_failures[0].status.starts_with("failed_parse_action:"));
+
+        let args = DoctorUndoArgs {
+            run_id: initial_run.run_id.clone(),
+            dry_run: false,
+            json: true,
+        };
+        execute_undo(&args, repo).expect("undo returns envelope even when action log is malformed");
+
+        let report = fs::read_to_string(&initial_run.report_file).unwrap_or_default();
+        assert!(
+            !report.contains("undone_at"),
+            "malformed action log must not stamp original report as undone: {report}"
+        );
+    }
+
+    #[test]
+    fn test_doctor_undo_missing_backup_does_not_mark_original_run_undone() {
+        let tmp = unique_temp_root("undo-missing-backup");
+        let repo = tmp.path();
+        let beads = repo.join(".beads");
+        fs::create_dir_all(&beads).unwrap();
+        fs::write(beads.join("foo.txt"), b"updated").unwrap();
+
+        let initial_run = run_dir::create_run_dir(repo).expect("create run");
+        let action = serde_json::json!({
+            "path": ".beads/foo.txt",
+            "op": "write_file",
+            "before_hash": "sha256:backup-was-not-preserved"
+        });
+        fs::write(&initial_run.actions_file, format!("{action}\n")).unwrap();
+
+        let args = DoctorUndoArgs {
+            run_id: initial_run.run_id.clone(),
+            dry_run: false,
+            json: true,
+        };
+        execute_undo(&args, repo).expect("undo returns envelope even when backup is missing");
+
+        let report = fs::read_to_string(&initial_run.report_file).unwrap_or_default();
+        assert!(
+            !report.contains("undone_at"),
+            "missing backup must not stamp original report as undone: {report}"
         );
     }
 
