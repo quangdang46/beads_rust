@@ -2298,7 +2298,11 @@ mod tests {
         let expected_sha = sha256_bytes_hex_prefixed(genuine);
 
         // Tamper.
-        fs::write(&snap_abs, b"{\"schema_version\":\"br.doctor.db_snapshot.v1\",\"rows\":[{\"injected\":true}]}").unwrap();
+        fs::write(
+            &snap_abs,
+            b"{\"schema_version\":\"br.doctor.db_snapshot.v1\",\"rows\":[{\"injected\":true}]}",
+        )
+        .unwrap();
 
         let record = StoredActionRecord {
             path: ".beads/beads.db".to_string(),

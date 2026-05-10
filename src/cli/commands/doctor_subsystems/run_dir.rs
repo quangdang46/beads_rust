@@ -556,8 +556,7 @@ mod tests {
             .next()
             .expect("run_dir.rs must have a non-test section");
         assert!(
-            production_section
-                .contains("if std::env::var_os(ENV_RUNS_DIR).is_none() {"),
+            production_section.contains("if std::env::var_os(ENV_RUNS_DIR).is_none() {"),
             "create_run_dir's gitignore touch must be gated on \
              BR_DOCTOR_RUNS_DIR being unset; if you removed that gate, \
              update the chokepoint carveout doc on \

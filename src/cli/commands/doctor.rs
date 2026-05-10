@@ -430,9 +430,7 @@ fn emit_refused_unsafe(reason: &str, evidence: &serde_json::Value, ctx: &OutputC
             "recovery_audit": recovery_audit,
         }));
     } else {
-        ctx.error(&format!(
-            "Refusing --repair: {reason} (gate={gate_name})"
-        ));
+        ctx.error(&format!("Refusing --repair: {reason} (gate={gate_name})"));
     }
 }
 
