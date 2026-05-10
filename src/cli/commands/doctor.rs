@@ -3,6 +3,7 @@
 #![allow(clippy::option_if_let_else)]
 
 use crate::cli::DoctorArgs;
+use crate::cli::commands::doctor_subsystems::exit_codes::DoctorExitCode;
 use crate::cli::commands::doctor_subsystems::mutate as chokepoint;
 use crate::cli::commands::doctor_subsystems::mutate::{Capabilities, MutateContext, Op};
 use crate::cli::commands::doctor_subsystems::run_dir::{self, RunDir};
@@ -333,6 +334,56 @@ fn emit_recovery_audit_record(record: &RecoveryAuditRecord) {
         fk_violations_cleaned = record.fk_violations_cleaned.unwrap_or(0),
         "doctor recovery audit record"
     );
+}
+
+/// Emit a `ConcurrencyLost` refusal payload before exiting with code 5.
+///
+/// Used by the `--repair` lock guard when another process holds the
+/// `.write.lock`. JSON callers receive a structured envelope with
+/// `exit_code: 5`, `code: "concurrency_lost"`, and the underlying
+/// timeout error text; non-JSON callers get a one-line error on stderr.
+/// The message intentionally names `.write.lock` so agent scripts can
+/// match on it the same way they do for other contention paths.
+fn emit_concurrency_lost(beads_dir: &Path, err: &BeadsError, ctx: &OutputContext) {
+    let lock_path = beads_dir.join(".write.lock");
+    let detail = err.to_string();
+    let recovery_audit = RecoveryAuditRecord {
+        phase: "doctor.concurrency".to_string(),
+        action: "acquire_workspace_write_lock".to_string(),
+        outcome: "refused".to_string(),
+        reason: Some(format!(
+            "workspace write lock at {} is held by another process: {detail}",
+            lock_path.display()
+        )),
+        applied_actions: Vec::new(),
+        quarantined_artifacts: Vec::new(),
+        verified_backups: Vec::new(),
+        imported: None,
+        skipped: None,
+        fk_violations_cleaned: None,
+    };
+    emit_recovery_audit_record(&recovery_audit);
+    if ctx.is_json() {
+        ctx.json(&serde_json::json!({
+            "ok": false,
+            "exit_code": DoctorExitCode::ConcurrencyLost.as_i32(),
+            "code": DoctorExitCode::ConcurrencyLost.as_str(),
+            "message": format!(
+                "Refusing --repair: workspace write lock at {} is held by another process",
+                lock_path.display()
+            ),
+            "detail": detail,
+            "lock_path": lock_path.display().to_string(),
+            "recovery_audit": recovery_audit,
+        }));
+    } else {
+        ctx.error(&format!(
+            "Refusing --repair: workspace write lock at {} is held by another process. \
+             Wait for the other br invocation to finish or pass --lock-timeout to wait longer. \
+             Underlying error: {detail}",
+            lock_path.display()
+        ));
+    }
 }
 
 impl FilesystemPathKind {
@@ -3656,6 +3707,58 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             print_report(&report, ctx)?;
             std::process::exit(1);
         }
+    };
+
+    // Round-3 fresh-eyes finding (`beads_rust-sexc`): every other mutating
+    // subcommand (`update`, `delete`, `close`, `dep`, `label`, …) routes its
+    // writes through `acquire_routed_workspace_write_lock` so concurrent
+    // processes cannot tear the on-disk DB family. `--repair` performs the
+    // most invasive mutations of all (VACUUM, REINDEX, JSONL rebuild,
+    // chokepointed file/DB ops), but its execute() previously had no
+    // explicit guard — it relied entirely on `main.rs`'s startup write lock
+    // (see `needs_write_lock()` matching `Commands::Doctor(_)`). That works
+    // when `br doctor` is invoked through the binary, but it offers no
+    // defense-in-depth for callers that exercise `commands::doctor::execute`
+    // directly (e.g., embedded use, future test harnesses) and the failure
+    // mode under contention is opaque (generic `BeadsError::Config` →
+    // exit code 1) instead of the structured `ConcurrencyLost` (exit 5)
+    // documented in `doctor_subsystems::exit_codes`.
+    //
+    // Wire the lock here, BEFORE live report collection, run-dir creation,
+    // fixer dispatch, or mutate() call:
+    //   * If `main.rs` already holds the workspace write lock for this
+    //     beads_dir (the common case under the binary), reuse it — flock()
+    //     is per-open-file-description on Linux and re-locking from a
+    //     fresh handle in the same process would deadlock against our
+    //     own startup guard.
+    //   * Otherwise, acquire the lock ourselves with the configured
+    //     `--lock-timeout`. On contention, exit with structured exit
+    //     code 5 (`ConcurrencyLost`) so agent scripts and CI can
+    //     reliably distinguish "another process held the lock" from
+    //     other failure modes.
+    //
+    // The guard binds to a let in `execute()` so it lives until function
+    // return — RAII drop releases the lock on success, panic, and every
+    // early-return below. Releasing the lock implicitly on panic is
+    // load-bearing: a panicking fixer must not strand the `.write.lock`
+    // file held against subsequent runs.
+    let _repair_lock_guard: Option<std::fs::File> = if args.repair && !args.robot_triage {
+        if cli.holds_write_lock_for(&beads_dir) {
+            // main.rs already serialized us against concurrent writers.
+            // Don't open a second flock handle — same process, different
+            // open-file-descriptions would deadlock on Linux flock(2).
+            None
+        } else {
+            match crate::sync::blocking_write_lock_with_timeout(&beads_dir, cli.lock_timeout) {
+                Ok(file) => Some(file),
+                Err(err) => {
+                    emit_concurrency_lost(&beads_dir, &err, ctx);
+                    std::process::exit(DoctorExitCode::ConcurrencyLost.as_i32());
+                }
+            }
+        }
+    } else {
+        None
     };
 
     let mut initial = collect_doctor_report(&beads_dir, &paths)?;

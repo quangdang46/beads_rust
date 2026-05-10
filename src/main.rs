@@ -86,7 +86,48 @@ fn main() {
             beads_rust::sync::blocking_write_lock_with_timeout(beads_dir, lock_timeout)
         }) {
             Some(Ok(lock)) => Some(lock),
-            Some(Err(e)) => handle_error(&e, json_error_mode, color_error_mode),
+            Some(Err(e)) => {
+                // Round-3 fresh-eyes (`beads_rust-sexc`): when the
+                // contended command is `br doctor --repair`, surface the
+                // structured `ConcurrencyLost` (exit code 5) documented
+                // in `doctor_subsystems::exit_codes` instead of the
+                // generic `BeadsError::Config` exit code. Other commands
+                // still flow through `handle_error` unchanged.
+                if let Commands::Doctor(doctor_args) = &cli.command
+                    && doctor_args.repair
+                {
+                    let lock_path = ctx
+                        .beads_dir
+                        .as_ref()
+                        .map(|d| d.join(".write.lock").display().to_string())
+                        .unwrap_or_else(|| ".beads/.write.lock".to_string());
+                    if json_error_mode {
+                        let payload = serde_json::json!({
+                            "ok": false,
+                            "exit_code": beads_rust::cli::commands::doctor_subsystems::exit_codes::DoctorExitCode::ConcurrencyLost.as_i32(),
+                            "code": beads_rust::cli::commands::doctor_subsystems::exit_codes::DoctorExitCode::ConcurrencyLost.as_str(),
+                            "message": format!(
+                                "Refusing --repair: workspace write lock at {lock_path} is held by another process",
+                            ),
+                            "detail": e.to_string(),
+                            "lock_path": lock_path,
+                        });
+                        eprintln!(
+                            "{}",
+                            serde_json::to_string_pretty(&payload)
+                                .unwrap_or_else(|_| payload.to_string())
+                        );
+                    } else {
+                        eprintln!(
+                            "Refusing --repair: workspace write lock at {lock_path} is held by another process. \
+                             Wait for the other br invocation to finish or pass --lock-timeout to wait longer. \
+                             Underlying error: {e}",
+                        );
+                    }
+                    std::process::exit(beads_rust::cli::commands::doctor_subsystems::exit_codes::DoctorExitCode::ConcurrencyLost.as_i32());
+                }
+                handle_error(&e, json_error_mode, color_error_mode)
+            }
             None => None,
         }
     } else {

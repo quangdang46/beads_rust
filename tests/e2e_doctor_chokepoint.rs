@@ -918,3 +918,115 @@ fn chokepoint_db_exec_undo_replay() {
         "expected the pre-DELETE corrupt row to be restored"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Test 9 (round-3 fresh-eyes follow-through, bead `beads_rust-sexc`):
+// `br doctor --repair` must serialize against concurrent mutating br
+// invocations via the workspace `.beads/.write.lock`. The detection
+// surface is the structured `ConcurrencyLost` exit code (5) from
+// `doctor_subsystems::exit_codes`, NOT the generic `BeadsError::Config`
+// (1) used pre-fix.
+//
+// We hold the lock from THIS test process by opening
+// `.beads/.write.lock` and `try_lock()`-ing the resulting `File`. That
+// installs the same advisory exclusive lock `blocking_write_lock_with_timeout`
+// installs, but from a different process than the subordinate `br`
+// child we then spawn — proving the cross-process serialization
+// contract from the bead.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn chokepoint_repair_acquires_workspace_lock() {
+    let tmp = TempDir::new().expect("tempdir");
+    let root = tmp.path().to_path_buf();
+
+    // Init a real workspace so .beads/.write.lock has a parent that
+    // exists and metadata.json is in place. Without `br init` the
+    // doctor short-circuits with "missing .beads directory" and exits
+    // BEFORE the lock guard runs, which is not the contention path we
+    // want to test.
+    br_init(&root);
+
+    let beads_dir = root.join(".beads");
+    let lock_path = beads_dir.join(".write.lock");
+
+    // Hold the workspace write lock from the test process. The br
+    // child below sees this as "another process holds the lock" and
+    // must refuse with exit code 5.
+    let lock_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .expect("open .write.lock");
+    lock_file
+        .try_lock()
+        .expect("test should be uncontended at this point");
+
+    // Use a tiny lock_timeout so the child gives up quickly instead of
+    // burning the default 30s timeout per the env's setting.
+    let bin_path = env!("CARGO_BIN_EXE_br");
+    let output = std::process::Command::new(bin_path)
+        .args(["--lock-timeout", "200", "doctor", "--repair", "--json"])
+        .current_dir(&root)
+        .env("RUST_LOG", "error")
+        .env("BR_NO_AUTOFLUSH", "1")
+        .env_remove("BD_DB")
+        .env_remove("BEADS_DB")
+        .output()
+        .expect("invoke br doctor --repair");
+
+    // Exit code must be the structured ConcurrencyLost (5), per the
+    // doctor_subsystems::exit_codes contract.
+    let code = output.status.code();
+    assert_eq!(
+        code,
+        Some(5),
+        "expected exit 5 ConcurrencyLost; got {:?}\nstdout={}\nstderr={}",
+        code,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The refusal envelope must mention the .write.lock path so agent
+    // scripts can match on it. JSON callers should also see
+    // code=concurrency_lost / exit_code=5 explicitly.
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains(".write.lock"),
+        "refusal output should mention .write.lock: {combined}"
+    );
+    assert!(
+        combined.contains("concurrency_lost")
+            || combined.contains("ConcurrencyLost")
+            || combined.contains("Refusing --repair"),
+        "refusal output should be recognizable: {combined}"
+    );
+
+    // Sanity: release the lock and prove the SUT was never blocked
+    // permanently — a second invocation after we drop the guard should
+    // either succeed (exit 0) or report normal findings (exit 1), but
+    // never repeat the ConcurrencyLost refusal.
+    drop(lock_file);
+    let output2 = std::process::Command::new(bin_path)
+        .args(["--lock-timeout", "5000", "doctor", "--repair", "--json"])
+        .current_dir(&root)
+        .env("RUST_LOG", "error")
+        .env("BR_NO_AUTOFLUSH", "1")
+        .env_remove("BD_DB")
+        .env_remove("BEADS_DB")
+        .output()
+        .expect("invoke br doctor --repair (post-release)");
+    assert_ne!(
+        output2.status.code(),
+        Some(5),
+        "post-release --repair must not still report ConcurrencyLost; status={:?} stderr={}",
+        output2.status,
+        String::from_utf8_lossy(&output2.stderr)
+    );
+}
