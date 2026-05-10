@@ -1485,10 +1485,30 @@ fn latest_run_from_symlink(runs_root: &Path) -> Result<Option<String>> {
     } else {
         base.join(link_target)
     };
-    if !target.is_dir() || !target.starts_with(runs_root) {
+    // Canonicalize *before* the prefix check so we cannot be fooled by:
+    //   - `..` traversal embedded in the symlink target (lexical
+    //     `starts_with` accepts `<runs_root>/../../etc/...` because the
+    //     string prefix is preserved even though the resolved path
+    //     escapes `runs_root`);
+    //   - symlinks anywhere in `runs_root`'s ancestor chain that make
+    //     the canonical and lexical forms diverge.
+    // If canonicalization fails (target missing, broken link, …) we
+    // fall through to "no symlinked run available" rather than handing
+    // back a path we can't reason about.
+    let canonical_target = match target.canonicalize() {
+        Ok(p) => p,
+        Err(_) => return Ok(None),
+    };
+    let canonical_root = match runs_root.canonicalize() {
+        Ok(p) => p,
+        // If runs_root itself does not exist we can't have a valid
+        // latest symlink under it.
+        Err(_) => return Ok(None),
+    };
+    if !canonical_target.is_dir() || !canonical_target.starts_with(&canonical_root) {
         return Ok(None);
     }
-    Ok(target
+    Ok(canonical_target
         .file_name()
         .and_then(|name| name.to_str())
         .map(ToString::to_string))
@@ -2068,6 +2088,55 @@ mod tests {
 
         let latest = find_latest_run(&runs_root).unwrap().unwrap();
         assert_eq!(latest, "20260101T000000Z__linked");
+    }
+
+    #[test]
+    fn test_doctor_undo_latest_rejects_symlink_traversal_outside_runs_root() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = unique_temp_root("undo-latest-link-traversal");
+        let repo = tmp.path();
+        let doctor = repo.join(".doctor");
+        let runs_root = doctor.join("runs");
+        fs::create_dir_all(runs_root.join("escape")).unwrap();
+        fs::create_dir_all(doctor.join("outside-run")).unwrap();
+
+        symlink("runs/escape/../../outside-run", doctor.join("latest")).unwrap();
+
+        let latest = latest_run_from_symlink(&runs_root).unwrap();
+        assert_eq!(latest, None);
+    }
+
+    /// Round-2 fresh-eyes regression test: a symlink whose target
+    /// reaches the same canonical run dir via a different lexical path
+    /// (i.e. via `..` segments that resolve back into `runs_root`)
+    /// must still be accepted. The prefix check has to canonicalize
+    /// *both* sides — not just refuse anything containing `..`.
+    #[test]
+    fn test_doctor_undo_latest_accepts_canonical_target_with_dot_dot() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = unique_temp_root("undo-latest-link-dotdot-canonical");
+        let repo = tmp.path();
+        let runs_root = repo.join(".doctor").join("runs");
+        let run_dir = runs_root.join("20260101T000000Z__legit");
+        fs::create_dir_all(run_dir.join("backups")).unwrap();
+        fs::write(run_dir.join("actions.jsonl"), b"").unwrap();
+
+        // Lexical target contains `..` but canonicalizes back inside
+        // runs_root. Pre-fix, this would also pass (string prefix
+        // matches accidentally). Post-fix, canonicalization is what
+        // makes it pass — and the parallel test
+        // `..._rejects_symlink_traversal_outside_runs_root` ensures
+        // the escape case still fails.
+        symlink(
+            "runs/20260101T000000Z__legit/../20260101T000000Z__legit",
+            repo.join(".doctor/latest"),
+        )
+        .unwrap();
+
+        let latest = latest_run_from_symlink(&runs_root).unwrap();
+        assert_eq!(latest, Some("20260101T000000Z__legit".into()));
     }
 
     #[test]

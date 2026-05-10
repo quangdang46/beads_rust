@@ -39,7 +39,7 @@
 
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -214,6 +214,7 @@ fn update_latest_symlink(latest_link: &Path, target: &Path) -> Result<(), BeadsE
     // `fs::rename` over an existing symlink atomically replaces it on
     // Unix.
     fs::rename(&tmp, latest_link).map_err(BeadsError::Io)?;
+    fsync_dir(latest_link.parent().unwrap_or_else(|| Path::new(".")))?;
     Ok(())
 }
 
@@ -250,7 +251,17 @@ fn ensure_doctor_in_gitignore(repo_root: &Path) -> Result<(), BeadsError> {
     tmp.as_file().sync_data().map_err(BeadsError::Io)?;
     tmp.persist(&gitignore)
         .map_err(|e| BeadsError::Io(e.error))?;
+    fsync_dir(parent)?;
     Ok(())
+}
+
+fn fsync_dir(dir: &Path) -> Result<(), BeadsError> {
+    let file = fs::File::open(dir).map_err(BeadsError::Io)?;
+    match file.sync_all() {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::InvalidInput => Ok(()),
+        Err(e) => Err(BeadsError::Io(e)),
+    }
 }
 
 /// Write `<run-dir>/undo.sh` — a pure-bash fallback that reads
@@ -405,6 +416,12 @@ mod tests {
             let run_id = generate_run_id(tmp.path());
             assert!(seen.insert(run_id), "run_id collision inside one process");
         }
+    }
+
+    #[test]
+    fn fsync_dir_accepts_existing_directory() {
+        let tmp = unique_temp_root("fsync-dir");
+        fsync_dir(tmp.path()).expect("fsync temp dir");
     }
 
     #[test]

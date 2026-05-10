@@ -879,16 +879,15 @@ fn run_db_exec(
                 return Err(BeadsError::Json(e));
             }
         };
-        let snap_path =
-            match write_unique_db_snapshot(backups_db, table, predicate_hash, &body) {
-                Ok(p) => p,
-                Err(e) => {
-                    let _ = conn.execute("ROLLBACK");
-                    let _ = conn.close();
-                    scrub_orphan_snapshots(&snapshot_paths);
-                    return Err(BeadsError::Io(e));
-                }
-            };
+        let snap_path = match write_unique_db_snapshot(backups_db, table, predicate_hash, &body) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK");
+                let _ = conn.close();
+                scrub_orphan_snapshots(&snapshot_paths);
+                return Err(BeadsError::Io(e));
+            }
+        };
         snapshot_paths.push(snap_path);
     }
 
