@@ -4036,6 +4036,7 @@ mod tests {
     use chrono::Utc;
     use fsqlite::Connection;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::{NamedTempFile, TempDir};
 
     fn find_check<'a>(checks: &'a [CheckResult], name: &str) -> Option<&'a CheckResult> {
@@ -6413,7 +6414,6 @@ mod tests {
 
         let undo = &session.run.undo_script;
         assert!(undo.is_file(), "undo.sh exists at {}", undo.display());
-        use std::os::unix::fs::PermissionsExt;
         let mode = fs::metadata(undo).unwrap().permissions().mode() & 0o777;
         assert_eq!(
             mode, 0o755,

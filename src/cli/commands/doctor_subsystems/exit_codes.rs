@@ -148,7 +148,6 @@ impl From<DoctorExitCode> for i32 {
 /// flow through [`std::process::exit`] in [`crate::cli::commands::doctor`].
 /// Documented here so the WP3-WP12 migration has a single helper to
 /// switch to.
-#[must_use = "exit_with does not return; the caller intends to terminate"]
 pub fn exit_with(code: DoctorExitCode) -> ! {
     std::process::exit(code.as_i32())
 }

@@ -37,8 +37,10 @@
 
 #![allow(dead_code)] // WP1 foundation; consumed by WP3-WP12.
 
+use std::fmt::Write as FmtWrite;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
@@ -119,10 +121,7 @@ pub fn create_run_dir(repo_root: &Path) -> Result<RunDir, BeadsError> {
 
     // .doctor/latest symlink (points relative inside the runs root so
     // it survives moves of the repo root).
-    let latest_link = runs_root
-        .parent()
-        .unwrap_or(&runs_root)
-        .join("latest");
+    let latest_link = runs_root.parent().unwrap_or(&runs_root).join("latest");
     update_latest_symlink(&latest_link, &root)?;
 
     // Best-effort .gitignore update; not fatal if the repo has no
@@ -164,12 +163,10 @@ fn generate_run_id(repo_root: &Path) -> String {
     hasher.update(repo_root.to_string_lossy().as_bytes());
     hasher.update(iso.as_bytes());
     hasher.update(std::process::id().to_le_bytes());
-    let short = hasher
-        .finalize()
-        .iter()
-        .take(3)
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
+    let mut short = String::with_capacity(6);
+    for byte in hasher.finalize().iter().take(3) {
+        write!(&mut short, "{byte:02x}").expect("writing to a String cannot fail");
+    }
     format!("{iso}__{short}")
 }
 
@@ -235,9 +232,11 @@ fn ensure_doctor_in_gitignore(repo_root: &Path) -> Result<(), BeadsError> {
     // Atomic write: tmp + rename.
     let parent = gitignore.parent().unwrap_or_else(|| Path::new("."));
     let mut tmp = tempfile::NamedTempFile::new_in(parent).map_err(BeadsError::Io)?;
-    tmp.write_all(new_contents.as_bytes()).map_err(BeadsError::Io)?;
+    tmp.write_all(new_contents.as_bytes())
+        .map_err(BeadsError::Io)?;
     tmp.as_file().sync_data().map_err(BeadsError::Io)?;
-    tmp.persist(&gitignore).map_err(|e| BeadsError::Io(e.error))?;
+    tmp.persist(&gitignore)
+        .map_err(|e| BeadsError::Io(e.error))?;
     Ok(())
 }
 
@@ -310,7 +309,6 @@ echo "undo complete for run {run_id}" >&2
     );
 
     fs::write(&run.undo_script, script).map_err(BeadsError::Io)?;
-    use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(&run.undo_script, fs::Permissions::from_mode(0o755))
         .map_err(BeadsError::Io)?;
     Ok(())
@@ -319,6 +317,7 @@ echo "undo complete for run {run_id}" >&2
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     fn unique_temp_root(label: &str) -> tempfile::TempDir {
         let prefix = format!("br-doctor-rundir-{label}-");
@@ -392,7 +391,6 @@ mod tests {
         write_undo_sh(&run).expect("write undo");
         assert!(run.undo_script.is_file());
         let meta = fs::metadata(&run.undo_script).unwrap();
-        use std::os::unix::fs::PermissionsExt;
         assert_eq!(meta.permissions().mode() & 0o777, 0o755);
         let body = fs::read_to_string(&run.undo_script).unwrap();
         assert!(body.starts_with("#!/usr/bin/env bash"));

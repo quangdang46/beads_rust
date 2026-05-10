@@ -173,9 +173,8 @@ fn scan_fingerprints(recovery_dir: &Path) -> std::io::Result<Vec<FingerprintMism
             out.extend(scan_fingerprints(&path)?);
             continue;
         }
-        let name = match path.file_name().and_then(|s| s.to_str()) {
-            Some(n) => n,
-            None => continue,
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
         };
         if !name.ends_with(".fingerprint.json") {
             continue;
@@ -192,9 +191,8 @@ fn scan_fingerprints(recovery_dir: &Path) -> std::io::Result<Vec<FingerprintMism
                 continue;
             }
         };
-        let target_rel = match fp.get("artifact").and_then(|v| v.as_str()) {
-            Some(s) => s,
-            None => continue,
+        let Some(target_rel) = fp.get("artifact").and_then(|v| v.as_str()) else {
+            continue;
         };
         let target = recovery_dir.join(target_rel);
         let expected_sha = fp
@@ -271,7 +269,11 @@ mod tests {
 
         let outcome = gate_schema_version_downgrade(&db_path);
         match outcome {
-            GateOutcome::Refuse { code, reason, evidence } => {
+            GateOutcome::Refuse {
+                code,
+                reason,
+                evidence,
+            } => {
                 assert_eq!(code, DoctorExitCode::RefusedUnsafe.as_i32());
                 assert!(reason.contains("schema_version"));
                 assert_eq!(evidence["gate"], "schema_version_downgrade");
@@ -340,9 +342,7 @@ mod tests {
             GateOutcome::Refuse { code, evidence, .. } => {
                 assert_eq!(code, DoctorExitCode::RefusedUnsafe.as_i32());
                 assert_eq!(evidence["gate"], "recovery_fingerprint_integrity");
-                let arr = evidence["mismatched_artifacts"]
-                    .as_array()
-                    .expect("array");
+                let arr = evidence["mismatched_artifacts"].as_array().expect("array");
                 assert_eq!(arr.len(), 1);
             }
             GateOutcome::Allow => panic!("must refuse on fingerprint mismatch"),
