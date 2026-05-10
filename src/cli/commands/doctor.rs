@@ -6,6 +6,7 @@ use crate::cli::DoctorArgs;
 use crate::cli::commands::doctor_subsystems::exit_codes::DoctorExitCode;
 use crate::cli::commands::doctor_subsystems::mutate as chokepoint;
 use crate::cli::commands::doctor_subsystems::mutate::{Capabilities, MutateContext, Op};
+use crate::cli::commands::doctor_subsystems::refuse_gates::{self, GateOutcome};
 use crate::cli::commands::doctor_subsystems::run_dir::{self, RunDir};
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -382,6 +383,55 @@ fn emit_concurrency_lost(beads_dir: &Path, err: &BeadsError, ctx: &OutputContext
              Wait for the other br invocation to finish or pass --lock-timeout to wait longer. \
              Underlying error: {detail}",
             lock_path.display()
+        ));
+    }
+}
+
+/// Round-5 fresh-eyes follow-through (`beads_rust-73ux`): emit the
+/// structured refusal envelope when a WP1 [`refuse_gates`] gate refuses
+/// to allow `--repair` to proceed.
+///
+/// Mirrors [`emit_concurrency_lost`]: a [`RecoveryAuditRecord`] carrying
+/// the gate's reason is logged unconditionally, and JSON callers receive
+/// a top-level envelope with `exit_code: 4`,
+/// `code: "refused_unsafe"`, and the gate's `evidence` payload (so
+/// agent scripts can inspect which gate refused and why without parsing
+/// the human message). Non-JSON callers get a one-line refusal on stderr.
+///
+/// The caller is expected to follow this with
+/// `process::exit(DoctorExitCode::RefusedUnsafe.as_i32())`.
+fn emit_refused_unsafe(reason: &str, evidence: &serde_json::Value, ctx: &OutputContext) {
+    let gate_name = evidence
+        .get("gate")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let recovery_audit = RecoveryAuditRecord {
+        phase: "doctor.refuse_gate".to_string(),
+        action: format!("gate:{gate_name}"),
+        outcome: "refused".to_string(),
+        reason: Some(reason.to_string()),
+        applied_actions: Vec::new(),
+        quarantined_artifacts: Vec::new(),
+        verified_backups: Vec::new(),
+        imported: None,
+        skipped: None,
+        fk_violations_cleaned: None,
+    };
+    emit_recovery_audit_record(&recovery_audit);
+    if ctx.is_json() {
+        ctx.json(&serde_json::json!({
+            "ok": false,
+            "exit_code": DoctorExitCode::RefusedUnsafe.as_i32(),
+            "code": DoctorExitCode::RefusedUnsafe.as_str(),
+            "message": reason,
+            "gate": gate_name,
+            "evidence": evidence,
+            "recovery_audit": recovery_audit,
+        }));
+    } else {
+        ctx.error(&format!(
+            "Refusing --repair: {reason} (gate={gate_name})"
         ));
     }
 }
@@ -3760,6 +3810,31 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     } else {
         None
     };
+
+    // Round-5 fresh-eyes follow-through (`beads_rust-73ux`): the WP1
+    // refuse-unsafe gates (schema-version-downgrade,
+    // recovery-fingerprint-integrity) must run BEFORE any
+    // run-dir creation, fixer dispatch, or `mutate()` call — they are
+    // *precondition* checks. We run them AFTER the workspace write lock
+    // is held so a concurrent writer cannot mutate the DB header (and
+    // thus the gate's verdict) between our gate read and the chokepoint
+    // execution. Pure-read; never mutates.
+    //
+    // On Refuse, exit 4 (`RefusedUnsafe`) with a structured envelope.
+    // The lock guard's RAII drop releases `.write.lock` on this exit.
+    if args.repair && !args.robot_triage {
+        match refuse_gates::run_all(&beads_dir, &paths.db_path) {
+            GateOutcome::Allow => {}
+            GateOutcome::Refuse {
+                code: _,
+                reason,
+                evidence,
+            } => {
+                emit_refused_unsafe(&reason, &evidence, ctx);
+                std::process::exit(DoctorExitCode::RefusedUnsafe.as_i32());
+            }
+        }
+    }
 
     let mut initial = collect_doctor_report(&beads_dir, &paths)?;
 
