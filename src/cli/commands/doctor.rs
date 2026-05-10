@@ -3,6 +3,9 @@
 #![allow(clippy::option_if_let_else)]
 
 use crate::cli::DoctorArgs;
+use crate::cli::commands::doctor_subsystems::mutate as chokepoint;
+use crate::cli::commands::doctor_subsystems::mutate::{Capabilities, MutateContext, Op};
+use crate::cli::commands::doctor_subsystems::run_dir::{self, RunDir};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::health::{AnomalyClass, ReliabilityAuditRecord, WorkspaceClassification};
@@ -25,6 +28,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 
 /// Check result status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -77,6 +81,78 @@ struct LocalRepairResult {
     vacuumed: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     quarantined_artifacts: Vec<String>,
+}
+
+/// Per-`--repair` invocation state: owns the on-disk run-artifact directory
+/// and the [`MutateContext`] that every WP3-rewired fixer threads its writes
+/// through.
+///
+/// Constructed once at the top of the `--repair` flow and lazily threaded
+/// down to each fixer that has been migrated to the chokepoint. Fixers that
+/// are still pre-WP4 (DB-only SQL paths, deep config rebuilds) currently
+/// ignore this and fall back to their legacy in-place writes; their
+/// migration is tracked under WP4+.
+///
+/// On `dry_run`, every routed call prints `[dry-run] would mutate …` to
+/// stderr without touching disk. The run-dir is still created (so the
+/// caller has somewhere to inspect the planned actions) but no
+/// `actions.jsonl` lines are appended.
+#[allow(dead_code)] // WP1 scaffold; wired into legacy fixers in later doctor work packages.
+struct DoctorRepairSession {
+    run: RunDir,
+    ctx: MutateContext,
+}
+
+#[allow(dead_code)] // WP1 scaffold; methods are exercised once repair call sites move to mutate().
+impl DoctorRepairSession {
+    /// Build a fresh session rooted at `repo_root`. Creates
+    /// `<repo_root>/.doctor/runs/<run-id>/` (or the
+    /// `BR_DOCTOR_RUNS_DIR` override) and seats a `MutateContext` with the
+    /// default `.beads/` + `.doctor/` capabilities, plus the explicit root
+    /// `.gitignore` path so the gitignore fixer can use the chokepoint
+    /// without widening write_scopes to the entire repo root.
+    ///
+    /// `fixer_id` may be a placeholder; callers update it via
+    /// [`Self::with_fixer`] before each `mutate()` call.
+    fn new(repo_root: &Path, dry_run: bool) -> Result<Self> {
+        let run = run_dir::create_run_dir(repo_root)?;
+        // Re-open the actions.jsonl in append mode under our own handle —
+        // create_run_dir already touches the file, but doesn't return a
+        // handle.
+        let actions_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&run.actions_file)?;
+        let mut capabilities = Capabilities::for_repo(repo_root);
+        // Allow the root .gitignore explicitly. It lives at <repo_root>/
+        // which is outside .beads/ and .doctor/.
+        capabilities.write_scopes.push(repo_root.join(".gitignore"));
+        let ctx = MutateContext {
+            run_id: run.run_id.clone(),
+            run_dir: run.root.clone(),
+            capabilities,
+            actions_file: Mutex::new(actions_file),
+            fixer_id: "doctor".to_string(),
+            repo_root: repo_root.to_path_buf(),
+            dry_run,
+            start_ns: now_ns_for_session(),
+        };
+        Ok(Self { run, ctx })
+    }
+
+    /// Replace the `fixer_id` in-place so the next `mutate()` call records
+    /// the right fixer in `actions.jsonl`.
+    fn set_fixer(&mut self, fixer_id: &str) {
+        self.ctx.fixer_id = fixer_id.to_string();
+    }
+}
+
+#[allow(dead_code)] // Used by DoctorRepairSession once the scaffold is wired into repair flow.
+fn now_ns_for_session() -> u128 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1393,6 +1469,7 @@ fn write_jsonl_rebuild_verification_failed_marker(
     db_path: &Path,
     post_repair: &DoctorRun,
     repair_result: &DoctorRepairResult,
+    session: Option<&mut DoctorRepairSession>,
 ) -> Result<PathBuf> {
     let recovery_dir = config::recovery_dir_for_db_path(db_path, beads_dir);
     fs::create_dir_all(&recovery_dir)?;
@@ -1422,7 +1499,20 @@ fn write_jsonl_rebuild_verification_failed_marker(
         "workspace_health": post_repair.report.workspace_health.as_deref(),
         "failed_checks": failed_checks,
     });
-    fs::write(&marker_path, serde_json::to_vec_pretty(&payload)?)?;
+    let bytes = serde_json::to_vec_pretty(&payload)?;
+    if let Some(session) = session {
+        session.set_fixer("doctor.jsonl_rebuild_verification_marker");
+        chokepoint::mutate(
+            &session.ctx,
+            &marker_path,
+            Op::WriteFile {
+                content: bytes,
+                mode: None,
+            },
+        )?;
+    } else {
+        fs::write(&marker_path, bytes)?;
+    }
     Ok(marker_path)
 }
 
@@ -2633,10 +2723,16 @@ fn check_root_gitignore(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
 
 /// When `--repair` is passed and the `gitignore.beads_inner` warning is present,
 /// automatically remove the offending lines from the root `.gitignore`.
+///
+/// When a [`DoctorRepairSession`] is provided, the rewrite is routed through
+/// the WP1 [`chokepoint::mutate`] (verbatim backup + `actions.jsonl` line +
+/// dry-run support). Otherwise (no session, or run-dir creation failed)
+/// we fall back to the legacy in-place atomic rewrite.
 fn fix_root_gitignore_if_warned(
     beads_dir: &Path,
     report: &DoctorReport,
     ctx: &OutputContext,
+    session: Option<&mut DoctorRepairSession>,
 ) -> bool {
     let has_warning = report
         .checks
@@ -2669,7 +2765,22 @@ fn fix_root_gitignore_if_warned(
         new_content.push('\n');
     }
 
-    if let Err(err) = write_root_gitignore_atomically(&gitignore_path, new_content.as_bytes()) {
+    let write_result = if let Some(session) = session {
+        session.set_fixer("doctor.gitignore_repair");
+        chokepoint::mutate(
+            &session.ctx,
+            &gitignore_path,
+            Op::WriteFile {
+                content: new_content.into_bytes(),
+                mode: None,
+            },
+        )
+        .map(|_| ())
+    } else {
+        write_root_gitignore_atomically(&gitignore_path, new_content.as_bytes())
+    };
+
+    if let Err(err) = write_result {
         if !ctx.is_json() {
             ctx.warning(&format!("Failed to fix .gitignore: {err}"));
         }
@@ -3525,9 +3636,31 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
 
     let mut initial = collect_doctor_report(&beads_dir, &paths)?;
 
+    // Build the per-run session once, lazily, when --repair is requested.
+    // Every WP3-rewired fixer threads its writes through `session.ctx`.
+    // If the run-dir cannot be created (e.g., the tree is read-only and the
+    // BR_DOCTOR_RUNS_DIR override was not set), we degrade gracefully:
+    // the repair flow falls back to its legacy in-place writes. This
+    // matches the project's no-regression rule for WP1→WP3.
+    let mut session: Option<DoctorRepairSession> = if args.repair {
+        match DoctorRepairSession::new(&beads_dir.parent().unwrap_or(&beads_dir).to_path_buf(), args.dry_run) {
+            Ok(sess) => Some(sess),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "Doctor repair session could not be created; falling back to legacy in-place writes"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Auto-fix root .gitignore if --repair is passed and the warning is present.
     let gitignore_repaired = if args.repair {
-        let repaired = fix_root_gitignore_if_warned(&beads_dir, &initial.report, ctx);
+        let repaired =
+            fix_root_gitignore_if_warned(&beads_dir, &initial.report, ctx, session.as_mut());
         if repaired {
             initial = collect_doctor_report(&beads_dir, &paths)?;
         }
@@ -3819,6 +3952,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             &paths.db_path,
             &post_repair,
             &repair_result,
+            session.as_mut(),
         )?)
     };
     let verification_failure_reason = verification_failure_marker.as_ref().map(|path| {
@@ -4436,6 +4570,7 @@ mod tests {
             &db_path,
             &post_repair,
             &repair,
+            None,
         )?;
         assert!(
             marker
@@ -4536,7 +4671,8 @@ mod tests {
         assert!(fix_root_gitignore_if_warned(
             &beads_dir,
             &report_before.report,
-            &ctx
+            &ctx,
+            None,
         ));
         assert_eq!(
             fs::read_to_string(&gitignore_path).unwrap(),
@@ -4601,7 +4737,7 @@ mod tests {
         };
         let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Json, false, true);
 
-        assert!(!fix_root_gitignore_if_warned(&beads_dir, &report, &ctx));
+        assert!(!fix_root_gitignore_if_warned(&beads_dir, &report, &ctx, None));
         assert_eq!(fs::read_to_string(&outside_gitignore).unwrap(), original);
         assert!(
             fs::symlink_metadata(&root_gitignore)

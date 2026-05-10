@@ -261,20 +261,42 @@ fn read_or_empty(path: &Path) -> std::io::Result<Vec<u8>> {
 }
 
 /// Best-effort canonicalization that tolerates not-yet-existing files
-/// (canonicalizes the parent + appends the file name).
+/// (walks up to the first existing ancestor, canonicalizes that, then
+/// re-joins the missing tail). This handles renames into not-yet-created
+/// quarantine subdirs.
 fn canonicalize_existing_or_parent(path: &Path) -> std::io::Result<PathBuf> {
     if path.exists() {
         return path.canonicalize();
     }
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let canonical_parent = parent.canonicalize()?;
-    let name = path.file_name().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no file name")
-    })?;
-    Ok(canonical_parent.join(name))
+    // Walk up until we find an existing ancestor.
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut cursor = path;
+    loop {
+        if let Some(name) = cursor.file_name() {
+            tail.push(name);
+        }
+        match cursor.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => {
+                if parent.exists() {
+                    let mut canonical = parent.canonicalize()?;
+                    for segment in tail.iter().rev() {
+                        canonical.push(segment);
+                    }
+                    return Ok(canonical);
+                }
+                cursor = parent;
+            }
+            _ => {
+                // No existing ancestor; canonicalize CWD as a fallback.
+                let cwd = Path::new(".").canonicalize()?;
+                let mut canonical = cwd;
+                for segment in tail.iter().rev() {
+                    canonical.push(segment);
+                }
+                return Ok(canonical);
+            }
+        }
+    }
 }
 
 fn ensure_in_scope(caps: &Capabilities, path: &Path) -> Result<(), BeadsError> {
@@ -282,7 +304,8 @@ fn ensure_in_scope(caps: &Capabilities, path: &Path) -> Result<(), BeadsError> {
     for scope in &caps.write_scopes {
         // Tolerate scopes that haven't been created yet (e.g.,
         // `.doctor/` on a fresh workspace).
-        let canonical_scope = canonicalize_existing_or_parent(scope).unwrap_or_else(|_| scope.clone());
+        let canonical_scope =
+            canonicalize_existing_or_parent(scope).unwrap_or_else(|_| scope.clone());
         if canonical.starts_with(&canonical_scope) {
             return Ok(());
         }
@@ -310,8 +333,7 @@ fn cmp_strict(a: &Path, b: &Path) -> std::io::Result<()> {
     let ba = fs::read(a)?;
     let bb = fs::read(b)?;
     if ba != bb {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(std::io::Error::other(
             "doctor: backup verify failed (cmp-strict)",
         ));
     }
@@ -335,11 +357,7 @@ fn now_ns() -> u128 {
 /// - I/O faults during backup or atomic-write
 /// - Out-of-scope paths (refused per safety envelope)
 /// - DB ops in WP1 (stubbed; `Internal` with `unimplemented_db_op` tag)
-pub fn mutate(
-    ctx: &MutateContext,
-    path: &Path,
-    op: Op,
-) -> Result<ActionResult, BeadsError> {
+pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, BeadsError> {
     // (1) Per-path advisory lock — minimal in-process mutex via the
     // actions_file lock; cross-process locking is provided by the
     // existing `acquire_routed_workspace_write_lock` upstream of the
@@ -358,6 +376,9 @@ pub fn mutate(
 
     // (3) Preconditions — write_scopes check.
     ensure_in_scope(&ctx.capabilities, path)?;
+    if let Op::Rename { to } = &op {
+        ensure_in_scope(&ctx.capabilities, to)?;
+    }
 
     // For DB ops, scope-check the project DB path instead of the
     // dummy-`path` callers will pass. WP4 will replace this stub.
@@ -367,6 +388,11 @@ pub fn mutate(
             op.name()
         )));
     }
+    let op_name = op.name();
+    let rename_to = match &op {
+        Op::Rename { to } => Some(to.to_string_lossy().into_owned()),
+        _ => None,
+    };
 
     // (4) Verbatim backup — only meaningful if the file existed.
     let rel = path.strip_prefix(&ctx.repo_root).unwrap_or(path);
@@ -379,11 +405,7 @@ pub fn mutate(
     // (5) Plan + (6) Execute atomically.
     let started_at_ns = now_ns().saturating_sub(ctx.start_ns);
     if ctx.dry_run {
-        eprintln!(
-            "[dry-run] would mutate {}: {}",
-            path.display(),
-            op.name()
-        );
+        eprintln!("[dry-run] would mutate {}: {}", path.display(), op_name);
         return Ok(ActionResult {
             ok: true,
             before_hash: before_hash.clone(),
@@ -391,7 +413,7 @@ pub fn mutate(
             error: None,
         });
     }
-    execute_atomic(path, &op).map_err(BeadsError::Io)?;
+    execute_atomic(path, op).map_err(BeadsError::Io)?;
 
     // (7) after_hash.
     let after_bytes = read_or_empty(path).map_err(BeadsError::Io)?;
@@ -406,13 +428,9 @@ pub fn mutate(
     let finished_at_ns = now_ns().saturating_sub(ctx.start_ns);
 
     // (8) Record.
-    let rename_to = match &op {
-        Op::Rename { to } => Some(to.to_string_lossy().into_owned()),
-        _ => None,
-    };
     let record = ActionRecord {
         path: rel.to_string_lossy().into_owned(),
-        op: op.name(),
+        op: op_name,
         before_hash: before_hash.clone(),
         after_hash: after_hash.clone(),
         started_at_ns,
@@ -426,10 +444,9 @@ pub fn mutate(
     };
     let line = serde_json::to_string(&record).map_err(BeadsError::Json)? + "\n";
     {
-        let mut f = ctx
-            .actions_file
-            .lock()
-            .map_err(|e| BeadsError::internal(format!("doctor: actions_file mutex poisoned: {e}")))?;
+        let mut f = ctx.actions_file.lock().map_err(|e| {
+            BeadsError::internal(format!("doctor: actions_file mutex poisoned: {e}"))
+        })?;
         f.write_all(line.as_bytes()).map_err(BeadsError::Io)?;
         f.sync_data().map_err(BeadsError::Io)?;
     }
@@ -446,35 +463,32 @@ pub fn mutate(
 /// `tempfile::NamedTempFile::persist` (i.e., `rename(2)`); the temp
 /// file lives in the **same directory** as the target so cross-FS
 /// rename never breaks atomicity.
-fn execute_atomic(path: &Path, op: &Op) -> std::io::Result<()> {
+fn execute_atomic(path: &Path, op: Op) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
     match op {
         Op::WriteFile { content, mode } => {
             let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-            tmp.write_all(content)?;
+            tmp.write_all(&content)?;
             tmp.as_file().sync_data()?;
             let perms = fs::Permissions::from_mode(mode.unwrap_or(0o644));
             fs::set_permissions(tmp.path(), perms)?;
             tmp.persist(path)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.error.to_string()))?;
+                .map_err(|e| std::io::Error::other(e.error.to_string()))?;
         }
         Op::AppendFile { content } => {
-            let mut f = OpenOptions::new()
-                .append(true)
-                .create(true)
-                .open(path)?;
-            f.write_all(content)?;
+            let mut f = OpenOptions::new().append(true).create(true).open(path)?;
+            f.write_all(&content)?;
             f.sync_data()?;
         }
         Op::Rename { to } => {
             if let Some(p) = to.parent() {
                 fs::create_dir_all(p)?;
             }
-            fs::rename(path, to)?;
+            fs::rename(path, &to)?;
         }
         Op::Chmod { mode } => {
-            fs::set_permissions(path, fs::Permissions::from_mode(*mode))?;
+            fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
         }
         Op::SymlinkAtomic { target } => {
             use std::os::unix::fs::symlink;
@@ -632,12 +646,8 @@ mod tests {
         let (ctx, _) = make_ctx(tmp.path(), false);
         let dst = ctx.run_dir.join("quarantine/orphan.lock");
 
-        let result = mutate(
-            &ctx,
-            &src,
-            Op::Rename { to: dst.clone() },
-        )
-        .expect("rename should succeed");
+        let result =
+            mutate(&ctx, &src, Op::Rename { to: dst.clone() }).expect("rename should succeed");
 
         assert!(result.ok);
         // before_hash should be a real hash of "lock-bytes".
@@ -679,6 +689,37 @@ mod tests {
         );
         // File untouched.
         assert_eq!(fs::read(&outside_target).unwrap(), b"untouched");
+    }
+
+    #[test]
+    fn rename_destination_outside_write_scope_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let source = beads_dir.join("keep-inside.txt");
+        fs::write(&source, b"keep inside").unwrap();
+
+        let (ctx, actions_path) = make_ctx(tmp.path(), false);
+        let outside = tempfile::tempdir().unwrap();
+        let outside_target = outside.path().join("escaped.txt");
+
+        let err = mutate(
+            &ctx,
+            &source,
+            Op::Rename {
+                to: outside_target.clone(),
+            },
+        )
+        .expect_err("out-of-scope rename destinations must be refused");
+        assert!(
+            err.to_string().contains("outside write_scopes"),
+            "error must mention scope refusal: {err}"
+        );
+        assert_eq!(fs::read(&source).unwrap(), b"keep inside");
+        assert!(!outside_target.exists());
+        assert_eq!(fs::metadata(&actions_path).unwrap().len(), 0);
+        let backup = ctx.run_dir.join("backups/.beads/keep-inside.txt");
+        assert!(!backup.exists());
     }
 
     #[test]
