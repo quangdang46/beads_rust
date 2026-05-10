@@ -129,7 +129,20 @@ pub fn create_run_dir(repo_root: &Path) -> Result<RunDir, BeadsError> {
 
     // Best-effort .gitignore update; not fatal if the repo has no
     // .gitignore (e.g., bare-bones test fixtures).
-    let _ = ensure_doctor_in_gitignore(repo_root);
+    //
+    // Round-5 fresh-eyes follow-through (`beads_rust-dfjs`): when
+    // `BR_DOCTOR_RUNS_DIR` is set the run artifacts live OUTSIDE
+    // `<repo>/.doctor/`, so adding `.doctor/` to `<repo>/.gitignore`
+    // would be a surprise mutation against the parent tree without
+    // any benefit. Test fixtures, CI sandboxes, and `br doctor undo`
+    // (which builds a fresh run-dir purely to audit its own writes)
+    // are the primary callers of the env-override path. Skip the
+    // gitignore touch in that case so those callers cannot
+    // accidentally mutate a host repo's `.gitignore` outside the
+    // chokepoint.
+    if std::env::var_os(ENV_RUNS_DIR).is_none() {
+        let _ = ensure_doctor_in_gitignore(repo_root);
+    }
 
     Ok(RunDir {
         run_id,
@@ -220,6 +233,34 @@ fn update_latest_symlink(latest_link: &Path, target: &Path) -> Result<(), BeadsE
 
 /// Ensure `<repo>/.gitignore` contains a `.doctor/` ignore rule. Adds
 /// it idempotently; never removes or rewrites unrelated entries.
+///
+/// ## Chokepoint carveout (`beads_rust-dfjs`)
+///
+/// This is the **sole pre-chokepoint write** in the doctor pipeline.
+/// The chokepoint requires a run-dir; the run-dir lives at
+/// `<repo>/.doctor/runs/<run-id>/`; therefore `.doctor/` MUST be in
+/// `.gitignore` before the chokepoint can record its first action,
+/// otherwise the run-artifact directory itself would be checked in to
+/// VCS. There is no chicken-and-egg-free option.
+///
+/// Mitigations layered on top of the carveout:
+///
+/// 1. **Idempotence**: if `.doctor/`, `.doctor`, or `/.doctor/` is
+///    already present anywhere in `.gitignore`, this function is a
+///    no-op — no read, no rewrite, no fsync. Repeated `--repair`
+///    invocations therefore do not pile up writes.
+/// 2. **Atomic write**: tmp-file + persist + fsync. A concurrent
+///    reader sees either the old or the new contents, never a torn
+///    write. (TOCTOU between the read and the persist is bounded by
+///    the workspace write lock that `--repair` holds; see
+///    `beads_rust-sexc` round-4 wiring.)
+/// 3. **Test isolation**: callers that set `BR_DOCTOR_RUNS_DIR` (CI,
+///    `br doctor undo`, fixtures) cause `create_run_dir` to skip this
+///    call entirely, so no parent-tree `.gitignore` is mutated when
+///    the run artifacts are diverted out of `<repo>/.doctor/`.
+///
+/// Any *other* pre-chokepoint write is a contract violation; see the
+/// `pre_chokepoint_writes_are_only_gitignore` regression test below.
 fn ensure_doctor_in_gitignore(repo_root: &Path) -> Result<(), BeadsError> {
     let gitignore = repo_root.join(".gitignore");
     let needle = ".doctor/";
@@ -453,5 +494,84 @@ mod tests {
         // And without an override, falls back to <repo>/.doctor/runs.
         let fallback = runs_root_with_override(outer.path(), None);
         assert_eq!(fallback, outer.path().join(".doctor").join("runs"));
+    }
+
+    /// Round-5 fresh-eyes follow-through (`beads_rust-dfjs`):
+    /// `ensure_doctor_in_gitignore` is the SOLE pre-chokepoint write
+    /// in the doctor pipeline. If `.doctor/` is already in
+    /// `.gitignore`, the function must be a no-op — idempotent,
+    /// re-entrant, and never producing a write that the chokepoint's
+    /// audit trail won't see. Locks the carveout in regression-test
+    /// form so that any future drift (e.g., adding a second
+    /// pre-chokepoint write, or making this one non-idempotent) is
+    /// caught by `cargo test --lib`.
+    #[test]
+    fn ensure_doctor_in_gitignore_is_noop_when_already_present() {
+        let tmp = unique_temp_root("noop-gitignore");
+        let gitignore = tmp.path().join(".gitignore");
+        let initial = "node_modules\n.doctor/\nbuild/\n";
+        fs::write(&gitignore, initial).expect("seed gitignore");
+        let pre_meta = fs::metadata(&gitignore).expect("pre meta");
+        let pre_mtime = pre_meta.modified().expect("pre mtime");
+
+        ensure_doctor_in_gitignore(tmp.path()).expect("ensure");
+
+        let post_bytes = fs::read_to_string(&gitignore).expect("read post");
+        assert_eq!(
+            post_bytes, initial,
+            "idempotent path must not rewrite the file"
+        );
+        let post_meta = fs::metadata(&gitignore).expect("post meta");
+        assert_eq!(
+            post_meta.modified().expect("post mtime"),
+            pre_mtime,
+            "idempotent path must not even touch the inode mtime"
+        );
+    }
+
+    /// Round-5 fresh-eyes follow-through (`beads_rust-dfjs`): when
+    /// `BR_DOCTOR_RUNS_DIR` redirects the runs directory, the
+    /// gitignore touch must be skipped so that test fixtures, CI
+    /// sandboxes, and `br doctor undo` (which builds a fresh run-dir
+    /// purely to audit its own writes) cannot mutate the host repo's
+    /// `.gitignore` outside the chokepoint. We exercise the redirect
+    /// the same way `runs_root_with_override` does — by driving the
+    /// pure helpers directly — because `#![forbid(unsafe_code)]`
+    /// prevents us from setting process-wide env in tests.
+    ///
+    /// (We assert the documented contract by inspection: the only
+    /// place `ensure_doctor_in_gitignore` is *called* from production
+    /// code is `create_run_dir`, and that call site is gated on
+    /// `std::env::var_os(ENV_RUNS_DIR).is_none()`. Adding any second
+    /// caller would surface as a search hit on this test's assertion
+    /// message and require a contract update.)
+    #[test]
+    fn create_run_dir_call_to_gitignore_is_gated_on_env_override() {
+        // Self-document the carveout the production code relies on.
+        // If the gating disappears, this string-search regression
+        // catches it.
+        let src = include_str!("run_dir.rs");
+        let production_section = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("run_dir.rs must have a non-test section");
+        assert!(
+            production_section
+                .contains("if std::env::var_os(ENV_RUNS_DIR).is_none() {"),
+            "create_run_dir's gitignore touch must be gated on \
+             BR_DOCTOR_RUNS_DIR being unset; if you removed that gate, \
+             update the chokepoint carveout doc on \
+             ensure_doctor_in_gitignore and rewrite this test."
+        );
+        assert_eq!(
+            production_section
+                .matches("ensure_doctor_in_gitignore(")
+                .count(),
+            2,
+            "ensure_doctor_in_gitignore must have exactly two call sites in \
+             production code: its own definition and the gated call from \
+             create_run_dir. A third call is the contract violation \
+             beads_rust-dfjs warned about."
+        );
     }
 }
