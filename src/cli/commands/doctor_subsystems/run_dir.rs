@@ -127,9 +127,6 @@ pub fn create_run_dir(repo_root: &Path) -> Result<RunDir, BeadsError> {
     let latest_link = runs_root.parent().unwrap_or(&runs_root).join("latest");
     update_latest_symlink(&latest_link, &root)?;
 
-    // Best-effort .gitignore update; not fatal if the repo has no
-    // .gitignore (e.g., bare-bones test fixtures).
-    //
     // Round-5 fresh-eyes follow-through (`beads_rust-dfjs`): when
     // `BR_DOCTOR_RUNS_DIR` is set the run artifacts live OUTSIDE
     // `<repo>/.doctor/`, so adding `.doctor/` to `<repo>/.gitignore`
@@ -141,7 +138,7 @@ pub fn create_run_dir(repo_root: &Path) -> Result<RunDir, BeadsError> {
     // accidentally mutate a host repo's `.gitignore` outside the
     // chokepoint.
     if std::env::var_os(ENV_RUNS_DIR).is_none() {
-        let _ = ensure_doctor_in_gitignore(repo_root);
+        ensure_doctor_in_gitignore(repo_root)?;
     }
 
     Ok(RunDir {
@@ -247,7 +244,7 @@ fn update_latest_symlink(latest_link: &Path, target: &Path) -> Result<(), BeadsE
 ///
 /// 1. **Idempotence**: if `.doctor/`, `.doctor`, or `/.doctor/` is
 ///    already present anywhere in `.gitignore`, this function is a
-///    no-op — no read, no rewrite, no fsync. Repeated `--repair`
+///    no-op — no rewrite, no fsync. Repeated `--repair`
 ///    invocations therefore do not pile up writes.
 /// 2. **Atomic write**: tmp-file + persist + fsync. A concurrent
 ///    reader sees either the old or the new contents, never a torn
@@ -529,6 +526,24 @@ mod tests {
         );
     }
 
+    /// Fresh-eyes follow-up on `beads_rust-dfjs`: if `.gitignore`
+    /// cannot be read/written as a regular file, the doctor must not
+    /// pretend run-dir creation succeeded. Otherwise the public
+    /// success contract ("`.gitignore` contains `.doctor/`") is false,
+    /// and `--repair` can proceed with unignored `.doctor/runs/*`
+    /// artifacts.
+    #[test]
+    fn ensure_doctor_in_gitignore_rejects_non_file_gitignore() {
+        let tmp = unique_temp_root("bad-gitignore");
+        fs::create_dir(tmp.path().join(".gitignore")).expect("directory at .gitignore path");
+
+        let err = ensure_doctor_in_gitignore(tmp.path()).expect_err("directory is not a gitignore");
+        assert!(
+            err.to_string().contains(".gitignore") || err.to_string().contains("directory"),
+            "error should name the invalid gitignore surface: {err}"
+        );
+    }
+
     /// Round-5 fresh-eyes follow-through (`beads_rust-dfjs`): when
     /// `BR_DOCTOR_RUNS_DIR` redirects the runs directory, the
     /// gitignore touch must be skipped so that test fixtures, CI
@@ -561,6 +576,12 @@ mod tests {
              BR_DOCTOR_RUNS_DIR being unset; if you removed that gate, \
              update the chokepoint carveout doc on \
              ensure_doctor_in_gitignore and rewrite this test."
+        );
+        assert!(
+            production_section.contains("ensure_doctor_in_gitignore(repo_root)?;"),
+            "create_run_dir must propagate gitignore update failures; \
+             otherwise its success contract can lie about `.doctor/` \
+             being ignored."
         );
         assert_eq!(
             production_section
