@@ -698,13 +698,13 @@ pub fn execute_undo(args: &DoctorUndoArgs, repo_root: &Path) -> Result<()> {
         // `mutate()` itself.
         let mut capabilities = MutateCapabilities::for_repo(repo_root);
         for record in &actions {
-            let target = repo_root.join(&record.path);
-            if !capabilities
-                .write_scopes
-                .iter()
-                .any(|scope| target.starts_with(scope))
+            if let Ok(target) = workspace_relative_path(repo_root, &record.path)
+                && !capabilities
+                    .write_scopes
+                    .iter()
+                    .any(|scope| target.starts_with(scope))
             {
-                capabilities.write_scopes.push(target.clone());
+                capabilities.write_scopes.push(target);
             }
             if let Some(rt) = &record.rename_to {
                 let rt_path = PathBuf::from(rt);
@@ -818,7 +818,17 @@ fn restore_one(
     backups_dir: &Path,
     record: &StoredActionRecord,
 ) -> UndoStep {
-    let target = repo_root.join(&record.path);
+    let target = match workspace_relative_path(repo_root, &record.path) {
+        Ok(target) => target,
+        Err(e) => {
+            return UndoStep {
+                path: record.path.clone(),
+                op: record.op.clone(),
+                status: format!("failed_invalid_action_path:{e}"),
+                backup_used: None,
+            };
+        }
+    };
     let backup = backups_dir.join(&record.path);
 
     // For Rename ops we recorded an empty after-hash; the recovery is
@@ -857,8 +867,22 @@ fn restore_one(
         }
     };
 
-    // Idempotence: if the live file already matches the backup byte-for-
-    // byte, we've already restored this action.
+    // Verify the backup's hash matches the recorded `before_hash` BEFORE
+    // any other check. If the backup has been tampered with so it now
+    // matches the live file, we must refuse rather than report
+    // `skipped_idempotent` — otherwise a corrupted backup could silently
+    // mask the fault.
+    if !record.before_hash.is_empty() && !before_hash_matches(&record.before_hash, &backup_bytes) {
+        return UndoStep {
+            path: record.path.clone(),
+            op: record.op.clone(),
+            status: "failed_hash_mismatch".to_string(),
+            backup_used: Some(backup.to_string_lossy().into_owned()),
+        };
+    }
+
+    // Idempotence: if the live file already matches the (verified) backup
+    // byte-for-byte, we've already restored this action.
     if let Ok(live) = fs::read(&target)
         && live == backup_bytes
     {
@@ -866,16 +890,6 @@ fn restore_one(
             path: record.path.clone(),
             op: record.op.clone(),
             status: "skipped_idempotent".to_string(),
-            backup_used: Some(backup.to_string_lossy().into_owned()),
-        };
-    }
-
-    // Verify the backup's hash matches the recorded `before_hash`.
-    if !record.before_hash.is_empty() && !before_hash_matches(&record.before_hash, &backup_bytes) {
-        return UndoStep {
-            path: record.path.clone(),
-            op: record.op.clone(),
-            status: "failed_hash_mismatch".to_string(),
             backup_used: Some(backup.to_string_lossy().into_owned()),
         };
     }
@@ -1331,7 +1345,17 @@ fn restore_rename(ctx: &MutateContext, record: &StoredActionRecord, target: Path
 }
 
 fn plan_one(repo_root: &Path, backups_dir: &Path, record: &StoredActionRecord) -> UndoStep {
-    let target = repo_root.join(&record.path);
+    let target = match workspace_relative_path(repo_root, &record.path) {
+        Ok(target) => target,
+        Err(e) => {
+            return UndoStep {
+                path: record.path.clone(),
+                op: record.op.clone(),
+                status: format!("failed_invalid_action_path:{e}"),
+                backup_used: None,
+            };
+        }
+    };
     let backup = backups_dir.join(&record.path);
     if record.op == "rename"
         && let Some(rt) = &record.rename_to
@@ -1767,6 +1791,25 @@ mod tests {
         assert!(workspace_relative_path(tmp.path(), ".doctor/runs/r/s.json").is_ok());
         assert!(workspace_relative_path(tmp.path(), "../outside.json").is_err());
         assert!(workspace_relative_path(tmp.path(), "/tmp/outside.json").is_err());
+    }
+
+    #[test]
+    fn doctor_undo_rejects_non_workspace_action_paths() {
+        let tmp = unique_temp_root("invalid-action-path");
+        let backups = tmp.path().join(".doctor/runs/r/backups");
+        let record = StoredActionRecord {
+            path: "../outside.db".to_string(),
+            op: "db_exec".to_string(),
+            before_hash: "sha256:test".to_string(),
+            rename_to: None,
+            db_snapshots: vec![".doctor/runs/r/backups/db/cache.json".to_string()],
+            affected_tables: Some("blocked_issues_cache".to_string()),
+            affected_predicate: None,
+        };
+
+        let step = plan_one(tmp.path(), &backups, &record);
+
+        assert_eq!(step.status, "failed_invalid_action_path:path_traversal");
     }
 
     #[test]
