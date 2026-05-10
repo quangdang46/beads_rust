@@ -641,3 +641,197 @@ fn chokepoint_robot_triage_envelope_v1() {
     );
     assert_eq!(env["robot_docs_command"], "br doctor robot-docs");
 }
+
+// ---------------------------------------------------------------------------
+// Test 7 — WP4 chokepoint round-trip for `Op::DbExec`
+//
+// Drives the chokepoint directly (instead of the CLI) because:
+//   - The legacy `repair_*` paths still bypass the chokepoint for DB
+//     work in WP4; CLI-level invocations of `--repair` route the cache
+//     rebuild through the non-chokepointed code, so a CLI test would
+//     not exercise the new `Op::DbExec` path.
+//   - The chokepoint is published as `pub` from the `mutate` module; a
+//     direct integration test pins down the contract end-to-end
+//     (capabilities advertises it; mutate() executes it; backups land
+//     in `<run-dir>/backups/db/`; actions.jsonl records the op).
+//
+// The undo path for `Op::DbExec` is **not** yet wired in WP4 — it
+// requires a new replay handler that reads the JSON snapshots and
+// re-INSERTs them. The "undo verifies forward path" portion of the
+// contract is therefore captured as `chokepoint_db_exec_undo_replay`
+// (`#[ignore]` + a follow-up bead).
+// ---------------------------------------------------------------------------
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn chokepoint_db_exec_round_trip() {
+    use beads_rust::cli::commands::doctor_subsystems::mutate::{
+        Capabilities, DbArg, MutateContext, Op, mutate,
+    };
+    use fsqlite::Connection;
+    use std::sync::Mutex;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let root = tmp.path().to_path_buf();
+    let beads_dir = root.join(".beads");
+    fs::create_dir_all(&beads_dir).expect("mkdir .beads");
+    let db_path = beads_dir.join("beads.db");
+
+    // Build a minimal DB with the cache table and intentionally-corrupt
+    // contents (a row whose blocked_by is wrong on purpose).
+    {
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        conn.execute(
+            "CREATE TABLE blocked_issues_cache (
+                issue_id TEXT PRIMARY KEY,
+                blocked_by TEXT NOT NULL,
+                blocked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blocked_issues_cache(issue_id, blocked_by, blocked_at) \
+             VALUES ('bd-1', '[\"WRONG\"]', '2026-05-01 00:00:00')",
+        )
+        .unwrap();
+        let _ = conn.close();
+    }
+
+    // Build a chokepoint context rooted at `root`.
+    let run_id = "wp4-db-exec-roundtrip".to_string();
+    let run_dir = root.join(".doctor").join("runs").join(&run_id);
+    fs::create_dir_all(run_dir.join("backups")).unwrap();
+    let actions_path = run_dir.join("actions.jsonl");
+    let actions_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&actions_path)
+        .unwrap();
+    let ctx = MutateContext {
+        run_id: run_id.clone(),
+        run_dir: run_dir.clone(),
+        capabilities: Capabilities::for_repo(&root),
+        actions_file: Mutex::new(actions_file),
+        fixer_id: "wp4-cache-rebuild".to_string(),
+        repo_root: root.clone(),
+        dry_run: false,
+        start_ns: 0,
+    };
+
+    // Forward path: rebuild the cache via DELETE + INSERT inside the
+    // chokepoint. We do TWO DbExec ops because fsqlite's executor only
+    // accepts one statement per call.
+    let result_delete = mutate(
+        &ctx,
+        &db_path,
+        Op::DbExec {
+            sql: "DELETE FROM blocked_issues_cache".into(),
+            args: vec![],
+            affected_tables: vec!["blocked_issues_cache".into()],
+            affected_predicate: None,
+        },
+    )
+    .expect("DELETE via chokepoint should succeed");
+    assert!(result_delete.ok);
+
+    let result_insert = mutate(
+        &ctx,
+        &db_path,
+        Op::DbExec {
+            sql: "INSERT INTO blocked_issues_cache(issue_id, blocked_by, blocked_at) \
+                  VALUES (?, ?, ?)"
+                .into(),
+            args: vec![
+                DbArg::Text("bd-1".into()),
+                DbArg::Text("[\"bd-2\"]".into()),
+                DbArg::Text("2026-05-09 00:00:00".into()),
+            ],
+            affected_tables: vec!["blocked_issues_cache".into()],
+            affected_predicate: None,
+        },
+    )
+    .expect("INSERT via chokepoint should succeed");
+    assert!(result_insert.ok);
+
+    // The cache now has the corrected row.
+    {
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let rows = conn
+            .query("SELECT issue_id, blocked_by FROM blocked_issues_cache")
+            .unwrap();
+        assert_eq!(rows.len(), 1, "expected one cache row after rebuild");
+        let blocked_by = match rows[0].get(1) {
+            Some(fsqlite_types::value::SqliteValue::Text(s)) => s.to_string(),
+            other => panic!("unexpected blocked_by value: {other:?}"),
+        };
+        assert_eq!(blocked_by, "[\"bd-2\"]");
+        let _ = conn.close();
+    }
+
+    // actions.jsonl: two `db_exec` lines, each with the snapshot
+    // fingerprint we configured.
+    let log = fs::read_to_string(&actions_path).expect("read actions.jsonl");
+    let lines: Vec<&str> = log.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "expected exactly two action lines; got {lines:?}"
+    );
+    for raw in &lines {
+        let v: Value = serde_json::from_str(raw).expect("parse action line");
+        assert_eq!(v["op"], "db_exec");
+        assert_eq!(v["fixer_id"], "wp4-cache-rebuild");
+        assert_eq!(v["affected_tables"], "blocked_issues_cache");
+        assert!(v["before_hash"].as_str().unwrap().starts_with("sha256:"));
+        assert!(v["after_hash"].as_str().unwrap().starts_with("sha256:"));
+    }
+
+    // Snapshots: at least one JSON snapshot in backups/db/ that
+    // captures the pre-DELETE state (a row with blocked_by="[\"WRONG\"]").
+    let snap_dir = run_dir.join("backups/db");
+    let snap_files: Vec<PathBuf> = fs::read_dir(&snap_dir)
+        .expect("read backups/db")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .collect();
+    assert!(
+        !snap_files.is_empty(),
+        "expected at least one snapshot under {}",
+        snap_dir.display()
+    );
+
+    let mut found_pre_delete = false;
+    for snap in &snap_files {
+        let body = fs::read_to_string(snap).unwrap();
+        let v: Value = serde_json::from_str(&body).expect("snapshot is JSON");
+        assert_eq!(v["table"], "blocked_issues_cache");
+        assert_eq!(v["schema_version"], "br.doctor.db_snapshot.v1");
+        let rows = v["rows"].as_array().expect("rows array");
+        if rows.iter().any(|r| {
+            r.get("issue_id").and_then(Value::as_str) == Some("bd-1")
+                && r.get("blocked_by").and_then(Value::as_str) == Some("[\"WRONG\"]")
+        }) {
+            found_pre_delete = true;
+        }
+    }
+    assert!(
+        found_pre_delete,
+        "expected a snapshot capturing the pre-DELETE corrupt row; got {snap_files:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 8 — WP4 follow-up: undo of `Op::DbExec` re-inserts JSON snapshots
+//
+// IGNORED: undo for DB ops is a follow-up bead. The forward path
+// (Test 7) is sufficient as a WP4 deliverable; a full replay handler
+// that reads `<run-dir>/backups/db/<table>__<sha8>__<ns>.json` and
+// re-INSERTs rows belongs in WP5.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "WP4 follow-up: undo replay for Op::DbExec snapshots not yet wired (filed as a P1 bead)"]
+fn chokepoint_db_exec_undo_replay() {
+    // Placeholder so the test name shows up in `cargo test --list`
+    // and the bead has a concrete failing target to attach to.
+    panic!("WP5 will land the snapshot-driven undo replay for Op::DbExec");
+}
