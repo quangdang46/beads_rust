@@ -2680,6 +2680,15 @@ pub struct DoctorArgs {
     #[arg(long = "robot-triage")]
     pub robot_triage: bool,
 
+    /// Fast path for pre-commit / CI: skip the slow detectors
+    /// (`db.recoverable_anomalies`, `counts.db_vs_jsonl`,
+    /// `sync.metadata`, `sqlite.cli_integrity`, `db.write_probe`) and
+    /// run only the cheap ones. Returns exit 0 if no findings, 1 if
+    /// findings present. Target latency: <1s on a healthy workspace.
+    /// Always read-only; ignored under `--repair`.
+    #[arg(long)]
+    pub quick: bool,
+
     /// Optional WP6 subcommand. When `None`, the flat doctor handler
     /// (above) runs as it always has.
     #[command(subcommand)]

@@ -3877,6 +3877,28 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     };
 
     if !args.repair {
+        if args.quick {
+            // Phase 8: drop the slow detectors so pre-commit / CI can
+            // gate on a sub-second `br doctor --quick --json`. The
+            // dropped detectors are: db.recoverable_anomalies,
+            // counts.db_vs_jsonl, sync.metadata, sqlite.cli_integrity,
+            // db.write_probe. The remaining checks are all O(file
+            // existence) or single PRAGMA so they stay cheap.
+            initial.report.checks.retain(|c| {
+                !matches!(
+                    c.name.as_str(),
+                    "db.recoverable_anomalies"
+                        | "counts.db_vs_jsonl"
+                        | "sync.metadata"
+                        | "sqlite.cli_integrity"
+                        | "sqlite3.integrity_check"
+                        | "db.write_probe"
+                )
+            });
+            // Recompute `ok` from the filtered set so the exit code
+            // reflects only the cheap checks the caller asked for.
+            initial.report.ok = !has_error(&initial.report.checks);
+        }
         print_report(&initial.report, ctx)?;
         if !initial.report.ok {
             std::process::exit(1);
