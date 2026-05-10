@@ -25,7 +25,7 @@
 
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
@@ -599,6 +599,11 @@ struct StoredActionRecord {
     /// the corresponding DbExec call. Empty for non-DbExec ops.
     #[serde(default)]
     db_snapshots: Vec<String>,
+    /// Optional `sha256:<hex>` digests of each `db_snapshots` body, in
+    /// matching order. Older action records may omit this; if present,
+    /// undo verifies every snapshot before parsing and replay.
+    #[serde(default)]
+    db_snapshot_sha256: Vec<String>,
     /// Comma-separated list of affected table names recorded by the
     /// DbExec forward path. The undo replay cross-checks this against
     /// the table names inside `db_snapshots` before touching the DB.
@@ -1001,8 +1006,19 @@ fn read_db_snapshot_envelopes(
     repo_root: &Path,
     record: &StoredActionRecord,
 ) -> std::result::Result<Vec<DbSnapshotEnvelope>, UndoStep> {
+    if !record.db_snapshot_sha256.is_empty()
+        && record.db_snapshot_sha256.len() != record.db_snapshots.len()
+    {
+        return Err(UndoStep {
+            path: record.path.clone(),
+            op: record.op.clone(),
+            status: "failed_snapshot_sha_count_mismatch".to_string(),
+            backup_used: Some(record.db_snapshots.join(",")),
+        });
+    }
+
     let mut envelopes = Vec::with_capacity(record.db_snapshots.len());
-    for rel_snap in &record.db_snapshots {
+    for (idx, rel_snap) in record.db_snapshots.iter().enumerate() {
         let snap_path = workspace_relative_path(repo_root, rel_snap).map_err(|e| UndoStep {
             path: record.path.clone(),
             op: record.op.clone(),
@@ -1015,6 +1031,17 @@ fn read_db_snapshot_envelopes(
             status: format!("failed_read_snapshot:{e}"),
             backup_used: Some(snap_path.to_string_lossy().into_owned()),
         })?;
+        if let Some(expected) = record.db_snapshot_sha256.get(idx) {
+            let actual = sha256_bytes_hex_prefixed(&body);
+            if &actual != expected {
+                return Err(UndoStep {
+                    path: record.path.clone(),
+                    op: record.op.clone(),
+                    status: format!("failed_snapshot_sha_mismatch:{rel_snap}"),
+                    backup_used: Some(snap_path.to_string_lossy().into_owned()),
+                });
+            }
+        }
         let env = serde_json::from_slice(&body).map_err(|e| UndoStep {
             path: record.path.clone(),
             op: record.op.clone(),
@@ -1409,7 +1436,19 @@ fn plan_db_exec(repo_root: &Path, record: &StoredActionRecord) -> UndoStep {
             backup_used: None,
         };
     }
-    for rel_snap in &record.db_snapshots {
+    // Same length-binding the live undo path enforces, applied here too
+    // so `--dry-run` reports the hash gap before a real replay does.
+    if !record.db_snapshot_sha256.is_empty()
+        && record.db_snapshot_sha256.len() != record.db_snapshots.len()
+    {
+        return UndoStep {
+            path: record.path.clone(),
+            op: record.op.clone(),
+            status: "failed_snapshot_sha_count_mismatch".to_string(),
+            backup_used: Some(record.db_snapshots.join(",")),
+        };
+    }
+    for (idx, rel_snap) in record.db_snapshots.iter().enumerate() {
         let snap_path = match workspace_relative_path(repo_root, rel_snap) {
             Ok(p) => p,
             Err(e) => {
@@ -1429,6 +1468,31 @@ fn plan_db_exec(repo_root: &Path, record: &StoredActionRecord) -> UndoStep {
                 backup_used: Some(snap_path.to_string_lossy().into_owned()),
             };
         }
+        // If the action record carries a hash, verify the on-disk body
+        // matches it. A mismatch here flags snapshot tampering — exactly
+        // the round-2 left-open item — and we refuse rather than
+        // pretend the dry-run would have worked.
+        if let Some(expected) = record.db_snapshot_sha256.get(idx) {
+            let bytes = match fs::read(&snap_path) {
+                Ok(b) => b,
+                Err(e) => {
+                    return UndoStep {
+                        path: record.path.clone(),
+                        op: record.op.clone(),
+                        status: format!("failed_read_snapshot:{e}"),
+                        backup_used: Some(snap_path.to_string_lossy().into_owned()),
+                    };
+                }
+            };
+            if &sha256_bytes_hex_prefixed(&bytes) != expected {
+                return UndoStep {
+                    path: record.path.clone(),
+                    op: record.op.clone(),
+                    status: format!("failed_snapshot_sha_mismatch:{rel_snap}"),
+                    backup_used: Some(snap_path.to_string_lossy().into_owned()),
+                };
+            }
+        }
     }
     UndoStep {
         path: record.path.clone(),
@@ -1439,10 +1503,13 @@ fn plan_db_exec(repo_root: &Path, record: &StoredActionRecord) -> UndoStep {
 }
 
 fn before_hash_matches(expected: &str, bytes: &[u8]) -> bool {
+    sha256_bytes_hex_prefixed(bytes) == expected
+}
+
+fn sha256_bytes_hex_prefixed(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let h = Sha256::digest(bytes);
-    let prefixed = format!("sha256:{}", crate::util::hex_encode(&h));
-    prefixed == expected
+    format!("sha256:{}", crate::util::hex_encode(&h))
 }
 
 fn find_latest_run(runs_root: &Path) -> Result<Option<String>> {
@@ -1532,7 +1599,6 @@ fn mark_report_undone(run_dir_path: &Path, run_id: &str) -> Result<()> {
     // undo bookkeeping is itself crash-safe.
     let parent = report.parent().unwrap_or_else(|| Path::new("."));
     let mut tmp = tempfile::NamedTempFile::new_in(parent).map_err(BeadsError::Io)?;
-    use std::io::Write as IoWrite;
     tmp.write_all(&bytes).map_err(BeadsError::Io)?;
     tmp.as_file().sync_data().map_err(BeadsError::Io)?;
     tmp.persist(&report).map_err(|e| BeadsError::Io(e.error))?;
@@ -1784,6 +1850,7 @@ mod tests {
             before_hash: "sha256:test".to_string(),
             rename_to: None,
             db_snapshots: vec![".doctor/runs/r/backups/db/cache.json".to_string()],
+            db_snapshot_sha256: Vec::new(),
             affected_tables: Some("blocked_issues_cache".to_string()),
             affected_predicate: None,
         };
@@ -1808,6 +1875,7 @@ mod tests {
             before_hash: "sha256:test".to_string(),
             rename_to: None,
             db_snapshots: vec![".doctor/runs/r/backups/db/cache.json".to_string()],
+            db_snapshot_sha256: Vec::new(),
             affected_tables: Some("blocked_issues_cache".to_string()),
             affected_predicate: Some("issue_id = 'bd-1'".to_string()),
         };
@@ -1846,6 +1914,7 @@ mod tests {
             before_hash: "sha256:test".to_string(),
             rename_to: None,
             db_snapshots: vec![".doctor/runs/r/backups/db/cache.json".to_string()],
+            db_snapshot_sha256: Vec::new(),
             affected_tables: Some("blocked_issues_cache".to_string()),
             affected_predicate: None,
         };
@@ -1853,6 +1922,33 @@ mod tests {
         let step = plan_one(tmp.path(), &backups, &record);
 
         assert_eq!(step.status, "failed_invalid_action_path:path_traversal");
+    }
+
+    #[test]
+    fn db_snapshot_reader_rejects_snapshot_sha_mismatch() {
+        let tmp = unique_temp_root("snapshot-sha-mismatch");
+        let rel = ".doctor/runs/r/backups/db/cache.json";
+        let snap = tmp.path().join(rel);
+        fs::create_dir_all(snap.parent().unwrap()).unwrap();
+        fs::write(
+            &snap,
+            br#"{"schema_version":"br.doctor.db_snapshot.v1","table":"blocked_issues_cache","predicate":null,"columns":[],"rows":[]}"#,
+        )
+        .unwrap();
+        let record = StoredActionRecord {
+            path: ".beads/beads.db".to_string(),
+            op: "db_exec".to_string(),
+            before_hash: "sha256:test".to_string(),
+            rename_to: None,
+            db_snapshots: vec![rel.to_string()],
+            db_snapshot_sha256: vec!["sha256:not-the-snapshot".to_string()],
+            affected_tables: Some("blocked_issues_cache".to_string()),
+            affected_predicate: None,
+        };
+
+        let step = read_db_snapshot_envelopes(tmp.path(), &record).unwrap_err();
+
+        assert!(step.status.starts_with("failed_snapshot_sha_mismatch:"));
     }
 
     #[test]
@@ -2180,6 +2276,47 @@ mod tests {
 
         let latest = latest_run_from_symlink(&runs_root).unwrap();
         assert_eq!(latest, Some("20260101T000000Z__legit".into()));
+    }
+
+    /// Regression for the round-3 hash-bind: plan_db_exec must refuse
+    /// when the on-disk snapshot body has been edited under our feet,
+    /// even in `--dry-run` mode. Without the hash-bind, a tampered
+    /// snapshot would parse and be reported as `would_restore`, then
+    /// silently inject the attacker's rows on a real undo.
+    #[test]
+    fn plan_db_exec_rejects_tampered_snapshot_body() {
+        let tmp = unique_temp_root("plan-db-tamper");
+        let repo = tmp.path();
+        let snap_rel = ".doctor/runs/r/backups/db/cache.json";
+        let snap_abs = repo.join(snap_rel);
+        fs::create_dir_all(snap_abs.parent().unwrap()).unwrap();
+        // Write a "genuine" snapshot body and record its hash. Then
+        // overwrite the file (simulating tampering) and ask the plan
+        // path what it thinks.
+        let genuine = b"{\"schema_version\":\"br.doctor.db_snapshot.v1\",\"rows\":[]}";
+        fs::write(&snap_abs, genuine).unwrap();
+        let expected_sha = sha256_bytes_hex_prefixed(genuine);
+
+        // Tamper.
+        fs::write(&snap_abs, b"{\"schema_version\":\"br.doctor.db_snapshot.v1\",\"rows\":[{\"injected\":true}]}").unwrap();
+
+        let record = StoredActionRecord {
+            path: ".beads/beads.db".to_string(),
+            op: "db_exec".to_string(),
+            before_hash: "sha256:test".to_string(),
+            rename_to: None,
+            db_snapshots: vec![snap_rel.to_string()],
+            db_snapshot_sha256: vec![expected_sha],
+            affected_tables: Some("cache".to_string()),
+            affected_predicate: None,
+        };
+
+        let step = plan_db_exec(repo, &record);
+        assert!(
+            step.status.starts_with("failed_snapshot_sha_mismatch"),
+            "plan must refuse tampered snapshot bodies, got {}",
+            step.status
+        );
     }
 
     #[test]

@@ -316,6 +316,15 @@ struct DbActionRecord<'a> {
     /// exact snapshots that were taken before the SQL fired.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     db_snapshots: Vec<String>,
+    /// `sha256:<hex>` digests of each `db_snapshots` body, in the same
+    /// order. Recorded so `br doctor undo` can verify that the on-disk
+    /// snapshot file has not been tampered with between the forward
+    /// DbExec and the replay. Without this binding, an attacker
+    /// (or a buggy out-of-band tool) editing
+    /// `.doctor/runs/<run-id>/backups/db/*.json` could inject rows on
+    /// undo. Empty for non-DbExec ops.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    db_snapshot_sha256: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     migrate_from: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -329,6 +338,9 @@ struct DbMutationOutcome {
     affected_tables: Option<String>,
     affected_predicate: Option<String>,
     db_snapshots: Vec<String>,
+    /// Per-snapshot SHA-256 digests in the same order as `db_snapshots`.
+    /// Empty for migrate ops (no row-level snapshots there).
+    db_snapshot_sha256: Vec<String>,
 }
 
 /// Compute `sha256:<hex>` of `bytes`.
@@ -685,27 +697,39 @@ fn mutate_db(
                 &tables_for_snapshot,
                 predicate_for_snapshot.as_deref(),
             )
-            .map(|snapshots| {
+            .map(|artifacts| {
                 let table_summary = if tables_for_snapshot.is_empty() {
                     None
                 } else {
                     Some(tables_for_snapshot.join(","))
                 };
-                let snapshot_strs: Vec<String> = snapshots
-                    .into_iter()
-                    .map(|p| {
-                        p.strip_prefix(&ctx.repo_root)
-                            .unwrap_or(&p)
+                let mut snapshot_strs = Vec::with_capacity(artifacts.len());
+                let mut snapshot_hashes = Vec::with_capacity(artifacts.len());
+                // The body-level sha256 is computed by `snapshot_db_table`
+                // BEFORE the snapshot file is written and returned here in
+                // `artifact.sha256_prefixed`. Recording it in
+                // actions.jsonl is what gives `br doctor undo` a way to
+                // detect snapshot-file tampering between the forward
+                // DbExec and the replay — closing the round-2 follow-up
+                // gap on hash-binding the snapshot to the action.
+                for artifact in artifacts {
+                    snapshot_strs.push(
+                        artifact
+                            .path
+                            .strip_prefix(&ctx.repo_root)
+                            .unwrap_or(&artifact.path)
                             .to_string_lossy()
-                            .into_owned()
-                    })
-                    .collect();
+                            .into_owned(),
+                    );
+                    snapshot_hashes.push(artifact.sha256_prefixed);
+                }
                 DbMutationOutcome {
                     after_hash: sha256_file_hex_prefixed(path)
                         .unwrap_or_else(|_| SHA256_EMPTY_PREFIXED.to_string()),
                     affected_tables: table_summary,
                     affected_predicate: predicate_for_snapshot,
                     db_snapshots: snapshot_strs,
+                    db_snapshot_sha256: snapshot_hashes,
                 }
             })
         }
@@ -717,6 +741,7 @@ fn mutate_db(
                 affected_tables: None,
                 affected_predicate: None,
                 db_snapshots: Vec::new(),
+                db_snapshot_sha256: Vec::new(),
             })
         }
         _ => unreachable!("mutate_db only handles DB ops"),
@@ -727,6 +752,7 @@ fn mutate_db(
         affected_tables: db_affected_tables,
         affected_predicate: db_predicate,
         db_snapshots,
+        db_snapshot_sha256,
     } = exec_result?;
     let finished_at_ns = now_ns().saturating_sub(ctx.start_ns);
 
@@ -752,6 +778,7 @@ fn mutate_db(
         affected_tables: db_affected_tables,
         affected_predicate: db_predicate,
         db_snapshots,
+        db_snapshot_sha256,
         migrate_from,
         migrate_to,
         warning,
@@ -811,7 +838,7 @@ fn run_db_exec(
     args: &[fsqlite_types::value::SqliteValue],
     affected_tables: &[String],
     affected_predicate: Option<&str>,
-) -> Result<Vec<PathBuf>, BeadsError> {
+) -> Result<Vec<DbSnapshotArtifact>, BeadsError> {
     use fsqlite::Connection;
 
     // Pre-flight identifier validation so we fail fast before opening
@@ -820,7 +847,7 @@ fn run_db_exec(
         validate_identifier(table)?;
     }
 
-    let mut snapshot_paths: Vec<PathBuf> = Vec::with_capacity(affected_tables.len());
+    let mut snapshot_artifacts: Vec<DbSnapshotArtifact> = Vec::with_capacity(affected_tables.len());
 
     // Single connection for the entire snapshot+mutate transaction.
     // Acquire BEGIN IMMEDIATE *before* the SELECTs so the writer lock
@@ -835,16 +862,21 @@ fn run_db_exec(
     // in this loop must ROLLBACK + scrub the partial snapshot files we
     // already wrote — they have no actions.jsonl entry referencing them.
     for table in affected_tables {
-        let snap_path = match snapshot_db_table(&conn, backups_db, table, affected_predicate) {
-            Ok(p) => p,
+        let artifact = match snapshot_db_table(&conn, backups_db, table, affected_predicate) {
+            Ok(a) => a,
             Err(e) => {
                 let _ = conn.execute("ROLLBACK");
                 let _ = conn.close();
-                scrub_orphan_snapshots(&snapshot_paths);
+                scrub_orphan_snapshots(
+                    &snapshot_artifacts
+                        .iter()
+                        .map(|a| a.path.clone())
+                        .collect::<Vec<_>>(),
+                );
                 return Err(e);
             }
         };
-        snapshot_paths.push(snap_path);
+        snapshot_artifacts.push(artifact);
     }
 
     // Run the mutating SQL on the same connection, still inside
@@ -862,19 +894,42 @@ fn run_db_exec(
             if let Err(e) = conn.execute("COMMIT") {
                 let _ = conn.execute("ROLLBACK");
                 let _ = conn.close();
-                scrub_orphan_snapshots(&snapshot_paths);
+                scrub_orphan_snapshots(
+                    &snapshot_artifacts
+                        .iter()
+                        .map(|a| a.path.clone())
+                        .collect::<Vec<_>>(),
+                );
                 return Err(e.into());
             }
         }
         Err(e) => {
             let _ = conn.execute("ROLLBACK");
             let _ = conn.close();
-            scrub_orphan_snapshots(&snapshot_paths);
+            scrub_orphan_snapshots(
+                &snapshot_artifacts
+                    .iter()
+                    .map(|a| a.path.clone())
+                    .collect::<Vec<_>>(),
+            );
             return Err(e.into());
         }
     }
     let _ = conn.close();
-    Ok(snapshot_paths)
+    Ok(snapshot_artifacts)
+}
+
+/// Returned by [`snapshot_db_table`] / [`run_db_exec`]. Pairs the
+/// snapshot file's on-disk path with the `sha256:<hex>` digest of the
+/// body that was just written. The digest is recorded in
+/// `actions.jsonl` and re-verified by `br doctor undo` to detect
+/// tampering of the snapshot file between the forward DbExec and the
+/// replay — closing the round-2 follow-up gap where an attacker editing
+/// the snapshot body could inject rows on undo.
+#[derive(Debug, Clone)]
+pub(crate) struct DbSnapshotArtifact {
+    pub path: PathBuf,
+    pub sha256_prefixed: String,
 }
 
 fn snapshot_db_table(
@@ -882,7 +937,7 @@ fn snapshot_db_table(
     backups_db: &Path,
     table: &str,
     affected_predicate: Option<&str>,
-) -> Result<PathBuf, BeadsError> {
+) -> Result<DbSnapshotArtifact, BeadsError> {
     let predicate = affected_predicate.unwrap_or("").trim();
     let select_sql = if predicate.is_empty() {
         format!("SELECT * FROM {table}")
@@ -917,7 +972,13 @@ fn snapshot_db_table(
         "rows": json_rows,
     });
     let body = serde_json::to_vec_pretty(&snapshot_envelope).map_err(BeadsError::Json)?;
-    write_unique_db_snapshot(backups_db, table, predicate_hash, &body).map_err(BeadsError::Io)
+    let body_sha256 = sha256_hex_prefixed(&body);
+    let path = write_unique_db_snapshot(backups_db, table, predicate_hash, &body)
+        .map_err(BeadsError::Io)?;
+    Ok(DbSnapshotArtifact {
+        path,
+        sha256_prefixed: body_sha256,
+    })
 }
 
 /// Best-effort removal of snapshot files that were written before a
@@ -1616,6 +1677,12 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(line).unwrap();
         assert_eq!(v["op"], "db_exec");
         assert_eq!(v["affected_tables"], "sample_widgets");
+        let hashes = v["db_snapshot_sha256"].as_array().unwrap();
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(
+            hashes[0].as_str().unwrap(),
+            sha256_hex_prefixed(body.as_bytes())
+        );
     }
 
     #[test]
