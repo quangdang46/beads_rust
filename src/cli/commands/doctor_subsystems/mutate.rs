@@ -53,10 +53,9 @@
 //! [`Op::DbMigrate`] runs a versioned schema migration end-to-end:
 //! verbatim `beads.db.pre-migrate` snapshot, `PRAGMA user_version ==
 //! from` precondition gate, then
-//! [`crate::storage::schema::run_migrations_atomic`] inside `BEGIN
-//! IMMEDIATE`/`COMMIT`. Failure rolls back AND restores the DB file
-//! from the snapshot. `beads_rust-folg` closed when the public hook
-//! landed.
+//! [`crate::storage::schema::run_migrations_atomic`]. Failure restores
+//! the DB file from the snapshot. `beads_rust-folg` closed when the
+//! public hook landed.
 //!
 //! ## Crate-internal-only
 //!
@@ -138,9 +137,8 @@ pub enum Op {
     /// Run a versioned schema migration end-to-end. WP4 + `beads_rust-folg`:
     /// the chokepoint snapshots `beads.db.pre-migrate` verbatim, verifies
     /// `PRAGMA user_version == from`, then drives
-    /// [`crate::storage::schema::run_migrations_atomic`] inside an outer
-    /// `BEGIN IMMEDIATE`/`COMMIT`. Failure rolls back AND restores the
-    /// DB file from the snapshot.
+    /// [`crate::storage::schema::run_migrations_atomic`]. Failure restores
+    /// the DB file from the snapshot.
     DbMigrate { from: u32, to: u32 },
     /// Replace the symlink at `path` with one pointing at `target`.
     /// Implemented atomically via tmp-symlink + rename.
@@ -176,7 +174,7 @@ impl DbArg {
             Self::Null => SqliteValue::Null,
             Self::I64(n) => SqliteValue::Integer(*n),
             Self::F64(f) => SqliteValue::Float(*f),
-            Self::Text(s) => SqliteValue::Text(std::sync::Arc::from(s.as_str())),
+            Self::Text(s) => SqliteValue::Text(s.as_str().into()),
             Self::Blob(b) => SqliteValue::Blob(std::sync::Arc::from(b.as_slice())),
         }
     }
@@ -642,8 +640,8 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
 ///    For `DbMigrate`: snapshot the entire DB file verbatim to
 ///    `<run-dir>/backups/db/beads.db.pre-migrate`.
 /// 3. Open a writable `fsqlite::Connection`, run the work inside
-///    `BEGIN IMMEDIATE` / `COMMIT`. On any error, `ROLLBACK` and
-///    return without writing an `actions.jsonl` line.
+///    the migration hook. On any error, restore from the pre-migrate
+///    snapshot and return without writing an `actions.jsonl` line.
 /// 4. Compute `after_hash` from the post-COMMIT DB file SHA-256.
 /// 5. Append a single `actions.jsonl` record describing the op.
 #[allow(clippy::too_many_lines)]
@@ -1103,8 +1101,7 @@ fn sqlite_value_to_json(val: &fsqlite_types::value::SqliteValue) -> serde_json::
 /// 2. Verify `PRAGMA user_version == from` and refuse with an internal
 ///    error otherwise.
 /// 3. Call [`crate::storage::schema::run_migrations_atomic`] which
-///    wraps `run_migrations` in `BEGIN IMMEDIATE`/`COMMIT` and stamps
-///    `PRAGMA user_version = to`.
+///    drives the migration steps and stamps `PRAGMA user_version = to`.
 /// 4. On any failure, restore the DB file from the snapshot before
 ///    returning the error.
 ///
@@ -1165,11 +1162,10 @@ fn run_db_migrate(
     }
 
     // (3) Drive the actual DDL via the new public hook
-    //     `crate::storage::schema::run_migrations_atomic` which wraps
-    //     `run_migrations` in BEGIN IMMEDIATE / COMMIT and stamps
+    //     `crate::storage::schema::run_migrations_atomic`, which stamps
     //     `PRAGMA user_version = to`. On any failure the chokepoint's
-    //     outer recovery path can restore from the pre-migrate snapshot
-    //     we wrote in step (1).
+    //     recovery path can restore from the pre-migrate snapshot we
+    //     wrote in step (1).
     let migrate_conn = Connection::open(db_path.to_string_lossy().into_owned())?;
     let migration_result = crate::storage::schema::run_migrations_atomic(&migrate_conn, from, to);
     let _ = migrate_conn.close();
@@ -1340,35 +1336,30 @@ fn execute_atomic(
 ///    [`super::surface::restore_one`] handles any non-rename, non-db
 ///    op by restoring the verbatim backup).
 ///
-/// In `dry_run`, no backup is written and no `actions.jsonl` line is
-/// appended; the closure is still invoked, mirroring `mutate()`'s
-/// pre-existing dry-run semantics for ops that have side effects
-/// outside the chokepoint's control. Callers gate the legacy work on
-/// `ctx.dry_run` themselves where appropriate.
+/// In `dry_run`, no backup is written, no `actions.jsonl` line is
+/// appended, and the legacy closure is not invoked.
 ///
 /// # Errors
 ///
 /// - Returns [`BeadsError`] if any path is outside `write_scopes`.
-/// - Returns the legacy closure's `Err(T)` unchanged if it faults.
+/// - Returns the legacy closure's error unchanged if it faults.
 /// - Returns [`BeadsError::Io`] if backup/hashing/log-write I/O fails.
 ///
-/// The closure's return value `T` is bubbled up to the caller so the
-/// existing legacy result-collection patterns (e.g.,
-/// `LocalRepairResult` accumulation) stay intact.
-pub fn record_legacy_op<F, T>(
+/// The closure returns `()` because legacy fixer state is accumulated by
+/// capturing mutable state from the caller.
+pub fn record_legacy_op<F>(
     ctx: &MutateContext,
     fixer_id: &str,
     paths: &[&Path],
     legacy: F,
-) -> Result<T, BeadsError>
+) -> Result<(), BeadsError>
 where
-    F: FnOnce() -> Result<T, BeadsError>,
+    F: FnOnce() -> Result<(), BeadsError>,
 {
     // (1) + (2) + (3): pre-state capture for every target. We collect
     // before doing any disk write so a precondition failure on path N
     // does not leave a partial backup tree behind for paths 0..N-1.
-    let mut pre_state: Vec<(PathBuf, PathBuf, String, bool)> =
-        Vec::with_capacity(paths.len());
+    let mut pre_state: Vec<(PathBuf, PathBuf, String, bool)> = Vec::with_capacity(paths.len());
     for path in paths {
         ensure_in_scope(&ctx.capabilities, path)?;
         let bytes_or_missing = match fs::read(path) {
@@ -1398,7 +1389,7 @@ where
         for (path, _, _, _) in &pre_state {
             eprintln!("[dry-run] would mutate {}: legacy_op", path.display());
         }
-        return legacy();
+        return Ok(());
     }
 
     // (4) Run the legacy work. If it errors, we still record the audit
@@ -1445,8 +1436,7 @@ where
         // ActionRecord is a stable wire contract shared with non-legacy
         // ops.
         if !existed_before {
-            line = line.trim_end_matches('}').to_string()
-                + ",\"existed_before\":false}";
+            line = line.trim_end_matches('}').to_string() + ",\"existed_before\":false}";
         }
         line.push('\n');
         let mut f = ctx.actions_file.lock().map_err(|e| {
@@ -1571,6 +1561,45 @@ mod tests {
         assert!(!backup.exists());
         // No actions.jsonl line written.
         assert_eq!(fs::metadata(&actions_path).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn legacy_op_dry_run_does_not_invoke_legacy_closure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let target = beads_dir.join("legacy.txt");
+        fs::write(&target, b"original").unwrap();
+
+        let (ctx, actions_path) = make_ctx(tmp.path(), true);
+        let invoked = std::cell::Cell::new(false);
+
+        record_legacy_op(&ctx, "legacy-dry-run", &[&target], || {
+            invoked.set(true);
+            fs::write(&target, b"mutated").map_err(BeadsError::Io)?;
+            Ok(())
+        })
+        .expect("dry-run legacy op should succeed");
+
+        assert!(
+            !invoked.get(),
+            "dry-run legacy op must not invoke the mutating closure"
+        );
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            b"original",
+            "dry-run legacy op must leave target bytes unchanged"
+        );
+        let backup = ctx.run_dir.join("backups/.beads/legacy.txt");
+        assert!(
+            !backup.exists(),
+            "dry-run legacy op must not create a backup"
+        );
+        assert_eq!(
+            fs::metadata(&actions_path).unwrap().len(),
+            0,
+            "dry-run legacy op must not append actions.jsonl"
+        );
     }
 
     #[test]
@@ -1984,8 +2013,7 @@ mod tests {
         // migration has a real upgrade to run.
         {
             let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
-            crate::storage::schema::apply_schema(&conn)
-                .expect("apply_schema on fresh test DB");
+            crate::storage::schema::apply_schema(&conn).expect("apply_schema on fresh test DB");
             // Demote user_version so run_migrations_atomic has work to do.
             conn.execute("PRAGMA user_version = 7").unwrap();
             let _ = conn.close();
@@ -2038,7 +2066,9 @@ mod tests {
             );
             // v9 unconditionally adds close_metadata.
             let rows = conn
-                .query("SELECT name FROM sqlite_master WHERE type='table' AND name='close_metadata'")
+                .query(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='close_metadata'",
+                )
                 .unwrap();
             assert_eq!(
                 rows.len(),

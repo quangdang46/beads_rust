@@ -1,5 +1,6 @@
 //! Database schema definitions and migration logic.
 
+use chrono::Utc;
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
 
@@ -472,9 +473,7 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
 }
 
 /// Run schema migrations to bring the connected database from
-/// `PRAGMA user_version == from` up to `target_version`, wrapping the
-/// whole sequence in `BEGIN IMMEDIATE` / `COMMIT` so the chokepoint
-/// caller can drive a `Op::DbMigrate` atomically.
+/// `PRAGMA user_version == from` up to `target_version`.
 ///
 /// This is the **public hook** for `doctor_subsystems::mutate::Op::DbMigrate`
 /// (`beads_rust-folg`). The chokepoint already verifies the
@@ -485,12 +484,8 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
 /// The inner `run_migrations` was previously private and contained
 /// its own per-step transactions. This wrapper:
 ///
-/// 1. Opens an outer `BEGIN IMMEDIATE` against `conn` so a failure
-///    rolls back every migration step in one shot. The inner
-///    `run_migrations` calls `execute_batch` and per-block transactions
-///    on the same connection, which fsqlite handles via savepoint-style
-///    nesting; if any inner step fails we propagate the error and let
-///    the outer `ROLLBACK` undo the work.
+/// 1. Re-verifies the `PRAGMA user_version == from` precondition on the
+///    connection that will run the migration.
 /// 2. Calls `run_migrations` with `issues_rebuilt: false` — the
 ///    chokepoint path is always invoked against an existing DB whose
 ///    `issues` table is already in place; the issues-rebuild signaling
@@ -504,15 +499,11 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
 /// Returns [`BeadsError::Database`] if any underlying SQL fails, or
 /// [`BeadsError::internal`] if the post-migration `user_version` does
 /// not match `target_version`.
-pub fn run_migrations_atomic(
-    conn: &Connection,
-    from: u32,
-    target_version: u32,
-) -> Result<()> {
+pub fn run_migrations_atomic(conn: &Connection, from: u32, target_version: u32) -> Result<()> {
     // Re-verify the precondition on this connection (the chokepoint
     // already did one read against a separate connection; doing it
-    // again here under the outer transaction closes the TOCTOU window
-    // between the chokepoint's read and this call's BEGIN).
+    // again here closes the TOCTOU window between the chokepoint's read
+    // and this call's migration connection).
     let row = conn.query_row("PRAGMA user_version")?;
     let current = row
         .get(0)
@@ -1632,6 +1623,10 @@ fn rebuild_content_hashes_for_go_parity(conn: &Connection) -> Result<usize> {
     conn.execute("BEGIN IMMEDIATE")?;
     let result = (|| -> Result<usize> {
         let mut updated = 0;
+        // Pre-compute once outside the loop and pass explicitly: legacy DBs
+        // created before the `DEFAULT CURRENT_TIMESTAMP` was added to
+        // `dirty_issues.marked_at` reject INSERTs that omit the column.
+        let now_str = Utc::now().to_rfc3339();
         for row in &rows {
             let id = row_text(row, 0).ok_or_else(|| BeadsError::Internal {
                 message: "content hash migration found issue row without id".to_string(),
@@ -1694,8 +1689,11 @@ fn rebuild_content_hashes_for_go_parity(conn: &Connection) -> Result<usize> {
                 &[SqliteValue::from(id.as_str())],
             )?;
             conn.execute_with_params(
-                "INSERT INTO dirty_issues (issue_id) VALUES (?)",
-                &[SqliteValue::from(id.as_str())],
+                "INSERT INTO dirty_issues (issue_id, marked_at) VALUES (?, ?)",
+                &[
+                    SqliteValue::from(id.as_str()),
+                    SqliteValue::from(now_str.as_str()),
+                ],
             )?;
             updated += 1;
         }
