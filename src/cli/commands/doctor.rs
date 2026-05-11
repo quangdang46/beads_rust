@@ -153,6 +153,33 @@ impl DoctorRepairSession {
     fn set_fixer(&mut self, fixer_id: &str) {
         self.ctx.fixer_id = fixer_id.to_string();
     }
+
+    /// Wrap a legacy `repair_*` call that mutates one or more files
+    /// directly (e.g., VACUUM, REINDEX, blocked-cache rebuild). The
+    /// helper snapshots each target verbatim into the run-dir BEFORE
+    /// the closure runs and appends a `legacy_op` line to
+    /// `actions.jsonl` per target AFTER, so `br doctor undo` can still
+    /// restore the pre-mutation bytes from `<run-dir>/backups/`.
+    ///
+    /// The legacy closure does whatever in-place SQL or rename work the
+    /// fixer already implements; this wrapper only adds before/after
+    /// audit + verbatim backup. Callers receive the closure's `T`
+    /// unchanged so existing result-collection patterns
+    /// (`LocalRepairResult` accumulation, tracing emit) stay intact.
+    fn record_legacy_mutation<F, T>(
+        &mut self,
+        fixer_id: &str,
+        paths: &[&Path],
+        legacy: F,
+    ) -> Result<T>
+    where
+        F: FnOnce() -> Result<T>,
+    {
+        let prior_fixer = std::mem::replace(&mut self.ctx.fixer_id, fixer_id.to_string());
+        let result = chokepoint::record_legacy_op(&self.ctx, fixer_id, paths, legacy);
+        self.ctx.fixer_id = prior_fixer;
+        result
+    }
 }
 
 #[allow(dead_code)] // Used by DoctorRepairSession once the scaffold is wired into repair flow.
@@ -857,7 +884,11 @@ fn report_has_page_corruption(report: &DoctorReport) -> bool {
 /// Run in-place VACUUM first, then try to install a compacted copy via VACUUM
 /// INTO. If upstream sqlite3 still reports `Page N: never used` afterward,
 /// the caller escalates to a JSONL rebuild.
-fn repair_via_vacuum(db_path: &Path, repair: &mut LocalRepairResult) {
+fn repair_via_vacuum(
+    db_path: &Path,
+    repair: &mut LocalRepairResult,
+    session: Option<&mut DoctorRepairSession>,
+) {
     if !db_path.is_file() {
         tracing::debug!(
             path = %db_path.display(),
@@ -865,37 +896,54 @@ fn repair_via_vacuum(db_path: &Path, repair: &mut LocalRepairResult) {
         );
         return;
     }
-    match SqliteStorage::open(db_path) {
-        Ok(storage) => {
-            if let Err(err) = storage.execute_raw("VACUUM") {
-                tracing::warn!(path = %db_path.display(), error = %err, "VACUUM failed");
-                return;
-            }
+    let do_vacuum = |repair: &mut LocalRepairResult| {
+        match SqliteStorage::open(db_path) {
+            Ok(storage) => {
+                if let Err(err) = storage.execute_raw("VACUUM") {
+                    tracing::warn!(path = %db_path.display(), error = %err, "VACUUM failed");
+                    return;
+                }
 
-            repair.vacuumed = true;
-            match config::compact_database_via_vacuum_into_in_place(storage, db_path, None) {
-                Ok(_storage) => {
-                    tracing::info!(
-                        path = %db_path.display(),
-                        "VACUUM plus VACUUM INTO compaction completed successfully"
-                    );
+                repair.vacuumed = true;
+                match config::compact_database_via_vacuum_into_in_place(storage, db_path, None) {
+                    Ok(_storage) => {
+                        tracing::info!(
+                            path = %db_path.display(),
+                            "VACUUM plus VACUUM INTO compaction completed successfully"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            path = %db_path.display(),
+                            error = %err,
+                            "VACUUM INTO compaction failed after VACUUM"
+                        );
+                    }
                 }
-                Err(err) => {
-                    tracing::warn!(
-                        path = %db_path.display(),
-                        error = %err,
-                        "VACUUM INTO compaction failed after VACUUM"
-                    );
-                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    path = %db_path.display(),
+                    error = %err,
+                    "Skipping VACUUM because the database could not be opened"
+                );
             }
         }
-        Err(err) => {
+    };
+    if let Some(session) = session {
+        let result = session.record_legacy_mutation("repair_via_vacuum", &[db_path], || {
+            do_vacuum(repair);
+            Ok(())
+        });
+        if let Err(err) = result {
             tracing::warn!(
                 path = %db_path.display(),
                 error = %err,
-                "Skipping VACUUM because the database could not be opened"
+                "Failed to record VACUUM legacy-op audit; mutation still proceeded if possible"
             );
         }
+    } else {
+        do_vacuum(repair);
     }
 }
 
@@ -1694,11 +1742,12 @@ fn repair_recoverable_db_state(
     beads_dir: &Path,
     db_path: &Path,
     report: &DoctorReport,
+    mut session: Option<&mut DoctorRepairSession>,
 ) -> LocalRepairResult {
     let mut repair = LocalRepairResult::default();
 
     if report_has_sidecar_anomaly(report) {
-        repair_database_sidecars(beads_dir, db_path, &mut repair);
+        repair_database_sidecars(beads_dir, db_path, &mut repair, session.as_deref_mut());
     }
 
     if !db_path.is_file() {
@@ -1709,7 +1758,7 @@ fn repair_recoverable_db_state(
         return repair;
     }
 
-    match SqliteStorage::open(db_path) {
+    let do_rebuild = |repair: &mut LocalRepairResult| match SqliteStorage::open(db_path) {
         Ok(mut storage) => {
             let force_rebuild = report_has_projection_content_mismatch_finding(report);
             let rebuild_result = if force_rebuild {
@@ -1721,7 +1770,6 @@ fn repair_recoverable_db_state(
             match rebuild_result {
                 Ok(blocked_cache_rebuilt) => {
                     repair.blocked_cache_rebuilt = blocked_cache_rebuilt;
-                    repair
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -1729,7 +1777,6 @@ fn repair_recoverable_db_state(
                         error = %err,
                         "Skipping blocked-cache repair; falling back to JSONL rebuild"
                     );
-                    repair
                 }
             }
         }
@@ -1739,16 +1786,36 @@ fn repair_recoverable_db_state(
                 error = %err,
                 "Skipping blocked-cache repair because the database could not be opened"
             );
-            repair
         }
+    };
+    if let Some(session) = session {
+        let result =
+            session.record_legacy_mutation("repair_recoverable_db_state", &[db_path], || {
+                do_rebuild(&mut repair);
+                Ok(())
+            });
+        if let Err(err) = result {
+            tracing::warn!(
+                path = %db_path.display(),
+                error = %err,
+                "Failed to record blocked-cache rebuild legacy-op audit; mutation still proceeded if possible"
+            );
+        }
+    } else {
+        do_rebuild(&mut repair);
     }
+    repair
 }
 
 /// Rebuild all indexes via `REINDEX` to fix partial-index row mismatches.
 ///
 /// This is safe — `REINDEX` only rebuilds existing indexes from the underlying
 /// table data.  It does not modify any row data.
-fn repair_partial_indexes(db_path: &Path, repair: &mut LocalRepairResult) {
+fn repair_partial_indexes(
+    db_path: &Path,
+    repair: &mut LocalRepairResult,
+    session: Option<&mut DoctorRepairSession>,
+) {
     if !db_path.is_file() {
         tracing::debug!(
             path = %db_path.display(),
@@ -1757,7 +1824,9 @@ fn repair_partial_indexes(db_path: &Path, repair: &mut LocalRepairResult) {
         return;
     }
 
-    match Connection::open(db_path.to_string_lossy().into_owned()) {
+    let do_reindex = |repair: &mut LocalRepairResult| match Connection::open(
+        db_path.to_string_lossy().into_owned(),
+    ) {
         Ok(conn) => {
             let _ = conn.execute("PRAGMA busy_timeout=30000");
             match conn.execute("REINDEX") {
@@ -1791,6 +1860,21 @@ fn repair_partial_indexes(db_path: &Path, repair: &mut LocalRepairResult) {
                 "Skipping REINDEX because the database could not be opened"
             );
         }
+    };
+    if let Some(session) = session {
+        let result = session.record_legacy_mutation("repair_partial_indexes", &[db_path], || {
+            do_reindex(repair);
+            Ok(())
+        });
+        if let Err(err) = result {
+            tracing::warn!(
+                path = %db_path.display(),
+                error = %err,
+                "Failed to record REINDEX legacy-op audit; mutation still proceeded if possible"
+            );
+        }
+    } else {
+        do_reindex(repair);
     }
 }
 
@@ -1811,9 +1895,14 @@ fn repair_partial_indexes(db_path: &Path, repair: &mut LocalRepairResult) {
 // surface to the operator via `LocalRepairResult::quarantined_artifacts`
 // and the `recovery_audit` JSON, so this is purely an
 // observability-completeness gap, not a correctness one.
-fn repair_database_sidecars(beads_dir: &Path, db_path: &Path, repair: &mut LocalRepairResult) {
+fn repair_database_sidecars(
+    beads_dir: &Path,
+    db_path: &Path,
+    repair: &mut LocalRepairResult,
+    session: Option<&mut DoctorRepairSession>,
+) {
     match inspect_database_sidecars(db_path) {
-        Ok(_) => quarantine_anomalous_sidecars(beads_dir, db_path, repair),
+        Ok(_) => quarantine_anomalous_sidecars(beads_dir, db_path, repair, session),
         Err(err) => tracing::warn!(
             path = %db_path.display(),
             error = %err,
@@ -1822,7 +1911,12 @@ fn repair_database_sidecars(beads_dir: &Path, db_path: &Path, repair: &mut Local
     }
 }
 
-fn quarantine_anomalous_sidecars(beads_dir: &Path, db_path: &Path, repair: &mut LocalRepairResult) {
+fn quarantine_anomalous_sidecars(
+    beads_dir: &Path,
+    db_path: &Path,
+    repair: &mut LocalRepairResult,
+    session: Option<&mut DoctorRepairSession>,
+) {
     match inspect_database_sidecars(db_path) {
         Ok(post_checkpoint_inspection) => {
             let quarantine_paths: BTreeSet<_> = post_checkpoint_inspection
@@ -1830,11 +1924,16 @@ fn quarantine_anomalous_sidecars(beads_dir: &Path, db_path: &Path, repair: &mut 
                 .into_iter()
                 .collect();
 
-            if !quarantine_paths.is_empty() {
+            if quarantine_paths.is_empty() {
+                return;
+            }
+
+            let do_quarantine = |repair: &mut LocalRepairResult,
+                                 paths: BTreeSet<PathBuf>| {
                 match config::quarantine_database_artifacts(
                     db_path,
                     beads_dir,
-                    quarantine_paths,
+                    paths,
                     "doctor-quarantine",
                 ) {
                     Ok(quarantined) => {
@@ -1849,6 +1948,28 @@ fn quarantine_anomalous_sidecars(beads_dir: &Path, db_path: &Path, repair: &mut 
                         "Failed to quarantine anomalous database sidecar artifacts"
                     ),
                 }
+            };
+
+            if let Some(session) = session {
+                let path_refs: Vec<&Path> =
+                    quarantine_paths.iter().map(PathBuf::as_path).collect();
+                let result = session.record_legacy_mutation(
+                    "repair_database_sidecars",
+                    &path_refs,
+                    || {
+                        do_quarantine(repair, quarantine_paths.clone());
+                        Ok(())
+                    },
+                );
+                if let Err(err) = result {
+                    tracing::warn!(
+                        path = %db_path.display(),
+                        error = %err,
+                        "Failed to record sidecar-quarantine legacy-op audit; mutation still proceeded if possible"
+                    );
+                }
+            } else {
+                do_quarantine(repair, quarantine_paths);
             }
         }
         Err(err) => tracing::warn!(

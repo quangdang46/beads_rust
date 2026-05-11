@@ -1315,6 +1315,150 @@ fn execute_atomic(
     Ok(())
 }
 
+/// Record a legacy-fixer disk mutation through the chokepoint without
+/// rewriting the fixer to use [`Op::WriteFile`] / [`Op::DbExec`] directly.
+///
+/// Some `repair_*` paths (notably `VACUUM`, `REINDEX`, and the blocked-
+/// cache rebuild through `reset_blocked_cache_table`) call into
+/// fsqlite/config helpers that perform their own in-place file or DB
+/// mutations and cannot be reformulated as a planned [`Op`] without a
+/// larger refactor. Until that lands, this helper gives those callers
+/// the same observability + recoverability the chokepoint provides:
+///
+/// 1. Read each target's bytes BEFORE the legacy work runs and compute
+///    `before_hash`. Missing files use the empty-input sentinel.
+/// 2. Enforce write_scopes for every target.
+/// 3. Write a verbatim backup of each existing target to
+///    `<run-dir>/backups/<rel-path>` and verify byte-identical via
+///    `cmp_strict` (same belt-and-braces tripwire `mutate()` uses).
+/// 4. Run the closure (the legacy fixer's actual work).
+/// 5. Read each target AGAIN and compute `after_hash`.
+/// 6. Append one `actions.jsonl` line per target with `op = "legacy_op"`
+///    and `fixer_id` = the supplied identifier so `br doctor undo` can
+///    replay the verbatim backup via its existing
+///    `WriteFile`-from-backup recovery (the default branch of
+///    [`super::surface::restore_one`] handles any non-rename, non-db
+///    op by restoring the verbatim backup).
+///
+/// In `dry_run`, no backup is written and no `actions.jsonl` line is
+/// appended; the closure is still invoked, mirroring `mutate()`'s
+/// pre-existing dry-run semantics for ops that have side effects
+/// outside the chokepoint's control. Callers gate the legacy work on
+/// `ctx.dry_run` themselves where appropriate.
+///
+/// # Errors
+///
+/// - Returns [`BeadsError`] if any path is outside `write_scopes`.
+/// - Returns the legacy closure's `Err(T)` unchanged if it faults.
+/// - Returns [`BeadsError::Io`] if backup/hashing/log-write I/O fails.
+///
+/// The closure's return value `T` is bubbled up to the caller so the
+/// existing legacy result-collection patterns (e.g.,
+/// `LocalRepairResult` accumulation) stay intact.
+pub fn record_legacy_op<F, T>(
+    ctx: &MutateContext,
+    fixer_id: &str,
+    paths: &[&Path],
+    legacy: F,
+) -> Result<T, BeadsError>
+where
+    F: FnOnce() -> Result<T, BeadsError>,
+{
+    // (1) + (2) + (3): pre-state capture for every target. We collect
+    // before doing any disk write so a precondition failure on path N
+    // does not leave a partial backup tree behind for paths 0..N-1.
+    let mut pre_state: Vec<(PathBuf, PathBuf, String, bool)> =
+        Vec::with_capacity(paths.len());
+    for path in paths {
+        ensure_in_scope(&ctx.capabilities, path)?;
+        let bytes_or_missing = match fs::read(path) {
+            Ok(b) => Some(b),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(BeadsError::Io(e)),
+        };
+        let before_hash = match &bytes_or_missing {
+            Some(bytes) => sha256_hex_prefixed(bytes),
+            None => SHA256_EMPTY_PREFIXED.to_string(),
+        };
+        let rel = path.strip_prefix(&ctx.repo_root).unwrap_or(path);
+        let backup = ctx.run_dir.join("backups").join(rel);
+        let existed = bytes_or_missing.is_some();
+        if !ctx.dry_run
+            && let Some(bytes) = bytes_or_missing
+        {
+            write_verbatim_backup(path, &backup, &bytes).map_err(BeadsError::Io)?;
+            cmp_strict(path, &backup).map_err(BeadsError::Io)?;
+        }
+        pre_state.push((path.to_path_buf(), backup, before_hash, existed));
+    }
+
+    let started_at_ns = now_ns().saturating_sub(ctx.start_ns);
+
+    if ctx.dry_run {
+        for (path, _, _, _) in &pre_state {
+            eprintln!("[dry-run] would mutate {}: legacy_op", path.display());
+        }
+        return legacy();
+    }
+
+    // (4) Run the legacy work. If it errors, we still record the audit
+    //     lines so the verbatim backups are linked to a JSONL entry the
+    //     operator can find; otherwise the backup files would be
+    //     orphaned under the run-dir.
+    let outcome = legacy();
+    let legacy_ok = outcome.is_ok();
+    let finished_at_ns = now_ns().saturating_sub(ctx.start_ns);
+
+    // (5) + (6): post-state hash + actions.jsonl line per path.
+    for (path, _, before_hash, existed_before) in &pre_state {
+        let rel = path.strip_prefix(&ctx.repo_root).unwrap_or(path);
+        let after_bytes_or_missing = match fs::read(path) {
+            Ok(b) => Some(b),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(BeadsError::Io(e)),
+        };
+        let after_hash = match &after_bytes_or_missing {
+            Some(bytes) => sha256_hex_prefixed(bytes),
+            None => SHA256_EMPTY_PREFIXED.to_string(),
+        };
+        let record = ActionRecord {
+            path: rel.to_string_lossy().into_owned(),
+            op: "legacy_op",
+            before_hash: before_hash.clone(),
+            after_hash,
+            started_at_ns,
+            finished_at_ns,
+            run_id: ctx.run_id.clone(),
+            fixer_id: fixer_id.to_string(),
+            ok: legacy_ok,
+            rename_to: None,
+            rolled_back: None,
+            error: None,
+        };
+        let mut line = serde_json::to_string(&record).map_err(BeadsError::Json)?;
+        // Tag whether the target file existed pre-mutation so `br
+        // doctor undo` (when extended) can tell the difference between
+        // "restore from verbatim backup" and "remove the post-creation
+        // file" — the legacy ops currently only mutate existing files,
+        // but recording the bit costs nothing and futureproofs the
+        // audit log. We append the extra field manually because
+        // ActionRecord is a stable wire contract shared with non-legacy
+        // ops.
+        if !existed_before {
+            line = line.trim_end_matches('}').to_string()
+                + ",\"existed_before\":false}";
+        }
+        line.push('\n');
+        let mut f = ctx.actions_file.lock().map_err(|e| {
+            BeadsError::internal(format!("doctor: actions_file mutex poisoned: {e}"))
+        })?;
+        f.write_all(line.as_bytes()).map_err(BeadsError::Io)?;
+        f.sync_data().map_err(BeadsError::Io)?;
+    }
+
+    outcome
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
