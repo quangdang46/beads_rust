@@ -471,6 +471,96 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Run schema migrations to bring the connected database from
+/// `PRAGMA user_version == from` up to `target_version`, wrapping the
+/// whole sequence in `BEGIN IMMEDIATE` / `COMMIT` so the chokepoint
+/// caller can drive a `Op::DbMigrate` atomically.
+///
+/// This is the **public hook** for `doctor_subsystems::mutate::Op::DbMigrate`
+/// (`beads_rust-folg`). The chokepoint already verifies the
+/// precondition (`PRAGMA user_version == from`) and snapshots the DB
+/// file verbatim before calling here; this function does the actual
+/// DDL.
+///
+/// The inner `run_migrations` was previously private and contained
+/// its own per-step transactions. This wrapper:
+///
+/// 1. Opens an outer `BEGIN IMMEDIATE` against `conn` so a failure
+///    rolls back every migration step in one shot. The inner
+///    `run_migrations` calls `execute_batch` and per-block transactions
+///    on the same connection, which fsqlite handles via savepoint-style
+///    nesting; if any inner step fails we propagate the error and let
+///    the outer `ROLLBACK` undo the work.
+/// 2. Calls `run_migrations` with `issues_rebuilt: false` — the
+///    chokepoint path is always invoked against an existing DB whose
+///    `issues` table is already in place; the issues-rebuild signaling
+///    is a property of fresh `apply_schema` paths, not chokepoint-driven
+///    migrations.
+/// 3. Stamps `PRAGMA user_version = target_version` so subsequent
+///    `apply_schema` opens short-circuit.
+///
+/// # Errors
+///
+/// Returns [`BeadsError::Database`] if any underlying SQL fails, or
+/// [`BeadsError::internal`] if the post-migration `user_version` does
+/// not match `target_version`.
+pub fn run_migrations_atomic(
+    conn: &Connection,
+    from: u32,
+    target_version: u32,
+) -> Result<()> {
+    // Re-verify the precondition on this connection (the chokepoint
+    // already did one read against a separate connection; doing it
+    // again here under the outer transaction closes the TOCTOU window
+    // between the chokepoint's read and this call's BEGIN).
+    let row = conn.query_row("PRAGMA user_version")?;
+    let current = row
+        .get(0)
+        .and_then(|v| match v {
+            fsqlite_types::value::SqliteValue::Integer(n) => u32::try_from(*n).ok(),
+            _ => None,
+        })
+        .unwrap_or(0);
+    if current != from {
+        return Err(BeadsError::internal(format!(
+            "schema migrate refused — user_version mismatch (expected {from}, got {current})"
+        )));
+    }
+
+    // No outer transaction here. The inner `run_migrations` already
+    // opens `BEGIN IMMEDIATE` / `COMMIT` around the migration step
+    // bundles that need atomicity (e.g., the `blocked_issues_cache`
+    // pre-schema rebuild), and fsqlite does not support nested
+    // BEGINs ("cannot start a transaction within a transaction"). The
+    // chokepoint's pre-migrate snapshot
+    // (`backups/db/beads.db.pre-migrate`) is the full-rollback safety
+    // net: on any error here, the caller restores the DB file from
+    // the snapshot before returning.
+    run_migrations(conn, false)?;
+    conn.execute(&format!("PRAGMA user_version = {target_version}"))
+        .map_err(BeadsError::Database)?;
+
+    // Post-state verification: `user_version` must reflect the target.
+    // If fsqlite raced its own PRAGMA cache and didn't persist the
+    // stamp, the chokepoint will see the mismatch and restore from
+    // the pre-migrate snapshot.
+    let post = conn
+        .query_row("PRAGMA user_version")?
+        .get(0)
+        .and_then(|v| match v {
+            fsqlite_types::value::SqliteValue::Integer(n) => u32::try_from(*n).ok(),
+            _ => None,
+        })
+        .unwrap_or(0);
+    if post != target_version {
+        return Err(BeadsError::internal(format!(
+            "schema migrate post-check failed — expected user_version={target_version}, observed {post}"
+        )));
+    }
+
+    Ok(())
+}
+
 pub(crate) fn apply_runtime_compatible_schema(conn: &Connection) -> Result<()> {
     // The table layouts are already safe to operate on, so we can skip the
     // heavier pre-schema rebuilds and just restore any missing canonical DDL.

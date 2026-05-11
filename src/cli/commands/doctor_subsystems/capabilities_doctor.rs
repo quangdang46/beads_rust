@@ -169,11 +169,12 @@ impl DoctorCapabilities {
                 OpEntry {
                     name: "db_migrate",
                     summary: "Versioned schema migration. Verifies PRAGMA user_version \
-                              matches `from`, snapshots the DB file verbatim, then defers \
-                              the actual DDL to schema.rs (warning: \
-                              migration_logic_not_yet_routed).",
+                              matches `from`, snapshots the DB file verbatim to \
+                              backups/db/beads.db.pre-migrate, then drives \
+                              schema::run_migrations_atomic inside BEGIN IMMEDIATE / COMMIT \
+                              (rolls back + restores from snapshot on failure).",
                     params: vec!["from", "to"],
-                    fully_routed: false,
+                    fully_routed: true,
                 },
             ],
         }
@@ -388,8 +389,8 @@ mod tests {
         );
         assert!(
             ops.iter()
-                .any(|o| o["name"] == "db_migrate" && o["fully_routed"] == false),
-            "db_migrate must be advertised as scaffold-only"
+                .any(|o| o["name"] == "db_migrate" && o["fully_routed"] == true),
+            "db_migrate must be advertised as fully routed (beads_rust-folg)"
         );
         for op in ops {
             assert!(op["params"].is_array(), "op.params must be an array: {op}");

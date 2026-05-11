@@ -50,14 +50,13 @@
 //! clobber each other. On any error the transaction is rolled back and
 //! **no** `actions.jsonl` line is written.
 //!
-//! [`Op::DbMigrate`] runs a versioned schema migration. WP4 ships the
-//! safety scaffolding — `from` / `to` precondition gate plus a verbatim
-//! `beads.db.pre-migrate` snapshot — and emits a
-//! `migration_logic_not_yet_routed` warning because schema.rs's
-//! `run_migrations()` is private and self-transactional. Wiring the
-//! actual DDL through the chokepoint is a follow-up: the safety net
-//! lands in WP4 so callers can route migrations through the chokepoint
-//! the moment the public hook lands.
+//! [`Op::DbMigrate`] runs a versioned schema migration end-to-end:
+//! verbatim `beads.db.pre-migrate` snapshot, `PRAGMA user_version ==
+//! from` precondition gate, then
+//! [`crate::storage::schema::run_migrations_atomic`] inside `BEGIN
+//! IMMEDIATE`/`COMMIT`. Failure rolls back AND restores the DB file
+//! from the snapshot. `beads_rust-folg` closed when the public hook
+//! landed.
 //!
 //! ## Crate-internal-only
 //!
@@ -136,11 +135,12 @@ pub enum Op {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         affected_predicate: Option<String>,
     },
-    /// Run a versioned schema migration. WP4 implements the safety
-    /// scaffolding (precondition gate + verbatim DB-file snapshot);
-    /// the actual DDL is currently driven by the legacy
-    /// `apply_runtime_compatible_schema` path so the chokepoint emits
-    /// a `migration_logic_not_yet_routed` warning.
+    /// Run a versioned schema migration end-to-end. WP4 + `beads_rust-folg`:
+    /// the chokepoint snapshots `beads.db.pre-migrate` verbatim, verifies
+    /// `PRAGMA user_version == from`, then drives
+    /// [`crate::storage::schema::run_migrations_atomic`] inside an outer
+    /// `BEGIN IMMEDIATE`/`COMMIT`. Failure rolls back AND restores the
+    /// DB file from the snapshot.
     DbMigrate { from: u32, to: u32 },
     /// Replace the symlink at `path` with one pointing at `target`.
     /// Implemented atomically via tmp-symlink + rename.
@@ -757,11 +757,7 @@ fn mutate_db(
     let finished_at_ns = now_ns().saturating_sub(ctx.start_ns);
 
     let (migrate_from, migrate_to, warning) = match op {
-        Op::DbMigrate { from, to } => (
-            Some(*from),
-            Some(*to),
-            Some("migration_logic_not_yet_routed"),
-        ),
+        Op::DbMigrate { from, to } => (Some(*from), Some(*to), None),
         _ => (None, None, None),
     };
 
@@ -1099,12 +1095,21 @@ fn sqlite_value_to_json(val: &fsqlite_types::value::SqliteValue) -> serde_json::
     }
 }
 
-/// Run the migration safety scaffolding for [`Op::DbMigrate`]. Verifies
-/// the precondition gate (`PRAGMA user_version == from`), snapshots the
-/// DB file verbatim, and returns `Ok(Some(()))` to flag the
-/// `migration_logic_not_yet_routed` warning so the caller can record
-/// it in `actions.jsonl`. Returning `Err` aborts before any state is
-/// changed.
+/// Drive an [`Op::DbMigrate`] end-to-end. Order of operations:
+///
+/// 1. Snapshot the DB file verbatim to `backups/db/beads.db.pre-migrate`
+///    BEFORE opening any connection (fsqlite can dirty header counters
+///    even on read-only PRAGMAs).
+/// 2. Verify `PRAGMA user_version == from` and refuse with an internal
+///    error otherwise.
+/// 3. Call [`crate::storage::schema::run_migrations_atomic`] which
+///    wraps `run_migrations` in `BEGIN IMMEDIATE`/`COMMIT` and stamps
+///    `PRAGMA user_version = to`.
+/// 4. On any failure, restore the DB file from the snapshot before
+///    returning the error.
+///
+/// Returns `Ok(None)` on success (no warning attached to the
+/// actions.jsonl record). Returns `Err` on any failure.
 fn run_db_migrate(
     db_path: &Path,
     backups_db: &Path,
@@ -1159,13 +1164,32 @@ fn run_db_migrate(
         )));
     }
 
-    // (3) The actual DDL is currently encapsulated in
-    //     `crate::storage::schema::run_migrations`, which is private
-    //     and self-transactional. Wiring its body through this
-    //     chokepoint is a follow-up; WP4 lands the safety net only.
-    //     Returning `Some(())` flags the warning for actions.jsonl.
-    let _ = to; // reserved for the future "actually migrate" path
-    Ok(Some(()))
+    // (3) Drive the actual DDL via the new public hook
+    //     `crate::storage::schema::run_migrations_atomic` which wraps
+    //     `run_migrations` in BEGIN IMMEDIATE / COMMIT and stamps
+    //     `PRAGMA user_version = to`. On any failure the chokepoint's
+    //     outer recovery path can restore from the pre-migrate snapshot
+    //     we wrote in step (1).
+    let migrate_conn = Connection::open(db_path.to_string_lossy().into_owned())?;
+    let migration_result = crate::storage::schema::run_migrations_atomic(&migrate_conn, from, to);
+    let _ = migrate_conn.close();
+    match migration_result {
+        Ok(()) => Ok(None),
+        Err(err) => {
+            // The atomic wrapper already attempted ROLLBACK. Best-effort
+            // restore from the pre-migrate snapshot so the live DB is
+            // in a known state for callers that don't immediately invoke
+            // `br doctor undo`. The chokepoint's actions.jsonl line is
+            // still written by the caller — recording the failed attempt
+            // is itself part of the audit contract.
+            if let Err(restore_err) = fs::copy(&snapshot_path, db_path) {
+                return Err(BeadsError::internal(format!(
+                    "doctor: db migrate failed ({err}); restore from snapshot also failed: {restore_err}"
+                )));
+            }
+            Err(err)
+        }
+    }
 }
 
 /// Execute the planned op atomically. File-based ops use
@@ -1805,30 +1829,39 @@ mod tests {
     }
 
     #[test]
-    fn test_db_migrate_happy_path_writes_backup_and_warning() {
+    fn test_db_migrate_happy_path_writes_backup_and_runs_ddl() {
         let tmp = tempfile::tempdir().unwrap();
-        let db = setup_test_db(tmp.path());
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db = beads_dir.join("beads.db");
 
-        // Stamp user_version = 4 so we can migrate 4 → 5.
+        // Stand up a real beads DB via apply_schema, then stamp
+        // user_version back to a pre-current value so the chokepoint
+        // migration has a real upgrade to run.
         {
             let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
-            conn.execute("PRAGMA user_version = 4").unwrap();
+            crate::storage::schema::apply_schema(&conn)
+                .expect("apply_schema on fresh test DB");
+            // Demote user_version so run_migrations_atomic has work to do.
+            conn.execute("PRAGMA user_version = 7").unwrap();
             let _ = conn.close();
         }
 
         let pre_size = fs::metadata(&db).unwrap().len();
         let (ctx, actions_path) = make_ctx(tmp.path(), false);
 
-        let result = mutate(&ctx, &db, Op::DbMigrate { from: 4, to: 5 })
-            .expect("DbMigrate safety scaffold should succeed");
+        let result = mutate(
+            &ctx,
+            &db,
+            Op::DbMigrate {
+                from: 7,
+                to: crate::storage::schema::CURRENT_SCHEMA_VERSION as u32,
+            },
+        )
+        .expect("DbMigrate should run schema migrations end-to-end");
         assert!(result.ok);
 
-        // Backup of the DB file exists. We don't assert byte-identical
-        // against a previous fs::read because fsqlite mutates header
-        // counters between connections; the safety guarantee that
-        // matters is that the snapshot was taken before any connection
-        // was opened (run_db_migrate snapshots first, then verifies
-        // the pragma).
+        // The pre-migrate snapshot is preserved verbatim for undo.
         let snap = ctx.run_dir.join("backups/db/beads.db.pre-migrate");
         assert!(
             snap.exists(),
@@ -1846,13 +1879,43 @@ mod tests {
             "snapshot must be a valid SQLite file (header check)"
         );
 
-        // actions.jsonl has the migration warning recorded.
+        // The DDL actually ran: PRAGMA user_version is now CURRENT_SCHEMA_VERSION.
+        let target = crate::storage::schema::CURRENT_SCHEMA_VERSION as u32;
+        {
+            let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+            let row = conn.query_row("PRAGMA user_version").unwrap();
+            let v = match row.get(0) {
+                Some(fsqlite_types::value::SqliteValue::Integer(n)) => u32::try_from(*n).unwrap(),
+                _ => 0,
+            };
+            assert_eq!(
+                v, target,
+                "post-migrate user_version should be CURRENT_SCHEMA_VERSION ({target})"
+            );
+            // v9 unconditionally adds close_metadata.
+            let rows = conn
+                .query("SELECT name FROM sqlite_master WHERE type='table' AND name='close_metadata'")
+                .unwrap();
+            assert_eq!(
+                rows.len(),
+                1,
+                "v9 migration must have created close_metadata table"
+            );
+            let _ = conn.close();
+        }
+
+        // actions.jsonl records the op and the version transition; the
+        // `migration_logic_not_yet_routed` warning is GONE now that
+        // beads_rust-folg has wired schema.rs through the chokepoint.
         let log = fs::read_to_string(&actions_path).unwrap();
         let line = log.lines().next().expect("expected one action line");
         let v: serde_json::Value = serde_json::from_str(line).unwrap();
         assert_eq!(v["op"], "db_migrate");
-        assert_eq!(v["migrate_from"], 4);
-        assert_eq!(v["migrate_to"], 5);
-        assert_eq!(v["warning"], "migration_logic_not_yet_routed");
+        assert_eq!(v["migrate_from"], 7);
+        assert_eq!(v["migrate_to"], i64::from(target));
+        assert!(
+            v.get("warning").is_none() || v["warning"].is_null(),
+            "warning field should be absent now that DDL routing is wired: {v}"
+        );
     }
 }
