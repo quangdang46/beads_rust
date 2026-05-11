@@ -1031,6 +1031,88 @@ fn chokepoint_repair_acquires_workspace_lock() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Test 9b (Phase-10 cold-prober follow-through, bead `beads_rust-mbpq`):
+// `br doctor --repair --dry-run` (and `--repair` in general) must refuse
+// IMMEDIATELY with exit 5 when another process holds the workspace lock,
+// NOT block up to --lock-timeout. The agent contract is "try-lock or
+// refuse"; the timing of the refusal is part of the contract.
+//
+// The pre-fix behavior was a silent 30s wait that contradicted both
+// capabilities --format json and robot-docs. This test enforces the
+// timing bound: the refusal must arrive within 2 seconds of the child
+// being spawned, regardless of --lock-timeout default.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn chokepoint_repair_dry_run_refuses_on_lock_contention() {
+    use std::time::{Duration, Instant};
+
+    let tmp = TempDir::new().expect("tempdir");
+    let root = tmp.path().to_path_buf();
+    br_init(&root);
+
+    let beads_dir = root.join(".beads");
+    let lock_path = beads_dir.join(".write.lock");
+
+    let lock_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .expect("open .write.lock");
+    lock_file
+        .try_lock()
+        .expect("test should be uncontended at this point");
+
+    let bin_path = env!("CARGO_BIN_EXE_br");
+    // Note: no `--lock-timeout` flag — relying on the doctor's default
+    // try-once behavior introduced by the mbpq fix. If the fix
+    // regresses, the child will wait for the 30s default and this
+    // test will trip the 2s timing assertion below.
+    let start = Instant::now();
+    let output = std::process::Command::new(bin_path)
+        .args(["doctor", "--repair", "--dry-run", "--json"])
+        .current_dir(&root)
+        .env("RUST_LOG", "error")
+        .env("BR_NO_AUTOFLUSH", "1")
+        .env_remove("BD_DB")
+        .env_remove("BEADS_DB")
+        .output()
+        .expect("invoke br doctor --repair --dry-run");
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "doctor --repair --dry-run took {elapsed:?} to refuse on lock contention; \
+         expected immediate refusal (mbpq regression)"
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "expected exit 5 ConcurrencyLost; got {:?}\nstdout={}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("concurrency_lost")
+            || combined.contains("ConcurrencyLost")
+            || combined.contains("Refusing --repair"),
+        "refusal output should be recognizable: {combined}"
+    );
+
+    drop(lock_file);
+}
+
 /// Round-5 fresh-eyes follow-through (`beads_rust-73ux`):
 /// `refuse_gates::run_all` must run BEFORE any fixer / `mutate()` call
 /// in the `--repair` flow. Plant a DB whose on-disk
