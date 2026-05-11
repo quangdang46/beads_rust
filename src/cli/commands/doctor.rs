@@ -7747,9 +7747,11 @@ mod tests {
         assert!(matches!(check.status, CheckStatus::Warn));
         let details = check.details.as_ref().expect("details present");
         let readonly = details["readonly_paths"].as_array().unwrap();
-        let kinds: Vec<&str> = readonly.iter().filter_map(|e| e["kind"].as_str()).collect();
         assert!(
-            kinds.contains(&"file"),
+            readonly
+                .iter()
+                .filter_map(|e| e["kind"].as_str())
+                .any(|kind| kind == "file"),
             "readonly_paths must flag the file kind: {readonly:?}"
         );
     }
