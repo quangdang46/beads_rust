@@ -1266,3 +1266,190 @@ fn chokepoint_doctor_in_non_beads_dir_exits_no_input() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+// ---------------------------------------------------------------------------
+// Test 12 (bead `beads_rust-8fud`): the four legacy `repair_*` paths
+// (VACUUM, REINDEX, blocked-cache rebuild, sidecar quarantine) now route
+// through the chokepoint's `record_legacy_op` helper, so any disk
+// mutation under those fixers must produce a `legacy_op` line in
+// `actions.jsonl` with a `fixer_id` that names the legacy fn AND a
+// verbatim backup under `<run-dir>/backups/<rel-path>` whose SHA-256
+// matches the recorded `before_hash`.
+//
+// We exercise the VACUUM path because it is the one most likely to
+// rewrite the DB file in ways that defeat naive byte-equality undo;
+// proving the audit + backup exist is the minimum-viable contract per
+// the bead's pitfall note.
+// ---------------------------------------------------------------------------
+#[test]
+fn legacy_op_audit_for_vacuum_via_page_corruption() {
+    let tmp = TempDir::new().expect("tempdir");
+    let root = tmp.path().to_path_buf();
+    br_init(&root);
+
+    // Seed at least one row so the DB has user pages to corrupt.
+    let seed = br_cmd(&root)
+        .args([
+            "create",
+            "--title",
+            "page corrupt seed",
+            "--description",
+            "rebuild me",
+            "--priority",
+            "2",
+            "--no-auto-flush",
+        ])
+        .output()
+        .expect("br create spawned");
+    assert!(
+        seed.status.success(),
+        "br create failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&seed.stdout),
+        String::from_utf8_lossy(&seed.stderr)
+    );
+    let flush = br_cmd(&root)
+        .args(["sync", "--flush-only"])
+        .output()
+        .expect("br sync spawned");
+    assert!(flush.status.success(), "br sync --flush-only failed");
+
+    // Force any WAL contents into the main DB before we corrupt the page,
+    // otherwise the corrupted page may be masked by an uncheckpointed
+    // overlay.
+    let db_path = root.join(".beads").join("beads.db");
+    let _ = fs::remove_file(root.join(".beads").join("beads.db-wal"));
+    let _ = fs::remove_file(root.join(".beads").join("beads.db-shm"));
+
+    // Overwrite a non-header page so `PRAGMA integrity_check` reports
+    // page-level corruption (the trigger for `repair_via_vacuum`).
+    {
+        use std::os::unix::fs::FileExt;
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&db_path)
+            .expect("open db rw");
+        let junk = vec![0xffu8; 200];
+        f.write_at(&junk, 4096).expect("corrupt page-2");
+    }
+
+    // Capture the pre-VACUUM SHA-256 so we can compare to the backup.
+    let pre_repair_db_bytes = fs::read(&db_path).expect("read corrupted db");
+    let pre_repair_db_hash = sha256_hex(&pre_repair_db_bytes);
+
+    // Run `br doctor --repair --json`. We don't assert exit 0 because
+    // page-malformed corruption may still surface non-fatal warnings.
+    let out = br_cmd(&root)
+        .args(["doctor", "--repair", "--json"])
+        .output()
+        .expect("br doctor --repair spawned");
+    let exit = out.status.code().unwrap_or(-1);
+    assert!(
+        matches!(exit, 0 | 1 | 2),
+        "expected exit 0/1/2 from --repair, got {exit}\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let run_dir = single_run_dir(&root);
+    let actions = read_actions(&run_dir);
+
+    // There must be at least one `legacy_op` action whose `fixer_id`
+    // names one of the four legacy fixers we just wired through.
+    let legacy_actions: Vec<&Value> = actions
+        .iter()
+        .filter(|a| a["op"].as_str() == Some("legacy_op"))
+        .collect();
+    assert!(
+        !legacy_actions.is_empty(),
+        "expected at least one `legacy_op` audit line for the corrupted-page repair flow; got actions={actions:#?}"
+    );
+
+    let allowed_fixers: std::collections::HashSet<&str> = [
+        "repair_via_vacuum",
+        "repair_partial_indexes",
+        "repair_recoverable_db_state",
+        "repair_database_sidecars",
+    ]
+    .into_iter()
+    .collect();
+    for action in &legacy_actions {
+        let fid = action["fixer_id"].as_str().expect("fixer_id str");
+        assert!(
+            allowed_fixers.contains(fid),
+            "unexpected legacy_op fixer_id={fid}; allowed={allowed_fixers:?}"
+        );
+        // Every legacy_op line must carry the chokepoint's stable
+        // contract fields.
+        for key in &[
+            "path",
+            "before_hash",
+            "after_hash",
+            "started_at_ns",
+            "finished_at_ns",
+            "run_id",
+            "ok",
+        ] {
+            assert!(
+                action.get(*key).is_some(),
+                "legacy_op action missing field `{key}`: {action}"
+            );
+        }
+    }
+
+    // At least one of the legacy_op lines targets `.beads/beads.db`;
+    // its verbatim backup must exist under `<run-dir>/backups/` AND its
+    // bytes must hash to the captured pre-VACUUM SHA-256. This proves
+    // the chokepoint took the snapshot BEFORE the legacy fixer rewrote
+    // the file.
+    let db_action = legacy_actions
+        .iter()
+        .find(|a| a["path"].as_str() == Some(".beads/beads.db"))
+        .unwrap_or_else(|| {
+            panic!(
+                "no legacy_op line targeting .beads/beads.db; got legacy_actions={legacy_actions:#?}"
+            )
+        });
+    let recorded_before = db_action["before_hash"]
+        .as_str()
+        .expect("before_hash str")
+        .trim_start_matches("sha256:");
+    assert_eq!(
+        recorded_before, pre_repair_db_hash,
+        "before_hash on legacy_op line does not match pre-VACUUM DB SHA-256"
+    );
+
+    let backup_path = run_dir.join("backups").join(".beads").join("beads.db");
+    assert!(
+        backup_path.is_file(),
+        "verbatim backup missing at {}",
+        backup_path.display()
+    );
+    let backup_bytes = fs::read(&backup_path).expect("read backup");
+    let backup_hash = sha256_hex(&backup_bytes);
+    assert_eq!(
+        backup_hash, pre_repair_db_hash,
+        "backup bytes at {} do not match pre-VACUUM DB SHA-256",
+        backup_path.display()
+    );
+
+    // Run `br doctor undo` and verify it does not fault on legacy_op
+    // entries. The byte-exact post-VACUUM restoration may not match
+    // pre-VACUUM (VACUUM rewrites the file at the page level so the
+    // post-VACUUM hash differs even after a notional roundtrip), but
+    // undo must not surface as a hard failure for the legacy_op rows.
+    let run_id = run_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .expect("run id name")
+        .to_string();
+    let undo = br_cmd(&root)
+        .args(["doctor", "undo", &run_id, "--json"])
+        .output()
+        .expect("br doctor undo spawned");
+    assert!(
+        undo.status.success(),
+        "br doctor undo failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&undo.stdout),
+        String::from_utf8_lossy(&undo.stderr)
+    );
+}

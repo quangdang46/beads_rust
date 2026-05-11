@@ -4100,17 +4100,22 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         // --repair is passed and the warnings are present.
         if has_blocked_cache_rebuild || has_partial_index_warnings || has_warn_page_anomalies {
             local_repair = if has_blocked_cache_rebuild {
-                repair_recoverable_db_state(&beads_dir, &paths.db_path, &initial.report)
+                repair_recoverable_db_state(
+                    &beads_dir,
+                    &paths.db_path,
+                    &initial.report,
+                    session.as_mut(),
+                )
             } else {
                 LocalRepairResult::default()
             };
 
             if has_partial_index_warnings {
-                repair_partial_indexes(&paths.db_path, &mut local_repair);
+                repair_partial_indexes(&paths.db_path, &mut local_repair, session.as_mut());
             }
 
             if has_warn_page_anomalies {
-                repair_via_vacuum(&paths.db_path, &mut local_repair);
+                repair_via_vacuum(&paths.db_path, &mut local_repair, session.as_mut());
             }
 
             let post_warning_repair = collect_doctor_report(&beads_dir, &paths)?;
@@ -4192,12 +4197,17 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         && (report_has_blocked_cache_rebuild_finding(&initial.report)
             || report_has_sidecar_anomaly(&initial.report))
     {
-        local_repair = repair_recoverable_db_state(&beads_dir, &paths.db_path, &initial.report);
+        local_repair = repair_recoverable_db_state(
+            &beads_dir,
+            &paths.db_path,
+            &initial.report,
+            session.as_mut(),
+        );
     }
 
     // Also attempt REINDEX if partial-index warnings are present alongside errors.
     if !local_repair.indexes_reindexed && report_has_partial_index_warnings(&initial.report) {
-        repair_partial_indexes(&paths.db_path, &mut local_repair);
+        repair_partial_indexes(&paths.db_path, &mut local_repair, session.as_mut());
     }
 
     // VACUUM to fix page-level anomalies (free space corruption, malformed
@@ -4205,7 +4215,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     // C sqlite3 (#237, #245).  VACUUM rewrites every page from scratch, so
     // it fixes both index and table corruption.
     if report_has_page_corruption(&initial.report) {
-        repair_via_vacuum(&paths.db_path, &mut local_repair);
+        repair_via_vacuum(&paths.db_path, &mut local_repair, session.as_mut());
     }
 
     let mut after_local_repair = if local_repair.applied() {
@@ -4227,7 +4237,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             path = %paths.db_path.display(),
             "Post-repair report has WARN-level page anomalies; running VACUUM to clean up orphaned pages"
         );
-        repair_via_vacuum(&paths.db_path, &mut local_repair);
+        repair_via_vacuum(&paths.db_path, &mut local_repair, session.as_mut());
         if local_repair.vacuumed {
             after_local_repair = collect_doctor_report(&beads_dir, &paths)?;
         }
@@ -5768,7 +5778,7 @@ mod tests {
             }],
         };
 
-        let repair = repair_recoverable_db_state(temp.path(), &db_path, &report);
+        let repair = repair_recoverable_db_state(temp.path(), &db_path, &report, None);
 
         assert!(repair.blocked_cache_rebuilt);
         let storage = SqliteStorage::open(&db_path).unwrap();
@@ -5818,7 +5828,7 @@ mod tests {
             }],
         };
 
-        let repair = repair_recoverable_db_state(temp.path(), &db_path, &report);
+        let repair = repair_recoverable_db_state(temp.path(), &db_path, &report, None);
 
         assert!(repair.blocked_cache_rebuilt);
         let storage = SqliteStorage::open(&db_path).unwrap();
@@ -5919,7 +5929,7 @@ mod tests {
             }],
         };
 
-        let repair = repair_recoverable_db_state(&beads_dir, &db_path, &report);
+        let repair = repair_recoverable_db_state(&beads_dir, &db_path, &report, None);
         assert!(
             !repair.quarantined_artifacts.is_empty(),
             "expected local repair to quarantine the orphan SHM sidecar"
@@ -5967,7 +5977,7 @@ mod tests {
             }],
         };
 
-        let repair = repair_recoverable_db_state(&beads_dir, &db_path, &report);
+        let repair = repair_recoverable_db_state(&beads_dir, &db_path, &report, None);
         assert!(
             repair.quarantined_artifacts.is_empty(),
             "WAL should not be quarantined for a Warn-level sidecar check"
@@ -6466,7 +6476,7 @@ mod tests {
             checks: Vec::new(),
         };
 
-        let local_repair = repair_recoverable_db_state(&beads_dir, &db_path, &report);
+        let local_repair = repair_recoverable_db_state(&beads_dir, &db_path, &report, None);
         assert!(!local_repair.blocked_cache_rebuilt);
     }
 
