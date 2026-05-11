@@ -1282,6 +1282,7 @@ fn chokepoint_doctor_in_non_beads_dir_exits_no_input() {
 // the bead's pitfall note.
 // ---------------------------------------------------------------------------
 #[test]
+#[allow(clippy::too_many_lines)]
 fn legacy_op_audit_for_vacuum_via_page_corruption() {
     let tmp = TempDir::new().expect("tempdir");
     let root = tmp.path().to_path_buf();
@@ -1344,7 +1345,7 @@ fn legacy_op_audit_for_vacuum_via_page_corruption() {
         .expect("br doctor --repair spawned");
     let exit = out.status.code().unwrap_or(-1);
     assert!(
-        matches!(exit, 0 | 1 | 2),
+        matches!(exit, 0..=2),
         "expected exit 0/1/2 from --repair, got {exit}\nstdout={}\nstderr={}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
@@ -1427,7 +1428,8 @@ fn legacy_op_audit_for_vacuum_via_page_corruption() {
     let backup_bytes = fs::read(&backup_path).expect("read backup");
     let backup_hash = sha256_hex(&backup_bytes);
     assert_eq!(
-        backup_hash, pre_repair_db_hash,
+        backup_hash,
+        pre_repair_db_hash,
         "backup bytes at {} do not match pre-VACUUM DB SHA-256",
         backup_path.display()
     );
