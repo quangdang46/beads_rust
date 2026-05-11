@@ -8,9 +8,8 @@
 //! - `exit_codes` — derived from [`super::exit_codes::DoctorExitCode::all`]
 //! - `write_scopes` — `.beads/`, `.doctor/`
 //! - `env_vars` — environment variables the doctor honors
-//! - `fixers` — empty for now; WP3-WP12 fills it in
-//! - `detectors` — empty for now; the legacy `check_*` family is not
-//!   yet enumerated in a single registry
+//! - `fixers` — currently wired repair/refuse paths
+//! - `detectors` — currently wired flat-doctor check IDs
 //!
 //! Stability: the JSON shape is stable contract. New fields are
 //! purely additive; agents must tolerate unknown keys.
@@ -52,9 +51,9 @@ pub struct DoctorCapabilities {
     /// Environment variables the doctor honors. Documented in
     /// `playbook.md` §1.4.
     pub env_vars: Vec<&'static str>,
-    /// Fixer registry. Empty in WP1; populated by WP3-WP12.
+    /// Fixer registry populated from the currently wired repair/refuse paths.
     pub fixers: Vec<FixerEntry>,
-    /// Detector registry. Empty in WP1.
+    /// Detector registry populated from the currently wired flat-doctor checks.
     pub detectors: Vec<DetectorEntry>,
     /// Names of every [`super::mutate::Op`] variant the chokepoint
     /// supports plus the parameters each takes. Stable contract: the
@@ -127,8 +126,8 @@ impl DoctorCapabilities {
                 "BD_DB",
                 "BEADS_JSONL",
             ],
-            fixers: Vec::new(),
-            detectors: Vec::new(),
+            fixers: build_fixer_registry(),
+            detectors: build_detector_registry(),
             ops_supported: vec![
                 OpEntry {
                     name: "write_file",
@@ -200,6 +199,150 @@ impl DoctorCapabilities {
     }
 }
 
+/// Detector registry — populated from the canonical `check_*` family
+/// in `src/cli/commands/doctor.rs`. Phase 10 cold-prober finding
+/// (`beads_rust-3idn`): a cold agent reading
+/// `br doctor capabilities --format json` previously saw `detectors:
+/// []` and read it as "the contract is half-wired". This list pins
+/// the agent-visible name of every detector the flat `br doctor`
+/// surface runs, so consumers can build allow-lists, `--only`/`--skip`
+/// selectors (future), and `--quick` parity tables against it.
+///
+/// `fast_path: true` flags the detectors the `--quick` mode keeps
+/// (cheap stat / parse / single-PRAGMA checks); `false` flags the
+/// ones `--quick` drops for sub-second pre-commit latency.
+fn build_detector_registry() -> Vec<DetectorEntry> {
+    // (id, subsystem, severity_default, fast_path)
+    let rows: &[(&str, &str, &str, bool)] = &[
+        ("beads_dir", "configs", "error", true),
+        ("metadata", "configs", "error", true),
+        ("gitignore.beads_inner", "configs", "warn", true),
+        ("gitignore.root", "configs", "warn", true),
+        ("jsonl.parse", "state_files", "error", true),
+        ("jsonl.merge_artifacts", "state_files", "warn", true),
+        ("sync_jsonl_path", "state_files", "warn", true),
+        ("sync_conflict_markers", "state_files", "error", true),
+        ("db.exists", "state_files", "error", true),
+        ("db.open", "state_files", "error", true),
+        ("db.sidecars", "state_files", "warn", true),
+        ("db.recovery_artifacts", "state_files", "info", true),
+        ("schema.tables", "schemas", "error", true),
+        ("schema.columns", "schemas", "error", true),
+        ("schema.inspect", "schemas", "error", true),
+        ("db.null_defaults", "schemas", "warn", true),
+        ("sqlite.integrity_check", "state_files", "error", true),
+        // --quick drops these:
+        ("db.recoverable_anomalies", "caches_indexes", "warn", false),
+        ("counts.db_vs_jsonl", "state_files", "warn", false),
+        ("sync.metadata", "state_files", "warn", false),
+        ("sqlite3.integrity_check", "state_files", "error", false),
+        ("db.write_probe", "state_files", "warn", false),
+        (
+            "audit.suspect_close_reasons",
+            "agent_coordination",
+            "warn",
+            true,
+        ),
+    ];
+    rows.iter()
+        .map(|(id, subsystem, sev, fast)| DetectorEntry {
+            id: (*id).to_string(),
+            subsystem: (*subsystem).to_string(),
+            severity_default: (*sev).to_string(),
+            fast_path: *fast,
+        })
+        .collect()
+}
+
+/// Fixer registry — one entry per `repair_*` path currently wired in
+/// `src/cli/commands/doctor.rs`. Phase 10 cold-prober finding
+/// (`beads_rust-3idn`): with this populated, an agent can list every
+/// fixer the doctor can apply under `--repair` without reading source.
+///
+/// `auto_fixable: true` means `--repair` will attempt the fix without
+/// further prompts; `false` reserved for advisory-only / refuse paths.
+/// `mutates: true` means the fixer routes writes through the
+/// `mutate()` chokepoint (per WP1+WP3 contract); `false` flags the
+/// few legacy paths that still bypass the chokepoint (see
+/// `beads_rust-8fud` for the migration plan).
+fn build_fixer_registry() -> Vec<FixerEntry> {
+    // (id, subsystem, auto_fixable, mutates_via_chokepoint, addressed_findings)
+    let rows: &[(&str, &str, bool, bool, &[&str])] = &[
+        (
+            "doctor.gitignore_repair",
+            "configs",
+            true,
+            true,
+            &["gitignore.beads_inner", "gitignore.root"],
+        ),
+        (
+            "doctor.repair_recoverable_db_state",
+            "caches_indexes",
+            true,
+            false,
+            &["db.recoverable_anomalies"],
+        ),
+        (
+            "doctor.repair_partial_indexes",
+            "caches_indexes",
+            true,
+            false,
+            &["db.recoverable_anomalies"],
+        ),
+        (
+            "doctor.repair_via_vacuum",
+            "state_files",
+            true,
+            false,
+            &["sqlite.integrity_check", "sqlite3.integrity_check"],
+        ),
+        (
+            "doctor.repair_database_from_jsonl",
+            "state_files",
+            true,
+            true,
+            &[
+                "db.open",
+                "counts.db_vs_jsonl",
+                "schema.tables",
+                "schema.columns",
+            ],
+        ),
+        (
+            "doctor.repair_database_sidecars",
+            "state_files",
+            true,
+            true,
+            &["db.sidecars"],
+        ),
+        (
+            "refuse_gates.schema_version_downgrade",
+            "schemas",
+            false,
+            false,
+            &["schema.columns"],
+        ),
+        (
+            "refuse_gates.recovery_fingerprint_integrity",
+            "state_files",
+            false,
+            false,
+            &["db.recovery_artifacts"],
+        ),
+    ];
+    rows.iter()
+        .map(
+            |(id, subsystem, auto_fixable, mutates, addressed)| FixerEntry {
+                id: (*id).to_string(),
+                subsystem: (*subsystem).to_string(),
+                auto_fixable: *auto_fixable,
+                mutates: *mutates,
+                addressed_findings: addressed.iter().map(|s| (*s).to_string()).collect(),
+            },
+        )
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,5 +394,84 @@ mod tests {
         for op in ops {
             assert!(op["params"].is_array(), "op.params must be an array: {op}");
         }
+    }
+
+    #[test]
+    fn capabilities_detectors_and_fixers_are_populated() {
+        // Phase 10 cold-prober finding (`beads_rust-3idn`): a cold
+        // agent must see the actual detector + fixer registries, not
+        // empty arrays. Lock the floor so future refactors can't
+        // silently drop entries back to [].
+        let caps = DoctorCapabilities::build();
+        assert!(
+            !caps.detectors.is_empty(),
+            "detector registry must enumerate the check_* family"
+        );
+        assert!(
+            !caps.fixers.is_empty(),
+            "fixer registry must enumerate the repair_* family"
+        );
+        // Canonical entries must be present.
+        let detector_ids: Vec<&str> = caps.detectors.iter().map(|d| d.id.as_str()).collect();
+        let mut sorted_detector_ids = detector_ids.clone();
+        sorted_detector_ids.sort_unstable();
+        sorted_detector_ids.dedup();
+        assert_eq!(
+            sorted_detector_ids.len(),
+            detector_ids.len(),
+            "detector registry must not contain duplicate ids"
+        );
+        for required in &[
+            "gitignore.beads_inner",
+            "jsonl.parse",
+            "db.open",
+            "sqlite.integrity_check",
+            "schema.tables",
+        ] {
+            assert!(
+                detector_ids.contains(required),
+                "detector registry missing {required}"
+            );
+        }
+        for obsolete in &["merge_artifacts", "sqlite.cli_integrity"] {
+            assert!(
+                !detector_ids.contains(obsolete),
+                "detector registry must not advertise obsolete check id {obsolete}"
+            );
+        }
+        let detector = |id: &str| {
+            caps.detectors
+                .iter()
+                .find(|d| d.id == id)
+                .unwrap_or_else(|| panic!("missing detector {id}"))
+        };
+        assert_eq!(detector("jsonl.merge_artifacts").severity_default, "warn");
+        assert_eq!(detector("schema.inspect").severity_default, "error");
+        let fixer_ids: Vec<&str> = caps.fixers.iter().map(|f| f.id.as_str()).collect();
+        for required in &[
+            "doctor.gitignore_repair",
+            "doctor.repair_via_vacuum",
+            "doctor.repair_database_from_jsonl",
+            "refuse_gates.schema_version_downgrade",
+        ] {
+            assert!(
+                fixer_ids.contains(required),
+                "fixer registry missing {required}"
+            );
+        }
+        // Every detector must declare a subsystem the existing checks
+        // recognize.
+        for d in &caps.detectors {
+            assert!(
+                !d.subsystem.is_empty(),
+                "detector {} missing subsystem",
+                d.id
+            );
+        }
+        // At least one fixer must route through the chokepoint (WP3+).
+        assert!(
+            caps.fixers.iter().any(|f| f.mutates),
+            "at least one fixer must route through mutate()"
+        );
     }
 }
