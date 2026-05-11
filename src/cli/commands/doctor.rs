@@ -896,38 +896,36 @@ fn repair_via_vacuum(
         );
         return;
     }
-    let do_vacuum = |repair: &mut LocalRepairResult| {
-        match SqliteStorage::open(db_path) {
-            Ok(storage) => {
-                if let Err(err) = storage.execute_raw("VACUUM") {
-                    tracing::warn!(path = %db_path.display(), error = %err, "VACUUM failed");
-                    return;
-                }
+    let do_vacuum = |repair: &mut LocalRepairResult| match SqliteStorage::open(db_path) {
+        Ok(storage) => {
+            if let Err(err) = storage.execute_raw("VACUUM") {
+                tracing::warn!(path = %db_path.display(), error = %err, "VACUUM failed");
+                return;
+            }
 
-                repair.vacuumed = true;
-                match config::compact_database_via_vacuum_into_in_place(storage, db_path, None) {
-                    Ok(_storage) => {
-                        tracing::info!(
-                            path = %db_path.display(),
-                            "VACUUM plus VACUUM INTO compaction completed successfully"
-                        );
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            path = %db_path.display(),
-                            error = %err,
-                            "VACUUM INTO compaction failed after VACUUM"
-                        );
-                    }
+            repair.vacuumed = true;
+            match config::compact_database_via_vacuum_into_in_place(storage, db_path, None) {
+                Ok(_storage) => {
+                    tracing::info!(
+                        path = %db_path.display(),
+                        "VACUUM plus VACUUM INTO compaction completed successfully"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        path = %db_path.display(),
+                        error = %err,
+                        "VACUUM INTO compaction failed after VACUUM"
+                    );
                 }
             }
-            Err(err) => {
-                tracing::warn!(
-                    path = %db_path.display(),
-                    error = %err,
-                    "Skipping VACUUM because the database could not be opened"
-                );
-            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                path = %db_path.display(),
+                error = %err,
+                "Skipping VACUUM because the database could not be opened"
+            );
         }
     };
     if let Some(session) = session {
@@ -1928,8 +1926,7 @@ fn quarantine_anomalous_sidecars(
                 return;
             }
 
-            let do_quarantine = |repair: &mut LocalRepairResult,
-                                 paths: BTreeSet<PathBuf>| {
+            let do_quarantine = |repair: &mut LocalRepairResult, paths: BTreeSet<PathBuf>| {
                 match config::quarantine_database_artifacts(
                     db_path,
                     beads_dir,
@@ -1951,16 +1948,12 @@ fn quarantine_anomalous_sidecars(
             };
 
             if let Some(session) = session {
-                let path_refs: Vec<&Path> =
-                    quarantine_paths.iter().map(PathBuf::as_path).collect();
-                let result = session.record_legacy_mutation(
-                    "repair_database_sidecars",
-                    &path_refs,
-                    || {
+                let path_refs: Vec<&Path> = quarantine_paths.iter().map(PathBuf::as_path).collect();
+                let result =
+                    session.record_legacy_mutation("repair_database_sidecars", &path_refs, || {
                         do_quarantine(repair, quarantine_paths.clone());
                         Ok(())
-                    },
-                );
+                    });
                 if let Err(err) = result {
                     tracing::warn!(
                         path = %db_path.display(),
@@ -3111,6 +3104,143 @@ fn check_routes_jsonl(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
     }
 }
 
+/// Detector: `RUST_LOG` is set to a verbose level that would dump tracing
+/// output to stderr and confuse agents parsing `br ... --json`. Agents who
+/// shell out without setting `RUST_LOG=error` can get dozens of `info`/`debug`
+/// lines per command on stderr, which makes failures hard to spot.
+///
+/// Detect-only. The doctor cannot mutate the parent shell's environment.
+/// Surfaces a warn-level advisory naming the active level + the
+/// recommended `RUST_LOG=error` setting from README.md.
+///
+/// Status mapping:
+/// - `ok` - release-build `RUST_LOG` unset, blank, or set to `warn`/`error`/`off`.
+/// - `warn` - debug-build `RUST_LOG` unset, or any explicit `info`, `debug`,
+///   `trace`, or per-module directive at those levels.
+///
+/// The advisory carries the canonical fix from README.md: `export RUST_LOG=error`.
+fn check_rust_log_noisy(checks: &mut Vec<CheckResult>) {
+    let raw = std::env::var("RUST_LOG").ok();
+    let raw_ref = raw.as_deref();
+
+    let level = rust_log_volume(raw_ref);
+    match level {
+        RustLogVolume::Quiet => {
+            push_check(
+                checks,
+                "rust_log",
+                CheckStatus::Ok,
+                Some(match raw_ref {
+                    None => {
+                        "RUST_LOG unset; release default is quiet enough for --json".to_string()
+                    }
+                    Some(v) => format!("RUST_LOG={v} (quiet)"),
+                }),
+                Some(serde_json::json!({
+                    "rust_log": raw_ref,
+                })),
+            );
+        }
+        RustLogVolume::Noisy { reason } => {
+            push_check(
+                checks,
+                "rust_log",
+                CheckStatus::Warn,
+                Some(format!(
+                    "RUST_LOG={} would dump verbose tracing to stderr and break agents parsing --json. \
+                     Run `export RUST_LOG=error` as documented in README.md.",
+                    raw_ref.unwrap_or("(unset)"),
+                )),
+                Some(serde_json::json!({
+                    "rust_log": raw_ref,
+                    "reason": reason,
+                    "recommended_fix": "export RUST_LOG=error",
+                })),
+            );
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RustLogVolume {
+    Quiet,
+    Noisy { reason: &'static str },
+}
+
+/// Classify a `RUST_LOG` env value as quiet or noisy. Mirrors the
+/// `tracing_subscriber::EnvFilter` precedence: per-module directives
+/// override the default. We only need a conservative "any directive
+/// asks for >= info" predicate for the advisory.
+fn rust_log_volume(raw: Option<&str>) -> RustLogVolume {
+    let Some(value) = raw else {
+        return rust_log_default_volume();
+    };
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return RustLogVolume::Quiet;
+    }
+    // Plain bare levels.
+    match normalized.as_str() {
+        "off" | "error" | "warn" => return RustLogVolume::Quiet,
+        "info" => {
+            return RustLogVolume::Noisy {
+                reason: "bare_level_info",
+            };
+        }
+        "debug" => {
+            return RustLogVolume::Noisy {
+                reason: "bare_level_debug",
+            };
+        }
+        "trace" => {
+            return RustLogVolume::Noisy {
+                reason: "bare_level_trace",
+            };
+        }
+        _ => {}
+    }
+
+    // Composite directive: any segment of the form `<mod>=<level>` or
+    // `<level>` that names info/debug/trace triggers warn.
+    for segment in normalized.split(',') {
+        let seg = segment.trim();
+        if seg.is_empty() {
+            continue;
+        }
+        // Extract the level part (after `=` if present).
+        let level_part = seg.rsplit('=').next().unwrap_or(seg).trim();
+        match level_part {
+            "info" => {
+                return RustLogVolume::Noisy {
+                    reason: "directive_info",
+                };
+            }
+            "debug" => {
+                return RustLogVolume::Noisy {
+                    reason: "directive_debug",
+                };
+            }
+            "trace" => {
+                return RustLogVolume::Noisy {
+                    reason: "directive_trace",
+                };
+            }
+            _ => {}
+        }
+    }
+    RustLogVolume::Quiet
+}
+
+fn rust_log_default_volume() -> RustLogVolume {
+    if cfg!(debug_assertions) {
+        RustLogVolume::Noisy {
+            reason: "debug_build_default",
+        }
+    } else {
+        RustLogVolume::Quiet
+    }
+}
+
 /// When `--repair` is passed and the `gitignore.beads_inner` warning is present,
 /// automatically remove the offending lines from the root `.gitignore`.
 ///
@@ -3827,6 +3957,7 @@ fn collect_doctor_report_with_mode(
     check_merge_artifacts(beads_dir, &mut checks)?;
     check_root_gitignore(beads_dir, &mut checks);
     check_routes_jsonl(beads_dir, &mut checks);
+    check_rust_log_noisy(&mut checks);
 
     let (jsonl_path, jsonl_count) = inspect_doctor_jsonl(beads_dir, paths, &mut checks);
     inspect_doctor_database(
@@ -7221,7 +7352,12 @@ mod tests {
         let bad = check.details.as_ref().unwrap()["malformed_lines"]
             .as_array()
             .unwrap();
-        assert!(bad[0]["reason"].as_str().unwrap().contains("missing `prefix`"));
+        assert!(
+            bad[0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("missing `prefix`")
+        );
     }
 
     #[test]
@@ -7284,5 +7420,91 @@ mod tests {
             details["valid_count"], 2,
             "blank lines must not be counted as routes"
         );
+    }
+
+    // --- rust_log_volume / check_rust_log_noisy tests (pass-2 / WP5) ---
+    //
+    // We test the pure classifier `rust_log_volume(Option<&str>)`
+    // directly. The wrapper `check_rust_log_noisy(checks)` reads
+    // `std::env::var("RUST_LOG")` which makes it sensitive to the
+    // ambient test-runner environment — exercising it through the
+    // classifier keeps the tests deterministic without needing
+    // `#![feature(restricted_std)]` or unsafe `std::env::set_var`.
+
+    #[test]
+    fn rust_log_volume_classifies_unset_like_compiled_default() {
+        assert_eq!(rust_log_volume(None), rust_log_default_volume());
+    }
+
+    #[test]
+    fn rust_log_volume_classifies_blank_as_quiet() {
+        assert_eq!(rust_log_volume(Some("")), RustLogVolume::Quiet);
+        assert_eq!(rust_log_volume(Some("   ")), RustLogVolume::Quiet);
+    }
+
+    #[test]
+    fn rust_log_volume_classifies_quiet_levels_as_quiet() {
+        for level in &["off", "error", "warn", "OFF", "Error", "WARN"] {
+            assert_eq!(
+                rust_log_volume(Some(level)),
+                RustLogVolume::Quiet,
+                "level {level} should be quiet"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_log_volume_classifies_bare_info_as_noisy() {
+        let v = rust_log_volume(Some("info"));
+        match v {
+            RustLogVolume::Noisy { reason } => assert_eq!(reason, "bare_level_info"),
+            _ => panic!("expected Noisy, got {v:?}"),
+        }
+    }
+
+    #[test]
+    fn rust_log_volume_classifies_bare_debug_as_noisy() {
+        let v = rust_log_volume(Some("debug"));
+        match v {
+            RustLogVolume::Noisy { reason } => assert_eq!(reason, "bare_level_debug"),
+            _ => panic!("expected Noisy, got {v:?}"),
+        }
+    }
+
+    #[test]
+    fn rust_log_volume_classifies_bare_trace_as_noisy() {
+        let v = rust_log_volume(Some("trace"));
+        match v {
+            RustLogVolume::Noisy { reason } => assert_eq!(reason, "bare_level_trace"),
+            _ => panic!("expected Noisy, got {v:?}"),
+        }
+    }
+
+    #[test]
+    fn rust_log_volume_classifies_per_module_directive_with_info_as_noisy() {
+        // Per-module directives that ask for info/debug/trace must
+        // still trip the warn — that's the real-world footgun (a
+        // developer leaves `beads_rust=info` set and forgets).
+        let v = rust_log_volume(Some("beads_rust=info"));
+        match v {
+            RustLogVolume::Noisy { reason } => assert_eq!(reason, "directive_info"),
+            _ => panic!("expected Noisy, got {v:?}"),
+        }
+    }
+
+    #[test]
+    fn rust_log_volume_classifies_composite_with_one_noisy_directive_as_noisy() {
+        // First directive is quiet, second is noisy → overall noisy.
+        let v = rust_log_volume(Some("warn,beads_rust=debug"));
+        match v {
+            RustLogVolume::Noisy { reason } => assert_eq!(reason, "directive_debug"),
+            _ => panic!("expected Noisy, got {v:?}"),
+        }
+    }
+
+    #[test]
+    fn rust_log_volume_classifies_composite_all_quiet_as_quiet() {
+        let v = rust_log_volume(Some("error,fsqlite=warn,beads_rust=off"));
+        assert_eq!(v, RustLogVolume::Quiet);
     }
 }
