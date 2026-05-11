@@ -3778,7 +3778,14 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             checks,
         };
         print_report(&report, ctx)?;
-        std::process::exit(1);
+        // Phase 10 cold-prober finding (`beads_rust-s7nx`): missing
+        // .beads/ is the canonical `no_input` (66) condition per the
+        // documented exit-code dictionary. `br doctor health` already
+        // returns 66 for this case; the flat `br doctor` path used to
+        // exit 1, which conflicted with the per-`DoctorExitCode` contract
+        // and made CI / pre-commit hooks unable to distinguish "no
+        // workspace here" from "workspace has findings".
+        std::process::exit(DoctorExitCode::NoInput.as_i32());
     };
 
     let paths = match config::resolve_paths(&beads_dir, cli.db.as_ref()) {

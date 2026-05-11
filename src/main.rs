@@ -81,7 +81,7 @@ fn main() {
         ctx.overrides.read_only_fast_open,
     ) && ctx.is_initialized()
     {
-        let lock_timeout = ctx.write_lock_timeout();
+        let lock_timeout = ctx.startup_write_lock_timeout(&cli.command);
         match ctx.beads_dir.as_deref().map(|beads_dir| {
             beads_rust::sync::blocking_write_lock_with_timeout(beads_dir, lock_timeout)
         }) {
@@ -727,12 +727,29 @@ impl StartupContext {
             .unwrap_or(false)
     }
 
-    fn write_lock_timeout(&self) -> Option<u64> {
+    fn configured_write_lock_timeout(&self) -> Option<u64> {
         self.config
             .as_ref()
             .and_then(config::lock_timeout_from_layer)
+            .or(self.overrides.lock_timeout)
+    }
+
+    fn write_lock_timeout(&self) -> Option<u64> {
+        self.configured_write_lock_timeout()
             .or(Some(beads_rust::sync::default_write_lock_timeout_ms()))
     }
+
+    fn startup_write_lock_timeout(&self, command: &Commands) -> Option<u64> {
+        if command_is_doctor_repair(command) {
+            self.configured_write_lock_timeout().or(Some(0))
+        } else {
+            self.write_lock_timeout()
+        }
+    }
+}
+
+fn command_is_doctor_repair(command: &Commands) -> bool {
+    matches!(command, Commands::Doctor(args) if args.repair && !args.robot_triage)
 }
 
 fn open_storage_from_ctx(
@@ -1267,6 +1284,41 @@ mod tests {
         assert_eq!(overrides.no_auto_flush, None);
         assert_eq!(overrides.no_auto_import, None);
         assert_eq!(overrides.allow_stale, None);
+    }
+
+    #[test]
+    fn doctor_repair_startup_write_lock_fails_fast_by_default() {
+        let ctx = StartupContext::empty(config::CliOverrides::default());
+        let doctor_repair = Cli::parse_from(["br", "doctor", "--repair", "--dry-run"]);
+        let doctor_read_only = Cli::parse_from(["br", "doctor"]);
+
+        assert_eq!(
+            ctx.startup_write_lock_timeout(&doctor_repair.command),
+            Some(0),
+            "doctor repair should try-lock by default so contention returns concurrency_lost quickly"
+        );
+        assert_eq!(
+            ctx.startup_write_lock_timeout(&doctor_read_only.command),
+            Some(beads_rust::sync::default_write_lock_timeout_ms()),
+            "plain doctor should keep the normal startup lock timeout"
+        );
+    }
+
+    #[test]
+    fn doctor_repair_startup_write_lock_honors_explicit_timeout() {
+        let cli = Cli::parse_from([
+            "br",
+            "--lock-timeout",
+            "2500",
+            "doctor",
+            "--repair",
+            "--dry-run",
+        ]);
+        let overrides = build_cli_overrides(&cli);
+        let mut ctx = StartupContext::empty(overrides.clone());
+        ctx.config = Some(overrides.as_layer());
+
+        assert_eq!(ctx.startup_write_lock_timeout(&cli.command), Some(2500));
     }
 
     #[test]

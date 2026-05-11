@@ -1229,3 +1229,40 @@ fn chokepoint_refuse_gate_blocks_downgrade() {
         "refused --repair must leave the workspace untouched"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Test 11 (Phase-10 cold-prober follow-through, bead `beads_rust-s7nx`):
+// `br doctor` (flat, no --repair) in a directory that does not contain a
+// `.beads/` workspace must exit with code 66 (`no_input`) per the
+// documented exit-code dictionary — NOT exit 0 or 1. The companion
+// `br doctor health` already handles this case cleanly; this test
+// asserts the flat path agrees.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn chokepoint_doctor_in_non_beads_dir_exits_no_input() {
+    let tmp = TempDir::new().expect("tempdir");
+    let root = tmp.path().to_path_buf();
+    // Intentionally NO `br init` — this dir has no `.beads/`.
+    assert!(!root.join(".beads").exists());
+
+    let bin_path = env!("CARGO_BIN_EXE_br");
+    let output = std::process::Command::new(bin_path)
+        .args(["doctor", "--json"])
+        .current_dir(&root)
+        .env("RUST_LOG", "error")
+        .env("BR_NO_AUTOFLUSH", "1")
+        .env_remove("BD_DB")
+        .env_remove("BEADS_DB")
+        .output()
+        .expect("invoke br doctor");
+
+    assert_eq!(
+        output.status.code(),
+        Some(66),
+        "expected exit 66 (no_input); got {:?}\nstdout={}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
