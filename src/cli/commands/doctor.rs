@@ -3241,6 +3241,124 @@ fn rust_log_default_volume() -> RustLogVolume {
     }
 }
 
+/// Detector: `.beads/` directory and its critical children must be
+/// writable by the running process. Pass-1 archaeology filed
+/// `fm-permissions-beads-dir-readonly` (P0): a read-only `.beads/`
+/// (or an `issues.jsonl` / `beads.db` with cleared user-write bits)
+/// causes sync writes to fail mid-stream, leaving the DB and JSONL
+/// in an inconsistent torn-write state.
+///
+/// Detect-only. The doctor never `chmod`s the operator's `.beads/`
+/// because the safe action is "tell the operator the exact mode they
+/// need", not "guess what the operator wanted". This honors the
+/// AGENTS.md no-destructive-mutation contract on permission state.
+///
+/// Status mapping:
+/// - `ok` — `.beads/` and the two critical children (`issues.jsonl`,
+///   `beads.db`) all have the user-write bit set on their POSIX mode.
+///   Missing children are NOT a finding here (other detectors cover
+///   them).
+/// - `warn` — at least one of `.beads/`, `.beads/issues.jsonl`, or
+///   `.beads/beads.db` exists with mode `& 0o200 == 0`. The check
+///   surfaces every affected path + its current mode + the canonical
+///   fix command (`chmod u+w <path>`).
+///
+/// Conservative-by-design:
+/// - Only POSIX user-write bit. We do NOT probe ACLs, NFS extended
+///   attrs, or `chattr +i` — the doctor returns false negatives on
+///   those rather than false positives that would alarm operators
+///   on perfectly fine setups.
+/// - No probe-write (a probe write would technically be a side
+///   effect; the spec calls for a future `Op::ProbeOnly` chokepoint
+///   channel we have not yet shipped — `beads_rust-probe-only` is the
+///   tracking work).
+fn check_permissions_beads_dir(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut readonly: Vec<serde_json::Value> = Vec::new();
+
+    // The directory itself.
+    if let Ok(meta) = fs::metadata(beads_dir) {
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o200 == 0 {
+            readonly.push(serde_json::json!({
+                "path": beads_dir.display().to_string(),
+                "mode_octal": format!("{mode:03o}"),
+                "fix": format!("chmod u+w {}", beads_dir.display()),
+                "kind": "directory",
+            }));
+        }
+    } else {
+        // Missing .beads/ is the beads_dir check's job, not this
+        // detector's. Emit an Ok ack with the absent context so
+        // downstream agents see the detector ran.
+        push_check(
+            checks,
+            "permissions.beads_dir",
+            CheckStatus::Ok,
+            Some(format!(
+                "{} not stat-able; deferring to beads_dir check",
+                beads_dir.display(),
+            )),
+            None,
+        );
+        return;
+    }
+
+    // Critical children.
+    for child_name in &["issues.jsonl", "beads.db"] {
+        let child = beads_dir.join(child_name);
+        let Ok(meta) = fs::metadata(&child) else {
+            continue;
+        };
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o200 == 0 {
+            readonly.push(serde_json::json!({
+                "path": child.display().to_string(),
+                "mode_octal": format!("{mode:03o}"),
+                "fix": format!("chmod u+w {}", child.display()),
+                "kind": "file",
+            }));
+        }
+    }
+
+    if readonly.is_empty() {
+        push_check(
+            checks,
+            "permissions.beads_dir",
+            CheckStatus::Ok,
+            Some("`.beads/` and critical children are user-writable".to_string()),
+            Some(serde_json::json!({
+                "beads_dir": beads_dir.display().to_string(),
+            })),
+        );
+    } else {
+        let paths: Vec<String> = readonly
+            .iter()
+            .filter_map(|e| {
+                e.get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
+        push_check(
+            checks,
+            "permissions.beads_dir",
+            CheckStatus::Warn,
+            Some(format!(
+                "{count} path(s) under .beads/ lack the user-write bit: {paths}. \
+                 Operator must fix manually; doctor never auto-chmods.",
+                count = readonly.len(),
+                paths = paths.join(", "),
+            )),
+            Some(serde_json::json!({
+                "beads_dir": beads_dir.display().to_string(),
+                "readonly_paths": readonly,
+            })),
+        );
+    }
+}
+
 /// When `--repair` is passed and the `gitignore.beads_inner` warning is present,
 /// automatically remove the offending lines from the root `.gitignore`.
 ///
@@ -3958,6 +4076,7 @@ fn collect_doctor_report_with_mode(
     check_root_gitignore(beads_dir, &mut checks);
     check_routes_jsonl(beads_dir, &mut checks);
     check_rust_log_noisy(&mut checks);
+    check_permissions_beads_dir(beads_dir, &mut checks);
 
     let (jsonl_path, jsonl_count) = inspect_doctor_jsonl(beads_dir, paths, &mut checks);
     inspect_doctor_database(
@@ -7264,6 +7383,38 @@ mod tests {
         assert!(value.get("rename_to").is_some(), "rename_to recorded");
     }
 
+    #[test]
+    fn check_permissions_beads_dir_reports_ok_for_temp_beads_dir() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let mut checks = Vec::new();
+        check_permissions_beads_dir(&beads_dir, &mut checks);
+
+        let check = find_check(&checks, "permissions.beads_dir").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+    }
+
+    #[test]
+    fn check_permissions_beads_dir_defers_when_metadata_unavailable() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads-missing");
+
+        let mut checks = Vec::new();
+        check_permissions_beads_dir(&beads_dir, &mut checks);
+
+        let check = find_check(&checks, "permissions.beads_dir").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+        assert!(
+            check
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("deferring to beads_dir")),
+            "{check:?}"
+        );
+    }
+
     // --- check_routes_jsonl tests (pass-2 / WP5 unblock for routes_external) ---
 
     #[test]
@@ -7458,7 +7609,7 @@ mod tests {
         let v = rust_log_volume(Some("info"));
         match v {
             RustLogVolume::Noisy { reason } => assert_eq!(reason, "bare_level_info"),
-            _ => panic!("expected Noisy, got {v:?}"),
+            RustLogVolume::Quiet => panic!("expected Noisy, got {v:?}"),
         }
     }
 
@@ -7467,7 +7618,7 @@ mod tests {
         let v = rust_log_volume(Some("debug"));
         match v {
             RustLogVolume::Noisy { reason } => assert_eq!(reason, "bare_level_debug"),
-            _ => panic!("expected Noisy, got {v:?}"),
+            RustLogVolume::Quiet => panic!("expected Noisy, got {v:?}"),
         }
     }
 
@@ -7476,7 +7627,7 @@ mod tests {
         let v = rust_log_volume(Some("trace"));
         match v {
             RustLogVolume::Noisy { reason } => assert_eq!(reason, "bare_level_trace"),
-            _ => panic!("expected Noisy, got {v:?}"),
+            RustLogVolume::Quiet => panic!("expected Noisy, got {v:?}"),
         }
     }
 
@@ -7488,7 +7639,7 @@ mod tests {
         let v = rust_log_volume(Some("beads_rust=info"));
         match v {
             RustLogVolume::Noisy { reason } => assert_eq!(reason, "directive_info"),
-            _ => panic!("expected Noisy, got {v:?}"),
+            RustLogVolume::Quiet => panic!("expected Noisy, got {v:?}"),
         }
     }
 
@@ -7498,7 +7649,7 @@ mod tests {
         let v = rust_log_volume(Some("warn,beads_rust=debug"));
         match v {
             RustLogVolume::Noisy { reason } => assert_eq!(reason, "directive_debug"),
-            _ => panic!("expected Noisy, got {v:?}"),
+            RustLogVolume::Quiet => panic!("expected Noisy, got {v:?}"),
         }
     }
 
@@ -7506,5 +7657,111 @@ mod tests {
     fn rust_log_volume_classifies_composite_all_quiet_as_quiet() {
         let v = rust_log_volume(Some("error,fsqlite=warn,beads_rust=off"));
         assert_eq!(v, RustLogVolume::Quiet);
+    }
+
+    // --- check_permissions_beads_dir tests (pass-2 / WP5) ---
+
+    #[test]
+    fn check_permissions_beads_dir_normal_workspace_is_ok() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::write(beads_dir.join("issues.jsonl"), b"").unwrap();
+        fs::write(beads_dir.join("beads.db"), b"").unwrap();
+        let mode = fs::metadata(&beads_dir).unwrap().permissions().mode() & 0o777;
+        assert!(mode & 0o200 != 0, "test setup: .beads must start writable");
+
+        let mut checks = Vec::new();
+        check_permissions_beads_dir(&beads_dir, &mut checks);
+        let check =
+            find_check(&checks, "permissions.beads_dir").expect("permissions.beads_dir present");
+        assert!(
+            matches!(check.status, CheckStatus::Ok),
+            "writable workspace must be Ok; got {:?}",
+            check.status
+        );
+    }
+
+    #[test]
+    fn check_permissions_beads_dir_readonly_directory_warns() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let mut perms = fs::metadata(&beads_dir).unwrap().permissions();
+        perms.set_mode(0o555);
+        fs::set_permissions(&beads_dir, perms).unwrap();
+
+        let mut checks = Vec::new();
+        check_permissions_beads_dir(&beads_dir, &mut checks);
+        // Restore writability so TempDir can clean up.
+        let mut restore = fs::metadata(&beads_dir).unwrap().permissions();
+        restore.set_mode(0o755);
+        fs::set_permissions(&beads_dir, restore).ok();
+
+        let check =
+            find_check(&checks, "permissions.beads_dir").expect("permissions.beads_dir present");
+        assert!(
+            matches!(check.status, CheckStatus::Warn),
+            "readonly .beads/ must trigger Warn; got {:?}",
+            check.status
+        );
+        let details = check.details.as_ref().expect("details present");
+        let readonly = details["readonly_paths"].as_array().unwrap();
+        assert!(!readonly.is_empty(), "readonly_paths must enumerate the dir");
+        assert_eq!(readonly[0]["kind"], "directory");
+        assert!(
+            readonly[0]["fix"]
+                .as_str()
+                .unwrap()
+                .starts_with("chmod u+w "),
+            "fix must name the canonical chmod command: {readonly:?}"
+        );
+    }
+
+    #[test]
+    fn check_permissions_beads_dir_readonly_issues_jsonl_warns() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let jsonl = beads_dir.join("issues.jsonl");
+        fs::write(&jsonl, b"").unwrap();
+        let mut perms = fs::metadata(&jsonl).unwrap().permissions();
+        perms.set_mode(0o444);
+        fs::set_permissions(&jsonl, perms).unwrap();
+
+        let mut checks = Vec::new();
+        check_permissions_beads_dir(&beads_dir, &mut checks);
+        // Restore for cleanup.
+        let mut restore = fs::metadata(&jsonl).unwrap().permissions();
+        restore.set_mode(0o644);
+        fs::set_permissions(&jsonl, restore).ok();
+
+        let check =
+            find_check(&checks, "permissions.beads_dir").expect("permissions.beads_dir present");
+        assert!(matches!(check.status, CheckStatus::Warn));
+        let details = check.details.as_ref().expect("details present");
+        let readonly = details["readonly_paths"].as_array().unwrap();
+        let kinds: Vec<&str> = readonly
+            .iter()
+            .filter_map(|e| e["kind"].as_str())
+            .collect();
+        assert!(
+            kinds.contains(&"file"),
+            "readonly_paths must flag the file kind: {readonly:?}"
+        );
+    }
+
+    #[test]
+    fn check_permissions_beads_dir_missing_beads_dir_does_not_panic() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join("does_not_exist");
+        let mut checks = Vec::new();
+        check_permissions_beads_dir(&beads_dir, &mut checks);
+        let check =
+            find_check(&checks, "permissions.beads_dir").expect("permissions.beads_dir present");
+        assert!(matches!(check.status, CheckStatus::Ok));
     }
 }
