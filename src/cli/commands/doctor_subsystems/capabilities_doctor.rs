@@ -219,6 +219,7 @@ fn build_detector_registry() -> Vec<DetectorEntry> {
         ("metadata", "configs", "error", true),
         ("gitignore.beads_inner", "configs", "warn", true),
         ("gitignore.root", "configs", "warn", true),
+        ("routes_jsonl", "routes_external", "warn", true),
         ("jsonl.parse", "state_files", "error", true),
         ("jsonl.merge_artifacts", "state_files", "warn", true),
         ("sync_jsonl_path", "state_files", "warn", true),

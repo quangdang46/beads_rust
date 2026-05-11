@@ -166,14 +166,14 @@ impl DoctorRepairSession {
     /// audit + verbatim backup. Callers receive the closure's `T`
     /// unchanged so existing result-collection patterns
     /// (`LocalRepairResult` accumulation, tracing emit) stay intact.
-    fn record_legacy_mutation<F, T>(
+    fn record_legacy_mutation<F>(
         &mut self,
         fixer_id: &str,
         paths: &[&Path],
         legacy: F,
-    ) -> Result<T>
+    ) -> Result<()>
     where
-        F: FnOnce() -> Result<T>,
+        F: FnOnce() -> Result<()>,
     {
         let prior_fixer = std::mem::replace(&mut self.ctx.fixer_id, fixer_id.to_string());
         let result = chokepoint::record_legacy_op(&self.ctx, fixer_id, paths, legacy);
@@ -2982,6 +2982,135 @@ fn check_root_gitignore(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
     }
 }
 
+/// Detector: `.beads/routes.jsonl` parses cleanly and every line carries a
+/// non-empty `prefix` + `path`. Routes are used by route-aware commands
+/// (`br show`, `br update`, `br dep`, etc.) to dispatch cross-workspace
+/// operations; one malformed line silently breaks every routed command.
+///
+/// This is the FM `fm-routes_external-routes-jsonl-corrupt` (P1) detector
+/// in the pass-1 archaeology — unblocks the `routes_external` subsystem's
+/// fixture suite (`beads_rust-gl1m`).
+///
+/// Detect-only. The doctor never auto-rewrites `routes.jsonl` because the
+/// operator's intent for cross-project routing is unknowable from the
+/// outside (deleting an orphan line could lose a routing decision the
+/// operator hasn't yet recorded elsewhere). On error, the check surfaces
+/// the bad line numbers + reasons; the operator handles the rewrite.
+///
+/// Status mapping:
+/// - `ok` — file missing (routes are optional) OR every line is well-formed.
+/// - `warn` — at least one line is malformed JSON, missing `prefix`/`path`,
+///   has a non-string `prefix`/`path`, or `prefix` is empty.
+fn check_routes_jsonl(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
+    let routes_path = beads_dir.join("routes.jsonl");
+
+    if !routes_path.is_file() {
+        // Routes are optional. Absence is not a finding.
+        push_check(
+            checks,
+            "routes_jsonl",
+            CheckStatus::Ok,
+            Some("No routes.jsonl present (cross-project routing is optional)".to_string()),
+            None,
+        );
+        return;
+    }
+
+    let body = match fs::read_to_string(&routes_path) {
+        Ok(s) => s,
+        Err(err) => {
+            push_check(
+                checks,
+                "routes_jsonl",
+                CheckStatus::Warn,
+                Some(format!("Failed to read routes.jsonl: {err}")),
+                Some(serde_json::json!({
+                    "path": routes_path.display().to_string(),
+                })),
+            );
+            return;
+        }
+    };
+
+    let mut malformed_lines: Vec<serde_json::Value> = Vec::new();
+    let mut valid_count: usize = 0;
+
+    for (idx, raw) in body.lines().enumerate() {
+        let line_no = idx + 1;
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let value: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(err) => {
+                malformed_lines.push(serde_json::json!({
+                    "line": line_no,
+                    "reason": format!("parse_error: {err}"),
+                }));
+                continue;
+            }
+        };
+
+        let mut reasons = Vec::new();
+        match value.get("prefix") {
+            None => reasons.push("missing `prefix` field".to_string()),
+            Some(prefix) => match prefix.as_str() {
+                Some("") => reasons.push("empty `prefix` field".to_string()),
+                Some(_) => {}
+                None => reasons.push("non-string `prefix` field".to_string()),
+            },
+        }
+        match value.get("path") {
+            None => reasons.push("missing `path` field".to_string()),
+            Some(path) => match path.as_str() {
+                Some("") => reasons.push("empty `path` field".to_string()),
+                Some(_) => {}
+                None => reasons.push("non-string `path` field".to_string()),
+            },
+        }
+
+        if reasons.is_empty() {
+            valid_count += 1;
+        } else {
+            malformed_lines.push(serde_json::json!({
+                "line": line_no,
+                "reason": reasons.join("; "),
+                "reasons": reasons,
+            }));
+        }
+    }
+
+    if malformed_lines.is_empty() {
+        push_check(
+            checks,
+            "routes_jsonl",
+            CheckStatus::Ok,
+            Some(format!("{valid_count} routes parsed cleanly")),
+            Some(serde_json::json!({
+                "path": routes_path.display().to_string(),
+                "valid_count": valid_count,
+            })),
+        );
+    } else {
+        let bad = malformed_lines.len();
+        push_check(
+            checks,
+            "routes_jsonl",
+            CheckStatus::Warn,
+            Some(format!(
+                "{bad} malformed route line(s) in routes.jsonl ({valid_count} valid). Operator must rewrite manually; doctor never auto-rewrites routes."
+            )),
+            Some(serde_json::json!({
+                "path": routes_path.display().to_string(),
+                "valid_count": valid_count,
+                "malformed_lines": malformed_lines,
+            })),
+        );
+    }
+}
+
 /// When `--repair` is passed and the `gitignore.beads_inner` warning is present,
 /// automatically remove the offending lines from the root `.gitignore`.
 ///
@@ -3697,6 +3826,7 @@ fn collect_doctor_report_with_mode(
     let mut checks = Vec::new();
     check_merge_artifacts(beads_dir, &mut checks)?;
     check_root_gitignore(beads_dir, &mut checks);
+    check_routes_jsonl(beads_dir, &mut checks);
 
     let (jsonl_path, jsonl_count) = inspect_doctor_jsonl(beads_dir, paths, &mut checks);
     inspect_doctor_database(
@@ -7001,5 +7131,158 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(line).unwrap();
         assert_eq!(value["op"], "rename");
         assert!(value.get("rename_to").is_some(), "rename_to recorded");
+    }
+
+    // --- check_routes_jsonl tests (pass-2 / WP5 unblock for routes_external) ---
+
+    #[test]
+    fn check_routes_jsonl_missing_is_ok() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        // No routes.jsonl planted.
+        let mut checks = Vec::new();
+        check_routes_jsonl(&beads_dir, &mut checks);
+        let check = find_check(&checks, "routes_jsonl").expect("routes_jsonl present");
+        assert!(
+            matches!(check.status, CheckStatus::Ok),
+            "missing routes.jsonl must be Ok (routing is optional); got {:?}",
+            check.status
+        );
+    }
+
+    #[test]
+    fn check_routes_jsonl_well_formed_is_ok() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let routes = beads_dir.join("routes.jsonl");
+        fs::write(
+            &routes,
+            "{\"prefix\":\"api-\",\"path\":\"../api\"}\n\
+             {\"prefix\":\"ops-\",\"path\":\"/srv/projects/ops/.beads\"}\n",
+        )
+        .unwrap();
+        let mut checks = Vec::new();
+        check_routes_jsonl(&beads_dir, &mut checks);
+        let check = find_check(&checks, "routes_jsonl").expect("routes_jsonl present");
+        assert!(
+            matches!(check.status, CheckStatus::Ok),
+            "well-formed routes.jsonl must be Ok; got {:?}",
+            check.status
+        );
+        let details = check.details.as_ref().expect("details present");
+        assert_eq!(details["valid_count"], 2);
+    }
+
+    #[test]
+    fn check_routes_jsonl_parse_error_warns() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let routes = beads_dir.join("routes.jsonl");
+        // One good line + one malformed line.
+        fs::write(
+            &routes,
+            "{\"prefix\":\"api-\",\"path\":\"../api\"}\n\
+             {not json at all}\n",
+        )
+        .unwrap();
+        let mut checks = Vec::new();
+        check_routes_jsonl(&beads_dir, &mut checks);
+        let check = find_check(&checks, "routes_jsonl").expect("routes_jsonl present");
+        assert!(
+            matches!(check.status, CheckStatus::Warn),
+            "malformed line must trigger Warn; got {:?}",
+            check.status
+        );
+        let details = check.details.as_ref().expect("details present");
+        let bad = details["malformed_lines"].as_array().unwrap();
+        assert_eq!(bad.len(), 1);
+        assert_eq!(bad[0]["line"], 2);
+        assert!(
+            bad[0]["reason"].as_str().unwrap().contains("parse_error"),
+            "reason must name parse_error"
+        );
+    }
+
+    #[test]
+    fn check_routes_jsonl_missing_prefix_field_warns() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let routes = beads_dir.join("routes.jsonl");
+        // Missing prefix entirely.
+        fs::write(&routes, "{\"path\":\"../api\"}\n").unwrap();
+        let mut checks = Vec::new();
+        check_routes_jsonl(&beads_dir, &mut checks);
+        let check = find_check(&checks, "routes_jsonl").expect("routes_jsonl present");
+        assert!(matches!(check.status, CheckStatus::Warn));
+        let bad = check.details.as_ref().unwrap()["malformed_lines"]
+            .as_array()
+            .unwrap();
+        assert!(bad[0]["reason"].as_str().unwrap().contains("missing `prefix`"));
+    }
+
+    #[test]
+    fn check_routes_jsonl_non_string_fields_warn_clearly() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let routes = beads_dir.join("routes.jsonl");
+        fs::write(&routes, "{\"prefix\":42,\"path\":[\"../api\"]}\n").unwrap();
+        let mut checks = Vec::new();
+        check_routes_jsonl(&beads_dir, &mut checks);
+        let check = find_check(&checks, "routes_jsonl").expect("routes_jsonl present");
+        assert!(matches!(check.status, CheckStatus::Warn));
+        let bad = check.details.as_ref().unwrap()["malformed_lines"]
+            .as_array()
+            .unwrap();
+        let reason = bad[0]["reason"].as_str().unwrap();
+        assert!(reason.contains("non-string `prefix`"), "{reason}");
+        assert!(reason.contains("non-string `path`"), "{reason}");
+    }
+
+    #[test]
+    fn check_routes_jsonl_empty_path_warns() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let routes = beads_dir.join("routes.jsonl");
+        fs::write(&routes, "{\"prefix\":\"api-\",\"path\":\"\"}\n").unwrap();
+        let mut checks = Vec::new();
+        check_routes_jsonl(&beads_dir, &mut checks);
+        let check = find_check(&checks, "routes_jsonl").expect("routes_jsonl present");
+        assert!(matches!(check.status, CheckStatus::Warn));
+        let bad = check.details.as_ref().unwrap()["malformed_lines"]
+            .as_array()
+            .unwrap();
+        assert!(bad[0]["reason"].as_str().unwrap().contains("empty `path`"));
+    }
+
+    #[test]
+    fn check_routes_jsonl_skips_blank_lines() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let routes = beads_dir.join("routes.jsonl");
+        fs::write(
+            &routes,
+            "\n\
+             {\"prefix\":\"api-\",\"path\":\"../api\"}\n\
+             \n\
+             {\"prefix\":\"ops-\",\"path\":\"../ops\"}\n\
+             \n",
+        )
+        .unwrap();
+        let mut checks = Vec::new();
+        check_routes_jsonl(&beads_dir, &mut checks);
+        let check = find_check(&checks, "routes_jsonl").expect("routes_jsonl present");
+        assert!(matches!(check.status, CheckStatus::Ok));
+        let details = check.details.as_ref().expect("details present");
+        assert_eq!(
+            details["valid_count"], 2,
+            "blank lines must not be counted as routes"
+        );
     }
 }
