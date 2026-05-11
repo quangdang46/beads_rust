@@ -3843,7 +3843,17 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             // open-file-descriptions would deadlock on Linux flock(2).
             None
         } else {
-            match crate::sync::blocking_write_lock_with_timeout(&beads_dir, cli.lock_timeout) {
+            // Phase 10 cold-prober finding (`beads_rust-mbpq` P0):
+            // the documented contract is "try-lock or refuse with
+            // exit 5 (concurrency_lost)" — NOT "block up to
+            // --lock-timeout then refuse". Concurrency between two
+            // `br doctor --repair` invocations is an unrecoverable
+            // operator-level condition: blocking for 30s and then
+            // erroring serves nobody. Operators who genuinely want
+            // to wait can pass `--lock-timeout 30000` explicitly;
+            // the default doctor path tries once and refuses fast.
+            let timeout_ms = cli.lock_timeout.unwrap_or(0);
+            match crate::sync::blocking_write_lock_with_timeout(&beads_dir, Some(timeout_ms)) {
                 Ok(file) => Some(file),
                 Err(err) => {
                     emit_concurrency_lost(&beads_dir, &err, ctx);
