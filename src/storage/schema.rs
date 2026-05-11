@@ -1948,6 +1948,50 @@ mod tests {
         assert_eq!(export_row.get(0).and_then(SqliteValue::as_integer), Some(0));
     }
 
+    /// Regression for beads_rust#290: legacy DBs that pre-date the
+    /// `marked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP` definition
+    /// kept `dirty_issues.marked_at` as a plain NOT NULL column with no
+    /// default. The v7 migration's `INSERT INTO dirty_issues (issue_id)`
+    /// path then tripped the constraint and bricked every `br` command
+    /// against the legacy DB. The fix passes `marked_at` explicitly so
+    /// the absence of a column-level default no longer matters.
+    #[test]
+    fn test_v7_rebuild_works_when_dirty_issues_has_no_default() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("Failed to apply schema");
+
+        // Re-create dirty_issues without the DEFAULT to mirror what
+        // a DB initialized under the pre-v7 schema looks like in the wild.
+        conn.execute("DROP TABLE dirty_issues").unwrap();
+        conn.execute(
+            "CREATE TABLE dirty_issues (
+                 issue_id TEXT PRIMARY KEY,
+                 marked_at TEXT NOT NULL
+             )",
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO issues (id, content_hash, title, status, priority, issue_type, created_at, updated_at) \
+             VALUES ('bd-legacy', 'old-rust-hash', 'Legacy', 'open', 2, 'task', '2026-04-02T20:00:00Z', '2026-04-03T01:00:00Z')",
+        ).unwrap();
+        conn.execute("PRAGMA user_version = 6").unwrap();
+
+        run_migrations(&conn, false)
+            .expect("v7 migration must succeed against legacy dirty_issues schema");
+
+        let dirty_row = conn
+            .query_row("SELECT COUNT(*) FROM dirty_issues WHERE issue_id = 'bd-legacy'")
+            .unwrap();
+        assert_eq!(
+            dirty_row.get(0).and_then(SqliteValue::as_integer),
+            Some(1),
+            "issue must be flagged dirty after v7 even on legacy table shape"
+        );
+    }
+
     #[test]
     fn test_v8_backfills_storage_null_in_default_columns() {
         let temp = TempDir::new().expect("tempdir");
