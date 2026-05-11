@@ -7709,7 +7709,10 @@ mod tests {
         );
         let details = check.details.as_ref().expect("details present");
         let readonly = details["readonly_paths"].as_array().unwrap();
-        assert!(!readonly.is_empty(), "readonly_paths must enumerate the dir");
+        assert!(
+            !readonly.is_empty(),
+            "readonly_paths must enumerate the dir"
+        );
         assert_eq!(readonly[0]["kind"], "directory");
         assert!(
             readonly[0]["fix"]
@@ -7744,10 +7747,7 @@ mod tests {
         assert!(matches!(check.status, CheckStatus::Warn));
         let details = check.details.as_ref().expect("details present");
         let readonly = details["readonly_paths"].as_array().unwrap();
-        let kinds: Vec<&str> = readonly
-            .iter()
-            .filter_map(|e| e["kind"].as_str())
-            .collect();
+        let kinds: Vec<&str> = readonly.iter().filter_map(|e| e["kind"].as_str()).collect();
         assert!(
             kinds.contains(&"file"),
             "readonly_paths must flag the file kind: {readonly:?}"
