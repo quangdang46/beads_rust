@@ -20,7 +20,7 @@ use crate::sync::{
     validate_no_git_path, validate_sync_path, validate_sync_path_with_external,
 };
 use chrono::{NaiveDate, Utc};
-use fsqlite::Connection;
+use fsqlite::{Connection, Row};
 use fsqlite_error::FrankenError;
 use fsqlite_types::SqliteValue;
 use rich_rust::prelude::*;
@@ -5399,8 +5399,8 @@ fn checkpoint_and_snapshot_repair_indexes(db_path: &Path, snapshot_path: &Path) 
     // with a snapshot that's missing whatever data the WAL still
     // held, silently destroying committed-but-uncheckpointed work.
     let conn = Connection::open(db_path.to_string_lossy().into_owned())?;
-    let checkpoint_ok = match conn.execute("PRAGMA wal_checkpoint(TRUNCATE)") {
-        Ok(_) => true,
+    let checkpoint_complete = match wal_checkpoint_truncate_complete(&conn) {
+        Ok(complete) => complete,
         Err(checkpoint_err) => {
             tracing::warn!(
                 error = %checkpoint_err,
@@ -5410,6 +5410,33 @@ fn checkpoint_and_snapshot_repair_indexes(db_path: &Path, snapshot_path: &Path) 
         }
     };
     close_repair_indexes_connection(conn, "after pre-snapshot WAL checkpoint");
+
+    // Clear sidecar snapshots from any previous `--repair-indexes`
+    // invocation BEFORE writing the new ones. Without this cleanup,
+    // a previous run that failed checkpoint (and therefore wrote
+    // `<snapshot>-wal` / `<snapshot>-shm`) could leave those files
+    // on disk; if the current run's checkpoint succeeds, we
+    // wouldn't overwrite them, and the restore path would
+    // incorrectly find them and use them as the "pre-state" — a
+    // Frankenstein mix of two different points in time. The
+    // missing-sidecar-snapshot signal is load-bearing in the
+    // restore logic, so we keep it accurate by clearing first.
+    let wal_snap = PathBuf::from(format!("{}-wal", snapshot_path.to_string_lossy()));
+    let shm_snap = PathBuf::from(format!("{}-shm", snapshot_path.to_string_lossy()));
+    for stale in [&wal_snap, &shm_snap] {
+        match std::fs::remove_file(stale) {
+            Ok(()) => tracing::debug!(
+                path = %stale.display(),
+                "doctor --repair-indexes: cleared stale sidecar snapshot from a previous run"
+            ),
+            Err(rm_err) if rm_err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(rm_err) => tracing::warn!(
+                error = %rm_err,
+                path = %stale.display(),
+                "doctor --repair-indexes: failed to remove stale sidecar snapshot; restore may incorrectly use it as pre-state"
+            ),
+        }
+    }
 
     std::fs::copy(db_path, snapshot_path).map_err(|err| BeadsError::Internal {
         message: format!(
@@ -5426,15 +5453,10 @@ fn checkpoint_and_snapshot_repair_indexes(db_path: &Path, snapshot_path: &Path) 
     // snapshot is complete, and missing sidecar snapshots are the
     // signal to the restore path that it should delete the live
     // sidecars (they have no valid pre-state to restore).
-    if !checkpoint_ok {
+    if !checkpoint_complete {
         let wal_live = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
         let shm_live = PathBuf::from(format!("{}-shm", db_path.to_string_lossy()));
-        let wal_snap = PathBuf::from(format!("{}-wal", snapshot_path.to_string_lossy()));
-        let shm_snap = PathBuf::from(format!("{}-shm", snapshot_path.to_string_lossy()));
-        for (live, snap, kind) in [
-            (&wal_live, &wal_snap, "WAL"),
-            (&shm_live, &shm_snap, "SHM"),
-        ] {
+        for (live, snap, kind) in [(&wal_live, &wal_snap, "WAL"), (&shm_live, &shm_snap, "SHM")] {
             if live.exists()
                 && let Err(copy_err) = std::fs::copy(live, snap)
             {
@@ -5448,6 +5470,42 @@ fn checkpoint_and_snapshot_repair_indexes(db_path: &Path, snapshot_path: &Path) 
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WalCheckpointStats {
+    busy: i64,
+    log_frames: i64,
+    checkpointed_frames: i64,
+}
+
+impl WalCheckpointStats {
+    const fn complete(self) -> bool {
+        self.busy == 0 && (self.log_frames < 0 || self.checkpointed_frames >= self.log_frames)
+    }
+}
+
+fn wal_checkpoint_truncate_complete(conn: &Connection) -> std::result::Result<bool, FrankenError> {
+    let rows = conn.query("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    let Some(row) = rows.first() else {
+        return Ok(false);
+    };
+    Ok(wal_checkpoint_stats_from_row(row).is_some_and(WalCheckpointStats::complete))
+}
+
+fn wal_checkpoint_stats_from_row(row: &Row) -> Option<WalCheckpointStats> {
+    Some(WalCheckpointStats {
+        busy: sqlite_value_i64(row.get(0))?,
+        log_frames: sqlite_value_i64(row.get(1))?,
+        checkpointed_frames: sqlite_value_i64(row.get(2))?,
+    })
+}
+
+const fn sqlite_value_i64(value: Option<&SqliteValue>) -> Option<i64> {
+    match value {
+        Some(SqliteValue::Integer(value)) => Some(*value),
+        _ => None,
+    }
 }
 
 fn restore_repair_indexes_snapshot(
@@ -5491,12 +5549,15 @@ fn restore_repair_indexes_snapshot(
                     live = %sidecar.display(),
                     "doctor --repair-indexes: restored sidecar from pre-checkpoint snapshot"
                 ),
-                Err(copy_err) => tracing::warn!(
-                    error = %copy_err,
-                    snapshot = %sidecar_snapshot.display(),
-                    live = %sidecar.display(),
-                    "doctor --repair-indexes: failed to restore sidecar from snapshot; next open may see inconsistent WAL state"
-                ),
+                Err(copy_err) => {
+                    return Err(BeadsError::Internal {
+                        message: format!(
+                            "doctor --repair-indexes: restored DB snapshot but failed to restore sidecar snapshot {} -> {}: original={original_err}, restore_sidecar={copy_err}",
+                            sidecar_snapshot.display(),
+                            sidecar.display(),
+                        ),
+                    });
+                }
             }
             // The snapshot copy stays on disk as forensic evidence
             // — operators can verify the restore by comparing the
@@ -10170,6 +10231,50 @@ version = "2026-05-11-abc123"
     // -----------------------------------------------------------------
     // br doctor --repair-indexes (beads_rust#288)
     // -----------------------------------------------------------------
+
+    #[test]
+    fn wal_checkpoint_stats_complete_accepts_full_checkpoint() {
+        let stats = WalCheckpointStats {
+            busy: 0,
+            log_frames: 7,
+            checkpointed_frames: 7,
+        };
+
+        assert!(stats.complete());
+    }
+
+    #[test]
+    fn wal_checkpoint_stats_complete_accepts_non_wal_sentinel() {
+        let stats = WalCheckpointStats {
+            busy: 0,
+            log_frames: -1,
+            checkpointed_frames: -1,
+        };
+
+        assert!(stats.complete());
+    }
+
+    #[test]
+    fn wal_checkpoint_stats_complete_rejects_busy_checkpoint() {
+        let stats = WalCheckpointStats {
+            busy: 1,
+            log_frames: 7,
+            checkpointed_frames: 0,
+        };
+
+        assert!(!stats.complete());
+    }
+
+    #[test]
+    fn wal_checkpoint_stats_complete_rejects_partial_checkpoint() {
+        let stats = WalCheckpointStats {
+            busy: 0,
+            log_frames: 7,
+            checkpointed_frames: 3,
+        };
+
+        assert!(!stats.complete());
+    }
 
     #[test]
     fn execute_repair_indexes_succeeds_against_healthy_db_and_retains_snapshot() {
