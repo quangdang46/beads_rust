@@ -514,6 +514,83 @@ fn push_check(
     });
 }
 
+/// Canonical mapping from `check.name` values (emitted by `push_check`)
+/// to `fm-<subsystem>-<slug>` FM identifiers from the Phase-1
+/// archaeology in `/data/projects/beads_rust__doctor_workspace/analysis/
+/// failure_modes/`. Pass-3 (gap item #3, `diagnostic_specificity`):
+/// agents reading `br doctor --json` get the human check name today,
+/// but no stable cross-pass identifier they can pin tooling to. This
+/// table is the bridge — the capabilities envelope advertises the
+/// mapping so consumers can translate either way.
+///
+/// Additive contract: not every check has an FM mapping (some are
+/// scaffolding-only or new pass-3 entries). Lookups return `None`
+/// for unmapped names; absence is not a fatal contract violation.
+/// As new detectors land, append their (check_name, fm_id) tuple
+/// here.
+///
+/// Stability: the FM identifiers are the canonical form
+/// `fm-<subsystem>-<slug>`. Renaming an existing mapping is a
+/// breaking change to the agent-facing contract; appending new
+/// rows is additive.
+pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
+    // state_files (pass-1 archaeology + pass-1 / pass-2 detectors)
+    ("jsonl.parse", "fm-state_files-jsonl-malformed-utf8"),
+    ("jsonl.merge_artifacts", "fm-state_files-jsonl-conflict-markers"),
+    ("sync_jsonl_path", "fm-state_files-jsonl-row-count-mismatch"),
+    ("sync_conflict_markers", "fm-state_files-jsonl-conflict-markers"),
+    ("merge_artifacts", "fm-state_files-merge-artifact-stuck"),
+    ("db.exists", "fm-state_files-empty-or-truncated-database"),
+    ("db.open", "fm-state_files-sqlite-page-malformed"),
+    ("db.sidecars", "fm-state_files-wal-shm-sidecar-orphan"),
+    ("db.recovery_artifacts", "fm-state_files-recovery-artifacts-orphaned"),
+    ("db.recoverable_anomalies", "fm-caches_indexes-blocked-cache-stale"),
+    ("counts.db_vs_jsonl", "fm-state_files-jsonl-row-count-mismatch"),
+    ("sync.metadata", "fm-state_files-dirty-flag-divergence"),
+    ("sqlite.integrity_check", "fm-state_files-sqlite-page-malformed"),
+    ("sqlite3.integrity_check", "fm-state_files-sqlite-page-malformed"),
+    ("db.write_probe", "fm-state_files-sqlite-page-malformed"),
+    ("db.null_defaults", "fm-schemas-missing-required-column"),
+    // schemas
+    ("schema.tables", "fm-schemas-missing-required-table"),
+    ("schema.columns", "fm-schemas-missing-required-column"),
+    ("schema.inspect", "fm-schemas-issue-column-order-divergence"),
+    // configs
+    ("beads_dir", "fm-configs-metadata-json-stale"),
+    ("metadata", "fm-configs-metadata-json-stale"),
+    ("metadata.json", "fm-configs-metadata-json-stale"),
+    ("gitignore.beads_inner", "fm-configs-gitignore-leaking-beads"),
+    ("gitignore.root", "fm-configs-gitignore-leaking-beads"),
+    ("config.yaml", "fm-configs-yaml-malformed"),
+    // agent_coordination
+    ("audit.suspect_close_reasons", "fm-agent_coordination-suspect-close-reason"),
+    // routes_external
+    ("routes_jsonl", "fm-routes_external-routes-jsonl-corrupt"),
+    ("routes.targets", "fm-routes_external-route-target-missing"),
+    // observability
+    ("rust_log", "fm-observability-rust-log-noisy-breaks-json"),
+    // permissions
+    ("permissions.beads_dir", "fm-permissions-beads-dir-readonly"),
+    // external_artifacts
+    ("binary_version", "fm-external_artifacts-binary-version-mismatch"),
+    // concurrency_primitives
+    ("write_lock", "fm-concurrency_primitives-orphaned-write-lock"),
+];
+
+/// Look up the canonical `fm-<subsystem>-<slug>` FM identifier for a
+/// `check.name` value. Returns `None` for unmapped names (scaffolding
+/// checks, new pass-3+ entries not yet registered). Lookup is O(N)
+/// over the static table; N is small (~32) so a HashMap would be
+/// overkill for a per-doctor-run call.
+#[must_use]
+#[allow(dead_code)] // public-by-design lookup helper; the table is also iterated directly by capabilities_doctor.
+fn finding_id_for(check_name: &str) -> Option<&'static str> {
+    CHECK_NAME_TO_FINDING_ID
+        .iter()
+        .find(|(name, _)| *name == check_name)
+        .map(|(_, fm_id)| *fm_id)
+}
+
 fn has_error(checks: &[CheckResult]) -> bool {
     checks
         .iter()
@@ -5430,11 +5507,14 @@ fn checkpoint_and_snapshot_repair_indexes(db_path: &Path, snapshot_path: &Path) 
                 "doctor --repair-indexes: cleared stale sidecar snapshot from a previous run"
             ),
             Err(rm_err) if rm_err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(rm_err) => tracing::warn!(
-                error = %rm_err,
-                path = %stale.display(),
-                "doctor --repair-indexes: failed to remove stale sidecar snapshot; restore may incorrectly use it as pre-state"
-            ),
+            Err(rm_err) => {
+                return Err(BeadsError::Internal {
+                    message: format!(
+                        "doctor --repair-indexes: failed to remove stale sidecar snapshot {}; refusing to continue because restore could incorrectly use it as pre-state: {rm_err}",
+                        stale.display(),
+                    ),
+                });
+            }
         }
     }
 
@@ -10366,14 +10446,8 @@ version = "2026-05-11-abc123"
         // are arbitrary — the test only cares that they exist before
         // and DON'T exist after the next successful invocation.
         let snapshot_path = db_path.with_extension("db.pre-repair-indexes");
-        let stale_wal = PathBuf::from(format!(
-            "{}-wal",
-            snapshot_path.to_string_lossy()
-        ));
-        let stale_shm = PathBuf::from(format!(
-            "{}-shm",
-            snapshot_path.to_string_lossy()
-        ));
+        let stale_wal = PathBuf::from(format!("{}-wal", snapshot_path.to_string_lossy()));
+        let stale_shm = PathBuf::from(format!("{}-shm", snapshot_path.to_string_lossy()));
         fs::write(&stale_wal, b"stale wal from a previous run").unwrap();
         fs::write(&stale_shm, b"stale shm from a previous run").unwrap();
 
@@ -10419,6 +10493,38 @@ version = "2026-05-11-abc123"
         assert!(
             snapshot_path.exists(),
             "current run's pre-snapshot must be retained at {}",
+            snapshot_path.display(),
+        );
+    }
+
+    #[test]
+    fn checkpoint_and_snapshot_repair_indexes_refuses_unremovable_stale_sidecar_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        storage
+            .create_issue(&sample_issue("bd-stale-sidecar-dir", "test"), "test")
+            .unwrap();
+        drop(storage);
+
+        let snapshot_path = db_path.with_extension("db.pre-repair-indexes");
+        let stale_wal = PathBuf::from(format!("{}-wal", snapshot_path.to_string_lossy()));
+        fs::create_dir(&stale_wal).unwrap();
+
+        let err = checkpoint_and_snapshot_repair_indexes(&db_path, &snapshot_path)
+            .expect_err("unremovable stale sidecar snapshot must fail closed");
+        let message = err.to_string();
+        assert!(
+            message.contains("failed to remove stale sidecar snapshot")
+                && message.contains("refusing to continue"),
+            "unexpected error: {message}",
+        );
+        assert!(
+            !snapshot_path.exists(),
+            "must fail before writing a new DB snapshot at {}",
             snapshot_path.display(),
         );
     }
@@ -10613,5 +10719,66 @@ version = "2026-05-11-abc123"
             "wisp ids must be filtered from the JSONL side too: {:?}",
             delta.only_jsonl
         );
+    }
+
+    // --- finding-id table tests (pass-3 / gap item #3) ---
+
+    #[test]
+    fn finding_id_table_has_no_duplicate_check_names() {
+        // Each check.name maps to AT MOST one canonical FM. A duplicate
+        // row would silently shadow the second entry under the
+        // linear-scan lookup; reject at test time.
+        let mut seen: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
+        for (name, _) in CHECK_NAME_TO_FINDING_ID {
+            assert!(
+                seen.insert(*name),
+                "duplicate check_name {name} in CHECK_NAME_TO_FINDING_ID"
+            );
+        }
+    }
+
+    #[test]
+    fn finding_id_table_uses_canonical_fm_form() {
+        // FM identifiers must match `fm-<subsystem>-<slug>` (no
+        // leading/trailing whitespace, no underscores in the
+        // subsystem half — the workspace uses snake_case for
+        // subsystem names and kebab-case for slugs).
+        for (name, fm_id) in CHECK_NAME_TO_FINDING_ID {
+            assert!(
+                fm_id.starts_with("fm-"),
+                "finding_id for {name} must start with `fm-`: {fm_id}"
+            );
+            assert!(
+                fm_id.len() > "fm-".len(),
+                "finding_id for {name} is just the prefix: {fm_id}"
+            );
+            assert!(
+                !fm_id.contains(' '),
+                "finding_id for {name} contains whitespace: {fm_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn finding_id_for_returns_canonical_form() {
+        // Spot-check three known entries across distinct subsystems.
+        assert_eq!(
+            finding_id_for("routes_jsonl"),
+            Some("fm-routes_external-routes-jsonl-corrupt")
+        );
+        assert_eq!(
+            finding_id_for("rust_log"),
+            Some("fm-observability-rust-log-noisy-breaks-json")
+        );
+        assert_eq!(
+            finding_id_for("audit.suspect_close_reasons"),
+            Some("fm-agent_coordination-suspect-close-reason")
+        );
+    }
+
+    #[test]
+    fn finding_id_for_returns_none_for_unmapped() {
+        assert_eq!(finding_id_for("definitely_not_a_real_check"), None);
+        assert_eq!(finding_id_for(""), None);
     }
 }

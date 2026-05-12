@@ -60,6 +60,28 @@ pub struct DoctorCapabilities {
     /// names are kebab-case to match `actions.jsonl` `op` values, the
     /// `params` array enumerates the field names a fixer must supply.
     pub ops_supported: Vec<OpEntry>,
+    /// Pass-3 finding-id schema unification (`diagnostic_specificity`).
+    /// Maps each emitted `check.name` value to its canonical
+    /// `fm-<subsystem>-<slug>` identifier from the Phase-1
+    /// archaeology. Agents tooling around `br doctor --json` can
+    /// translate either way:
+    ///
+    /// ```jq
+    /// .checks[].name as $n
+    /// | (.. | .finding_id_map[]? | select(.check_name == $n) | .finding_id) // null
+    /// ```
+    ///
+    /// Stable contract: rows are additive. Unmapped check names
+    /// (scaffolding / not-yet-classified) carry no entry rather
+    /// than a synthetic placeholder.
+    pub finding_id_map: Vec<FindingIdEntry>,
+}
+
+/// One row in the check-name → FM-id map.
+#[derive(Debug, Clone, Serialize)]
+pub struct FindingIdEntry {
+    pub check_name: &'static str,
+    pub finding_id: &'static str,
 }
 
 /// One row in the supported-ops list. Matches the variants in
@@ -177,6 +199,7 @@ impl DoctorCapabilities {
                     fully_routed: true,
                 },
             ],
+            finding_id_map: build_finding_id_map(),
         }
     }
 
@@ -349,6 +372,22 @@ fn build_fixer_registry() -> Vec<FixerEntry> {
                 addressed_findings: addressed.iter().map(|s| (*s).to_string()).collect(),
             },
         )
+        .collect()
+}
+
+/// Build the check-name → finding-id map from the canonical table in
+/// `super::super::doctor::CHECK_NAME_TO_FINDING_ID`. Pass-3 gap item
+/// #3 (`diagnostic_specificity`): every agent reading
+/// `br doctor --json` should be able to translate a check.name to
+/// its stable `fm-<subsystem>-<slug>` identifier without
+/// out-of-band knowledge.
+fn build_finding_id_map() -> Vec<FindingIdEntry> {
+    super::super::doctor::CHECK_NAME_TO_FINDING_ID
+        .iter()
+        .map(|(check_name, finding_id)| FindingIdEntry {
+            check_name,
+            finding_id,
+        })
         .collect()
 }
 
