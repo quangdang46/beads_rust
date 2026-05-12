@@ -220,6 +220,7 @@ fn build_detector_registry() -> Vec<DetectorEntry> {
         ("gitignore.beads_inner", "configs", "warn", true),
         ("gitignore.root", "configs", "warn", true),
         ("routes_jsonl", "routes_external", "warn", true),
+        ("routes.targets", "routes_external", "warn", true),
         ("rust_log", "observability", "warn", true),
         ("permissions.beads_dir", "permissions", "warn", true),
         ("config.yaml", "configs", "warn", true),
