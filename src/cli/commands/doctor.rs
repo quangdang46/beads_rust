@@ -641,13 +641,71 @@ fn append_count_mismatch_anomaly(check: &CheckResult, anomalies: &mut Vec<Anomal
         return;
     };
 
-    push_anomaly(
-        anomalies,
-        AnomalyClass::DbJsonlCountMismatch {
-            db_count,
-            jsonl_count,
-        },
-    );
+    // Only emit the cardinality-only finding when counts actually differ.
+    // The check now warns on equal-count + diverging-id-set too (#286);
+    // in that case we want the dedicated `DbJsonlIdSetMismatch` anomaly,
+    // not the misleading `count_mismatch` one.
+    if db_count != jsonl_count {
+        push_anomaly(
+            anomalies,
+            AnomalyClass::DbJsonlCountMismatch {
+                db_count,
+                jsonl_count,
+            },
+        );
+    }
+
+    // If the check carried an `id_delta` payload, emit the set-mismatch
+    // anomaly with the per-side breakdown so operators see *which* ids
+    // diverged, not just that some did. The payload is the same shape
+    // produced by `IdDelta::to_json`.
+    if let Some(id_delta) = details.get("id_delta") {
+        let only_db = id_delta
+            .get("only_db")
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let only_jsonl = id_delta
+            .get("only_jsonl")
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let only_db_count = id_delta
+            .get("only_db_count")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(only_db.len());
+        let only_jsonl_count = id_delta
+            .get("only_jsonl_count")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(only_jsonl.len());
+        let both_count = id_delta
+            .get("both_count")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(0);
+        if only_db_count > 0 || only_jsonl_count > 0 {
+            push_anomaly(
+                anomalies,
+                AnomalyClass::DbJsonlIdSetMismatch {
+                    only_db_count,
+                    only_jsonl_count,
+                    only_db,
+                    only_jsonl,
+                    both_count,
+                },
+            );
+        }
+    }
 }
 
 fn sidecar_presence_from_check(check: &CheckResult) -> (bool, bool) {
@@ -4343,6 +4401,109 @@ enum JsonlCountState {
     Unreadable,
 }
 
+/// ID-set delta between SQLite store and JSONL stream, used by
+/// `counts.db_vs_jsonl` to surface the structural shape of any
+/// divergence rather than just the cardinality difference. The
+/// detection cap (`IdDelta::PER_SIDE_PREVIEW_LIMIT`) keeps the
+/// emitted JSON bounded on huge drifts; the counts always reflect
+/// the true total even when the previews are clipped.
+struct IdDelta {
+    only_db: Vec<String>,
+    only_jsonl: Vec<String>,
+    both_count: usize,
+}
+
+impl IdDelta {
+    /// Maximum number of ids we serialize per side into the `details`
+    /// JSON. Operators almost always want the *first few* divergent
+    /// ids so they can grep the JSONL or the DB for the row; the rest
+    /// is noise.
+    const PER_SIDE_PREVIEW_LIMIT: usize = 50;
+
+    fn to_json(&self) -> serde_json::Value {
+        let cap = Self::PER_SIDE_PREVIEW_LIMIT;
+        let mut only_db_preview = self.only_db.clone();
+        let mut only_jsonl_preview = self.only_jsonl.clone();
+        only_db_preview.sort();
+        only_jsonl_preview.sort();
+        only_db_preview.truncate(cap);
+        only_jsonl_preview.truncate(cap);
+        serde_json::json!({
+            "only_db_count": self.only_db.len(),
+            "only_jsonl_count": self.only_jsonl.len(),
+            "both_count": self.both_count,
+            "only_db": only_db_preview,
+            "only_jsonl": only_jsonl_preview,
+            "preview_limit": cap,
+        })
+    }
+}
+
+/// Compute the per-id set delta between the DB's `issues` table and
+/// the JSONL stream at `jsonl_path`. Both sides honor the same
+/// ephemeral/wisp filter the cardinality check uses so the comparison
+/// is apples-to-apples. The function is read-only and bounded by the
+/// in-memory HashSet of the union of ids — fine for any realistic
+/// `.beads/` size.
+fn compute_db_jsonl_id_delta(conn: &Connection, jsonl_path: &Path) -> Result<IdDelta> {
+    use std::collections::HashSet;
+    use std::io::{BufRead, BufReader};
+
+    // DB side: include the same filter the cardinality check uses so
+    // counts and ids agree on the same population.
+    let rows = conn.query(
+        "SELECT id FROM issues \
+         WHERE (ephemeral = 0 OR ephemeral IS NULL) AND id NOT LIKE '%-wisp-%'",
+    )?;
+    let mut db_ids: HashSet<String> = HashSet::with_capacity(rows.len());
+    for row in &rows {
+        if let Some(id) = row.get(0).and_then(SqliteValue::as_text) {
+            db_ids.insert(id.to_string());
+        }
+    }
+
+    // JSONL side: re-parse each record. We can't reuse the validator's
+    // summary here because it doesn't carry the id set, and threading
+    // the set through `JsonlCountState` would require touching every
+    // callsite of `check_jsonl`. The re-read is bounded to once per
+    // doctor run and only happens on the warn path.
+    let file = std::fs::File::open(jsonl_path)?;
+    let reader = BufReader::with_capacity(2 * 1024 * 1024, file);
+    let mut jsonl_ids: HashSet<String> = HashSet::new();
+    for line in reader.lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Lightweight extract: pull just `id` rather than deserializing
+        // the full Issue. Doctor isn't a hot path but the JSONL can be
+        // large and we don't need the rest of the fields.
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed)
+            && let Some(id) = value.get("id").and_then(serde_json::Value::as_str)
+        {
+            // Apply the same wisp filter as the DB query so the
+            // comparison stays apples-to-apples.
+            if id.contains("-wisp-") {
+                continue;
+            }
+            jsonl_ids.insert(id.to_string());
+        }
+    }
+
+    let mut only_db: Vec<String> = db_ids.difference(&jsonl_ids).cloned().collect();
+    let mut only_jsonl: Vec<String> = jsonl_ids.difference(&db_ids).cloned().collect();
+    only_db.sort();
+    only_jsonl.sort();
+    let both_count = db_ids.intersection(&jsonl_ids).count();
+
+    Ok(IdDelta {
+        only_db,
+        only_jsonl,
+        both_count,
+    })
+}
+
 fn check_jsonl(path: &Path, checks: &mut Vec<CheckResult>) -> Result<JsonlCountState> {
     let summary = validate_jsonl_issue_records(path)?;
 
@@ -4395,6 +4556,7 @@ fn check_jsonl(path: &Path, checks: &mut Vec<CheckResult>) -> Result<JsonlCountS
 fn check_db_count(
     conn: &Connection,
     jsonl_count: JsonlCountState,
+    jsonl_path: Option<&Path>,
     checks: &mut Vec<CheckResult>,
 ) -> Result<()> {
     let db_count: i64 = conn.query_row(
@@ -4409,6 +4571,34 @@ fn check_db_count(
             #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
             let db_count_usize = db_count as usize;
             if db_count_usize == jsonl_count {
+                // Even when cardinality matches, the ID sets can disagree.
+                // Compute the delta unconditionally on the warn path and
+                // also on the matched-count path *only* when we have a
+                // JSONL handle, so `|only_db| == |only_jsonl| > 0`
+                // (the case the count check silently passes on) is
+                // still surfaced as a `db_jsonl_id_set_mismatch` finding.
+                if let Some(path) = jsonl_path
+                    && let Ok(delta) = compute_db_jsonl_id_delta(conn, path)
+                    && (!delta.only_db.is_empty() || !delta.only_jsonl.is_empty())
+                {
+                    push_check(
+                        checks,
+                        "counts.db_vs_jsonl",
+                        CheckStatus::Warn,
+                        Some(format!(
+                            "DB and JSONL counts match ({}) but id sets diverge: {} only in DB, {} only in JSONL",
+                            db_count,
+                            delta.only_db.len(),
+                            delta.only_jsonl.len(),
+                        )),
+                        Some(serde_json::json!({
+                            "db": db_count,
+                            "jsonl": jsonl_count,
+                            "id_delta": delta.to_json(),
+                        })),
+                    );
+                    return Ok(());
+                }
                 push_check(
                     checks,
                     "counts.db_vs_jsonl",
@@ -4417,15 +4607,21 @@ fn check_db_count(
                     None,
                 );
             } else {
+                let mut details = serde_json::json!({
+                    "db": db_count,
+                    "jsonl": jsonl_count,
+                });
+                if let Some(path) = jsonl_path
+                    && let Ok(delta) = compute_db_jsonl_id_delta(conn, path)
+                {
+                    details["id_delta"] = delta.to_json();
+                }
                 push_check(
                     checks,
                     "counts.db_vs_jsonl",
                     CheckStatus::Warn,
                     Some("DB and JSONL counts differ".to_string()),
-                    Some(serde_json::json!({
-                        "db": db_count,
-                        "jsonl": jsonl_count
-                    })),
+                    Some(details),
                 );
             }
         }
@@ -5008,7 +5204,7 @@ fn inspect_existing_doctor_database(
         // beads_rust-m3mi: audit-suspect close_reasons (warn level)
         check_suspect_close_reasons(&conn, checks);
         if mode == DoctorInspectionMode::Full {
-            if let Err(err) = check_db_count(&conn, jsonl_count, checks) {
+            if let Err(err) = check_db_count(&conn, jsonl_count, jsonl_path, checks) {
                 push_inspection_error(
                     checks,
                     "counts.db_vs_jsonl",
@@ -5922,6 +6118,55 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_doctor_checks_preserves_id_delta_total_counts() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let jsonl_path = temp.path().join("issues.jsonl");
+        let checks = vec![CheckResult {
+            name: "counts.db_vs_jsonl".to_string(),
+            status: CheckStatus::Warn,
+            message: Some("DB and JSONL counts match but id sets diverge".to_string()),
+            details: Some(serde_json::json!({
+                "db": 100,
+                "jsonl": 100,
+                "id_delta": {
+                    "only_db_count": 100,
+                    "only_jsonl_count": 100,
+                    "both_count": 0,
+                    "only_db": ["db-1", "db-2"],
+                    "only_jsonl": ["jsonl-1"],
+                    "preview_limit": 2
+                }
+            })),
+        }];
+
+        let classification = classify_doctor_checks(&db_path, &jsonl_path, &checks);
+
+        assert_eq!(classification.health, WorkspaceHealth::Degraded);
+        let Some(AnomalyClass::DbJsonlIdSetMismatch {
+            only_db_count,
+            only_jsonl_count,
+            only_db,
+            only_jsonl,
+            both_count,
+        }) = classification
+            .anomalies
+            .iter()
+            .find(|anomaly| matches!(anomaly, AnomalyClass::DbJsonlIdSetMismatch { .. }))
+        else {
+            panic!(
+                "expected id-set mismatch anomaly: {:?}",
+                classification.anomalies
+            );
+        };
+        assert_eq!(*only_db_count, 100);
+        assert_eq!(*only_jsonl_count, 100);
+        assert_eq!(*both_count, 0);
+        assert_eq!(only_db.as_slice(), ["db-1".to_string(), "db-2".to_string()]);
+        assert_eq!(only_jsonl.as_slice(), ["jsonl-1".to_string()]);
+    }
+
+    #[test]
     fn test_classify_doctor_checks_marks_warn_recoverable_anomalies_degraded() {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("beads.db");
@@ -6507,6 +6752,53 @@ mod tests {
             "unexpected count-check message: {:?}",
             counts_check.message
         );
+    }
+
+    #[test]
+    fn test_collect_doctor_report_warns_on_equal_count_id_set_mismatch() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        storage
+            .create_issue(&sample_issue("bd-db01", "Only in DB"), "doctor-test")
+            .unwrap();
+
+        let json = serde_json::to_string(&sample_issue("bd-jsonl01", "Only in JSONL")).unwrap();
+        fs::write(&jsonl_path, format!("{json}\n")).unwrap();
+
+        let paths = config::ConfigPaths {
+            beads_dir: beads_dir.clone(),
+            db_path,
+            jsonl_path,
+            metadata: config::Metadata::default(),
+        };
+
+        let report = collect_doctor_report(&beads_dir, &paths).expect("doctor report");
+        let counts_check =
+            find_check(&report.report.checks, "counts.db_vs_jsonl").expect("count check");
+
+        assert!(matches!(counts_check.status, CheckStatus::Warn));
+        assert!(
+            counts_check
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("id sets diverge")),
+            "unexpected count-check message: {:?}",
+            counts_check.message
+        );
+        let id_delta = counts_check
+            .details
+            .as_ref()
+            .and_then(|details| details.get("id_delta"))
+            .expect("id delta details");
+        assert_eq!(id_delta["only_db_count"], 1);
+        assert_eq!(id_delta["only_jsonl_count"], 1);
+        assert_eq!(id_delta["only_db"][0], "bd-db01");
+        assert_eq!(id_delta["only_jsonl"][0], "bd-jsonl01");
     }
 
     #[test]
@@ -9152,6 +9444,105 @@ version = "2026-05-11-abc123"
             matches!(check.status, CheckStatus::Ok),
             "symlink .write.lock should defer to TOCTOU detector; got {:?}",
             check.status
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // id-set divergence detection (beads_rust#286)
+    // -----------------------------------------------------------------
+
+    /// Helper for the id-delta tests: insert a row into the `issues`
+    /// table using only the columns the cardinality query reads (the
+    /// schema has many NOT NULL columns we don't care about for this
+    /// test, but the default values cover them).
+    fn insert_minimal_issue(storage: &mut SqliteStorage, id: &str) {
+        let issue = sample_issue(id, "test");
+        storage.create_issue(&issue, "test").unwrap();
+    }
+
+    /// Helper: write an `issues.jsonl` containing exactly the supplied
+    /// id list, each as a minimal valid record.
+    fn write_jsonl_with_ids(path: &Path, ids: &[&str]) {
+        let mut buf = String::new();
+        for id in ids {
+            buf.push_str(&format!(
+                "{{\"id\":\"{}\",\"title\":\"t\",\"status\":\"open\",\"priority\":2,\"issue_type\":\"task\",\"created_at\":\"2026-05-01T00:00:00Z\",\"updated_at\":\"2026-05-01T00:00:00Z\"}}\n",
+                id
+            ));
+        }
+        fs::write(path, buf).unwrap();
+    }
+
+    #[test]
+    fn compute_db_jsonl_id_delta_detects_only_db_only_jsonl_and_both() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        insert_minimal_issue(&mut storage, "bd-1");
+        insert_minimal_issue(&mut storage, "bd-2");
+        insert_minimal_issue(&mut storage, "bd-only-db");
+        drop(storage);
+
+        let jsonl_path = tmp.path().join("issues.jsonl");
+        write_jsonl_with_ids(&jsonl_path, &["bd-1", "bd-2", "bd-only-jsonl"]);
+
+        let conn =
+            Connection::open(db_path.to_string_lossy().into_owned()).expect("open db for read");
+        let delta = compute_db_jsonl_id_delta(&conn, &jsonl_path).expect("id delta should succeed");
+
+        // The intersection contains bd-1 and bd-2.
+        assert_eq!(delta.both_count, 2);
+        assert_eq!(delta.only_db, vec!["bd-only-db".to_string()]);
+        assert_eq!(delta.only_jsonl, vec!["bd-only-jsonl".to_string()]);
+    }
+
+    #[test]
+    fn compute_db_jsonl_id_delta_is_empty_when_stores_agree() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        insert_minimal_issue(&mut storage, "bd-a");
+        insert_minimal_issue(&mut storage, "bd-b");
+        drop(storage);
+
+        let jsonl_path = tmp.path().join("issues.jsonl");
+        write_jsonl_with_ids(&jsonl_path, &["bd-a", "bd-b"]);
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let delta = compute_db_jsonl_id_delta(&conn, &jsonl_path).unwrap();
+
+        assert_eq!(delta.both_count, 2);
+        assert!(delta.only_db.is_empty());
+        assert!(delta.only_jsonl.is_empty());
+    }
+
+    #[test]
+    fn compute_db_jsonl_id_delta_skips_wisp_ids() {
+        // Wisp-suffixed ids are intentionally filtered out of the DB
+        // cardinality query (`id NOT LIKE '%-wisp-%'`). The delta
+        // computation must apply the same filter on the JSONL side
+        // so a wisp record present in JSONL but absent from the DB
+        // doesn't surface as a spurious `only_jsonl` finding.
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        insert_minimal_issue(&mut storage, "bd-a");
+        drop(storage);
+
+        let jsonl_path = tmp.path().join("issues.jsonl");
+        write_jsonl_with_ids(&jsonl_path, &["bd-a", "bd-wisp-ephemeral"]);
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let delta = compute_db_jsonl_id_delta(&conn, &jsonl_path).unwrap();
+
+        // The wisp id must be filtered out, otherwise the delta would
+        // (incorrectly) report bd-wisp-ephemeral as only_jsonl.
+        assert_eq!(delta.both_count, 1);
+        assert!(delta.only_db.is_empty(), "{:?}", delta.only_db);
+        assert!(
+            delta.only_jsonl.is_empty(),
+            "wisp ids must be filtered from the JSONL side too: {:?}",
+            delta.only_jsonl
         );
     }
 }

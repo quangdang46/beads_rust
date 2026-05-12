@@ -79,6 +79,19 @@ pub enum AnomalyClass {
         db_count: usize,
         jsonl_count: usize,
     },
+    /// Issue ID set differs between DB and JSONL. Emitted in addition to
+    /// (or instead of) `DbJsonlCountMismatch` when we have enough
+    /// information to enumerate which ids live on which side. Both
+    /// stores can have equal cardinality while still disagreeing on
+    /// which specific issues exist — the count-only check passes in
+    /// that case, the set check does not. See beads_rust#286.
+    DbJsonlIdSetMismatch {
+        only_db_count: usize,
+        only_jsonl_count: usize,
+        only_db: Vec<String>,
+        only_jsonl: Vec<String>,
+        both_count: usize,
+    },
     JsonlNewer,
     DbNewer,
     StaleRecoveryArtifacts,
@@ -126,6 +139,7 @@ impl AnomalyClass {
             Self::JsonlParseError { .. } => "jsonl_parse_error",
             Self::JsonlConflictMarkers => "jsonl_conflict_markers",
             Self::DbJsonlCountMismatch { .. } => "db_jsonl_count_mismatch",
+            Self::DbJsonlIdSetMismatch { .. } => "db_jsonl_id_set_mismatch",
             Self::JsonlNewer => "jsonl_newer",
             Self::DbNewer => "db_newer",
             Self::StaleRecoveryArtifacts => "stale_recovery_artifacts",
@@ -159,6 +173,7 @@ impl AnomalyClass {
 
             Self::SidecarMismatch { .. }
             | Self::DbJsonlCountMismatch { .. }
+            | Self::DbJsonlIdSetMismatch { .. }
             | Self::JsonlNewer
             | Self::DbNewer
             | Self::StaleRecoveryArtifacts
@@ -216,6 +231,37 @@ impl fmt::Display for AnomalyClass {
                 write!(
                     f,
                     "DB/JSONL count mismatch (db={db_count}, jsonl={jsonl_count})"
+                )
+            }
+            Self::DbJsonlIdSetMismatch {
+                only_db_count,
+                only_jsonl_count,
+                only_db,
+                only_jsonl,
+                both_count,
+            } => {
+                // Cap the inline preview at the first few ids per side so
+                // the doctor finding stays readable for large drifts.
+                // `details` carries total counts plus the bounded previews.
+                let preview = |ids: &[String]| -> String {
+                    const LIMIT: usize = 3;
+                    if ids.len() <= LIMIT {
+                        ids.join(", ")
+                    } else {
+                        format!(
+                            "{}, … (+{} more)",
+                            ids[..LIMIT].join(", "),
+                            ids.len() - LIMIT
+                        )
+                    }
+                };
+                write!(
+                    f,
+                    "DB/JSONL id-set mismatch (only_db={}: [{}]; only_jsonl={}: [{}]; both={both_count})",
+                    only_db_count,
+                    preview(only_db),
+                    only_jsonl_count,
+                    preview(only_jsonl),
                 )
             }
             Self::JsonlNewer => f.write_str("JSONL has newer data than database"),
