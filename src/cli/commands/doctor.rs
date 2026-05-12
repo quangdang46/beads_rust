@@ -384,13 +384,13 @@ fn emit_recovery_audit_record(record: &RecoveryAuditRecord) {
 
 /// Emit a `ConcurrencyLost` refusal payload before exiting with code 5.
 ///
-/// Used by the `--repair` lock guard when another process holds the
+/// Used by doctor repair lock guards when another process holds the
 /// `.write.lock`. JSON callers receive a structured envelope with
 /// `exit_code: 5`, `code: "concurrency_lost"`, and the underlying
 /// timeout error text; non-JSON callers get a one-line error on stderr.
 /// The message intentionally names `.write.lock` so agent scripts can
 /// match on it the same way they do for other contention paths.
-fn emit_concurrency_lost(beads_dir: &Path, err: &BeadsError, ctx: &OutputContext) {
+fn emit_concurrency_lost(beads_dir: &Path, err: &BeadsError, ctx: &OutputContext, operation: &str) {
     let lock_path = beads_dir.join(".write.lock");
     let detail = err.to_string();
     let recovery_audit = RecoveryAuditRecord {
@@ -415,7 +415,7 @@ fn emit_concurrency_lost(beads_dir: &Path, err: &BeadsError, ctx: &OutputContext
             "exit_code": DoctorExitCode::ConcurrencyLost.as_i32(),
             "code": DoctorExitCode::ConcurrencyLost.as_str(),
             "message": format!(
-                "Refusing --repair: workspace write lock at {} is held by another process",
+                "Refusing {operation}: workspace write lock at {} is held by another process",
                 lock_path.display()
             ),
             "detail": detail,
@@ -424,7 +424,7 @@ fn emit_concurrency_lost(beads_dir: &Path, err: &BeadsError, ctx: &OutputContext
         }));
     } else {
         ctx.error(&format!(
-            "Refusing --repair: workspace write lock at {} is held by another process. \
+            "Refusing {operation}: workspace write lock at {} is held by another process. \
              Wait for the other br invocation to finish or pass --lock-timeout to wait longer. \
              Underlying error: {detail}",
             lock_path.display()
@@ -5065,17 +5065,18 @@ fn execute_repair_indexes(
     paths: &config::ConfigPaths,
     ctx: &OutputContext,
     args: &DoctorArgs,
+    cli: &config::CliOverrides,
 ) -> Result<()> {
     // Acquire the workspace write lock the same way --repair does.
     // A REINDEX inside a transaction is a write, and concurrency with
     // another writer is operator error.
-    let _write_lock_guard = if cli_holds_write_lock(beads_dir) {
+    let _write_lock_guard = if cli.holds_write_lock_for(beads_dir) {
         None
     } else {
         match crate::sync::blocking_write_lock_with_timeout(beads_dir, Some(0)) {
             Ok(file) => Some(file),
             Err(err) => {
-                emit_concurrency_lost(beads_dir, &err, ctx);
+                emit_concurrency_lost(beads_dir, &err, ctx, "--repair-indexes");
                 std::process::exit(DoctorExitCode::ConcurrencyLost.as_i32());
             }
         }
@@ -5123,6 +5124,7 @@ fn execute_repair_indexes(
         // No user indexes — nothing to reindex. Leave the snapshot in
         // place so the operator has a recoverable pre-state regardless.
         ctx.info("doctor --repair-indexes: no user indexes found; nothing to do");
+        conn.close()?;
         return Ok(());
     }
 
@@ -5132,7 +5134,8 @@ fn execute_repair_indexes(
     // half-rebuilt-tree window the user flagged in their #288 repro
     // (step 2 -> 3 -> 4 iterative discovery).
     conn.execute("BEGIN IMMEDIATE")?;
-    let reindex_result: Result<()> = (|| {
+    let reindex_result: Result<usize> = (|| {
+        let mut reindexed_count = 0;
         for name in &index_names {
             // Indexes might not all be quotable as identifiers safely
             // via Rust's format!. `sqlite_master` rows come from
@@ -5149,16 +5152,17 @@ fn execute_repair_indexes(
                 continue;
             }
             conn.execute(&format!("REINDEX {name}"))?;
+            reindexed_count += 1;
         }
-        Ok(())
+        conn.execute("COMMIT")?;
+        Ok(reindexed_count)
     })();
 
     match reindex_result {
-        Ok(()) => {
-            conn.execute("COMMIT")?;
+        Ok(reindexed_count) => {
+            conn.close()?;
             ctx.success(&format!(
-                "doctor --repair-indexes: REINDEX completed on {} user indexes (pre-snapshot retained at {})",
-                index_names.len(),
+                "doctor --repair-indexes: REINDEX completed on {reindexed_count} user indexes (pre-snapshot retained at {})",
                 snapshot_path.display(),
             ));
             Ok(())
@@ -5176,7 +5180,12 @@ fn execute_repair_indexes(
             );
             // Close the connection before the file copy so we don't
             // race the SQLite WAL machinery on the live DB.
-            drop(conn);
+            if let Err(close_err) = conn.close() {
+                tracing::warn!(
+                    error = %close_err,
+                    "doctor --repair-indexes: failed to close connection before restoring pre-snapshot"
+                );
+            }
             std::fs::copy(&snapshot_path, &paths.db_path).map_err(|copy_err| {
                 BeadsError::Internal {
                     message: format!(
@@ -5187,21 +5196,6 @@ fn execute_repair_indexes(
             Err(err)
         }
     }
-}
-
-/// Mirror of the `cli.holds_write_lock_for(beads_dir)` check used by
-/// the flat doctor handler. Returns true when the caller's main.rs
-/// already serialized us against concurrent writers and we shouldn't
-/// open a second flock handle (same-process flock(2) deadlock on Linux).
-fn cli_holds_write_lock(_beads_dir: &Path) -> bool {
-    // The repair-indexes path is invoked from the same `execute()`
-    // function as the regular flat doctor, but we don't have direct
-    // access to the `CliOverrides` instance here. Take the
-    // conservative path and always acquire our own lock — the
-    // try-once-or-refuse semantics with `Some(0)` timeout matches the
-    // existing `--repair` behavior, so an external main.rs holder
-    // would already have caused the flat handler to skip locking too.
-    false
 }
 
 fn collect_doctor_report(beads_dir: &Path, paths: &config::ConfigPaths) -> Result<DoctorRun> {
@@ -5521,7 +5515,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             match crate::sync::blocking_write_lock_with_timeout(&beads_dir, Some(timeout_ms)) {
                 Ok(file) => Some(file),
                 Err(err) => {
-                    emit_concurrency_lost(&beads_dir, &err, ctx);
+                    emit_concurrency_lost(&beads_dir, &err, ctx, "--repair");
                     std::process::exit(DoctorExitCode::ConcurrencyLost.as_i32());
                 }
             }
@@ -5595,7 +5589,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     // operators get the repair result instead of the pre-repair
     // findings.
     if args.repair_indexes {
-        return execute_repair_indexes(&beads_dir, &paths, ctx, args);
+        return execute_repair_indexes(&beads_dir, &paths, ctx, args, cli);
     }
 
     // Auto-fix root .gitignore if --repair is passed and the warning is present.
@@ -9745,8 +9739,9 @@ version = "2026-05-11-abc123"
             subcommand: None,
         };
         let ctx = OutputContext::from_flags(false, true, true);
+        let cli = crate::config::CliOverrides::default();
 
-        let result = execute_repair_indexes(&beads_dir, &paths, &ctx, &args);
+        let result = execute_repair_indexes(&beads_dir, &paths, &ctx, &args, &cli);
         assert!(
             result.is_ok(),
             "repair-indexes against a healthy DB must succeed: {:?}",
@@ -9768,6 +9763,56 @@ version = "2026-05-11-abc123"
         let storage = SqliteStorage::open(&db_path).unwrap();
         let reloaded = storage.get_issue("bd-ri-1").unwrap();
         assert!(reloaded.is_some(), "issue row must survive REINDEX");
+    }
+
+    #[test]
+    fn execute_repair_indexes_reuses_startup_write_lock() {
+        use crate::config::{CliOverrides, ConfigPaths};
+        use crate::output::OutputContext;
+
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        storage
+            .create_issue(&sample_issue("bd-ri-lock-1", "lock reuse"), "test")
+            .unwrap();
+        drop(storage);
+
+        let _startup_lock =
+            crate::sync::blocking_write_lock_with_timeout(&beads_dir, Some(0)).unwrap();
+        let cli = CliOverrides {
+            held_write_lock_beads_dir: Some(beads_dir.clone()),
+            ..CliOverrides::default()
+        };
+        let paths = ConfigPaths {
+            beads_dir: beads_dir.clone(),
+            db_path: db_path.clone(),
+            jsonl_path: beads_dir.join("issues.jsonl"),
+            metadata: crate::config::Metadata::default(),
+        };
+        let args = DoctorArgs {
+            repair: false,
+            repair_indexes: true,
+            allow_repeated_repair: false,
+            dry_run: false,
+            robot_triage: false,
+            quick: false,
+            subcommand: None,
+        };
+        let ctx = OutputContext::from_flags(false, true, true);
+
+        execute_repair_indexes(&beads_dir, &paths, &ctx, &args, &cli).unwrap();
+
+        let snapshot_path = db_path.with_extension("db.pre-repair-indexes");
+        assert!(
+            snapshot_path.exists(),
+            "held-lock repair-indexes should still retain the pre-snapshot"
+        );
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        assert!(storage.get_issue("bd-ri-lock-1").unwrap().is_some());
     }
 
     #[test]
@@ -9804,8 +9849,9 @@ version = "2026-05-11-abc123"
             subcommand: None,
         };
         let ctx = OutputContext::from_flags(false, true, true);
+        let cli = crate::config::CliOverrides::default();
 
-        execute_repair_indexes(&beads_dir, &paths, &ctx, &args).unwrap();
+        execute_repair_indexes(&beads_dir, &paths, &ctx, &args, &cli).unwrap();
 
         // Dry-run must not even take the pre-snapshot — the file
         // shouldn't exist.
