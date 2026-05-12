@@ -5102,19 +5102,23 @@ fn execute_repair_indexes(
         ),
     })?;
 
-    // Open the DB and enumerate every user index attached to the
-    // issues table family (issues, dependencies, comments, labels,
-    // etc.) so we don't reindex sqlite_autoindex_* or any internal
-    // index — those are managed by SQLite and not the partial-index
-    // class we're after.
+    // Open the DB and enumerate every user-defined index so we don't
+    // reindex sqlite_autoindex_* or any internal index — those are
+    // managed by SQLite and not the partial-index class we're after.
     let conn = Connection::open(paths.db_path.to_string_lossy().into_owned())?;
-    let rows = conn.query(
+    let rows = match conn.query(
         "SELECT name FROM sqlite_master \
          WHERE type = 'index' \
            AND name NOT LIKE 'sqlite_autoindex_%' \
            AND sql IS NOT NULL \
          ORDER BY name",
-    )?;
+    ) {
+        Ok(rows) => rows,
+        Err(err) => {
+            close_repair_indexes_connection(conn, "after index enumeration failed");
+            return Err(err.into());
+        }
+    };
     let index_names: Vec<String> = rows
         .iter()
         .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(String::from))
@@ -5133,18 +5137,21 @@ fn execute_repair_indexes(
     // pre-state on any failure mid-pass. This avoids the
     // half-rebuilt-tree window the user flagged in their #288 repro
     // (step 2 -> 3 -> 4 iterative discovery).
-    conn.execute("BEGIN IMMEDIATE")?;
+    if let Err(err) = conn.execute("BEGIN IMMEDIATE") {
+        close_repair_indexes_connection(conn, "after BEGIN IMMEDIATE failed");
+        return Err(err.into());
+    }
     let reindex_result: Result<usize> = (|| {
         let mut reindexed_count = 0;
         for name in &index_names {
             // Indexes might not all be quotable as identifiers safely
             // via Rust's format!. `sqlite_master` rows come from
             // user-supplied CREATE INDEX statements so we treat them
-            // as untrusted: validate against `[A-Za-z0-9_]+` and the
-            // (rare) double-quoted forms before splicing into the
+            // as untrusted: validate against unquoted SQLite identifier
+            // characters before splicing into the
             // REINDEX statement. Any non-conforming name is skipped
             // with a warning rather than executed.
-            if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            if !is_unquoted_sql_identifier(name) {
                 tracing::warn!(
                     index_name = %name,
                     "doctor --repair-indexes: skipping index with non-identifier characters; rerun with manual REINDEX after auditing the name"
@@ -5180,12 +5187,7 @@ fn execute_repair_indexes(
             );
             // Close the connection before the file copy so we don't
             // race the SQLite WAL machinery on the live DB.
-            if let Err(close_err) = conn.close() {
-                tracing::warn!(
-                    error = %close_err,
-                    "doctor --repair-indexes: failed to close connection before restoring pre-snapshot"
-                );
-            }
+            close_repair_indexes_connection(conn, "before restoring pre-snapshot");
             std::fs::copy(&snapshot_path, &paths.db_path).map_err(|copy_err| {
                 BeadsError::Internal {
                     message: format!(
@@ -5196,6 +5198,25 @@ fn execute_repair_indexes(
             Err(err)
         }
     }
+}
+
+fn close_repair_indexes_connection(conn: Connection, context: &str) {
+    if let Err(close_err) = conn.close() {
+        tracing::warn!(
+            error = %close_err,
+            context,
+            "doctor --repair-indexes: failed to close connection"
+        );
+    }
+}
+
+fn is_unquoted_sql_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || matches!(first, '_'))
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_'))
 }
 
 fn collect_doctor_report(beads_dir: &Path, paths: &config::ConfigPaths) -> Result<DoctorRun> {
@@ -9813,6 +9834,61 @@ version = "2026-05-11-abc123"
         );
         let storage = SqliteStorage::open(&db_path).unwrap();
         assert!(storage.get_issue("bd-ri-lock-1").unwrap().is_some());
+    }
+
+    #[test]
+    fn execute_repair_indexes_skips_names_that_need_quoting() {
+        use crate::config::ConfigPaths;
+        use crate::output::OutputContext;
+
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        storage
+            .create_issue(&sample_issue("bd-ri-quoted-1", "quoted index"), "test")
+            .unwrap();
+        drop(storage);
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        conn.execute(r#"CREATE INDEX "123doctor_weird" ON issues(title)"#)
+            .unwrap();
+        conn.close().unwrap();
+
+        let paths = ConfigPaths {
+            beads_dir: beads_dir.clone(),
+            db_path: db_path.clone(),
+            jsonl_path: beads_dir.join("issues.jsonl"),
+            metadata: crate::config::Metadata::default(),
+        };
+        let args = DoctorArgs {
+            repair: false,
+            repair_indexes: true,
+            allow_repeated_repair: false,
+            dry_run: false,
+            robot_triage: false,
+            quick: false,
+            subcommand: None,
+        };
+        let ctx = OutputContext::from_flags(false, true, true);
+        let cli = crate::config::CliOverrides::default();
+
+        execute_repair_indexes(&beads_dir, &paths, &ctx, &args, &cli).unwrap();
+
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        assert!(storage.get_issue("bd-ri-quoted-1").unwrap().is_some());
+    }
+
+    #[test]
+    fn unquoted_sql_identifier_requires_valid_first_character() {
+        assert!(is_unquoted_sql_identifier("_doctor_idx"));
+        assert!(is_unquoted_sql_identifier("doctor_idx_123"));
+        assert!(!is_unquoted_sql_identifier(""));
+        assert!(!is_unquoted_sql_identifier("123doctor_idx"));
+        assert!(!is_unquoted_sql_identifier("doctor-idx"));
+        assert!(!is_unquoted_sql_identifier("doctor idx"));
     }
 
     #[test]
