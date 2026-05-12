@@ -3475,6 +3475,218 @@ fn check_config_yaml(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
     }
 }
 
+/// Detector: `.beads/metadata.json` is parseable + its declared
+/// `database` / `jsonl_export` targets exist on disk. Pass-1
+/// archaeology filed `fm-configs-metadata-json-stale` (P1):
+/// `metadata.json` drifts from the on-disk DB+JSONL filenames after
+/// renames / bd-migration tools / direct edits, leaving br's path
+/// resolution and the disk state out of sync.
+///
+/// Detect-only. The doctor never rewrites `metadata.json` because
+/// there's no algorithmic way to know whether the operator intended
+/// the metadata or the on-disk files to be authoritative.
+///
+/// Status mapping:
+/// - `ok` — file missing (br treats as defaults) OR file parses AND
+///   every explicitly declared non-empty `database` / `jsonl_export`
+///   target resolves to an existing file.
+/// - `warn` — file exists but is malformed JSON, has the wrong top-level
+///   shape, or names files that don't exist. Surfaces the specific
+///   reason (parse_error / target_missing) and the conservative
+///   operator-fix advice.
+fn check_metadata_json(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
+    let metadata_path = beads_dir.join("metadata.json");
+
+    if !metadata_path.is_file() {
+        push_check(
+            checks,
+            "metadata.json",
+            CheckStatus::Ok,
+            Some(
+                "No .beads/metadata.json present (br uses defaults: beads.db + issues.jsonl)"
+                    .to_string(),
+            ),
+            None,
+        );
+        return;
+    }
+
+    let body = match fs::read_to_string(&metadata_path) {
+        Ok(s) => s,
+        Err(err) => {
+            push_check(
+                checks,
+                "metadata.json",
+                CheckStatus::Warn,
+                Some(format!("Failed to read metadata.json: {err}")),
+                Some(serde_json::json!({
+                    "path": metadata_path.display().to_string(),
+                })),
+            );
+            return;
+        }
+    };
+
+    // Empty file is treated as malformed (the loader does the same).
+    if body.trim().is_empty() {
+        push_check(
+            checks,
+            "metadata.json",
+            CheckStatus::Warn,
+            Some("metadata.json is empty".to_string()),
+            Some(serde_json::json!({
+                "path": metadata_path.display().to_string(),
+                "reason": "empty_file",
+                "recommended_fix": format!(
+                    "Either delete {} so br uses defaults, or write a valid JSON object.",
+                    metadata_path.display(),
+                ),
+            })),
+        );
+        return;
+    }
+
+    // Generic-Value parse first so the doctor can surface a precise
+    // parse error WITHOUT coupling to the full Metadata struct's
+    // unknown-field-rejection semantics.
+    let value: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(err) => {
+            push_check(
+                checks,
+                "metadata.json",
+                CheckStatus::Warn,
+                Some(format!("metadata.json is malformed JSON: {err}")),
+                Some(serde_json::json!({
+                    "path": metadata_path.display().to_string(),
+                    "reason": "parse_error",
+                    "parse_error": err.to_string(),
+                    "recommended_fix": format!(
+                        "Open {} in an editor and fix the JSON; see parse_error for the precise location.",
+                        metadata_path.display(),
+                    ),
+                })),
+            );
+            return;
+        }
+    };
+
+    // Must be a JSON object.
+    let obj = match value.as_object() {
+        Some(obj) => obj,
+        None => {
+            push_check(
+                checks,
+                "metadata.json",
+                CheckStatus::Warn,
+                Some("metadata.json top-level value must be a JSON object".to_string()),
+                Some(serde_json::json!({
+                    "path": metadata_path.display().to_string(),
+                    "reason": "wrong_top_level_shape",
+                })),
+            );
+            return;
+        }
+    };
+
+    // Cross-check `database` and `jsonl_export` against disk.
+    let database = obj
+        .get("database")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let jsonl_export = obj
+        .get("jsonl_export")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let mut drift: Vec<serde_json::Value> = Vec::new();
+
+    // `database` is optional in the legacy schema; if present, it must resolve.
+    if let Some(db_name) = database {
+        let db_path = resolve_metadata_database_target(beads_dir, db_name);
+        if !db_path.exists() {
+            drift.push(serde_json::json!({
+                "field": "database",
+                "value": db_name,
+                "expected_path": db_path.display().to_string(),
+                "reason": "target_missing",
+            }));
+        }
+    }
+
+    // `jsonl_export` similarly: if present and non-empty, must exist.
+    if let Some(jsonl_name) = jsonl_export {
+        let jsonl_path = resolve_metadata_jsonl_target(beads_dir, jsonl_name);
+        if !jsonl_path.exists() {
+            drift.push(serde_json::json!({
+                "field": "jsonl_export",
+                "value": jsonl_name,
+                "expected_path": jsonl_path.display().to_string(),
+                "reason": "target_missing",
+            }));
+        }
+    }
+
+    if drift.is_empty() {
+        push_check(
+            checks,
+            "metadata.json",
+            CheckStatus::Ok,
+            Some(format!(
+                "metadata.json parses cleanly ({} bytes); declared targets exist on disk",
+                body.len(),
+            )),
+            Some(serde_json::json!({
+                "path": metadata_path.display().to_string(),
+                "bytes": body.len(),
+                "database": database,
+                "jsonl_export": jsonl_export,
+            })),
+        );
+    } else {
+        let fields: Vec<&str> = drift.iter().filter_map(|e| e["field"].as_str()).collect();
+        push_check(
+            checks,
+            "metadata.json",
+            CheckStatus::Warn,
+            Some(format!(
+                "metadata.json declares {n} field(s) ({fields}) pointing at files that don't exist; \
+                 operator must reconcile by either renaming the on-disk file or editing metadata.json.",
+                n = drift.len(),
+                fields = fields.join(", "),
+            )),
+            Some(serde_json::json!({
+                "path": metadata_path.display().to_string(),
+                "drift": drift,
+                "recommended_fix": format!(
+                    "Inspect {} and the listed expected_path entries; either rename the file or update metadata.json.",
+                    metadata_path.display(),
+                ),
+            })),
+        );
+    }
+}
+
+fn resolve_metadata_database_target(beads_dir: &Path, database: &str) -> PathBuf {
+    let candidate = PathBuf::from(database);
+    if candidate.is_absolute() {
+        candidate
+    } else {
+        crate::util::resolve_cache_dir(beads_dir).join(candidate)
+    }
+}
+
+fn resolve_metadata_jsonl_target(beads_dir: &Path, jsonl_export: &str) -> PathBuf {
+    let candidate = PathBuf::from(jsonl_export);
+    if candidate.is_absolute() {
+        candidate
+    } else {
+        beads_dir.join(candidate)
+    }
+}
+
 /// When `--repair` is passed and the `gitignore.beads_inner` warning is present,
 /// automatically remove the offending lines from the root `.gitignore`.
 ///
@@ -4194,6 +4406,7 @@ fn collect_doctor_report_with_mode(
     check_rust_log_noisy(&mut checks);
     check_permissions_beads_dir(beads_dir, &mut checks);
     check_config_yaml(beads_dir, &mut checks);
+    check_metadata_json(beads_dir, &mut checks);
 
     let (jsonl_path, jsonl_count) = inspect_doctor_jsonl(beads_dir, paths, &mut checks);
     inspect_doctor_database(
@@ -4420,6 +4633,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             // them to the WRONG file (config.yaml is broken, not
             // metadata.json).
             check_config_yaml(&beads_dir, &mut checks);
+            check_metadata_json(&beads_dir, &mut checks);
             push_check(
                 &mut checks,
                 "metadata",
@@ -8018,5 +8232,167 @@ mod tests {
             "syntax-error YAML must trigger Warn; got {:?}",
             check.status
         );
+    }
+
+    // --- check_metadata_json tests (pass-2 / WP5) ---
+
+    #[test]
+    fn check_metadata_json_missing_is_ok() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let mut checks = Vec::new();
+        check_metadata_json(&beads_dir, &mut checks);
+        let check = find_check(&checks, "metadata.json").expect("metadata.json present");
+        assert!(
+            matches!(check.status, CheckStatus::Ok),
+            "missing metadata.json must be Ok (br uses defaults); got {:?}",
+            check.status
+        );
+    }
+
+    #[test]
+    fn check_metadata_json_empty_warns() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::write(beads_dir.join("metadata.json"), b"").unwrap();
+        let mut checks = Vec::new();
+        check_metadata_json(&beads_dir, &mut checks);
+        let check = find_check(&checks, "metadata.json").expect("metadata.json present");
+        assert!(
+            matches!(check.status, CheckStatus::Warn),
+            "empty metadata.json must be Warn (br loader rejects); got {:?}",
+            check.status
+        );
+        let details = check.details.as_ref().expect("details present");
+        assert_eq!(details["reason"], "empty_file");
+    }
+
+    #[test]
+    fn check_metadata_json_valid_with_existing_targets_is_ok() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::write(beads_dir.join("beads.db"), b"").unwrap();
+        fs::write(beads_dir.join("issues.jsonl"), b"").unwrap();
+        fs::write(
+            beads_dir.join("metadata.json"),
+            br#"{"database":"beads.db","jsonl_export":"issues.jsonl"}"#,
+        )
+        .unwrap();
+        let mut checks = Vec::new();
+        check_metadata_json(&beads_dir, &mut checks);
+        let check = find_check(&checks, "metadata.json").expect("metadata.json present");
+        assert!(
+            matches!(check.status, CheckStatus::Ok),
+            "valid metadata.json with present targets must be Ok; got {:?}",
+            check.status
+        );
+    }
+
+    #[test]
+    fn check_metadata_json_whitespace_targets_use_defaults() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::write(
+            beads_dir.join("metadata.json"),
+            br#"{"database":"  ","jsonl_export":"\t"}"#,
+        )
+        .unwrap();
+        let mut checks = Vec::new();
+        check_metadata_json(&beads_dir, &mut checks);
+        let check = find_check(&checks, "metadata.json").expect("metadata.json present");
+        assert!(
+            matches!(check.status, CheckStatus::Ok),
+            "whitespace metadata targets load as defaults and must not drift-warn; got {:?}",
+            check.status
+        );
+    }
+
+    #[test]
+    fn check_metadata_json_malformed_warns_with_parse_error() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::write(
+            beads_dir.join("metadata.json"),
+            br#"{ "database": "beads.db", not_quoted_key: "issues.jsonl" }"#,
+        )
+        .unwrap();
+        let mut checks = Vec::new();
+        check_metadata_json(&beads_dir, &mut checks);
+        let check = find_check(&checks, "metadata.json").expect("metadata.json present");
+        assert!(matches!(check.status, CheckStatus::Warn));
+        let details = check.details.as_ref().expect("details present");
+        assert_eq!(details["reason"], "parse_error");
+        assert!(
+            details["parse_error"].as_str().is_some(),
+            "parse_error must be populated"
+        );
+    }
+
+    #[test]
+    fn check_metadata_json_non_object_top_level_warns() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::write(
+            beads_dir.join("metadata.json"),
+            br#"["not", "an", "object"]"#,
+        )
+        .unwrap();
+        let mut checks = Vec::new();
+        check_metadata_json(&beads_dir, &mut checks);
+        let check = find_check(&checks, "metadata.json").expect("metadata.json present");
+        assert!(matches!(check.status, CheckStatus::Warn));
+        let details = check.details.as_ref().expect("details present");
+        assert_eq!(details["reason"], "wrong_top_level_shape");
+    }
+
+    #[test]
+    fn check_metadata_json_drift_warns() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        // Declare files that don't exist.
+        fs::write(
+            beads_dir.join("metadata.json"),
+            br#"{"database":"renamed.db","jsonl_export":"renamed.jsonl"}"#,
+        )
+        .unwrap();
+        let mut checks = Vec::new();
+        check_metadata_json(&beads_dir, &mut checks);
+        let check = find_check(&checks, "metadata.json").expect("metadata.json present");
+        assert!(matches!(check.status, CheckStatus::Warn));
+        let details = check.details.as_ref().expect("details present");
+        let drift = details["drift"].as_array().expect("drift array");
+        assert_eq!(drift.len(), 2, "both declared targets should be flagged");
+        let fields: Vec<&str> = drift.iter().filter_map(|e| e["field"].as_str()).collect();
+        assert!(fields.contains(&"database"));
+        assert!(fields.contains(&"jsonl_export"));
+    }
+
+    #[test]
+    fn check_metadata_json_partial_drift_warns_only_for_missing() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        // beads.db exists; jsonl_export points at a missing file.
+        fs::write(beads_dir.join("beads.db"), b"").unwrap();
+        fs::write(
+            beads_dir.join("metadata.json"),
+            br#"{"database":"beads.db","jsonl_export":"missing.jsonl"}"#,
+        )
+        .unwrap();
+        let mut checks = Vec::new();
+        check_metadata_json(&beads_dir, &mut checks);
+        let check = find_check(&checks, "metadata.json").expect("metadata.json present");
+        assert!(matches!(check.status, CheckStatus::Warn));
+        let details = check.details.as_ref().expect("details present");
+        let drift = details["drift"].as_array().expect("drift array");
+        assert_eq!(drift.len(), 1, "only the missing field should be flagged");
+        assert_eq!(drift[0]["field"], "jsonl_export");
     }
 }
