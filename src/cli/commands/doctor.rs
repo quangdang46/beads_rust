@@ -3170,75 +3170,82 @@ fn check_routes_jsonl(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
 /// redirects show up during `br doctor` instead of only when an agent tries to
 /// operate on a routed issue.
 fn check_routes_targets_resolve(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
-    let routes_path = beads_dir.join("routes.jsonl");
+    let route_sources = doctor_route_sources(beads_dir);
 
-    if !routes_path.is_file() {
+    if route_sources.is_empty() {
         push_check(
             checks,
             "routes.targets",
             CheckStatus::Ok,
-            Some("No routes.jsonl present (route targets are optional)".to_string()),
+            Some("No local or town routes.jsonl present (route targets are optional)".to_string()),
             None,
         );
         return;
     }
 
-    let routes = match config::routing::load_routes(&routes_path) {
-        Ok(routes) => routes,
-        Err(err) => {
-            push_check(
-                checks,
-                "routes.targets",
-                CheckStatus::Warn,
-                Some(format!(
-                    "Could not resolve route targets because routes.jsonl is invalid: {err}"
-                )),
-                Some(serde_json::json!({
-                    "path": routes_path.display().to_string(),
-                })),
-            );
-            return;
-        }
-    };
-
-    let route_count = routes.len();
-    let project_root = beads_dir.parent().unwrap_or(beads_dir);
     let mut unresolved_routes = Vec::new();
+    let mut inspected_paths = Vec::new();
+    let mut route_count = 0usize;
     let mut resolved_count = 0usize;
 
-    for route in &routes {
-        if route.path.trim().is_empty() {
-            unresolved_routes.push(serde_json::json!({
-                "prefix": route.prefix.as_str(),
-                "path": route.path.as_str(),
-                "reason": "empty route path",
-            }));
-            continue;
-        }
-
-        let target_path = doctor_route_target_beads_dir(route, project_root);
-        match config::routing::follow_redirects(&target_path, 10) {
-            Ok(final_path)
-                if final_path.is_dir()
-                    && final_path
-                        .file_name()
-                        .is_some_and(config::is_beads_dir_name) =>
-            {
-                resolved_count += 1;
+    for (routes_path, base_dir) in route_sources {
+        inspected_paths.push(routes_path.display().to_string());
+        let routes = match config::routing::load_routes(&routes_path) {
+            Ok(routes) => routes,
+            Err(err) => {
+                push_check(
+                    checks,
+                    "routes.targets",
+                    CheckStatus::Warn,
+                    Some(format!(
+                        "Could not resolve route targets because routes.jsonl is invalid: {err}"
+                    )),
+                    Some(serde_json::json!({
+                        "path": routes_path.display().to_string(),
+                    })),
+                );
+                return;
             }
-            Ok(final_path) => unresolved_routes.push(serde_json::json!({
-                "prefix": route.prefix.as_str(),
-                "path": route.path.as_str(),
-                "target": target_path.display().to_string(),
-                "resolved": final_path.display().to_string(),
-                "reason": "target is not a beads directory",
-            })),
-            Err(err) => unresolved_routes.push(serde_json::json!({
-                "prefix": route.prefix.as_str(),
-                "path": route.path.as_str(),
-                "target": target_path.display().to_string(),
-                "reason": err.to_string(),
-            })),
+        };
+        route_count += routes.len();
+
+        for route in &routes {
+            if route.path.trim().is_empty() {
+                unresolved_routes.push(serde_json::json!({
+                    "route_file": routes_path.display().to_string(),
+                    "prefix": route.prefix.as_str(),
+                    "path": route.path.as_str(),
+                    "reason": "empty route path",
+                }));
+                continue;
+            }
+
+            let target_path = doctor_route_target_beads_dir(route, &base_dir);
+            match config::routing::follow_redirects(&target_path, 10) {
+                Ok(final_path)
+                    if final_path.is_dir()
+                        && final_path
+                            .file_name()
+                            .is_some_and(config::is_beads_dir_name) =>
+                {
+                    resolved_count += 1;
+                }
+                Ok(final_path) => unresolved_routes.push(serde_json::json!({
+                    "route_file": routes_path.display().to_string(),
+                    "prefix": route.prefix.as_str(),
+                    "path": route.path.as_str(),
+                    "target": target_path.display().to_string(),
+                    "resolved": final_path.display().to_string(),
+                    "reason": "target is not a beads directory",
+                })),
+                Err(err) => unresolved_routes.push(serde_json::json!({
+                    "route_file": routes_path.display().to_string(),
+                    "prefix": route.prefix.as_str(),
+                    "path": route.path.as_str(),
+                    "target": target_path.display().to_string(),
+                    "reason": err.to_string(),
+                })),
+            }
         }
     }
 
@@ -3249,7 +3256,7 @@ fn check_routes_targets_resolve(beads_dir: &Path, checks: &mut Vec<CheckResult>)
             CheckStatus::Ok,
             Some(format!("{resolved_count} route target(s) resolved cleanly")),
             Some(serde_json::json!({
-                "path": routes_path.display().to_string(),
+                "paths": inspected_paths,
                 "route_count": route_count,
                 "resolved_count": resolved_count,
             })),
@@ -3264,7 +3271,7 @@ fn check_routes_targets_resolve(beads_dir: &Path, checks: &mut Vec<CheckResult>)
                 "{unresolved_count} route target(s) failed to resolve ({resolved_count} resolved). Update routes.jsonl or the referenced project paths."
             )),
             Some(serde_json::json!({
-                "path": routes_path.display().to_string(),
+                "paths": inspected_paths,
                 "route_count": route_count,
                 "resolved_count": resolved_count,
                 "unresolved_routes": unresolved_routes,
@@ -3273,19 +3280,36 @@ fn check_routes_targets_resolve(beads_dir: &Path, checks: &mut Vec<CheckResult>)
     }
 }
 
-fn doctor_route_target_beads_dir(
-    route: &config::routing::RouteEntry,
-    project_root: &Path,
-) -> PathBuf {
+fn doctor_route_sources(beads_dir: &Path) -> Vec<(PathBuf, PathBuf)> {
+    let project_root = beads_dir.parent().unwrap_or(beads_dir);
+    let mut sources = Vec::new();
+
+    let local_routes_path = beads_dir.join("routes.jsonl");
+    if local_routes_path.is_file() {
+        sources.push((local_routes_path, project_root.to_path_buf()));
+    }
+
+    if let Some(town_root) = config::routing::find_town_root(project_root) {
+        let town_beads_dir = town_root.join(".beads");
+        let town_routes_path = town_beads_dir.join("routes.jsonl");
+        if town_beads_dir != beads_dir && town_routes_path.is_file() {
+            sources.push((town_routes_path, town_root));
+        }
+    }
+
+    sources
+}
+
+fn doctor_route_target_beads_dir(route: &config::routing::RouteEntry, base_dir: &Path) -> PathBuf {
     if route.path == "." {
-        return project_root.join(".beads");
+        return base_dir.join(".beads");
     }
 
     let path = PathBuf::from(&route.path);
     let resolved = if path.is_absolute() {
         path
     } else {
-        project_root.join(path)
+        base_dir.join(path)
     };
 
     if resolved.file_name().is_some_and(config::is_beads_dir_name) {
@@ -4705,32 +4729,57 @@ fn check_db_count(
             let db_count_usize = db_count as usize;
             if db_count_usize == jsonl_count {
                 // Even when cardinality matches, the ID sets can disagree.
-                // Compute the delta unconditionally on the warn path and
-                // also on the matched-count path *only* when we have a
-                // JSONL handle, so `|only_db| == |only_jsonl| > 0`
-                // (the case the count check silently passes on) is
-                // still surfaced as a `db_jsonl_id_set_mismatch` finding.
-                if let Some(path) = jsonl_path
-                    && let Ok(delta) = compute_db_jsonl_id_delta(conn, path)
-                    && (!delta.only_db.is_empty() || !delta.only_jsonl.is_empty())
-                {
-                    push_check(
-                        checks,
-                        "counts.db_vs_jsonl",
-                        CheckStatus::Warn,
-                        Some(format!(
-                            "DB and JSONL counts match ({}) but id sets diverge: {} only in DB, {} only in JSONL",
-                            db_count,
-                            delta.only_db.len(),
-                            delta.only_jsonl.len(),
-                        )),
-                        Some(serde_json::json!({
-                            "db": db_count,
-                            "jsonl": jsonl_count,
-                            "id_delta": delta.to_json(),
-                        })),
-                    );
-                    return Ok(());
+                // Compute the delta when we have a JSONL handle so the
+                // `|only_db| == |only_jsonl| > 0` case (cardinality
+                // passes silently) is surfaced as a
+                // `db_jsonl_id_set_mismatch` finding.
+                if let Some(path) = jsonl_path {
+                    match compute_db_jsonl_id_delta(conn, path) {
+                        Ok(delta) if !delta.only_db.is_empty() || !delta.only_jsonl.is_empty() => {
+                            push_check(
+                                checks,
+                                "counts.db_vs_jsonl",
+                                CheckStatus::Warn,
+                                Some(format!(
+                                    "DB and JSONL counts match ({}) but id sets diverge: {} only in DB, {} only in JSONL",
+                                    db_count,
+                                    delta.only_db.len(),
+                                    delta.only_jsonl.len(),
+                                )),
+                                Some(serde_json::json!({
+                                    "db": db_count,
+                                    "jsonl": jsonl_count,
+                                    "id_delta": delta.to_json(),
+                                })),
+                            );
+                            return Ok(());
+                        }
+                        Ok(_) => {
+                            // Counts match AND set delta is empty —
+                            // the stores genuinely agree.
+                        }
+                        Err(delta_err) => {
+                            // Compute failed mid-walk (rare: JSONL
+                            // disappeared between count and id-walk,
+                            // or DB query died). Surface as Warn so
+                            // operators don't read this as "stores
+                            // agree" — we couldn't verify the set.
+                            push_check(
+                                checks,
+                                "counts.db_vs_jsonl",
+                                CheckStatus::Warn,
+                                Some(format!(
+                                    "DB and JSONL counts match ({db_count}) but id-set verification failed: {delta_err}"
+                                )),
+                                Some(serde_json::json!({
+                                    "db": db_count,
+                                    "jsonl": jsonl_count,
+                                    "id_delta_error": delta_err.to_string(),
+                                })),
+                            );
+                            return Ok(());
+                        }
+                    }
                 }
                 push_check(
                     checks,
@@ -4744,10 +4793,19 @@ fn check_db_count(
                     "db": db_count,
                     "jsonl": jsonl_count,
                 });
-                if let Some(path) = jsonl_path
-                    && let Ok(delta) = compute_db_jsonl_id_delta(conn, path)
-                {
-                    details["id_delta"] = delta.to_json();
+                if let Some(path) = jsonl_path {
+                    match compute_db_jsonl_id_delta(conn, path) {
+                        Ok(delta) => {
+                            details["id_delta"] = delta.to_json();
+                        }
+                        Err(delta_err) => {
+                            // Counts already differ so the Warn is
+                            // already going to fire; we just record
+                            // the auxiliary id-delta failure rather
+                            // than silently dropping it.
+                            details["id_delta_error"] = serde_json::json!(delta_err.to_string());
+                        }
+                    }
                 }
                 push_check(
                     checks,
@@ -5219,6 +5277,8 @@ fn execute_repair_indexes(
     // the REINDEX transaction. The snapshot path lives next to the
     // DB so it shares the same filesystem and rename is atomic.
     let snapshot_path = paths.db_path.with_extension("db.pre-repair-indexes");
+    let wal_path = PathBuf::from(format!("{}-wal", paths.db_path.to_string_lossy()));
+    let shm_path = PathBuf::from(format!("{}-shm", paths.db_path.to_string_lossy()));
     if args.dry_run {
         ctx.info(&format!(
             "[dry-run] Would snapshot {} -> {} and REINDEX every user index on the issues family",
@@ -5226,6 +5286,25 @@ fn execute_repair_indexes(
             snapshot_path.display(),
         ));
         return Ok(());
+    }
+    // WAL-safety contract: SQLite in WAL mode keeps recent writes in
+    // `<db>-wal` until checkpoint flushes them to the main DB. If we
+    // copy the `.db` file while the WAL still has unflushed frames,
+    // the snapshot is incomplete; worse, on rollback-via-copy the
+    // live `<db>-wal` still has post-REINDEX frames that get replayed
+    // on next open, silently undoing the rollback. Checkpoint the WAL
+    // before snapshot so the `.db` file alone is a complete pre-state.
+    // Failure here is non-fatal — we fall through and rely on the
+    // sidecar deletion in the restore path.
+    {
+        let conn = Connection::open(paths.db_path.to_string_lossy().into_owned())?;
+        if let Err(checkpoint_err) = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)") {
+            tracing::warn!(
+                error = %checkpoint_err,
+                "doctor --repair-indexes: wal_checkpoint(TRUNCATE) before snapshot failed; restore path will delete the WAL sidecar instead"
+            );
+        }
+        close_repair_indexes_connection(conn, "after pre-snapshot WAL checkpoint");
     }
     std::fs::copy(&paths.db_path, &snapshot_path).map_err(|err| BeadsError::Internal {
         message: format!(
@@ -5313,6 +5392,30 @@ fn execute_repair_indexes(
                     ),
                 }
             })?;
+            // Critical: delete the WAL/SHM sidecars after the .db
+            // restore. The sidecars may contain frames from the
+            // failed REINDEX transaction; if SQLite reopens against
+            // a restored .db + a stale WAL, it replays those frames
+            // and silently re-introduces the very state we just
+            // rolled back. Removal failure is non-fatal but logged
+            // — the next sqlite open will rebuild the sidecars from
+            // the restored .db, which is what we want.
+            for sidecar in [&wal_path, &shm_path] {
+                match std::fs::remove_file(sidecar) {
+                    Ok(()) => tracing::debug!(
+                        path = %sidecar.display(),
+                        "doctor --repair-indexes: cleared sidecar after restore"
+                    ),
+                    Err(rm_err) if rm_err.kind() == std::io::ErrorKind::NotFound => {
+                        // Already gone (or never existed) — fine.
+                    }
+                    Err(rm_err) => tracing::warn!(
+                        error = %rm_err,
+                        path = %sidecar.display(),
+                        "doctor --repair-indexes: failed to remove sidecar after restore; next open may replay stale WAL frames"
+                    ),
+                }
+            }
             Err(err)
         }
     }
@@ -9059,6 +9162,46 @@ mod tests {
                 .unwrap()
                 .contains("Redirect target not found"),
             "{unresolved:?}"
+        );
+    }
+
+    #[test]
+    fn check_routes_targets_resolve_town_root_routes() {
+        let tmp = TempDir::new().unwrap();
+        let town_root = tmp.path().join("town");
+        let project_root = town_root.join("projects").join("client");
+        let beads_dir = project_root.join(".beads");
+        let town_beads_dir = town_root.join(".beads");
+        fs::create_dir_all(town_root.join("mayor")).unwrap();
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&town_beads_dir).unwrap();
+        fs::write(town_root.join("mayor").join("town.json"), "{}").unwrap();
+        fs::write(
+            town_beads_dir.join("routes.jsonl"),
+            "{\"prefix\":\"ghost-\",\"path\":\"missing-project\"}\n",
+        )
+        .unwrap();
+
+        let mut checks = Vec::new();
+        check_routes_targets_resolve(&beads_dir, &mut checks);
+
+        let check = find_check(&checks, "routes.targets").expect("routes.targets present");
+        assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
+        let details = check.details.as_ref().expect("details present");
+        assert_eq!(details["route_count"], 1);
+        let unresolved = details["unresolved_routes"].as_array().unwrap();
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(unresolved[0]["prefix"], "ghost-");
+        assert_eq!(
+            unresolved[0]["target"],
+            town_root
+                .join("missing-project/.beads")
+                .display()
+                .to_string()
+        );
+        assert_eq!(
+            unresolved[0]["route_file"],
+            town_beads_dir.join("routes.jsonl").display().to_string()
         );
     }
 
