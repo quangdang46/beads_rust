@@ -3049,7 +3049,8 @@ fn check_root_gitignore(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
 /// the bad line numbers + reasons; the operator handles the rewrite.
 ///
 /// Status mapping:
-/// - `ok` — file missing (routes are optional) OR every line is well-formed.
+/// - `ok` — file missing (routes are optional) OR every non-comment route line
+///   is well-formed.
 /// - `warn` — at least one line is malformed JSON, missing `prefix`/`path`,
 ///   has a non-string `prefix`/`path`, or `prefix` is empty.
 fn check_routes_jsonl(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
@@ -3089,7 +3090,7 @@ fn check_routes_jsonl(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
     for (idx, raw) in body.lines().enumerate() {
         let line_no = idx + 1;
         let line = raw.trim();
-        if line.is_empty() {
+        if config::routing::is_ignorable_route_jsonl_line(line) {
             continue;
         }
 
@@ -8830,6 +8831,31 @@ mod tests {
         assert_eq!(
             details["valid_count"], 2,
             "blank lines must not be counted as routes"
+        );
+    }
+
+    #[test]
+    fn check_routes_jsonl_skips_comment_lines() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let routes = beads_dir.join("routes.jsonl");
+        fs::write(
+            &routes,
+            "# local routes\n\
+             {\"prefix\":\"api-\",\"path\":\"../api\"}\n\
+             \n\
+             # town-level route intentionally omitted in this fixture\n",
+        )
+        .unwrap();
+        let mut checks = Vec::new();
+        check_routes_jsonl(&beads_dir, &mut checks);
+        let check = find_check(&checks, "routes_jsonl").expect("routes_jsonl present");
+        assert!(matches!(check.status, CheckStatus::Ok));
+        let details = check.details.as_ref().expect("details present");
+        assert_eq!(
+            details["valid_count"], 1,
+            "comment lines must not be counted as routes"
         );
     }
 
