@@ -44,3 +44,33 @@ fixture passes; non-zero on first failure with a clear diagnostic.
 Per AGENTS.md: no `Command::new("git")` from runtime `br` code; the fixture
 recipes themselves may call `git init` for setup (e.g. to materialise a real
 `.git/info/exclude`).
+
+## Idempotence replay gate (pass-3, opt-in)
+
+`run_all.sh` supports an OPT-IN idempotence-replay gate between Stage 3
+(`--repair`) and Stage 4 (`post_repair` assertions). When enabled, the harness
+runs `--repair` a SECOND time on the already-repaired workspace and asserts
+the new run-dir's `actions.jsonl` is empty — proving the fixer is idempotent
+per the chokepoint contract:
+
+```bash
+REPLAY_IDEMPOTENCE=1 bash tests/doctor_fixtures/run_all.sh
+```
+
+The gate is opt-in because a second `--repair` creates a new run-dir which
+becomes "latest", causing Stage 5's `undo latest` to reverse the no-op replay
+instead of the original repair. Fixtures whose `post_undo` stage asserts
+"undo restored the corruption" (e.g., the gitignore fixers) are incompatible
+with the replay flow under the standard harness.
+
+**Per-fixture opt-out**: drop a `.skip_replay` marker file in the fixture
+directory. The gitignore fixtures ship with one and document why.
+
+**Suite-level opt-out**: `REPLAY_IDEMPOTENCE_SKIP="name1 name2"` to skip
+specific fixtures regardless of the marker file.
+
+The pass-3 design intent is to fold a per-fixture replay assertion INTO
+each fixture's `assert.sh post_repair` stage in a future pass, sidestepping
+the run-dir / undo-latest interaction. Until then the env-gated suite-level
+gate is the documented mechanism.
+

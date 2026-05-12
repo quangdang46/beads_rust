@@ -143,6 +143,72 @@ run_fixture() {
     ( cd "$tmp" && "${doctor_env[@]}" "$TOOL_BIN" doctor --repair --json ) \
         > "$diag/repair.json" 2> "$diag/repair.stderr" || true
 
+    # Stage 3.5 (pass-3, opt-in): idempotence replay gate. The
+    # chokepoint contract requires that running `--repair` twice
+    # in a row is a no-op on the second invocation. A second run
+    # that produces any non-empty actions.jsonl line means either
+    # the detector is impure (mutates a side-channel) or the fixer
+    # isn't idempotent.
+    #
+    # OPT-IN: REPLAY_IDEMPOTENCE=1 enables the gate. Default off
+    # because the default suite's post_undo stages assert that
+    # `undo latest` reverses the FIRST repair; a second --repair
+    # creates a no-op run-dir that becomes the new "latest",
+    # which would break post_undo for fixtures whose corruption
+    # the repair successfully clears (e.g., gitignore fixers).
+    #
+    # CI / pass-3 idempotence-audit invocation:
+    #   REPLAY_IDEMPOTENCE=1 \
+    #   REPLAY_IDEMPOTENCE_SKIP="gitignore_leaking_beads gitignore_bare_pattern" \
+    #   bash tests/doctor_fixtures/run_all.sh
+    #
+    # Per-fixture opt-out (independent of the suite-level gate):
+    # drop a `.skip_replay` marker file inside the fixture dir.
+    if [ "${REPLAY_IDEMPOTENCE:-0}" = "1" ]; then
+        local skip_replay=0
+        if [ -n "${REPLAY_IDEMPOTENCE_SKIP:-}" ]; then
+            local skip_item
+            for skip_item in ${REPLAY_IDEMPOTENCE_SKIP}; do
+                if [ "$skip_item" = "$name" ]; then
+                    skip_replay=1
+                    break
+                fi
+            done
+        fi
+        if [ -f "$fixture_dir/.skip_replay" ]; then
+            skip_replay=1
+        fi
+        if [ "$skip_replay" -eq 0 ]; then
+            local before_run_count
+            before_run_count="$(find "$tmp/.doctor/runs" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l || echo 0)"
+            # Trim potential whitespace from wc -l output for the [
+            # comparison below (BSD/Linux wc differ on padding).
+            before_run_count="${before_run_count//[[:space:]]/}"
+            ( cd "$tmp" && "${doctor_env[@]}" "$TOOL_BIN" doctor --repair --json ) \
+                > "$diag/repair_replay.json" 2> "$diag/repair_replay.stderr" || true
+            local after_run_count
+            after_run_count="$(find "$tmp/.doctor/runs" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l || echo 0)"
+            after_run_count="${after_run_count//[[:space:]]/}"
+            if [ "${after_run_count:-0}" -gt "${before_run_count:-0}" ]; then
+                local newest_run
+                newest_run="$(find "$tmp/.doctor/runs" -maxdepth 1 -mindepth 1 -type d \
+                              -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | awk '{print $2}')"
+                if [ -n "$newest_run" ] && [ -f "$newest_run/actions.jsonl" ]; then
+                    local replay_action_count
+                    replay_action_count="$(grep -c -v '^[[:space:]]*$' "$newest_run/actions.jsonl" 2>/dev/null || echo 0)"
+                    replay_action_count="${replay_action_count//[[:space:]]/}"
+                    if [ "${replay_action_count:-0}" -gt 0 ]; then
+                        echo "[FAIL] $name: idempotence replay failed — second --repair produced $replay_action_count action(s)" >&2
+                        echo "  --- replay actions.jsonl ---" >&2
+                        sed 's/^/  /' "$newest_run/actions.jsonl" >&2
+                        echo "  (workspace at $tmp)" >&2
+                        return 1
+                    fi
+                fi
+            fi
+        fi
+    fi
+
     # Stage 4: post_repair assertions.
     if ! ( cd "$tmp" && "${doctor_env[@]}" bash "$assert_sh" "$tmp" post_repair ) \
             > "$diag/post_repair.stdout" 2> "$diag/post_repair.stderr"; then
