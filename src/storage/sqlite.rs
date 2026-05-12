@@ -12764,6 +12764,71 @@ mod tests {
         assert!(storage.may_have_blocked_command_results().unwrap());
     }
 
+    /// Regression for beads_rust#285. The issue reported that `br close`
+    /// persisted to JSONL but not to the SQLite store and that the
+    /// dirty-tracker stayed empty — meaning the JSONL→DB→JSONL
+    /// reconciliation never fired for the row. Pins both halves of
+    /// the close-as-update contract: the SQLite row reports
+    /// `status='closed'` post-update, and `dirty_issues` contains the
+    /// id so the next flush exports the change. If anyone regresses
+    /// `update_issue`'s `ctx.mark_dirty(id)` call (sqlite.rs:2634 at
+    /// the time this test was added) this fails fast.
+    #[test]
+    fn test_close_path_marks_dirty_and_persists_to_db() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap();
+
+        let issue = make_issue("bd-close-285", "Close me", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue, "tester").unwrap();
+
+        // Sanity: dirty-tracker is empty after create. (`create_issue`
+        // marks dirty, so we clear it explicitly so the assertion below
+        // measures only the close path's contribution.)
+        storage.clear_all_dirty_issues().unwrap();
+        assert_eq!(storage.get_dirty_issue_count().unwrap(), 0);
+
+        let close_update = IssueUpdate {
+            status: Some(Status::Closed),
+            closed_at: Some(Some(Utc.with_ymd_and_hms(2026, 5, 2, 0, 0, 0).unwrap())),
+            close_reason: Some(Some("done".to_string())),
+            skip_cache_rebuild: true,
+            ..IssueUpdate::default()
+        };
+        let updated = storage
+            .update_issue("bd-close-285", &close_update, "tester")
+            .expect("close path must succeed");
+
+        // Half 1: the in-memory return value reports Closed.
+        assert_eq!(updated.status, Status::Closed, "returned issue.status");
+
+        // Half 2: the SQLite store actually reflects Closed. Reading
+        // through `get_issue` exercises the same query path consumers
+        // use; a raw SELECT is unnecessary because the user-visible
+        // symptom is the wrong status surfacing through that API.
+        let reloaded = storage
+            .get_issue("bd-close-285")
+            .expect("get_issue")
+            .expect("issue must still exist after close");
+        assert_eq!(
+            reloaded.status,
+            Status::Closed,
+            "SQLite row must report closed; if this fails, br close persisted to JSONL but not DB (issue #285)"
+        );
+
+        // Half 3: dirty_issues queued the close so the next flush can
+        // export it. If this count is zero the JSONL→DB reconciliation
+        // path has nothing to act on and divergence accumulates over
+        // time (the 2.4% drift rate the issue reports).
+        assert_eq!(
+            storage.get_dirty_issue_count().unwrap(),
+            1,
+            "close path must enqueue dirty_issues; without this br sync --flush-only is a no-op after close (issue #285)"
+        );
+        let dirty: Vec<(String, String)> = storage.get_dirty_issue_metadata().unwrap();
+        assert_eq!(dirty.len(), 1);
+        assert_eq!(dirty[0].0, "bd-close-285");
+    }
+
     #[test]
     fn test_update_issue_changes_fields() {
         let mut storage = SqliteStorage::open_memory().unwrap();
