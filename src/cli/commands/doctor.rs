@@ -3190,8 +3190,11 @@ fn check_routes_targets_resolve(beads_dir: &Path, checks: &mut Vec<CheckResult>)
 
     for (routes_path, base_dir) in route_sources {
         inspected_paths.push(routes_path.display().to_string());
-        let routes = match config::routing::load_routes(&routes_path) {
-            Ok(routes) => routes,
+        match inspect_route_target_source(&routes_path, &base_dir, &mut unresolved_routes) {
+            Ok((source_route_count, source_resolved_count)) => {
+                route_count += source_route_count;
+                resolved_count += source_resolved_count;
+            }
             Err(err) => {
                 push_check(
                     checks,
@@ -3205,46 +3208,6 @@ fn check_routes_targets_resolve(beads_dir: &Path, checks: &mut Vec<CheckResult>)
                     })),
                 );
                 return;
-            }
-        };
-        route_count += routes.len();
-
-        for route in &routes {
-            if route.path.trim().is_empty() {
-                unresolved_routes.push(serde_json::json!({
-                    "route_file": routes_path.display().to_string(),
-                    "prefix": route.prefix.as_str(),
-                    "path": route.path.as_str(),
-                    "reason": "empty route path",
-                }));
-                continue;
-            }
-
-            let target_path = doctor_route_target_beads_dir(route, &base_dir);
-            match config::routing::follow_redirects(&target_path, 10) {
-                Ok(final_path)
-                    if final_path.is_dir()
-                        && final_path
-                            .file_name()
-                            .is_some_and(config::is_beads_dir_name) =>
-                {
-                    resolved_count += 1;
-                }
-                Ok(final_path) => unresolved_routes.push(serde_json::json!({
-                    "route_file": routes_path.display().to_string(),
-                    "prefix": route.prefix.as_str(),
-                    "path": route.path.as_str(),
-                    "target": target_path.display().to_string(),
-                    "resolved": final_path.display().to_string(),
-                    "reason": "target is not a beads directory",
-                })),
-                Err(err) => unresolved_routes.push(serde_json::json!({
-                    "route_file": routes_path.display().to_string(),
-                    "prefix": route.prefix.as_str(),
-                    "path": route.path.as_str(),
-                    "target": target_path.display().to_string(),
-                    "reason": err.to_string(),
-                })),
             }
         }
     }
@@ -3278,6 +3241,56 @@ fn check_routes_targets_resolve(beads_dir: &Path, checks: &mut Vec<CheckResult>)
             })),
         );
     }
+}
+
+fn inspect_route_target_source(
+    routes_path: &Path,
+    base_dir: &Path,
+    unresolved_routes: &mut Vec<serde_json::Value>,
+) -> Result<(usize, usize)> {
+    let routes = config::routing::load_routes(routes_path)?;
+    let mut resolved_count = 0usize;
+
+    for route in &routes {
+        if route.path.trim().is_empty() {
+            unresolved_routes.push(serde_json::json!({
+                "route_file": routes_path.display().to_string(),
+                "prefix": route.prefix.as_str(),
+                "path": route.path.as_str(),
+                "reason": "empty route path",
+            }));
+            continue;
+        }
+
+        let target_path = doctor_route_target_beads_dir(route, base_dir);
+        match config::routing::follow_redirects(&target_path, 10) {
+            Ok(final_path)
+                if final_path.is_dir()
+                    && final_path
+                        .file_name()
+                        .is_some_and(config::is_beads_dir_name) =>
+            {
+                resolved_count += 1;
+            }
+            Ok(final_path) => unresolved_routes.push(serde_json::json!({
+                "route_file": routes_path.display().to_string(),
+                "prefix": route.prefix.as_str(),
+                "path": route.path.as_str(),
+                "target": target_path.display().to_string(),
+                "resolved": final_path.display().to_string(),
+                "reason": "target is not a beads directory",
+            })),
+            Err(err) => unresolved_routes.push(serde_json::json!({
+                "route_file": routes_path.display().to_string(),
+                "prefix": route.prefix.as_str(),
+                "path": route.path.as_str(),
+                "target": target_path.display().to_string(),
+                "reason": err.to_string(),
+            })),
+        }
+    }
+
+    Ok((routes.len(), resolved_count))
 }
 
 fn doctor_route_sources(beads_dir: &Path) -> Vec<(PathBuf, PathBuf)> {
@@ -4725,96 +4738,7 @@ fn check_db_count(
 
     match jsonl_count {
         JsonlCountState::Available(jsonl_count) => {
-            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-            let db_count_usize = db_count as usize;
-            if db_count_usize == jsonl_count {
-                // Even when cardinality matches, the ID sets can disagree.
-                // Compute the delta when we have a JSONL handle so the
-                // `|only_db| == |only_jsonl| > 0` case (cardinality
-                // passes silently) is surfaced as a
-                // `db_jsonl_id_set_mismatch` finding.
-                if let Some(path) = jsonl_path {
-                    match compute_db_jsonl_id_delta(conn, path) {
-                        Ok(delta) if !delta.only_db.is_empty() || !delta.only_jsonl.is_empty() => {
-                            push_check(
-                                checks,
-                                "counts.db_vs_jsonl",
-                                CheckStatus::Warn,
-                                Some(format!(
-                                    "DB and JSONL counts match ({}) but id sets diverge: {} only in DB, {} only in JSONL",
-                                    db_count,
-                                    delta.only_db.len(),
-                                    delta.only_jsonl.len(),
-                                )),
-                                Some(serde_json::json!({
-                                    "db": db_count,
-                                    "jsonl": jsonl_count,
-                                    "id_delta": delta.to_json(),
-                                })),
-                            );
-                            return Ok(());
-                        }
-                        Ok(_) => {
-                            // Counts match AND set delta is empty —
-                            // the stores genuinely agree.
-                        }
-                        Err(delta_err) => {
-                            // Compute failed mid-walk (rare: JSONL
-                            // disappeared between count and id-walk,
-                            // or DB query died). Surface as Warn so
-                            // operators don't read this as "stores
-                            // agree" — we couldn't verify the set.
-                            push_check(
-                                checks,
-                                "counts.db_vs_jsonl",
-                                CheckStatus::Warn,
-                                Some(format!(
-                                    "DB and JSONL counts match ({db_count}) but id-set verification failed: {delta_err}"
-                                )),
-                                Some(serde_json::json!({
-                                    "db": db_count,
-                                    "jsonl": jsonl_count,
-                                    "id_delta_error": delta_err.to_string(),
-                                })),
-                            );
-                            return Ok(());
-                        }
-                    }
-                }
-                push_check(
-                    checks,
-                    "counts.db_vs_jsonl",
-                    CheckStatus::Ok,
-                    Some(format!("Both have {db_count} records")),
-                    None,
-                );
-            } else {
-                let mut details = serde_json::json!({
-                    "db": db_count,
-                    "jsonl": jsonl_count,
-                });
-                if let Some(path) = jsonl_path {
-                    match compute_db_jsonl_id_delta(conn, path) {
-                        Ok(delta) => {
-                            details["id_delta"] = delta.to_json();
-                        }
-                        Err(delta_err) => {
-                            // Counts already differ so the Warn is
-                            // already going to fire; we just record
-                            // the auxiliary id-delta failure rather
-                            // than silently dropping it.
-                            details["id_delta_error"] = serde_json::json!(delta_err.to_string());
-                        }
-                    }
-                }
-                push_check(
-                    checks,
-                    "counts.db_vs_jsonl",
-                    CheckStatus::Warn,
-                    Some("DB and JSONL counts differ".to_string()),
-                    Some(details),
-                );
-            }
+            check_available_db_count(conn, db_count, jsonl_count, jsonl_path, checks);
         }
         JsonlCountState::Invalid => {
             push_check(
@@ -4846,6 +4770,102 @@ fn check_db_count(
     }
 
     Ok(())
+}
+
+fn check_available_db_count(
+    conn: &Connection,
+    db_count: i64,
+    jsonl_count: usize,
+    jsonl_path: Option<&Path>,
+    checks: &mut Vec<CheckResult>,
+) {
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    let db_count_usize = db_count as usize;
+
+    if db_count_usize == jsonl_count {
+        if push_matching_count_id_delta_check(conn, db_count, jsonl_count, jsonl_path, checks) {
+            return;
+        }
+        push_check(
+            checks,
+            "counts.db_vs_jsonl",
+            CheckStatus::Ok,
+            Some(format!("Both have {db_count} records")),
+            None,
+        );
+        return;
+    }
+
+    let mut details = serde_json::json!({
+        "db": db_count,
+        "jsonl": jsonl_count,
+    });
+    if let Some(path) = jsonl_path {
+        match compute_db_jsonl_id_delta(conn, path) {
+            Ok(delta) => details["id_delta"] = delta.to_json(),
+            Err(delta_err) => {
+                details["id_delta_error"] = serde_json::json!(delta_err.to_string());
+            }
+        }
+    }
+    push_check(
+        checks,
+        "counts.db_vs_jsonl",
+        CheckStatus::Warn,
+        Some("DB and JSONL counts differ".to_string()),
+        Some(details),
+    );
+}
+
+fn push_matching_count_id_delta_check(
+    conn: &Connection,
+    db_count: i64,
+    jsonl_count: usize,
+    jsonl_path: Option<&Path>,
+    checks: &mut Vec<CheckResult>,
+) -> bool {
+    let Some(path) = jsonl_path else {
+        return false;
+    };
+
+    match compute_db_jsonl_id_delta(conn, path) {
+        Ok(delta) if !delta.only_db.is_empty() || !delta.only_jsonl.is_empty() => {
+            push_check(
+                checks,
+                "counts.db_vs_jsonl",
+                CheckStatus::Warn,
+                Some(format!(
+                    "DB and JSONL counts match ({}) but id sets diverge: {} only in DB, {} only in JSONL",
+                    db_count,
+                    delta.only_db.len(),
+                    delta.only_jsonl.len(),
+                )),
+                Some(serde_json::json!({
+                    "db": db_count,
+                    "jsonl": jsonl_count,
+                    "id_delta": delta.to_json(),
+                })),
+            );
+            true
+        }
+        Ok(_) => false,
+        Err(delta_err) => {
+            push_check(
+                checks,
+                "counts.db_vs_jsonl",
+                CheckStatus::Warn,
+                Some(format!(
+                    "DB and JSONL counts match ({db_count}) but id-set verification failed: {delta_err}"
+                )),
+                Some(serde_json::json!({
+                    "db": db_count,
+                    "jsonl": jsonl_count,
+                    "id_delta_error": delta_err.to_string(),
+                })),
+            );
+            true
+        }
+    }
 }
 
 // ============================================================================
@@ -5279,6 +5299,7 @@ fn execute_repair_indexes(
     let snapshot_path = paths.db_path.with_extension("db.pre-repair-indexes");
     let wal_path = PathBuf::from(format!("{}-wal", paths.db_path.to_string_lossy()));
     let shm_path = PathBuf::from(format!("{}-shm", paths.db_path.to_string_lossy()));
+
     if args.dry_run {
         ctx.info(&format!(
             "[dry-run] Would snapshot {} -> {} and REINDEX every user index on the issues family",
@@ -5287,31 +5308,8 @@ fn execute_repair_indexes(
         ));
         return Ok(());
     }
-    // WAL-safety contract: SQLite in WAL mode keeps recent writes in
-    // `<db>-wal` until checkpoint flushes them to the main DB. If we
-    // copy the `.db` file while the WAL still has unflushed frames,
-    // the snapshot is incomplete; worse, on rollback-via-copy the
-    // live `<db>-wal` still has post-REINDEX frames that get replayed
-    // on next open, silently undoing the rollback. Checkpoint the WAL
-    // before snapshot so the `.db` file alone is a complete pre-state.
-    // Failure here is non-fatal — we fall through and rely on the
-    // sidecar deletion in the restore path.
-    {
-        let conn = Connection::open(paths.db_path.to_string_lossy().into_owned())?;
-        if let Err(checkpoint_err) = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)") {
-            tracing::warn!(
-                error = %checkpoint_err,
-                "doctor --repair-indexes: wal_checkpoint(TRUNCATE) before snapshot failed; restore path will delete the WAL sidecar instead"
-            );
-        }
-        close_repair_indexes_connection(conn, "after pre-snapshot WAL checkpoint");
-    }
-    std::fs::copy(&paths.db_path, &snapshot_path).map_err(|err| BeadsError::Internal {
-        message: format!(
-            "doctor --repair-indexes: pre-snapshot backup failed ({}): {err}",
-            snapshot_path.display(),
-        ),
-    })?;
+
+    checkpoint_and_snapshot_repair_indexes(&paths.db_path, &snapshot_path)?;
 
     // Open the DB and enumerate every user-defined index so we don't
     // reindex sqlite_autoindex_* or any internal index — those are
@@ -5385,40 +5383,62 @@ fn execute_repair_indexes(
             // Close the connection before the file copy so we don't
             // race the SQLite WAL machinery on the live DB.
             close_repair_indexes_connection(conn, "before restoring pre-snapshot");
-            std::fs::copy(&snapshot_path, &paths.db_path).map_err(|copy_err| {
-                BeadsError::Internal {
-                    message: format!(
-                        "doctor --repair-indexes: REINDEX failed and pre-snapshot restore also failed: original={err}, restore={copy_err}",
-                    ),
-                }
-            })?;
-            // Critical: delete the WAL/SHM sidecars after the .db
-            // restore. The sidecars may contain frames from the
-            // failed REINDEX transaction; if SQLite reopens against
-            // a restored .db + a stale WAL, it replays those frames
-            // and silently re-introduces the very state we just
-            // rolled back. Removal failure is non-fatal but logged
-            // — the next sqlite open will rebuild the sidecars from
-            // the restored .db, which is what we want.
-            for sidecar in [&wal_path, &shm_path] {
-                match std::fs::remove_file(sidecar) {
-                    Ok(()) => tracing::debug!(
-                        path = %sidecar.display(),
-                        "doctor --repair-indexes: cleared sidecar after restore"
-                    ),
-                    Err(rm_err) if rm_err.kind() == std::io::ErrorKind::NotFound => {
-                        // Already gone (or never existed) — fine.
-                    }
-                    Err(rm_err) => tracing::warn!(
-                        error = %rm_err,
-                        path = %sidecar.display(),
-                        "doctor --repair-indexes: failed to remove sidecar after restore; next open may replay stale WAL frames"
-                    ),
-                }
-            }
+            restore_repair_indexes_snapshot(paths, &snapshot_path, [&wal_path, &shm_path], &err)?;
             Err(err)
         }
     }
+}
+
+fn checkpoint_and_snapshot_repair_indexes(db_path: &Path, snapshot_path: &Path) -> Result<()> {
+    // WAL-safety contract: checkpoint before snapshot so the `.db`
+    // file alone is a complete pre-state for restore-via-copy.
+    let conn = Connection::open(db_path.to_string_lossy().into_owned())?;
+    if let Err(checkpoint_err) = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)") {
+        tracing::warn!(
+            error = %checkpoint_err,
+            "doctor --repair-indexes: wal_checkpoint(TRUNCATE) before snapshot failed; restore path will delete the WAL sidecar instead"
+        );
+    }
+    close_repair_indexes_connection(conn, "after pre-snapshot WAL checkpoint");
+
+    std::fs::copy(db_path, snapshot_path).map_err(|err| BeadsError::Internal {
+        message: format!(
+            "doctor --repair-indexes: pre-snapshot backup failed ({}): {err}",
+            snapshot_path.display(),
+        ),
+    })?;
+    Ok(())
+}
+
+fn restore_repair_indexes_snapshot(
+    paths: &config::ConfigPaths,
+    snapshot_path: &Path,
+    sidecars: [&PathBuf; 2],
+    original_err: &BeadsError,
+) -> Result<()> {
+    std::fs::copy(snapshot_path, &paths.db_path).map_err(|copy_err| BeadsError::Internal {
+        message: format!(
+            "doctor --repair-indexes: REINDEX failed and pre-snapshot restore also failed: original={original_err}, restore={copy_err}",
+        ),
+    })?;
+
+    // Critical: clear sidecars after restore so stale WAL frames from
+    // the failed REINDEX cannot replay against the restored DB file.
+    for sidecar in sidecars {
+        match std::fs::remove_file(sidecar) {
+            Ok(()) => tracing::debug!(
+                path = %sidecar.display(),
+                "doctor --repair-indexes: cleared sidecar after restore"
+            ),
+            Err(rm_err) if rm_err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(rm_err) => tracing::warn!(
+                error = %rm_err,
+                path = %sidecar.display(),
+                "doctor --repair-indexes: failed to remove sidecar after restore; next open may replay stale WAL frames"
+            ),
+        }
+    }
+    Ok(())
 }
 
 fn close_repair_indexes_connection(conn: Connection, context: &str) {
