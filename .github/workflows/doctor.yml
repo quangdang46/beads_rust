@@ -92,6 +92,28 @@ jobs:
           jq -e '.schema_version == "br.doctor.triage.v1"' /tmp/doctor_triage.json
           jq -e 'has("summary") and has("findings") and has("quick_ref")' /tmp/doctor_triage.json
 
+      - name: Fixture suite (default mode)
+        env:
+          TOOL_BIN: ${{ github.workspace }}/target/release/br
+        run: |
+          set -euo pipefail
+          # Default run_all.sh: corrupt → detect → --repair → post_repair
+          # → undo latest → post_undo. Every fixture must pass.
+          bash tests/doctor_fixtures/run_all.sh
+
+      - name: Fixture suite (idempotence replay gate, opt-in)
+        env:
+          TOOL_BIN: ${{ github.workspace }}/target/release/br
+          REPLAY_IDEMPOTENCE: "1"
+        run: |
+          set -euo pipefail
+          # Pass-3: run --repair twice per fixture and assert the
+          # second invocation is a no-op (zero non-empty
+          # actions.jsonl lines in the new run-dir). Fixtures with
+          # .skip_replay markers are honored. Closes the
+          # idempotence-replay gap from the pass-2 scorecard.
+          bash tests/doctor_fixtures/run_all.sh
+
       - name: Scorecard regression check
         run: |
           set -euo pipefail
