@@ -3169,8 +3169,8 @@ enum RustLogVolume {
 
 /// Classify a `RUST_LOG` env value as quiet or noisy. Mirrors the
 /// `tracing_subscriber::EnvFilter` precedence: per-module directives
-/// override the default. We only need a conservative "any directive
-/// asks for >= info" predicate for the advisory.
+/// override the default. Directives without an explicit level are equivalent
+/// to `trace`, so they must be treated as noisy too.
 fn rust_log_volume(raw: Option<&str>) -> RustLogVolume {
     let Some(value) = raw else {
         return rust_log_default_volume();
@@ -3200,16 +3200,18 @@ fn rust_log_volume(raw: Option<&str>) -> RustLogVolume {
         _ => {}
     }
 
-    // Composite directive: any segment of the form `<mod>=<level>` or
-    // `<level>` that names info/debug/trace triggers warn.
+    // Composite directive: any segment of the form `<mod>=<level>`,
+    // `<level>`, or target-only `<mod>` that enables info/debug/trace
+    // triggers warn. Upstream EnvFilter treats target-only directives as
+    // `trace`.
     for segment in normalized.split(',') {
         let seg = segment.trim();
         if seg.is_empty() {
             continue;
         }
-        // Extract the level part (after `=` if present).
         let level_part = seg.rsplit('=').next().unwrap_or(seg).trim();
         match level_part {
+            "off" | "error" | "warn" => {}
             "info" => {
                 return RustLogVolume::Noisy {
                     reason: "directive_info",
@@ -3225,7 +3227,16 @@ fn rust_log_volume(raw: Option<&str>) -> RustLogVolume {
                     reason: "directive_trace",
                 };
             }
-            _ => {}
+            _ if !seg.contains('=') => {
+                return RustLogVolume::Noisy {
+                    reason: "directive_target_only",
+                };
+            }
+            _ => {
+                return RustLogVolume::Noisy {
+                    reason: "directive_unclassified",
+                };
+            }
         }
     }
     RustLogVolume::Quiet
@@ -3356,6 +3367,111 @@ fn check_permissions_beads_dir(beads_dir: &Path, checks: &mut Vec<CheckResult>) 
                 "readonly_paths": readonly,
             })),
         );
+    }
+}
+
+/// Detector: `.beads/config.yaml` parses cleanly as YAML. Pass-1
+/// archaeology filed `fm-configs-yaml-malformed` (P1): a malformed
+/// project config short-circuits every `br` invocation at startup
+/// with an opaque error and no localization. The doctor surfaces the
+/// parse error with line/column context so the operator can fix it
+/// without grepping unfamiliar code paths.
+///
+/// Detect-only. The doctor never auto-rewrites `config.yaml`: there's
+/// no algorithmic way to know what the operator INTENDED to write, so
+/// the safe action is to report + advise.
+///
+/// Status mapping:
+/// - `ok` — `config.yaml` missing (project config is optional) OR
+///   parses cleanly as YAML.
+/// - `warn` — file exists but `serde_yml::from_str` returns a parse
+///   error. Surfaces the error message + the offending file path so
+///   the operator can open the file and fix the line `serde_yml`
+///   names.
+fn check_config_yaml(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
+    let config_path = beads_dir.join("config.yaml");
+
+    if !config_path.is_file() {
+        push_check(
+            checks,
+            "config.yaml",
+            CheckStatus::Ok,
+            Some("No .beads/config.yaml present (project config is optional)".to_string()),
+            None,
+        );
+        return;
+    }
+
+    let body = match fs::read_to_string(&config_path) {
+        Ok(s) => s,
+        Err(err) => {
+            push_check(
+                checks,
+                "config.yaml",
+                CheckStatus::Warn,
+                Some(format!("Failed to read config.yaml: {err}")),
+                Some(serde_json::json!({
+                    "path": config_path.display().to_string(),
+                })),
+            );
+            return;
+        }
+    };
+
+    // Empty file is acceptable (treated as "all defaults").
+    if body.trim().is_empty() {
+        push_check(
+            checks,
+            "config.yaml",
+            CheckStatus::Ok,
+            Some("config.yaml is empty (all defaults)".to_string()),
+            Some(serde_json::json!({
+                "path": config_path.display().to_string(),
+                "bytes": 0_u64,
+            })),
+        );
+        return;
+    }
+
+    // Try parsing as a generic `serde_yml::Value` first — that lets us
+    // surface the precise parse error without coupling to the full
+    // ConfigLayer schema (which is stricter; an unknown-field warning
+    // there is different from a malformed YAML structure).
+    match serde_yml::from_str::<serde_yml::Value>(&body) {
+        Ok(_) => {
+            push_check(
+                checks,
+                "config.yaml",
+                CheckStatus::Ok,
+                Some(format!("config.yaml parses cleanly ({} bytes)", body.len())),
+                Some(serde_json::json!({
+                    "path": config_path.display().to_string(),
+                    "bytes": body.len(),
+                })),
+            );
+        }
+        Err(err) => {
+            // serde_yml's Display includes line/col when available; the
+            // doctor exposes the raw message so operators don't have to
+            // re-run `br` themselves to see it.
+            push_check(
+                checks,
+                "config.yaml",
+                CheckStatus::Warn,
+                Some(format!(
+                    "config.yaml is malformed YAML: {err}. Operator must fix manually; doctor never auto-rewrites config.",
+                )),
+                Some(serde_json::json!({
+                    "path": config_path.display().to_string(),
+                    "parse_error": err.to_string(),
+                    "recommended_fix": format!(
+                        "Open {} in an editor and fix the YAML; \
+                         see the parse_error field for the precise location.",
+                        config_path.display(),
+                    ),
+                })),
+            );
+        }
     }
 }
 
@@ -4077,6 +4193,7 @@ fn collect_doctor_report_with_mode(
     check_routes_jsonl(beads_dir, &mut checks);
     check_rust_log_noisy(&mut checks);
     check_permissions_beads_dir(beads_dir, &mut checks);
+    check_config_yaml(beads_dir, &mut checks);
 
     let (jsonl_path, jsonl_count) = inspect_doctor_jsonl(beads_dir, paths, &mut checks);
     inspect_doctor_database(
@@ -4293,6 +4410,16 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         Ok(paths) => paths,
         Err(err) => {
             let mut checks = Vec::new();
+            // Pass-2 / WP5: when resolve_paths fails (typically because
+            // .beads/config.yaml has a YAML parse error), run the
+            // file-parse detectors that DON'T need a fully-resolved
+            // ConfigPaths handle. `check_config_yaml` surfaces the
+            // precise serde_yml error + the canonical "Open the file"
+            // fix; without this, the operator gets the bare
+            // "Failed to read metadata.json" message which routes
+            // them to the WRONG file (config.yaml is broken, not
+            // metadata.json).
+            check_config_yaml(&beads_dir, &mut checks);
             push_check(
                 &mut checks,
                 "metadata",
@@ -7644,11 +7771,38 @@ mod tests {
     }
 
     #[test]
+    fn rust_log_volume_classifies_target_only_directive_as_noisy() {
+        let v = rust_log_volume(Some("beads_rust"));
+        match v {
+            RustLogVolume::Noisy { reason } => assert_eq!(reason, "directive_target_only"),
+            RustLogVolume::Quiet => panic!("expected Noisy, got {v:?}"),
+        }
+    }
+
+    #[test]
     fn rust_log_volume_classifies_composite_with_one_noisy_directive_as_noisy() {
         // First directive is quiet, second is noisy → overall noisy.
         let v = rust_log_volume(Some("warn,beads_rust=debug"));
         match v {
             RustLogVolume::Noisy { reason } => assert_eq!(reason, "directive_debug"),
+            RustLogVolume::Quiet => panic!("expected Noisy, got {v:?}"),
+        }
+    }
+
+    #[test]
+    fn rust_log_volume_classifies_composite_with_target_only_directive_as_noisy() {
+        let v = rust_log_volume(Some("error,beads_rust"));
+        match v {
+            RustLogVolume::Noisy { reason } => assert_eq!(reason, "directive_target_only"),
+            RustLogVolume::Quiet => panic!("expected Noisy, got {v:?}"),
+        }
+    }
+
+    #[test]
+    fn rust_log_volume_classifies_span_filter_without_level_as_noisy() {
+        let v = rust_log_volume(Some("[span{field=value}]"));
+        match v {
+            RustLogVolume::Noisy { reason } => assert_eq!(reason, "directive_unclassified"),
             RustLogVolume::Quiet => panic!("expected Noisy, got {v:?}"),
         }
     }
@@ -7765,5 +7919,104 @@ mod tests {
         let check =
             find_check(&checks, "permissions.beads_dir").expect("permissions.beads_dir present");
         assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    // --- check_config_yaml tests (pass-2 / WP5) ---
+
+    #[test]
+    fn check_config_yaml_missing_is_ok() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let mut checks = Vec::new();
+        check_config_yaml(&beads_dir, &mut checks);
+        let check = find_check(&checks, "config.yaml").expect("config.yaml present");
+        assert!(
+            matches!(check.status, CheckStatus::Ok),
+            "missing config.yaml must be Ok (project config is optional); got {:?}",
+            check.status
+        );
+    }
+
+    #[test]
+    fn check_config_yaml_empty_is_ok() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::write(beads_dir.join("config.yaml"), b"").unwrap();
+        let mut checks = Vec::new();
+        check_config_yaml(&beads_dir, &mut checks);
+        let check = find_check(&checks, "config.yaml").expect("config.yaml present");
+        assert!(
+            matches!(check.status, CheckStatus::Ok),
+            "empty config.yaml means all-defaults; must be Ok"
+        );
+    }
+
+    #[test]
+    fn check_config_yaml_valid_is_ok() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let yaml = "id:\n  prefix: \"proj\"\ndefaults:\n  priority: 2\n  type: task\n";
+        fs::write(beads_dir.join("config.yaml"), yaml).unwrap();
+        let mut checks = Vec::new();
+        check_config_yaml(&beads_dir, &mut checks);
+        let check = find_check(&checks, "config.yaml").expect("config.yaml present");
+        assert!(
+            matches!(check.status, CheckStatus::Ok),
+            "valid config.yaml must be Ok; got {:?}",
+            check.status
+        );
+        let details = check.details.as_ref().expect("details present");
+        assert!(details["bytes"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn check_config_yaml_malformed_warns_with_parse_error() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        // Mis-indented mapping: a YAML parser surfaces a clear error.
+        let yaml = "id:\n  prefix: \"proj\"\n  - bad\n  invalid_block_mapping\n";
+        fs::write(beads_dir.join("config.yaml"), yaml).unwrap();
+        let mut checks = Vec::new();
+        check_config_yaml(&beads_dir, &mut checks);
+        let check = find_check(&checks, "config.yaml").expect("config.yaml present");
+        assert!(
+            matches!(check.status, CheckStatus::Warn),
+            "malformed YAML must trigger Warn; got {:?}",
+            check.status
+        );
+        let details = check.details.as_ref().expect("details present");
+        assert!(
+            details["parse_error"].as_str().is_some(),
+            "parse_error must be populated"
+        );
+        assert!(
+            details["recommended_fix"]
+                .as_str()
+                .unwrap()
+                .contains("Open"),
+            "recommended_fix should advise the operator to open the file"
+        );
+    }
+
+    #[test]
+    fn check_config_yaml_completely_invalid_warns() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        // Mismatched quotes / control characters in a flow-style value.
+        let yaml = "[broken: yaml,\n  with: unterminated: \"quote\n  another: line\n";
+        fs::write(beads_dir.join("config.yaml"), yaml).unwrap();
+        let mut checks = Vec::new();
+        check_config_yaml(&beads_dir, &mut checks);
+        let check = find_check(&checks, "config.yaml").expect("config.yaml present");
+        assert!(
+            matches!(check.status, CheckStatus::Warn),
+            "syntax-error YAML must trigger Warn; got {:?}",
+            check.status
+        );
     }
 }
