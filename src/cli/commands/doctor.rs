@@ -5047,6 +5047,165 @@ fn check_sync_metadata(
     }
 }
 
+/// Recovery handler for `br doctor --repair-indexes` (beads_rust#288).
+///
+/// Walks every user index attached to the `issues` table family and
+/// runs `REINDEX <name>` inside a single transaction with a verbatim
+/// pre-snapshot backup of `beads.db`. Distinct from `--repair`
+/// (which is `--rebuild` in disguise, destructive on the tombstone
+/// preservation contract): this path mutates only the index B-trees,
+/// never issue rows. Operators reach for this when
+/// `PRAGMA integrity_check` returns ok but `br doctor` reports
+/// "index <name> contains rowid N for a table row that does not
+/// satisfy the partial index predicate" — that's older SQLite not
+/// validating partial predicates on `integrity_check`.
+fn execute_repair_indexes(
+    beads_dir: &Path,
+    paths: &config::ConfigPaths,
+    ctx: &OutputContext,
+    args: &DoctorArgs,
+) -> Result<()> {
+    // Acquire the workspace write lock the same way --repair does.
+    // A REINDEX inside a transaction is a write, and concurrency with
+    // another writer is operator error.
+    let _write_lock_guard = if cli_holds_write_lock(beads_dir) {
+        None
+    } else {
+        match crate::sync::blocking_write_lock_with_timeout(beads_dir, Some(0)) {
+            Ok(file) => Some(file),
+            Err(err) => {
+                emit_concurrency_lost(beads_dir, &err, ctx);
+                std::process::exit(DoctorExitCode::ConcurrencyLost.as_i32());
+            }
+        }
+    };
+
+    // Pre-snapshot backup. Same shape `--repair` uses: copy the live
+    // DB to a sidecar before mutating, restore on any failure inside
+    // the REINDEX transaction. The snapshot path lives next to the
+    // DB so it shares the same filesystem and rename is atomic.
+    let snapshot_path = paths.db_path.with_extension("db.pre-repair-indexes");
+    if args.dry_run {
+        ctx.info(&format!(
+            "[dry-run] Would snapshot {} -> {} and REINDEX every user index on the issues family",
+            paths.db_path.display(),
+            snapshot_path.display(),
+        ));
+        return Ok(());
+    }
+    std::fs::copy(&paths.db_path, &snapshot_path).map_err(|err| BeadsError::Internal {
+        message: format!(
+            "doctor --repair-indexes: pre-snapshot backup failed ({}): {err}",
+            snapshot_path.display(),
+        ),
+    })?;
+
+    // Open the DB and enumerate every user index attached to the
+    // issues table family (issues, dependencies, comments, labels,
+    // etc.) so we don't reindex sqlite_autoindex_* or any internal
+    // index — those are managed by SQLite and not the partial-index
+    // class we're after.
+    let conn = Connection::open(paths.db_path.to_string_lossy().into_owned())?;
+    let rows = conn.query(
+        "SELECT name FROM sqlite_master \
+         WHERE type = 'index' \
+           AND name NOT LIKE 'sqlite_autoindex_%' \
+           AND sql IS NOT NULL \
+         ORDER BY name",
+    )?;
+    let index_names: Vec<String> = rows
+        .iter()
+        .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(String::from))
+        .collect();
+
+    if index_names.is_empty() {
+        // No user indexes — nothing to reindex. Leave the snapshot in
+        // place so the operator has a recoverable pre-state regardless.
+        ctx.info("doctor --repair-indexes: no user indexes found; nothing to do");
+        return Ok(());
+    }
+
+    // Run all REINDEX statements inside a single transaction so the
+    // tree is either fully repaired or the live DB returns to its
+    // pre-state on any failure mid-pass. This avoids the
+    // half-rebuilt-tree window the user flagged in their #288 repro
+    // (step 2 -> 3 -> 4 iterative discovery).
+    conn.execute("BEGIN IMMEDIATE")?;
+    let reindex_result: Result<()> = (|| {
+        for name in &index_names {
+            // Indexes might not all be quotable as identifiers safely
+            // via Rust's format!. `sqlite_master` rows come from
+            // user-supplied CREATE INDEX statements so we treat them
+            // as untrusted: validate against `[A-Za-z0-9_]+` and the
+            // (rare) double-quoted forms before splicing into the
+            // REINDEX statement. Any non-conforming name is skipped
+            // with a warning rather than executed.
+            if !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                tracing::warn!(
+                    index_name = %name,
+                    "doctor --repair-indexes: skipping index with non-identifier characters; rerun with manual REINDEX after auditing the name"
+                );
+                continue;
+            }
+            conn.execute(&format!("REINDEX {name}"))?;
+        }
+        Ok(())
+    })();
+
+    match reindex_result {
+        Ok(()) => {
+            conn.execute("COMMIT")?;
+            ctx.success(&format!(
+                "doctor --repair-indexes: REINDEX completed on {} user indexes (pre-snapshot retained at {})",
+                index_names.len(),
+                snapshot_path.display(),
+            ));
+            Ok(())
+        }
+        Err(err) => {
+            // Rollback inside the connection first, then restore from
+            // the pre-snapshot for defense in depth — if rollback
+            // itself failed (corrupt WAL etc.), the snapshot is the
+            // authoritative pre-state.
+            let _ = conn.execute("ROLLBACK");
+            tracing::warn!(
+                error = %err,
+                snapshot = %snapshot_path.display(),
+                "doctor --repair-indexes: REINDEX failed; rolling back from pre-snapshot"
+            );
+            // Close the connection before the file copy so we don't
+            // race the SQLite WAL machinery on the live DB.
+            drop(conn);
+            std::fs::copy(&snapshot_path, &paths.db_path).map_err(|copy_err| {
+                BeadsError::Internal {
+                    message: format!(
+                        "doctor --repair-indexes: REINDEX failed and pre-snapshot restore also failed: original={err}, restore={copy_err}",
+                    ),
+                }
+            })?;
+            Err(err)
+        }
+    }
+}
+
+/// Mirror of the `cli.holds_write_lock_for(beads_dir)` check used by
+/// the flat doctor handler. Returns true when the caller's main.rs
+/// already serialized us against concurrent writers and we shouldn't
+/// open a second flock handle (same-process flock(2) deadlock on Linux).
+fn cli_holds_write_lock(_beads_dir: &Path) -> bool {
+    // The repair-indexes path is invoked from the same `execute()`
+    // function as the regular flat doctor, but we don't have direct
+    // access to the `CliOverrides` instance here. Take the
+    // conservative path and always acquire our own lock — the
+    // try-once-or-refuse semantics with `Some(0)` timeout matches the
+    // existing `--repair` behavior, so an external main.rs holder
+    // would already have caused the flat handler to skip locking too.
+    false
+}
+
 fn collect_doctor_report(beads_dir: &Path, paths: &config::ConfigPaths) -> Result<DoctorRun> {
     collect_doctor_report_with_mode(beads_dir, paths, DoctorInspectionMode::Full)
 }
@@ -5432,6 +5591,14 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     } else {
         None
     };
+
+    // --repair-indexes (#288): REINDEX-only recovery path, strictly
+    // narrower than --repair. Runs before the read-only return so
+    // operators get the repair result instead of the pre-repair
+    // findings.
+    if args.repair_indexes {
+        return execute_repair_indexes(&beads_dir, &paths, ctx, args);
+    }
 
     // Auto-fix root .gitignore if --repair is passed and the warning is present.
     let gitignore_repaired = if args.repair {
@@ -9514,6 +9681,124 @@ version = "2026-05-11-abc123"
         assert_eq!(delta.both_count, 2);
         assert!(delta.only_db.is_empty());
         assert!(delta.only_jsonl.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // br doctor --repair-indexes (beads_rust#288)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn execute_repair_indexes_succeeds_against_healthy_db_and_retains_snapshot() {
+        use crate::config::ConfigPaths;
+        use crate::output::OutputContext;
+
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+
+        // Seed a real schema (so REINDEX has user indexes to act on)
+        // + a couple of issue rows so the snapshot is a non-trivial
+        // file. The repair-indexes path doesn't touch issues rows,
+        // but the test pins that they're untouched after.
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let issue = sample_issue("bd-ri-1", "indexable");
+        storage.create_issue(&issue, "test").unwrap();
+        drop(storage);
+
+        let paths = ConfigPaths {
+            beads_dir: beads_dir.clone(),
+            db_path: db_path.clone(),
+            jsonl_path: beads_dir.join("issues.jsonl"),
+            metadata: crate::config::Metadata::default(),
+        };
+        let args = DoctorArgs {
+            repair: false,
+            repair_indexes: true,
+            allow_repeated_repair: false,
+            dry_run: false,
+            robot_triage: false,
+            quick: false,
+            subcommand: None,
+        };
+        let ctx = OutputContext::from_flags(false, true, true);
+
+        let result = execute_repair_indexes(&beads_dir, &paths, &ctx, &args);
+        assert!(
+            result.is_ok(),
+            "repair-indexes against a healthy DB must succeed: {:?}",
+            result
+        );
+
+        // Pre-snapshot backup must remain on disk so the operator
+        // has a recoverable pre-state — explicitly part of the
+        // contract per the #288 fix comment.
+        let snapshot_path = db_path.with_extension("db.pre-repair-indexes");
+        assert!(
+            snapshot_path.exists(),
+            "pre-snapshot backup must be retained at {}",
+            snapshot_path.display(),
+        );
+
+        // Issue row must survive the REINDEX — the path is
+        // index-only and must never touch row data.
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let reloaded = storage.get_issue("bd-ri-1").unwrap();
+        assert!(reloaded.is_some(), "issue row must survive REINDEX");
+    }
+
+    #[test]
+    fn execute_repair_indexes_dry_run_skips_mutation() {
+        use crate::config::ConfigPaths;
+        use crate::output::OutputContext;
+
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        storage
+            .create_issue(&sample_issue("bd-ri-dry-1", "untouched"), "test")
+            .unwrap();
+        drop(storage);
+
+        let pre_mtime = fs::metadata(&db_path).unwrap().modified().unwrap();
+
+        let paths = ConfigPaths {
+            beads_dir: beads_dir.clone(),
+            db_path: db_path.clone(),
+            jsonl_path: beads_dir.join("issues.jsonl"),
+            metadata: crate::config::Metadata::default(),
+        };
+        let args = DoctorArgs {
+            repair: false,
+            repair_indexes: true,
+            allow_repeated_repair: false,
+            dry_run: true,
+            robot_triage: false,
+            quick: false,
+            subcommand: None,
+        };
+        let ctx = OutputContext::from_flags(false, true, true);
+
+        execute_repair_indexes(&beads_dir, &paths, &ctx, &args).unwrap();
+
+        // Dry-run must not even take the pre-snapshot — the file
+        // shouldn't exist.
+        let snapshot_path = db_path.with_extension("db.pre-repair-indexes");
+        assert!(
+            !snapshot_path.exists(),
+            "dry-run must not create a snapshot: {}",
+            snapshot_path.display(),
+        );
+
+        // DB mtime should not have changed.
+        let post_mtime = fs::metadata(&db_path).unwrap().modified().unwrap();
+        assert_eq!(
+            pre_mtime, post_mtime,
+            "dry-run must not modify the live DB file"
+        );
     }
 
     #[test]

@@ -2665,6 +2665,19 @@ pub struct DoctorArgs {
     #[arg(long)]
     pub repair: bool,
 
+    /// REINDEX-only recovery for the partial-index stale-entry class
+    /// (see beads_rust#288). Strictly narrower than `--repair`: walks
+    /// every table that owns partial indexes, runs `REINDEX <table>`
+    /// inside a single transaction with a verbatim pre-snapshot
+    /// backup, and never touches issue rows. Use when
+    /// `PRAGMA integrity_check` returns `ok` but `br doctor` reports
+    /// `index <name> contains rowid N for a table row that does not
+    /// satisfy the partial index predicate` — that's older SQLite
+    /// not validating partial predicates on `integrity_check`.
+    /// Mutually exclusive with `--repair`.
+    #[arg(long, conflicts_with = "repair")]
+    pub repair_indexes: bool,
+
     /// Allow another JSONL rebuild after prior failed recovery evidence
     #[arg(long)]
     pub allow_repeated_repair: bool,
