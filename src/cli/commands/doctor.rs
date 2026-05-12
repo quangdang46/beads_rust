@@ -3578,12 +3578,9 @@ fn parse_metadata_json_object(
     body: &str,
     checks: &mut Vec<CheckResult>,
 ) -> Option<serde_json::Map<String, serde_json::Value>> {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
-        let err = serde_json::from_str::<serde_json::Value>(body)
-            .expect_err("metadata JSON parse failed once");
-        push_metadata_json_parse_error(metadata_path, &err, checks);
-        return None;
-    };
+    let value = serde_json::from_str::<serde_json::Value>(body)
+        .inspect_err(|err| push_metadata_json_parse_error(metadata_path, err, checks))
+        .ok()?;
 
     let serde_json::Value::Object(obj) = value else {
         push_check(
@@ -3630,8 +3627,7 @@ fn metadata_declared_field<'a>(
 ) -> Option<&'a str> {
     obj.get(field)
         .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
+        .filter(|value| !value.trim().is_empty())
 }
 
 fn collect_metadata_json_drift(
@@ -8741,13 +8737,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let beads_dir = tmp.path().join(".beads");
         fs::create_dir_all(&beads_dir).unwrap();
-        fs::write(beads_dir.join("beads.db"), b"").unwrap();
+        let db_path = beads_dir.join("beads.db");
+        fs::write(&db_path, b"").unwrap();
         fs::write(beads_dir.join("issues.jsonl"), b"").unwrap();
-        fs::write(
-            beads_dir.join("metadata.json"),
-            br#"{"database":"beads.db","jsonl_export":"issues.jsonl"}"#,
-        )
-        .unwrap();
+        let metadata = serde_json::json!({
+            "database": db_path.display().to_string(),
+            "jsonl_export": "issues.jsonl",
+        });
+        fs::write(beads_dir.join("metadata.json"), metadata.to_string()).unwrap();
         let mut checks = Vec::new();
         check_metadata_json(&beads_dir, &mut checks);
         let check = find_check(&checks, "metadata.json").expect("metadata.json present");
@@ -8776,6 +8773,43 @@ mod tests {
             "whitespace metadata targets load as defaults and must not drift-warn; got {:?}",
             check.status
         );
+    }
+
+    #[test]
+    fn check_metadata_json_preserves_nonempty_target_whitespace() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::write(beads_dir.join("beads.db"), b"").unwrap();
+        fs::write(beads_dir.join("issues.jsonl"), b"").unwrap();
+        fs::write(
+            beads_dir.join("metadata.json"),
+            br#"{"database":" beads.db ","jsonl_export":" issues.jsonl "}"#,
+        )
+        .unwrap();
+        let mut checks = Vec::new();
+        check_metadata_json(&beads_dir, &mut checks);
+        let check = find_check(&checks, "metadata.json").expect("metadata.json present");
+        assert!(
+            matches!(check.status, CheckStatus::Warn),
+            "non-empty whitespace is part of the runtime path and must drift-warn; got {:?}",
+            check.status
+        );
+        let details = check.details.as_ref().expect("details present");
+        let drift = details["drift"].as_array().expect("drift array");
+        assert_eq!(
+            drift.len(),
+            2,
+            "both whitespace-padded targets should drift"
+        );
+        assert!(
+            drift
+                .iter()
+                .any(|entry| { entry["field"] == "database" && entry["value"] == " beads.db " })
+        );
+        assert!(drift.iter().any(|entry| {
+            entry["field"] == "jsonl_export" && entry["value"] == " issues.jsonl "
+        }));
     }
 
     #[test]
@@ -8824,11 +8858,11 @@ mod tests {
         let beads_dir = tmp.path().join(".beads");
         fs::create_dir_all(&beads_dir).unwrap();
         // Declare files that don't exist.
-        fs::write(
-            beads_dir.join("metadata.json"),
-            br#"{"database":"renamed.db","jsonl_export":"renamed.jsonl"}"#,
-        )
-        .unwrap();
+        let metadata = serde_json::json!({
+            "database": tmp.path().join("renamed.db").display().to_string(),
+            "jsonl_export": tmp.path().join("renamed.jsonl").display().to_string(),
+        });
+        fs::write(beads_dir.join("metadata.json"), metadata.to_string()).unwrap();
         let mut checks = Vec::new();
         check_metadata_json(&beads_dir, &mut checks);
         let check = find_check(&checks, "metadata.json").expect("metadata.json present");
@@ -8847,12 +8881,13 @@ mod tests {
         let beads_dir = tmp.path().join(".beads");
         fs::create_dir_all(&beads_dir).unwrap();
         // beads.db exists; jsonl_export points at a missing file.
-        fs::write(beads_dir.join("beads.db"), b"").unwrap();
-        fs::write(
-            beads_dir.join("metadata.json"),
-            br#"{"database":"beads.db","jsonl_export":"missing.jsonl"}"#,
-        )
-        .unwrap();
+        let db_path = beads_dir.join("beads.db");
+        fs::write(&db_path, b"").unwrap();
+        let metadata = serde_json::json!({
+            "database": db_path.display().to_string(),
+            "jsonl_export": "missing.jsonl",
+        });
+        fs::write(beads_dir.join("metadata.json"), metadata.to_string()).unwrap();
         let mut checks = Vec::new();
         check_metadata_json(&beads_dir, &mut checks);
         let check = find_check(&checks, "metadata.json").expect("metadata.json present");

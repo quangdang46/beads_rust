@@ -17,14 +17,10 @@ cd "$target_dir"
 "$tool_bin" init >/dev/null 2>&1
 
 # Overwrite metadata.json to declare a jsonl_export that points at a
-# non-existent file. Keep `database` honest so we exercise the
-# partial-drift branch of the detector.
-cat > .beads/metadata.json <<'JSON'
-{
-  "database": "beads.db",
-  "jsonl_export": "renamed-by-operator.jsonl"
-}
-JSON
+# non-existent file. Keep `database` honest with an absolute path so
+# ambient BEADS_CACHE_DIR cannot redirect the partial-drift assertion.
+printf '{\n  "database": "%s/.beads/beads.db",\n  "jsonl_export": "renamed-by-operator.jsonl"\n}\n' \
+  "$target_dir" > .beads/metadata.json
 
 if [ -e .fixture_baseline ]; then
   echo "fixture baseline already exists; expected a fresh workspace" >&2

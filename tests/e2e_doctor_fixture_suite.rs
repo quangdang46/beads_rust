@@ -52,7 +52,9 @@ fn doctor_fixture_suite_passes() {
         .env_remove("BD_DB")
         .env_remove("BD_DATABASE")
         .env_remove("BEADS_DB")
+        .env_remove("BEADS_CACHE_DIR")
         .env_remove("BEADS_DIR")
+        .env_remove("BEADS_JSONL")
         .env_remove("BR_STARTUP_CACHE")
         .output()
         .expect("spawn run_all.sh");
