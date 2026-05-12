@@ -5391,14 +5391,24 @@ fn execute_repair_indexes(
 
 fn checkpoint_and_snapshot_repair_indexes(db_path: &Path, snapshot_path: &Path) -> Result<()> {
     // WAL-safety contract: checkpoint before snapshot so the `.db`
-    // file alone is a complete pre-state for restore-via-copy.
+    // file alone is a complete pre-state for restore-via-copy. When
+    // checkpoint fails (concurrent reader holding a snapshot,
+    // unsupported journal mode, etc.) we MUST also snapshot the WAL
+    // and SHM sidecars so the restore path can restore the full
+    // pre-state — otherwise a restore would overwrite the live DB
+    // with a snapshot that's missing whatever data the WAL still
+    // held, silently destroying committed-but-uncheckpointed work.
     let conn = Connection::open(db_path.to_string_lossy().into_owned())?;
-    if let Err(checkpoint_err) = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)") {
-        tracing::warn!(
-            error = %checkpoint_err,
-            "doctor --repair-indexes: wal_checkpoint(TRUNCATE) before snapshot failed; restore path will delete the WAL sidecar instead"
-        );
-    }
+    let checkpoint_ok = match conn.execute("PRAGMA wal_checkpoint(TRUNCATE)") {
+        Ok(_) => true,
+        Err(checkpoint_err) => {
+            tracing::warn!(
+                error = %checkpoint_err,
+                "doctor --repair-indexes: wal_checkpoint(TRUNCATE) before snapshot failed; will also snapshot WAL/SHM sidecars to preserve full pre-state"
+            );
+            false
+        }
+    };
     close_repair_indexes_connection(conn, "after pre-snapshot WAL checkpoint");
 
     std::fs::copy(db_path, snapshot_path).map_err(|err| BeadsError::Internal {
@@ -5407,6 +5417,36 @@ fn checkpoint_and_snapshot_repair_indexes(db_path: &Path, snapshot_path: &Path) 
             snapshot_path.display(),
         ),
     })?;
+
+    // When checkpoint failed, also snapshot the WAL/SHM sidecars
+    // alongside the `.db` so the restore path can restore the full
+    // pre-state. We use a sidecar-paths convention parallel to the
+    // main snapshot: `<snapshot_path>-wal`, `<snapshot_path>-shm`.
+    // When checkpoint succeeded we deliberately skip — the `.db`
+    // snapshot is complete, and missing sidecar snapshots are the
+    // signal to the restore path that it should delete the live
+    // sidecars (they have no valid pre-state to restore).
+    if !checkpoint_ok {
+        let wal_live = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
+        let shm_live = PathBuf::from(format!("{}-shm", db_path.to_string_lossy()));
+        let wal_snap = PathBuf::from(format!("{}-wal", snapshot_path.to_string_lossy()));
+        let shm_snap = PathBuf::from(format!("{}-shm", snapshot_path.to_string_lossy()));
+        for (live, snap, kind) in [
+            (&wal_live, &wal_snap, "WAL"),
+            (&shm_live, &shm_snap, "SHM"),
+        ] {
+            if live.exists()
+                && let Err(copy_err) = std::fs::copy(live, snap)
+            {
+                return Err(BeadsError::Internal {
+                    message: format!(
+                        "doctor --repair-indexes: post-checkpoint-failure {kind} snapshot ({}) failed: {copy_err}",
+                        snap.display(),
+                    ),
+                });
+            }
+        }
+    }
     Ok(())
 }
 
@@ -5422,23 +5462,78 @@ fn restore_repair_indexes_snapshot(
         ),
     })?;
 
-    // Critical: clear sidecars after restore so stale WAL frames from
-    // the failed REINDEX cannot replay against the restored DB file.
+    // WAL/SHM restore handling. Two paths:
+    //
+    // (A) `<snapshot>-wal` / `<snapshot>-shm` exist on disk: the
+    //     pre-snapshot checkpoint failed and we preserved the live
+    //     sidecars verbatim. Copy them back over the live sidecars
+    //     so the post-restore state is byte-identical to the
+    //     pre-repair-indexes pre-state. This is the only path that
+    //     preserves committed-but-uncheckpointed WAL frames the
+    //     user had at the time of the call.
+    //
+    // (B) Sidecar snapshots don't exist: the pre-snapshot checkpoint
+    //     succeeded, so the `.db` snapshot is complete and any live
+    //     WAL/SHM contains only post-snapshot frames from the failed
+    //     REINDEX transaction. Delete the live sidecars so they
+    //     can't replay against the restored `.db` and silently undo
+    //     the rollback.
     for sidecar in sidecars {
-        match std::fs::remove_file(sidecar) {
-            Ok(()) => tracing::debug!(
-                path = %sidecar.display(),
-                "doctor --repair-indexes: cleared sidecar after restore"
-            ),
-            Err(rm_err) if rm_err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(rm_err) => tracing::warn!(
-                error = %rm_err,
-                path = %sidecar.display(),
-                "doctor --repair-indexes: failed to remove sidecar after restore; next open may replay stale WAL frames"
-            ),
+        let sidecar_snapshot = PathBuf::from(format!(
+            "{}-{}",
+            snapshot_path.display(),
+            sidecar_suffix(sidecar).unwrap_or("orphan"),
+        ));
+        if sidecar_snapshot.exists() {
+            match std::fs::copy(&sidecar_snapshot, sidecar) {
+                Ok(_) => tracing::debug!(
+                    snapshot = %sidecar_snapshot.display(),
+                    live = %sidecar.display(),
+                    "doctor --repair-indexes: restored sidecar from pre-checkpoint snapshot"
+                ),
+                Err(copy_err) => tracing::warn!(
+                    error = %copy_err,
+                    snapshot = %sidecar_snapshot.display(),
+                    live = %sidecar.display(),
+                    "doctor --repair-indexes: failed to restore sidecar from snapshot; next open may see inconsistent WAL state"
+                ),
+            }
+            // The snapshot copy stays on disk as forensic evidence
+            // — operators can verify the restore by comparing the
+            // restored sidecar against `<snapshot>-{wal,shm}`.
+        } else {
+            match std::fs::remove_file(sidecar) {
+                Ok(()) => tracing::debug!(
+                    path = %sidecar.display(),
+                    "doctor --repair-indexes: cleared sidecar after restore (checkpoint succeeded; live sidecar held only post-REINDEX frames)"
+                ),
+                Err(rm_err) if rm_err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(rm_err) => tracing::warn!(
+                    error = %rm_err,
+                    path = %sidecar.display(),
+                    "doctor --repair-indexes: failed to remove sidecar after restore; next open may replay stale WAL frames"
+                ),
+            }
         }
     }
     Ok(())
+}
+
+/// Extract the sidecar kind (`wal` or `shm`) from a live sidecar
+/// path, so the restore loop can locate the matching snapshot file.
+/// Returns `None` if the path doesn't end in `-wal` or `-shm` — that
+/// would be a programmer error (the caller is supposed to pass only
+/// `.db-wal` / `.db-shm` paths) but we degrade to logging-only
+/// rather than panicking.
+fn sidecar_suffix(sidecar: &Path) -> Option<&'static str> {
+    let s = sidecar.to_string_lossy();
+    if s.ends_with("-wal") {
+        Some("wal")
+    } else if s.ends_with("-shm") {
+        Some("shm")
+    } else {
+        None
+    }
 }
 
 fn close_repair_indexes_connection(conn: Connection, context: &str) {
