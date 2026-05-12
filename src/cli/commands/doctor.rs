@@ -10337,6 +10337,92 @@ version = "2026-05-11-abc123"
         assert!(reloaded.is_some(), "issue row must survive REINDEX");
     }
 
+    /// Regression: pin that stale `<snapshot>-wal` / `<snapshot>-shm`
+    /// files from a previous `--repair-indexes` invocation that hit
+    /// a checkpoint failure don't leak into a subsequent successful
+    /// invocation's restore semantics. Without the explicit cleanup
+    /// at the start of `checkpoint_and_snapshot_repair_indexes`, the
+    /// second invocation would see stale sidecar snapshots, treat
+    /// them as the "pre-state for current run", and a restore-on-
+    /// failure path would resurrect the wrong WAL data.
+    #[test]
+    fn execute_repair_indexes_clears_stale_sidecar_snapshots_from_previous_run() {
+        use crate::config::ConfigPaths;
+        use crate::output::OutputContext;
+
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        storage
+            .create_issue(&sample_issue("bd-stale-sidecar", "test"), "test")
+            .unwrap();
+        drop(storage);
+
+        // Plant stale sidecar-snapshot files as if a previous run had
+        // failed its checkpoint and snapshotted them. The contents
+        // are arbitrary — the test only cares that they exist before
+        // and DON'T exist after the next successful invocation.
+        let snapshot_path = db_path.with_extension("db.pre-repair-indexes");
+        let stale_wal = PathBuf::from(format!(
+            "{}-wal",
+            snapshot_path.to_string_lossy()
+        ));
+        let stale_shm = PathBuf::from(format!(
+            "{}-shm",
+            snapshot_path.to_string_lossy()
+        ));
+        fs::write(&stale_wal, b"stale wal from a previous run").unwrap();
+        fs::write(&stale_shm, b"stale shm from a previous run").unwrap();
+
+        let paths = ConfigPaths {
+            beads_dir: beads_dir.clone(),
+            db_path: db_path.clone(),
+            jsonl_path: beads_dir.join("issues.jsonl"),
+            metadata: crate::config::Metadata::default(),
+        };
+        let args = DoctorArgs {
+            repair: false,
+            repair_indexes: true,
+            allow_repeated_repair: false,
+            dry_run: false,
+            robot_triage: false,
+            quick: false,
+            subcommand: None,
+        };
+        let ctx = OutputContext::from_flags(false, true, true);
+        let cli = crate::config::CliOverrides::default();
+
+        execute_repair_indexes(&beads_dir, &paths, &ctx, &args, &cli)
+            .expect("repair-indexes must succeed on healthy DB");
+
+        // Stale sidecar snapshots from the planted previous run must
+        // not survive the new invocation. A successful checkpoint
+        // means the new `.db` snapshot is complete on its own, so the
+        // sidecar snapshots must be cleared — otherwise a future
+        // restore would falsely restore the planted stale WAL.
+        assert!(
+            !stale_wal.exists(),
+            "stale snapshot-wal from previous run must be cleared on a successful checkpoint; still present at {}",
+            stale_wal.display(),
+        );
+        assert!(
+            !stale_shm.exists(),
+            "stale snapshot-shm from previous run must be cleared on a successful checkpoint; still present at {}",
+            stale_shm.display(),
+        );
+
+        // The current run's `.db` snapshot must exist as forensic
+        // evidence regardless.
+        assert!(
+            snapshot_path.exists(),
+            "current run's pre-snapshot must be retained at {}",
+            snapshot_path.display(),
+        );
+    }
+
     #[test]
     fn execute_repair_indexes_reuses_startup_write_lock() {
         use crate::config::{CliOverrides, ConfigPaths};
