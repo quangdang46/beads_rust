@@ -506,12 +506,49 @@ fn push_check(
     message: Option<String>,
     details: Option<serde_json::Value>,
 ) {
+    // Pass-3 finding-id schema unification: if the check name has
+    // a canonical FM mapping in CHECK_NAME_TO_FINDING_ID, inject
+    // `finding_id` into the details payload so agents see it
+    // inline next to every check (no separate capabilities-envelope
+    // lookup required). The injection is additive: callers that
+    // pass a JSON object get a new key; callers that pass non-object
+    // or None get a fresh object wrapping the FM id alongside the
+    // original details under a "data" key.
+    let details_with_fm = match finding_id_for(name) {
+        Some(fm) => Some(inject_finding_id(details, fm)),
+        None => details,
+    };
     checks.push(CheckResult {
         name: name.to_string(),
         status,
         message,
-        details,
+        details: details_with_fm,
     });
+}
+
+/// Inject `finding_id: "fm-..."` into a CheckResult's details
+/// payload. Three input shapes:
+/// - `None` -> `Some({"finding_id": fm})`
+/// - `Some(Object{..})` -> `Some(Object{"finding_id": fm, ..orig})`
+/// - `Some(non-object)` -> `Some({"finding_id": fm, "data": orig})`
+///   (defensive; no detector emits non-object details today)
+fn inject_finding_id(details: Option<serde_json::Value>, fm: &'static str) -> serde_json::Value {
+    use serde_json::Value;
+    match details {
+        None => serde_json::json!({ "finding_id": fm }),
+        Some(Value::Object(mut map)) => {
+            // First-write wins: don't override a caller-supplied
+            // finding_id (preserves the contract that detectors can
+            // assert authority over their own FM mapping).
+            map.entry("finding_id".to_string())
+                .or_insert(Value::String(fm.to_string()));
+            Value::Object(map)
+        }
+        Some(other) => serde_json::json!({
+            "finding_id": fm,
+            "data": other,
+        }),
+    }
 }
 
 /// Canonical mapping from `check.name` values (emitted by `push_check`)
@@ -536,19 +573,40 @@ fn push_check(
 pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
     // state_files (pass-1 archaeology + pass-1 / pass-2 detectors)
     ("jsonl.parse", "fm-state_files-jsonl-malformed-utf8"),
-    ("jsonl.merge_artifacts", "fm-state_files-jsonl-conflict-markers"),
+    (
+        "jsonl.merge_artifacts",
+        "fm-state_files-jsonl-conflict-markers",
+    ),
     ("sync_jsonl_path", "fm-state_files-jsonl-row-count-mismatch"),
-    ("sync_conflict_markers", "fm-state_files-jsonl-conflict-markers"),
+    (
+        "sync_conflict_markers",
+        "fm-state_files-jsonl-conflict-markers",
+    ),
     ("merge_artifacts", "fm-state_files-merge-artifact-stuck"),
     ("db.exists", "fm-state_files-empty-or-truncated-database"),
     ("db.open", "fm-state_files-sqlite-page-malformed"),
     ("db.sidecars", "fm-state_files-wal-shm-sidecar-orphan"),
-    ("db.recovery_artifacts", "fm-state_files-recovery-artifacts-orphaned"),
-    ("db.recoverable_anomalies", "fm-caches_indexes-blocked-cache-stale"),
-    ("counts.db_vs_jsonl", "fm-state_files-jsonl-row-count-mismatch"),
+    (
+        "db.recovery_artifacts",
+        "fm-state_files-recovery-artifacts-orphaned",
+    ),
+    (
+        "db.recoverable_anomalies",
+        "fm-caches_indexes-blocked-cache-stale",
+    ),
+    (
+        "counts.db_vs_jsonl",
+        "fm-state_files-jsonl-row-count-mismatch",
+    ),
     ("sync.metadata", "fm-state_files-dirty-flag-divergence"),
-    ("sqlite.integrity_check", "fm-state_files-sqlite-page-malformed"),
-    ("sqlite3.integrity_check", "fm-state_files-sqlite-page-malformed"),
+    (
+        "sqlite.integrity_check",
+        "fm-state_files-sqlite-page-malformed",
+    ),
+    (
+        "sqlite3.integrity_check",
+        "fm-state_files-sqlite-page-malformed",
+    ),
     ("db.write_probe", "fm-state_files-sqlite-page-malformed"),
     ("db.null_defaults", "fm-schemas-missing-required-column"),
     // schemas
@@ -559,11 +617,17 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
     ("beads_dir", "fm-configs-metadata-json-stale"),
     ("metadata", "fm-configs-metadata-json-stale"),
     ("metadata.json", "fm-configs-metadata-json-stale"),
-    ("gitignore.beads_inner", "fm-configs-gitignore-leaking-beads"),
+    (
+        "gitignore.beads_inner",
+        "fm-configs-gitignore-leaking-beads",
+    ),
     ("gitignore.root", "fm-configs-gitignore-leaking-beads"),
     ("config.yaml", "fm-configs-yaml-malformed"),
     // agent_coordination
-    ("audit.suspect_close_reasons", "fm-agent_coordination-suspect-close-reason"),
+    (
+        "audit.suspect_close_reasons",
+        "fm-agent_coordination-suspect-close-reason",
+    ),
     // routes_external
     ("routes_jsonl", "fm-routes_external-routes-jsonl-corrupt"),
     ("routes.targets", "fm-routes_external-route-target-missing"),
@@ -572,9 +636,15 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
     // permissions
     ("permissions.beads_dir", "fm-permissions-beads-dir-readonly"),
     // external_artifacts
-    ("binary_version", "fm-external_artifacts-binary-version-mismatch"),
+    (
+        "binary_version",
+        "fm-external_artifacts-binary-version-mismatch",
+    ),
     // concurrency_primitives
-    ("write_lock", "fm-concurrency_primitives-orphaned-write-lock"),
+    (
+        "write_lock",
+        "fm-concurrency_primitives-orphaned-write-lock",
+    ),
 ];
 
 /// Look up the canonical `fm-<subsystem>-<slug>` FM identifier for a
@@ -10780,5 +10850,77 @@ version = "2026-05-11-abc123"
     fn finding_id_for_returns_none_for_unmapped() {
         assert_eq!(finding_id_for("definitely_not_a_real_check"), None);
         assert_eq!(finding_id_for(""), None);
+    }
+
+    #[test]
+    fn push_check_injects_finding_id_into_object_details() {
+        let mut checks = Vec::new();
+
+        push_check(
+            &mut checks,
+            "db.exists",
+            CheckStatus::Ok,
+            None,
+            Some(serde_json::json!({ "path": ".beads/beads.db" })),
+        );
+
+        let details = checks[0]
+            .details
+            .as_ref()
+            .expect("mapped checks should carry finding_id details");
+        assert_eq!(
+            details
+                .get("finding_id")
+                .and_then(serde_json::Value::as_str),
+            Some("fm-state_files-empty-or-truncated-database")
+        );
+        assert_eq!(
+            details.get("path").and_then(serde_json::Value::as_str),
+            Some(".beads/beads.db")
+        );
+    }
+
+    #[test]
+    fn push_check_wraps_non_object_details_with_finding_id() {
+        let mut checks = Vec::new();
+
+        push_check(
+            &mut checks,
+            "db.exists",
+            CheckStatus::Warn,
+            None,
+            Some(serde_json::json!(["legacy-shape"])),
+        );
+
+        let details = checks[0]
+            .details
+            .as_ref()
+            .expect("mapped checks should carry finding_id details");
+        assert_eq!(
+            details
+                .get("finding_id")
+                .and_then(serde_json::Value::as_str),
+            Some("fm-state_files-empty-or-truncated-database")
+        );
+        assert_eq!(
+            details.get("data"),
+            Some(&serde_json::json!(["legacy-shape"]))
+        );
+    }
+
+    #[test]
+    fn push_check_leaves_unmapped_details_unchanged() {
+        let mut checks = Vec::new();
+        let original = serde_json::json!({ "path": ".beads/other" });
+
+        push_check(
+            &mut checks,
+            "unmapped.check",
+            CheckStatus::Error,
+            None,
+            Some(original.clone()),
+        );
+
+        assert_eq!(checks[0].details, Some(original));
     }
 }
