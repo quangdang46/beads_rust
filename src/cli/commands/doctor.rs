@@ -3669,6 +3669,236 @@ fn check_metadata_json(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
     }
 }
 
+/// Detector: the running `br` binary's compile-time
+/// `CARGO_PKG_VERSION` matches the `version` field of any `Cargo.toml`
+/// whose `[package].name == "beads_rust"` reachable upward from
+/// `beads_dir`. Pass-1 archaeology filed
+/// `fm-external_artifacts-binary-version-mismatch` (P1): an operator
+/// rebuilds br in-tree but a stale older binary remains on PATH,
+/// silently producing different output than the source-tree expects.
+///
+/// Detect-only and conservative. The doctor cannot replace its own
+/// running binary; that is `br upgrade`'s job. We only emit a warn
+/// when:
+///   1. A reachable `Cargo.toml` declares `name = "beads_rust"`.
+///   2. Its `version` field parses as a valid semver.
+///   3. The running binary's `CARGO_PKG_VERSION` parses as semver.
+///   4. The tree-version is STRICTLY GREATER than the binary-version
+///      (running an OLDER binary against a NEWER tree — the dev-loop
+///      footgun). Tree behind binary is silent (operator may be
+///      working in a side-branch).
+///
+/// Conservative-by-design:
+/// - No network probes.
+/// - No PATH-walking sibling-binary enumeration (that's the
+///   `fm-external_artifacts-multiple-br-in-path` FM — separate
+///   detector / spec).
+/// - No GitHub-latest-release comparison (offline-by-default skill
+///   policy; live network calls would be opt-in via `--online`).
+/// - If no `beads_rust` Cargo.toml is reachable, the detector emits
+///   `ok` with `not_in_beads_rust_repo: true` — the common operator
+///   case is running br outside its own source tree.
+///
+/// Status mapping:
+/// - `ok` — versions match, OR no reachable beads_rust Cargo.toml,
+///   OR either version is unparseable (silent — the operator's
+///   tree may be using a non-semver tag).
+/// - `warn` — tree version > binary version. Surfaces both
+///   versions + the canonical fix (`cargo install --path . --locked`
+///   from the repo root).
+fn check_binary_version_mismatch(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
+    let binary_version_str = env!("CARGO_PKG_VERSION");
+
+    // Walk upward from beads_dir.parent() looking for a Cargo.toml
+    // whose [package].name == "beads_rust".
+    let Some(repo_root) = find_beads_rust_repo_root(beads_dir) else {
+        push_check(
+            checks,
+            "binary_version",
+            CheckStatus::Ok,
+            Some(format!(
+                "Running br {binary_version_str}; no beads_rust Cargo.toml reachable from .beads/ — not flagging"
+            )),
+            Some(serde_json::json!({
+                "binary_version": binary_version_str,
+                "not_in_beads_rust_repo": true,
+            })),
+        );
+        return;
+    };
+
+    let cargo_toml_path = repo_root.join("Cargo.toml");
+    let tree_version_str = match read_cargo_toml_version(&cargo_toml_path) {
+        Some(v) => v,
+        None => {
+            // Cargo.toml unreadable or missing version — silent.
+            push_check(
+                checks,
+                "binary_version",
+                CheckStatus::Ok,
+                Some(format!(
+                    "Running br {binary_version_str}; beads_rust Cargo.toml at {} has no readable version",
+                    cargo_toml_path.display(),
+                )),
+                Some(serde_json::json!({
+                    "binary_version": binary_version_str,
+                    "cargo_toml": cargo_toml_path.display().to_string(),
+                })),
+            );
+            return;
+        }
+    };
+
+    let binary_version = match semver::Version::parse(binary_version_str) {
+        Ok(v) => v,
+        Err(_) => {
+            push_check(
+                checks,
+                "binary_version",
+                CheckStatus::Ok,
+                Some(format!(
+                    "Running br {binary_version_str}; binary version is not parseable semver"
+                )),
+                None,
+            );
+            return;
+        }
+    };
+    let tree_version = match semver::Version::parse(&tree_version_str) {
+        Ok(v) => v,
+        Err(_) => {
+            push_check(
+                checks,
+                "binary_version",
+                CheckStatus::Ok,
+                Some(format!(
+                    "Running br {binary_version_str}; Cargo.toml version {tree_version_str} is not parseable semver"
+                )),
+                None,
+            );
+            return;
+        }
+    };
+
+    if tree_version > binary_version {
+        push_check(
+            checks,
+            "binary_version",
+            CheckStatus::Warn,
+            Some(format!(
+                "Running br {binary_version_str} but beads_rust Cargo.toml at {} declares {tree_version_str}. \
+                 Rebuild + reinstall to pick up the newer tree.",
+                cargo_toml_path.display(),
+            )),
+            Some(serde_json::json!({
+                "binary_version": binary_version_str,
+                "tree_version": tree_version_str,
+                "cargo_toml": cargo_toml_path.display().to_string(),
+                "repo_root": repo_root.display().to_string(),
+                "recommended_fix": format!(
+                    "cd {} && cargo install --path . --locked",
+                    repo_root.display(),
+                ),
+            })),
+        );
+    } else {
+        push_check(
+            checks,
+            "binary_version",
+            CheckStatus::Ok,
+            Some(format!(
+                "Running br {binary_version_str}; matches (or is ahead of) Cargo.toml at {} ({})",
+                cargo_toml_path.display(),
+                tree_version_str,
+            )),
+            Some(serde_json::json!({
+                "binary_version": binary_version_str,
+                "tree_version": tree_version_str,
+                "cargo_toml": cargo_toml_path.display().to_string(),
+            })),
+        );
+    }
+}
+
+/// Walk upward from `start` looking for a `Cargo.toml` whose
+/// `[package].name == "beads_rust"`. Returns the directory containing
+/// that Cargo.toml, or `None` if none is found in the ancestry. Bounded
+/// at 32 levels to avoid pathological symlink loops.
+fn find_beads_rust_repo_root(start: &Path) -> Option<PathBuf> {
+    let mut current = start.parent()?.to_path_buf();
+    for _ in 0..32 {
+        let candidate = current.join("Cargo.toml");
+        if let Some(name) = read_cargo_toml_package_name(&candidate) {
+            if name == "beads_rust" {
+                return Some(current);
+            }
+        }
+        let Some(parent) = current.parent() else {
+            return None;
+        };
+        if parent == current {
+            return None;
+        }
+        current = parent.to_path_buf();
+    }
+    None
+}
+
+/// Extract `[package].name` from a `Cargo.toml` path. Returns `None` on
+/// any I/O or parse failure (intentional — the detector is conservative).
+fn read_cargo_toml_package_name(path: &Path) -> Option<String> {
+    let body = fs::read_to_string(path).ok()?;
+    parse_cargo_toml_package_field(&body, "name")
+}
+
+/// Extract `[package].version` from a `Cargo.toml` path. Returns `None`
+/// on any I/O or parse failure.
+fn read_cargo_toml_version(path: &Path) -> Option<String> {
+    let body = fs::read_to_string(path).ok()?;
+    parse_cargo_toml_package_field(&body, "version")
+}
+
+/// Minimal TOML-by-line parser for `[package]` fields. We do NOT pull
+/// in a full TOML crate just for this — `Cargo.toml` is line-oriented
+/// in practice and the chance of `[package]\n... = "..."` getting
+/// arbitrarily nested is near-zero. Returns the string value of the
+/// named field if found INSIDE the `[package]` section, `None`
+/// otherwise.
+fn parse_cargo_toml_package_field(body: &str, field: &str) -> Option<String> {
+    let mut in_package = false;
+    for raw in body.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix('[') {
+            // New section starts; check if it's [package].
+            let section = rest.trim_end_matches(']').trim();
+            in_package = section == "package";
+            continue;
+        }
+        if !in_package {
+            continue;
+        }
+        // Match `<field> = "..."` (single or double quoted).
+        if let Some(rest) = line.strip_prefix(field) {
+            let rest = rest.trim_start();
+            if let Some(rest) = rest.strip_prefix('=') {
+                let rest = rest.trim();
+                // Strip optional inline comment.
+                let val_with_quotes = rest.split('#').next().unwrap_or("").trim();
+                if val_with_quotes.starts_with('"') && val_with_quotes.ends_with('"') {
+                    return Some(val_with_quotes[1..val_with_quotes.len() - 1].to_string());
+                }
+                if val_with_quotes.starts_with('\'') && val_with_quotes.ends_with('\'') {
+                    return Some(val_with_quotes[1..val_with_quotes.len() - 1].to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 fn resolve_metadata_database_target(beads_dir: &Path, database: &str) -> PathBuf {
     let candidate = PathBuf::from(database);
     if candidate.is_absolute() {
@@ -4407,6 +4637,7 @@ fn collect_doctor_report_with_mode(
     check_permissions_beads_dir(beads_dir, &mut checks);
     check_config_yaml(beads_dir, &mut checks);
     check_metadata_json(beads_dir, &mut checks);
+    check_binary_version_mismatch(beads_dir, &mut checks);
 
     let (jsonl_path, jsonl_count) = inspect_doctor_jsonl(beads_dir, paths, &mut checks);
     inspect_doctor_database(
@@ -8394,5 +8625,208 @@ mod tests {
         let drift = details["drift"].as_array().expect("drift array");
         assert_eq!(drift.len(), 1, "only the missing field should be flagged");
         assert_eq!(drift[0]["field"], "jsonl_export");
+    }
+
+    // --- check_binary_version_mismatch + helpers tests (pass-2 / WP5) ---
+
+    #[test]
+    fn parse_cargo_toml_package_field_finds_version() {
+        let body = r#"
+[package]
+name = "beads_rust"
+version = "0.2.6"
+edition = "2024"
+"#;
+        assert_eq!(
+            parse_cargo_toml_package_field(body, "version").as_deref(),
+            Some("0.2.6")
+        );
+        assert_eq!(
+            parse_cargo_toml_package_field(body, "name").as_deref(),
+            Some("beads_rust")
+        );
+    }
+
+    #[test]
+    fn parse_cargo_toml_package_field_ignores_other_sections() {
+        let body = r#"
+[package]
+name = "beads_rust"
+version = "0.2.6"
+
+[dependencies]
+version = "1.0.0"
+name = "other"
+"#;
+        // Must return the [package].version, not [dependencies].version.
+        assert_eq!(
+            parse_cargo_toml_package_field(body, "version").as_deref(),
+            Some("0.2.6")
+        );
+        assert_eq!(
+            parse_cargo_toml_package_field(body, "name").as_deref(),
+            Some("beads_rust")
+        );
+    }
+
+    #[test]
+    fn parse_cargo_toml_package_field_handles_inline_comments() {
+        let body = r#"
+[package]
+name = "beads_rust"
+version = "0.2.6"  # release candidate
+"#;
+        assert_eq!(
+            parse_cargo_toml_package_field(body, "version").as_deref(),
+            Some("0.2.6")
+        );
+    }
+
+    #[test]
+    fn parse_cargo_toml_package_field_returns_none_for_missing() {
+        let body = r#"
+[package]
+name = "beads_rust"
+"#;
+        assert!(parse_cargo_toml_package_field(body, "version").is_none());
+    }
+
+    #[test]
+    fn find_beads_rust_repo_root_finds_self() {
+        // The .beads_dir we pass is /tmp/<dir>/.beads where
+        // <dir>/Cargo.toml has name = "beads_rust".
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let cargo = tmp.path().join("Cargo.toml");
+        fs::write(
+            &cargo,
+            r#"[package]
+name = "beads_rust"
+version = "0.99.0"
+edition = "2024"
+"#,
+        )
+        .unwrap();
+        let root = find_beads_rust_repo_root(&beads_dir);
+        assert_eq!(root.as_deref(), Some(tmp.path()));
+    }
+
+    #[test]
+    fn find_beads_rust_repo_root_returns_none_for_other_repo() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let cargo = tmp.path().join("Cargo.toml");
+        // Wrong [package].name.
+        fs::write(
+            &cargo,
+            r#"[package]
+name = "some_other_crate"
+version = "1.0.0"
+"#,
+        )
+        .unwrap();
+        let root = find_beads_rust_repo_root(&beads_dir);
+        assert!(root.is_none(), "must NOT match unrelated Cargo.toml");
+    }
+
+    #[test]
+    fn check_binary_version_mismatch_not_in_repo_is_ok() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        // No Cargo.toml anywhere upward — common when br runs outside
+        // its own source tree.
+        let mut checks = Vec::new();
+        check_binary_version_mismatch(&beads_dir, &mut checks);
+        let check = find_check(&checks, "binary_version").expect("binary_version present");
+        assert!(
+            matches!(check.status, CheckStatus::Ok),
+            "no beads_rust Cargo.toml reachable should be Ok; got {:?}",
+            check.status
+        );
+    }
+
+    #[test]
+    fn check_binary_version_mismatch_tree_ahead_warns() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        // Plant a Cargo.toml whose version is FAR ahead of any binary
+        // version we'd ship (99.99.99 > 0.x.y).
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            r#"[package]
+name = "beads_rust"
+version = "99.99.99"
+edition = "2024"
+"#,
+        )
+        .unwrap();
+        let mut checks = Vec::new();
+        check_binary_version_mismatch(&beads_dir, &mut checks);
+        let check = find_check(&checks, "binary_version").expect("binary_version present");
+        assert!(
+            matches!(check.status, CheckStatus::Warn),
+            "tree-ahead-of-binary must trigger Warn; got {:?}",
+            check.status
+        );
+        let details = check.details.as_ref().expect("details present");
+        assert_eq!(details["tree_version"], "99.99.99");
+        assert!(
+            details["recommended_fix"]
+                .as_str()
+                .unwrap()
+                .contains("cargo install --path"),
+            "recommended_fix should name the canonical rebuild command"
+        );
+    }
+
+    #[test]
+    fn check_binary_version_mismatch_tree_behind_is_ok() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        // Plant a Cargo.toml with version "0.0.1" — guaranteed BEHIND
+        // any released binary. Operator may be working on a side branch.
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            r#"[package]
+name = "beads_rust"
+version = "0.0.1"
+edition = "2024"
+"#,
+        )
+        .unwrap();
+        let mut checks = Vec::new();
+        check_binary_version_mismatch(&beads_dir, &mut checks);
+        let check = find_check(&checks, "binary_version").expect("binary_version present");
+        assert!(
+            matches!(check.status, CheckStatus::Ok),
+            "tree-behind-binary must be silent (operator on side branch); got {:?}",
+            check.status
+        );
+    }
+
+    #[test]
+    fn check_binary_version_mismatch_non_semver_tree_is_ok() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        // Non-semver tree version — silent (operator may be using a
+        // CalVer or git-sha tag).
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            r#"[package]
+name = "beads_rust"
+version = "2026-05-11-abc123"
+"#,
+        )
+        .unwrap();
+        let mut checks = Vec::new();
+        check_binary_version_mismatch(&beads_dir, &mut checks);
+        let check = find_check(&checks, "binary_version").expect("binary_version present");
+        assert!(matches!(check.status, CheckStatus::Ok));
     }
 }
