@@ -3498,112 +3498,149 @@ fn check_metadata_json(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
     let metadata_path = beads_dir.join("metadata.json");
 
     if !metadata_path.is_file() {
-        push_check(
-            checks,
-            "metadata.json",
-            CheckStatus::Ok,
-            Some(
-                "No .beads/metadata.json present (br uses defaults: beads.db + issues.jsonl)"
-                    .to_string(),
-            ),
-            None,
-        );
+        push_metadata_json_missing(checks);
         return;
     }
 
     let body = match fs::read_to_string(&metadata_path) {
         Ok(s) => s,
-        Err(err) => {
-            push_check(
-                checks,
-                "metadata.json",
-                CheckStatus::Warn,
-                Some(format!("Failed to read metadata.json: {err}")),
-                Some(serde_json::json!({
-                    "path": metadata_path.display().to_string(),
-                })),
-            );
-            return;
-        }
+        Err(err) => return push_metadata_json_read_error(&metadata_path, &err, checks),
     };
 
     // Empty file is treated as malformed (the loader does the same).
     if body.trim().is_empty() {
+        push_metadata_json_empty(&metadata_path, checks);
+        return;
+    }
+
+    let Some(obj) = parse_metadata_json_object(&metadata_path, &body, checks) else {
+        return;
+    };
+    let database = metadata_declared_field(&obj, "database");
+    let jsonl_export = metadata_declared_field(&obj, "jsonl_export");
+    let drift = collect_metadata_json_drift(beads_dir, database, jsonl_export);
+
+    if drift.is_empty() {
+        push_metadata_json_ok(&metadata_path, body.len(), database, jsonl_export, checks);
+    } else {
+        push_metadata_json_drift(&metadata_path, &drift, checks);
+    }
+}
+
+fn push_metadata_json_missing(checks: &mut Vec<CheckResult>) {
+    push_check(
+        checks,
+        "metadata.json",
+        CheckStatus::Ok,
+        Some(
+            "No .beads/metadata.json present (br uses defaults: beads.db + issues.jsonl)"
+                .to_string(),
+        ),
+        None,
+    );
+}
+
+fn push_metadata_json_read_error(
+    metadata_path: &Path,
+    err: &io::Error,
+    checks: &mut Vec<CheckResult>,
+) {
+    push_check(
+        checks,
+        "metadata.json",
+        CheckStatus::Warn,
+        Some(format!("Failed to read metadata.json: {err}")),
+        Some(serde_json::json!({
+            "path": metadata_path.display().to_string(),
+        })),
+    );
+}
+
+fn push_metadata_json_empty(metadata_path: &Path, checks: &mut Vec<CheckResult>) {
+    push_check(
+        checks,
+        "metadata.json",
+        CheckStatus::Warn,
+        Some("metadata.json is empty".to_string()),
+        Some(serde_json::json!({
+            "path": metadata_path.display().to_string(),
+            "reason": "empty_file",
+            "recommended_fix": format!(
+                "Either delete {} so br uses defaults, or write a valid JSON object.",
+                metadata_path.display(),
+            ),
+        })),
+    );
+}
+
+fn parse_metadata_json_object(
+    metadata_path: &Path,
+    body: &str,
+    checks: &mut Vec<CheckResult>,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        let err = serde_json::from_str::<serde_json::Value>(body)
+            .expect_err("metadata JSON parse failed once");
+        push_metadata_json_parse_error(metadata_path, &err, checks);
+        return None;
+    };
+
+    let serde_json::Value::Object(obj) = value else {
         push_check(
             checks,
             "metadata.json",
             CheckStatus::Warn,
-            Some("metadata.json is empty".to_string()),
+            Some("metadata.json top-level value must be a JSON object".to_string()),
             Some(serde_json::json!({
                 "path": metadata_path.display().to_string(),
-                "reason": "empty_file",
-                "recommended_fix": format!(
-                    "Either delete {} so br uses defaults, or write a valid JSON object.",
-                    metadata_path.display(),
-                ),
+                "reason": "wrong_top_level_shape",
             })),
         );
-        return;
-    }
-
-    // Generic-Value parse first so the doctor can surface a precise
-    // parse error WITHOUT coupling to the full Metadata struct's
-    // unknown-field-rejection semantics.
-    let value: serde_json::Value = match serde_json::from_str(&body) {
-        Ok(v) => v,
-        Err(err) => {
-            push_check(
-                checks,
-                "metadata.json",
-                CheckStatus::Warn,
-                Some(format!("metadata.json is malformed JSON: {err}")),
-                Some(serde_json::json!({
-                    "path": metadata_path.display().to_string(),
-                    "reason": "parse_error",
-                    "parse_error": err.to_string(),
-                    "recommended_fix": format!(
-                        "Open {} in an editor and fix the JSON; see parse_error for the precise location.",
-                        metadata_path.display(),
-                    ),
-                })),
-            );
-            return;
-        }
+        return None;
     };
 
-    // Must be a JSON object.
-    let obj = match value.as_object() {
-        Some(obj) => obj,
-        None => {
-            push_check(
-                checks,
-                "metadata.json",
-                CheckStatus::Warn,
-                Some("metadata.json top-level value must be a JSON object".to_string()),
-                Some(serde_json::json!({
-                    "path": metadata_path.display().to_string(),
-                    "reason": "wrong_top_level_shape",
-                })),
-            );
-            return;
-        }
-    };
+    Some(obj)
+}
 
-    // Cross-check `database` and `jsonl_export` against disk.
-    let database = obj
-        .get("database")
+fn push_metadata_json_parse_error(
+    metadata_path: &Path,
+    err: &serde_json::Error,
+    checks: &mut Vec<CheckResult>,
+) {
+    push_check(
+        checks,
+        "metadata.json",
+        CheckStatus::Warn,
+        Some(format!("metadata.json is malformed JSON: {err}")),
+        Some(serde_json::json!({
+            "path": metadata_path.display().to_string(),
+            "reason": "parse_error",
+            "parse_error": err.to_string(),
+            "recommended_fix": format!(
+                "Open {} in an editor and fix the JSON; see parse_error for the precise location.",
+                metadata_path.display(),
+            ),
+        })),
+    );
+}
+
+fn metadata_declared_field<'a>(
+    obj: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Option<&'a str> {
+    obj.get(field)
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let jsonl_export = obj
-        .get("jsonl_export")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
+        .filter(|value| !value.is_empty())
+}
 
-    let mut drift: Vec<serde_json::Value> = Vec::new();
+fn collect_metadata_json_drift(
+    beads_dir: &Path,
+    database: Option<&str>,
+    jsonl_export: Option<&str>,
+) -> Vec<serde_json::Value> {
+    let mut drift = Vec::new();
 
-    // `database` is optional in the legacy schema; if present, it must resolve.
     if let Some(db_name) = database {
         let db_path = resolve_metadata_database_target(beads_dir, db_name);
         if !db_path.exists() {
@@ -3616,7 +3653,6 @@ fn check_metadata_json(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
         }
     }
 
-    // `jsonl_export` similarly: if present and non-empty, must exist.
     if let Some(jsonl_name) = jsonl_export {
         let jsonl_path = resolve_metadata_jsonl_target(beads_dir, jsonl_name);
         if !jsonl_path.exists() {
@@ -3629,44 +3665,57 @@ fn check_metadata_json(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
         }
     }
 
-    if drift.is_empty() {
-        push_check(
-            checks,
-            "metadata.json",
-            CheckStatus::Ok,
-            Some(format!(
-                "metadata.json parses cleanly ({} bytes); declared targets exist on disk",
-                body.len(),
-            )),
-            Some(serde_json::json!({
-                "path": metadata_path.display().to_string(),
-                "bytes": body.len(),
-                "database": database,
-                "jsonl_export": jsonl_export,
-            })),
-        );
-    } else {
-        let fields: Vec<&str> = drift.iter().filter_map(|e| e["field"].as_str()).collect();
-        push_check(
-            checks,
-            "metadata.json",
-            CheckStatus::Warn,
-            Some(format!(
-                "metadata.json declares {n} field(s) ({fields}) pointing at files that don't exist; \
-                 operator must reconcile by either renaming the on-disk file or editing metadata.json.",
-                n = drift.len(),
-                fields = fields.join(", "),
-            )),
-            Some(serde_json::json!({
-                "path": metadata_path.display().to_string(),
-                "drift": drift,
-                "recommended_fix": format!(
-                    "Inspect {} and the listed expected_path entries; either rename the file or update metadata.json.",
-                    metadata_path.display(),
-                ),
-            })),
-        );
-    }
+    drift
+}
+
+fn push_metadata_json_ok(
+    metadata_path: &Path,
+    bytes: usize,
+    database: Option<&str>,
+    jsonl_export: Option<&str>,
+    checks: &mut Vec<CheckResult>,
+) {
+    push_check(
+        checks,
+        "metadata.json",
+        CheckStatus::Ok,
+        Some(format!(
+            "metadata.json parses cleanly ({bytes} bytes); declared targets exist on disk"
+        )),
+        Some(serde_json::json!({
+            "path": metadata_path.display().to_string(),
+            "bytes": bytes,
+            "database": database,
+            "jsonl_export": jsonl_export,
+        })),
+    );
+}
+
+fn push_metadata_json_drift(
+    metadata_path: &Path,
+    drift: &[serde_json::Value],
+    checks: &mut Vec<CheckResult>,
+) {
+    let fields: Vec<&str> = drift.iter().filter_map(|e| e["field"].as_str()).collect();
+    push_check(
+        checks,
+        "metadata.json",
+        CheckStatus::Warn,
+        Some(format!(
+            "metadata.json declares {n} field(s) ({fields}) pointing at files that don't exist; \
+             operator must reconcile by either renaming the on-disk file or editing metadata.json.",
+            n = drift.len(),
+            fields = fields.join(", "),
+        )),
+        Some(serde_json::json!({
+            "path": metadata_path.display().to_string(),
+            "drift": drift,
+            "recommended_fix": format!(
+                "Inspect {} and the listed expected_path entries; either rename the file or update metadata.json.",
+                metadata_path.display(),
+            ),
+        })),
+    );
 }
 
 /// Detector: the running `br` binary's compile-time
@@ -3728,56 +3777,47 @@ fn check_binary_version_mismatch(beads_dir: &Path, checks: &mut Vec<CheckResult>
     };
 
     let cargo_toml_path = repo_root.join("Cargo.toml");
-    let tree_version_str = match read_cargo_toml_version(&cargo_toml_path) {
-        Some(v) => v,
-        None => {
-            // Cargo.toml unreadable or missing version — silent.
-            push_check(
-                checks,
-                "binary_version",
-                CheckStatus::Ok,
-                Some(format!(
-                    "Running br {binary_version_str}; beads_rust Cargo.toml at {} has no readable version",
-                    cargo_toml_path.display(),
-                )),
-                Some(serde_json::json!({
-                    "binary_version": binary_version_str,
-                    "cargo_toml": cargo_toml_path.display().to_string(),
-                })),
-            );
-            return;
-        }
+    let Some(tree_version_str) = read_cargo_toml_version(&cargo_toml_path) else {
+        // Cargo.toml unreadable or missing version — silent.
+        push_check(
+            checks,
+            "binary_version",
+            CheckStatus::Ok,
+            Some(format!(
+                "Running br {binary_version_str}; beads_rust Cargo.toml at {} has no readable version",
+                cargo_toml_path.display(),
+            )),
+            Some(serde_json::json!({
+                "binary_version": binary_version_str,
+                "cargo_toml": cargo_toml_path.display().to_string(),
+            })),
+        );
+        return;
     };
 
-    let binary_version = match semver::Version::parse(binary_version_str) {
-        Ok(v) => v,
-        Err(_) => {
-            push_check(
-                checks,
-                "binary_version",
-                CheckStatus::Ok,
-                Some(format!(
-                    "Running br {binary_version_str}; binary version is not parseable semver"
-                )),
-                None,
-            );
-            return;
-        }
+    let Ok(binary_version) = semver::Version::parse(binary_version_str) else {
+        push_check(
+            checks,
+            "binary_version",
+            CheckStatus::Ok,
+            Some(format!(
+                "Running br {binary_version_str}; binary version is not parseable semver"
+            )),
+            None,
+        );
+        return;
     };
-    let tree_version = match semver::Version::parse(&tree_version_str) {
-        Ok(v) => v,
-        Err(_) => {
-            push_check(
-                checks,
-                "binary_version",
-                CheckStatus::Ok,
-                Some(format!(
-                    "Running br {binary_version_str}; Cargo.toml version {tree_version_str} is not parseable semver"
-                )),
-                None,
-            );
-            return;
-        }
+    let Ok(tree_version) = semver::Version::parse(&tree_version_str) else {
+        push_check(
+            checks,
+            "binary_version",
+            CheckStatus::Ok,
+            Some(format!(
+                "Running br {binary_version_str}; Cargo.toml version {tree_version_str} is not parseable semver"
+            )),
+            None,
+        );
+        return;
     };
 
     if tree_version > binary_version {
@@ -3828,14 +3868,12 @@ fn find_beads_rust_repo_root(start: &Path) -> Option<PathBuf> {
     let mut current = start.parent()?.to_path_buf();
     for _ in 0..32 {
         let candidate = current.join("Cargo.toml");
-        if let Some(name) = read_cargo_toml_package_name(&candidate) {
-            if name == "beads_rust" {
-                return Some(current);
-            }
+        if let Some(name) = read_cargo_toml_package_name(&candidate)
+            && name == "beads_rust"
+        {
+            return Some(current);
         }
-        let Some(parent) = current.parent() else {
-            return None;
-        };
+        let parent = current.parent()?;
         if parent == current {
             return None;
         }
@@ -3897,6 +3935,203 @@ fn parse_cargo_toml_package_field(body: &str, field: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Default staleness threshold for `.beads/.write.lock`. A lock file
+/// whose mtime is older than this with no live `br` process around is
+/// almost certainly an orphan from a crashed writer. Operator can
+/// override via `BR_DOCTOR_STALE_LOCK_THRESHOLD_SECS`.
+///
+/// 300 seconds is generous: the longest legitimate write transactions
+/// (DB rebuild from JSONL, full VACUUM) complete in well under a
+/// minute on the largest real-world workspaces.
+const DEFAULT_STALE_LOCK_THRESHOLD_SECS: u64 = 300;
+
+/// Detector: `.beads/.write.lock` exists as a regular file whose mtime
+/// is older than the staleness threshold. Pass-1 archaeology filed
+/// `fm-concurrency_primitives-orphaned-write-lock` (P1): a crashed
+/// `br` writer (kill -9, OOM, panic-abort in release mode) leaves
+/// the advisory flock file on disk, wedging subsequent writers until
+/// an operator removes it manually.
+///
+/// Detect-only. The doctor NEVER removes `.write.lock` automatically:
+/// touching a lock file that a live process holds would corrupt that
+/// process's locking discipline. The operator must verify no `br`
+/// process is active in this workspace, then move the file aside
+/// themselves (the canonical fix is `mv .beads/.write.lock
+/// .beads/.write.lock.stale-<ISO8601>`).
+///
+/// Conservative-by-design:
+/// - Only mtime-based staleness check. We do NOT introspect
+///   /proc/locks (Linux-only) or spawn lsof (would change behavior
+///   under heredoc-style test isolation).
+/// - Outside-source-tree mtime checks rely on `SystemTime::now()` and
+///   `metadata.modified()` — both Unix + Windows + macOS safe.
+/// - If the threshold env var is set to a non-parseable value we
+///   silently fall back to the default rather than panic.
+/// - Missing file = Ok (no lock, no contention).
+///
+/// Status mapping:
+/// - `ok` — file missing OR exists but mtime is within the threshold.
+/// - `warn` — file exists, is a regular file, and mtime is older than
+///   the threshold. Surfaces the path, mtime as RFC3339, age in
+///   seconds, threshold, and the canonical operator-fix command.
+fn check_orphaned_write_lock(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
+    let lock_path = beads_dir.join(".write.lock");
+
+    let Ok(meta) = fs::symlink_metadata(&lock_path) else {
+        push_write_lock_missing(checks);
+        return;
+    };
+
+    // Symlinks are the sibling FM's job
+    // (fm-concurrency_primitives-write-lock-toctou). Skip silently
+    // here so we don't double-flag.
+    if !meta.file_type().is_file() {
+        push_write_lock_non_file(&meta, checks);
+        return;
+    }
+
+    let threshold_secs = stale_lock_threshold_secs();
+
+    let Ok(modified) = meta.modified() else {
+        // mtime unreadable — emit Ok with explicit "deferring" note
+        // rather than warn (the operator can't act on what we can't
+        // measure).
+        push_write_lock_mtime_unreadable(&lock_path, checks);
+        return;
+    };
+
+    let Ok(age) = std::time::SystemTime::now().duration_since(modified) else {
+        // Clock skew: mtime is in the future. Surface as Warn with
+        // a distinct reason so the operator sees the clock issue.
+        push_write_lock_future_mtime(&lock_path, checks);
+        return;
+    };
+    let age_secs = age.as_secs();
+
+    if age_secs < threshold_secs {
+        push_write_lock_fresh(&lock_path, age_secs, threshold_secs, checks);
+        return;
+    }
+
+    // Stale candidate. Emit warn with the canonical operator-fix.
+    push_write_lock_stale(&lock_path, modified, age_secs, threshold_secs, checks);
+}
+
+fn push_write_lock_missing(checks: &mut Vec<CheckResult>) {
+    push_check(
+        checks,
+        "write_lock",
+        CheckStatus::Ok,
+        Some("No .beads/.write.lock present (no writer contention)".to_string()),
+        None,
+    );
+}
+
+fn push_write_lock_non_file(meta: &fs::Metadata, checks: &mut Vec<CheckResult>) {
+    push_check(
+        checks,
+        "write_lock",
+        CheckStatus::Ok,
+        Some(format!(
+            ".beads/.write.lock is not a regular file (file_type: {:?}); deferring to sibling detectors",
+            meta.file_type(),
+        )),
+        None,
+    );
+}
+
+fn stale_lock_threshold_secs() -> u64 {
+    std::env::var("BR_DOCTOR_STALE_LOCK_THRESHOLD_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_STALE_LOCK_THRESHOLD_SECS)
+}
+
+fn push_write_lock_mtime_unreadable(lock_path: &Path, checks: &mut Vec<CheckResult>) {
+    push_check(
+        checks,
+        "write_lock",
+        CheckStatus::Ok,
+        Some(
+            ".beads/.write.lock present but mtime unreadable; cannot assess staleness".to_string(),
+        ),
+        Some(serde_json::json!({
+            "path": lock_path.display().to_string(),
+        })),
+    );
+}
+
+fn push_write_lock_future_mtime(lock_path: &Path, checks: &mut Vec<CheckResult>) {
+    push_check(
+        checks,
+        "write_lock",
+        CheckStatus::Warn,
+        Some(
+            ".beads/.write.lock has an mtime in the future (clock skew?); review manually"
+                .to_string(),
+        ),
+        Some(serde_json::json!({
+            "path": lock_path.display().to_string(),
+            "reason": "mtime_in_future",
+        })),
+    );
+}
+
+fn push_write_lock_fresh(
+    lock_path: &Path,
+    age_secs: u64,
+    threshold_secs: u64,
+    checks: &mut Vec<CheckResult>,
+) {
+    push_check(
+        checks,
+        "write_lock",
+        CheckStatus::Ok,
+        Some(format!(
+            ".beads/.write.lock is {age_secs}s old (within {threshold_secs}s threshold); not stale"
+        )),
+        Some(serde_json::json!({
+            "path": lock_path.display().to_string(),
+            "age_secs": age_secs,
+            "threshold_secs": threshold_secs,
+        })),
+    );
+}
+
+fn push_write_lock_stale(
+    lock_path: &Path,
+    modified: std::time::SystemTime,
+    age_secs: u64,
+    threshold_secs: u64,
+    checks: &mut Vec<CheckResult>,
+) {
+    let mtime_rfc3339 = chrono::DateTime::<chrono::Utc>::from(modified)
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let stale_suffix = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    push_check(
+        checks,
+        "write_lock",
+        CheckStatus::Warn,
+        Some(format!(
+            ".beads/.write.lock is {age_secs}s old (threshold {threshold_secs}s) and looks orphaned. \
+             Verify no live `br` process is in this workspace, then move the lock aside manually."
+        )),
+        Some(serde_json::json!({
+            "path": lock_path.display().to_string(),
+            "mtime": mtime_rfc3339,
+            "age_secs": age_secs,
+            "threshold_secs": threshold_secs,
+            "reason": "stale_mtime",
+            "recommended_fix": format!(
+                "After verifying no `br` is running here: mv {p} {p}.stale-{stale_suffix}",
+                p = lock_path.display(),
+            ),
+            "verify_no_br_running": "pgrep -af 'br ' | grep -v doctor | grep -v grep",
+            "env_override": "BR_DOCTOR_STALE_LOCK_THRESHOLD_SECS",
+        })),
+    );
 }
 
 fn resolve_metadata_database_target(beads_dir: &Path, database: &str) -> PathBuf {
@@ -4638,6 +4873,7 @@ fn collect_doctor_report_with_mode(
     check_config_yaml(beads_dir, &mut checks);
     check_metadata_json(beads_dir, &mut checks);
     check_binary_version_mismatch(beads_dir, &mut checks);
+    check_orphaned_write_lock(beads_dir, &mut checks);
 
     let (jsonl_path, jsonl_count) = inspect_doctor_jsonl(beads_dir, paths, &mut checks);
     inspect_doctor_database(
@@ -8828,5 +9064,59 @@ version = "2026-05-11-abc123"
         check_binary_version_mismatch(&beads_dir, &mut checks);
         let check = find_check(&checks, "binary_version").expect("binary_version present");
         assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    // --- check_orphaned_write_lock tests (pass-2 / WP5) ---
+
+    #[test]
+    fn check_orphaned_write_lock_missing_is_ok() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        // No .write.lock planted.
+        let mut checks = Vec::new();
+        check_orphaned_write_lock(&beads_dir, &mut checks);
+        let check = find_check(&checks, "write_lock").expect("write_lock present");
+        assert!(
+            matches!(check.status, CheckStatus::Ok),
+            "missing .write.lock must be Ok (no contention); got {:?}",
+            check.status
+        );
+    }
+
+    #[test]
+    fn check_orphaned_write_lock_fresh_is_ok() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::write(beads_dir.join(".write.lock"), b"").unwrap();
+        // Fresh file: mtime is now → well within the 300s default
+        // threshold.
+        let mut checks = Vec::new();
+        check_orphaned_write_lock(&beads_dir, &mut checks);
+        let check = find_check(&checks, "write_lock").expect("write_lock present");
+        assert!(
+            matches!(check.status, CheckStatus::Ok),
+            "fresh .write.lock must be Ok; got {:?}",
+            check.status
+        );
+    }
+
+    #[test]
+    fn check_orphaned_write_lock_symlink_defers() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let target = beads_dir.join("target_file");
+        fs::write(&target, b"").unwrap();
+        std::os::unix::fs::symlink(&target, beads_dir.join(".write.lock")).unwrap();
+        let mut checks = Vec::new();
+        check_orphaned_write_lock(&beads_dir, &mut checks);
+        let check = find_check(&checks, "write_lock").expect("write_lock present");
+        assert!(
+            matches!(check.status, CheckStatus::Ok),
+            "symlink .write.lock should defer to TOCTOU detector; got {:?}",
+            check.status
+        );
     }
 }

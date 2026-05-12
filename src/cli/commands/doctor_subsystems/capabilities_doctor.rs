@@ -225,6 +225,7 @@ fn build_detector_registry() -> Vec<DetectorEntry> {
         ("config.yaml", "configs", "warn", true),
         ("metadata.json", "configs", "warn", true),
         ("binary_version", "external_artifacts", "warn", true),
+        ("write_lock", "concurrency_primitives", "warn", true),
         ("jsonl.parse", "state_files", "error", true),
         ("jsonl.merge_artifacts", "state_files", "warn", true),
         ("sync_jsonl_path", "state_files", "warn", true),
