@@ -239,31 +239,14 @@ impl fmt::Display for AnomalyClass {
                 only_db,
                 only_jsonl,
                 both_count,
-            } => {
-                // Cap the inline preview at the first few ids per side so
-                // the doctor finding stays readable for large drifts.
-                // `details` carries total counts plus the bounded previews.
-                let preview = |ids: &[String]| -> String {
-                    const LIMIT: usize = 3;
-                    if ids.len() <= LIMIT {
-                        ids.join(", ")
-                    } else {
-                        format!(
-                            "{}, … (+{} more)",
-                            ids[..LIMIT].join(", "),
-                            ids.len() - LIMIT
-                        )
-                    }
-                };
-                write!(
-                    f,
-                    "DB/JSONL id-set mismatch (only_db={}: [{}]; only_jsonl={}: [{}]; both={both_count})",
-                    only_db_count,
-                    preview(only_db),
-                    only_jsonl_count,
-                    preview(only_jsonl),
-                )
-            }
+            } => fmt_db_jsonl_id_set_mismatch(
+                f,
+                *only_db_count,
+                *only_jsonl_count,
+                only_db,
+                only_jsonl,
+                *both_count,
+            ),
             Self::JsonlNewer => f.write_str("JSONL has newer data than database"),
             Self::DbNewer => f.write_str("database has newer data than JSONL"),
             Self::StaleRecoveryArtifacts => f.write_str("stale recovery artifacts present"),
@@ -309,6 +292,37 @@ impl fmt::Display for AnomalyClass {
             }
             Self::OrphanedLockFile => f.write_str("orphaned lock file (.beads.lock) present"),
         }
+    }
+}
+
+fn fmt_db_jsonl_id_set_mismatch(
+    f: &mut fmt::Formatter<'_>,
+    only_db_count: usize,
+    only_jsonl_count: usize,
+    only_db: &[String],
+    only_jsonl: &[String],
+    both_count: usize,
+) -> fmt::Result {
+    write!(
+        f,
+        "DB/JSONL id-set mismatch (only_db={}: [{}]; only_jsonl={}: [{}]; both={both_count})",
+        only_db_count,
+        preview_anomaly_ids(only_db),
+        only_jsonl_count,
+        preview_anomaly_ids(only_jsonl),
+    )
+}
+
+fn preview_anomaly_ids(ids: &[String]) -> String {
+    const LIMIT: usize = 3;
+    if ids.len() <= LIMIT {
+        ids.join(", ")
+    } else {
+        format!(
+            "{}, … (+{} more)",
+            ids[..LIMIT].join(", "),
+            ids.len() - LIMIT
+        )
     }
 }
 

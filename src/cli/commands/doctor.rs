@@ -5140,10 +5140,7 @@ fn execute_repair_indexes(
             // (rare) double-quoted forms before splicing into the
             // REINDEX statement. Any non-conforming name is skipped
             // with a warning rather than executed.
-            if !name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_')
-            {
+            if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                 tracing::warn!(
                     index_name = %name,
                     "doctor --repair-indexes: skipping index with non-identifier characters; rerun with manual REINDEX after auditing the name"
@@ -9742,7 +9739,7 @@ version = "2026-05-11-abc123"
 
         // Issue row must survive the REINDEX — the path is
         // index-only and must never touch row data.
-        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let storage = SqliteStorage::open(&db_path).unwrap();
         let reloaded = storage.get_issue("bd-ri-1").unwrap();
         assert!(reloaded.is_some(), "issue row must survive REINDEX");
     }
