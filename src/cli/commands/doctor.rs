@@ -3163,6 +3163,138 @@ fn check_routes_jsonl(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
     }
 }
 
+/// Detector: routes parse and their target `.beads` directories resolve.
+///
+/// `routes_jsonl` validates the shape of each line. This companion check follows
+/// the same resolution rules as routed commands so stale project paths and broken
+/// redirects show up during `br doctor` instead of only when an agent tries to
+/// operate on a routed issue.
+fn check_routes_targets_resolve(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
+    let routes_path = beads_dir.join("routes.jsonl");
+
+    if !routes_path.is_file() {
+        push_check(
+            checks,
+            "routes.targets",
+            CheckStatus::Ok,
+            Some("No routes.jsonl present (route targets are optional)".to_string()),
+            None,
+        );
+        return;
+    }
+
+    let routes = match config::routing::load_routes(&routes_path) {
+        Ok(routes) => routes,
+        Err(err) => {
+            push_check(
+                checks,
+                "routes.targets",
+                CheckStatus::Warn,
+                Some(format!(
+                    "Could not resolve route targets because routes.jsonl is invalid: {err}"
+                )),
+                Some(serde_json::json!({
+                    "path": routes_path.display().to_string(),
+                })),
+            );
+            return;
+        }
+    };
+
+    let route_count = routes.len();
+    let project_root = beads_dir.parent().unwrap_or(beads_dir);
+    let mut unresolved_routes = Vec::new();
+    let mut resolved_count = 0usize;
+
+    for route in &routes {
+        if route.path.trim().is_empty() {
+            unresolved_routes.push(serde_json::json!({
+                "prefix": route.prefix.as_str(),
+                "path": route.path.as_str(),
+                "reason": "empty route path",
+            }));
+            continue;
+        }
+
+        let target_path = doctor_route_target_beads_dir(route, project_root);
+        match config::routing::follow_redirects(&target_path, 10) {
+            Ok(final_path)
+                if final_path.is_dir()
+                    && final_path
+                        .file_name()
+                        .is_some_and(config::is_beads_dir_name) =>
+            {
+                resolved_count += 1;
+            }
+            Ok(final_path) => unresolved_routes.push(serde_json::json!({
+                "prefix": route.prefix.as_str(),
+                "path": route.path.as_str(),
+                "target": target_path.display().to_string(),
+                "resolved": final_path.display().to_string(),
+                "reason": "target is not a beads directory",
+            })),
+            Err(err) => unresolved_routes.push(serde_json::json!({
+                "prefix": route.prefix.as_str(),
+                "path": route.path.as_str(),
+                "target": target_path.display().to_string(),
+                "reason": err.to_string(),
+            })),
+        }
+    }
+
+    if unresolved_routes.is_empty() {
+        push_check(
+            checks,
+            "routes.targets",
+            CheckStatus::Ok,
+            Some(format!("{resolved_count} route target(s) resolved cleanly")),
+            Some(serde_json::json!({
+                "path": routes_path.display().to_string(),
+                "route_count": route_count,
+                "resolved_count": resolved_count,
+            })),
+        );
+    } else {
+        let unresolved_count = unresolved_routes.len();
+        push_check(
+            checks,
+            "routes.targets",
+            CheckStatus::Warn,
+            Some(format!(
+                "{unresolved_count} route target(s) failed to resolve ({resolved_count} resolved). Update routes.jsonl or the referenced project paths."
+            )),
+            Some(serde_json::json!({
+                "path": routes_path.display().to_string(),
+                "route_count": route_count,
+                "resolved_count": resolved_count,
+                "unresolved_routes": unresolved_routes,
+            })),
+        );
+    }
+}
+
+fn doctor_route_target_beads_dir(
+    route: &config::routing::RouteEntry,
+    project_root: &Path,
+) -> PathBuf {
+    if route.path == "." {
+        return project_root.join(".beads");
+    }
+
+    let path = PathBuf::from(&route.path);
+    let resolved = if path.is_absolute() {
+        path
+    } else {
+        project_root.join(path)
+    };
+
+    if resolved.file_name().is_some_and(config::is_beads_dir_name) {
+        resolved
+    } else {
+        resolved.join(".beads")
+    }
+}
+
 /// Detector: `RUST_LOG` is set to a verbose level that would dump tracing
 /// output to stderr and confuse agents parsing `br ... --json`. Agents who
 /// shell out without setting `RUST_LOG=error` can get dozens of `info`/`debug`
@@ -5051,7 +5183,7 @@ fn check_sync_metadata(
 /// Recovery handler for `br doctor --repair-indexes` (beads_rust#288).
 ///
 /// Walks every user index attached to the `issues` table family and
-/// runs `REINDEX <name>` inside a single transaction with a verbatim
+/// runs `REINDEX "<name>"` inside a single transaction with a verbatim
 /// pre-snapshot backup of `beads.db`. Distinct from `--repair`
 /// (which is `--rebuild` in disguise, destructive on the tombstone
 /// preservation contract): this path mutates only the index B-trees,
@@ -5144,21 +5276,7 @@ fn execute_repair_indexes(
     let reindex_result: Result<usize> = (|| {
         let mut reindexed_count = 0;
         for name in &index_names {
-            // Indexes might not all be quotable as identifiers safely
-            // via Rust's format!. `sqlite_master` rows come from
-            // user-supplied CREATE INDEX statements so we treat them
-            // as untrusted: validate against unquoted SQLite identifier
-            // characters before splicing into the
-            // REINDEX statement. Any non-conforming name is skipped
-            // with a warning rather than executed.
-            if !is_unquoted_sql_identifier(name) {
-                tracing::warn!(
-                    index_name = %name,
-                    "doctor --repair-indexes: skipping index with non-identifier characters; rerun with manual REINDEX after auditing the name"
-                );
-                continue;
-            }
-            conn.execute(&format!("REINDEX {name}"))?;
+            conn.execute(&format!("REINDEX {}", quote_sql_identifier(name)))?;
             reindexed_count += 1;
         }
         conn.execute("COMMIT")?;
@@ -5210,13 +5328,17 @@ fn close_repair_indexes_connection(conn: Connection, context: &str) {
     }
 }
 
-fn is_unquoted_sql_identifier(name: &str) -> bool {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    (first.is_ascii_alphabetic() || matches!(first, '_'))
-        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_'))
+fn quote_sql_identifier(name: &str) -> String {
+    let mut quoted = String::with_capacity(name.len() + 2);
+    quoted.push('"');
+    for c in name.chars() {
+        if matches!(c, '"') {
+            quoted.push('"');
+        }
+        quoted.push(c);
+    }
+    quoted.push('"');
+    quoted
 }
 
 fn collect_doctor_report(beads_dir: &Path, paths: &config::ConfigPaths) -> Result<DoctorRun> {
@@ -5238,6 +5360,7 @@ fn collect_doctor_report_with_mode(
     check_metadata_json(beads_dir, &mut checks);
     check_binary_version_mismatch(beads_dir, &mut checks);
     check_orphaned_write_lock(beads_dir, &mut checks);
+    check_routes_targets_resolve(beads_dir, &mut checks);
 
     let (jsonl_path, jsonl_count) = inspect_doctor_jsonl(beads_dir, paths, &mut checks);
     inspect_doctor_database(
@@ -8874,6 +8997,71 @@ mod tests {
         );
     }
 
+    #[test]
+    fn check_routes_targets_resolve_missing_routes_file_is_ok() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let mut checks = Vec::new();
+        check_routes_targets_resolve(&beads_dir, &mut checks);
+
+        let check = find_check(&checks, "routes.targets").expect("routes.targets present");
+        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+    }
+
+    #[test]
+    fn check_routes_targets_resolve_project_root_route_is_ok() {
+        let tmp = TempDir::new().unwrap();
+        let project_root = tmp.path();
+        let beads_dir = project_root.join(".beads");
+        let api_beads = project_root.join("api").join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&api_beads).unwrap();
+        fs::write(
+            beads_dir.join("routes.jsonl"),
+            "{\"prefix\":\"api-\",\"path\":\"api\"}\n",
+        )
+        .unwrap();
+
+        let mut checks = Vec::new();
+        check_routes_targets_resolve(&beads_dir, &mut checks);
+
+        let check = find_check(&checks, "routes.targets").expect("routes.targets present");
+        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+        let details = check.details.as_ref().expect("details present");
+        assert_eq!(details["route_count"], 1);
+        assert_eq!(details["resolved_count"], 1);
+    }
+
+    #[test]
+    fn check_routes_targets_resolve_missing_target_warns() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::write(
+            beads_dir.join("routes.jsonl"),
+            "{\"prefix\":\"api-\",\"path\":\"missing\"}\n",
+        )
+        .unwrap();
+
+        let mut checks = Vec::new();
+        check_routes_targets_resolve(&beads_dir, &mut checks);
+
+        let check = find_check(&checks, "routes.targets").expect("routes.targets present");
+        assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
+        let details = check.details.as_ref().expect("details present");
+        let unresolved = details["unresolved_routes"].as_array().unwrap();
+        assert_eq!(unresolved.len(), 1);
+        assert!(
+            unresolved[0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("Redirect target not found"),
+            "{unresolved:?}"
+        );
+    }
+
     // --- rust_log_volume / check_rust_log_noisy tests (pass-2 / WP5) ---
     //
     // We test the pure classifier `rust_log_volume(Option<&str>)`
@@ -9837,7 +10025,7 @@ version = "2026-05-11-abc123"
     }
 
     #[test]
-    fn execute_repair_indexes_skips_names_that_need_quoting() {
+    fn execute_repair_indexes_quotes_names_that_need_quoting() {
         use crate::config::ConfigPaths;
         use crate::output::OutputContext;
 
@@ -9854,6 +10042,8 @@ version = "2026-05-11-abc123"
 
         let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
         conn.execute(r#"CREATE INDEX "123doctor_weird" ON issues(title)"#)
+            .unwrap();
+        conn.execute(r#"CREATE INDEX "doctor""quoted" ON issues(status)"#)
             .unwrap();
         conn.close().unwrap();
 
@@ -9882,13 +10072,13 @@ version = "2026-05-11-abc123"
     }
 
     #[test]
-    fn unquoted_sql_identifier_requires_valid_first_character() {
-        assert!(is_unquoted_sql_identifier("_doctor_idx"));
-        assert!(is_unquoted_sql_identifier("doctor_idx_123"));
-        assert!(!is_unquoted_sql_identifier(""));
-        assert!(!is_unquoted_sql_identifier("123doctor_idx"));
-        assert!(!is_unquoted_sql_identifier("doctor-idx"));
-        assert!(!is_unquoted_sql_identifier("doctor idx"));
+    fn quote_sql_identifier_escapes_embedded_quotes() {
+        assert_eq!(quote_sql_identifier("doctor_idx"), "\"doctor_idx\"");
+        assert_eq!(quote_sql_identifier("123doctor_idx"), "\"123doctor_idx\"");
+        assert_eq!(
+            quote_sql_identifier("doctor\"quoted"),
+            "\"doctor\"\"quoted\""
+        );
     }
 
     #[test]

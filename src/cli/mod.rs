@@ -2667,7 +2667,7 @@ pub struct DoctorArgs {
 
     /// REINDEX-only recovery for the partial-index stale-entry class
     /// (see beads_rust#288). Strictly narrower than `--repair`: walks
-    /// every table that owns partial indexes, runs `REINDEX <table>`
+    /// every user-defined index, runs `REINDEX "<name>"`
     /// inside a single transaction with a verbatim pre-snapshot
     /// backup, and never touches issue rows. Use when
     /// `PRAGMA integrity_check` returns `ok` but `br doctor` reports
