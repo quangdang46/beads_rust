@@ -362,7 +362,12 @@ pub struct HealthOutput {
 /// Always returns `Ok`; the doctor exit code is the liveness signal,
 /// not an error.
 pub fn execute_health(args: &DoctorHealthArgs, repo_root: &Path) -> Result<i32> {
-    let start = Instant::now();
+    let output = build_health_output(repo_root, Instant::now());
+    emit_health(args, &output);
+    Ok(output.exit_code)
+}
+
+fn build_health_output(repo_root: &Path, start: Instant) -> HealthOutput {
     let beads = repo_root.join(".beads");
     let beads_dir_present = beads.is_dir();
 
@@ -372,8 +377,19 @@ pub fn execute_health(args: &DoctorHealthArgs, repo_root: &Path) -> Result<i32> 
             env!("CARGO_PKG_VERSION")
         );
         let exit_code = DoctorExitCode::NoInput.as_i32();
-        emit_health(args, &line, exit_code, start, beads_dir_present);
-        return Ok(exit_code);
+        return HealthOutput {
+            schema_version: HEALTH_SCHEMA,
+            status: "no_workspace",
+            exit_code,
+            beads_dir_present,
+            db_present: false,
+            jsonl_present: false,
+            merge_artifacts_present: false,
+            orphan_write_lock: false,
+            orphan_sync_lock: false,
+            elapsed_ms: start.elapsed().as_millis(),
+            line,
+        };
     }
 
     let db = beads.join("beads.db");
@@ -421,47 +437,28 @@ pub fn execute_health(args: &DoctorHealthArgs, repo_root: &Path) -> Result<i32> 
         line.push_str(" sync_lock=present");
     }
 
-    emit_health(args, &line, exit_code, start, beads_dir_present);
-    Ok(exit_code)
+    HealthOutput {
+        schema_version: HEALTH_SCHEMA,
+        status,
+        exit_code,
+        beads_dir_present,
+        db_present,
+        jsonl_present,
+        merge_artifacts_present,
+        orphan_write_lock,
+        orphan_sync_lock,
+        elapsed_ms: start.elapsed().as_millis(),
+        line,
+    }
 }
 
-fn emit_health(
-    args: &DoctorHealthArgs,
-    line: &str,
-    exit_code: i32,
-    start: Instant,
-    beads_dir_present: bool,
-) {
-    let elapsed_ms = start.elapsed().as_millis();
+fn emit_health(args: &DoctorHealthArgs, payload: &HealthOutput) {
     if args.json {
-        let beads = std::env::current_dir()
-            .map(|p| p.join(".beads"))
-            .unwrap_or_default();
-        let payload = HealthOutput {
-            schema_version: HEALTH_SCHEMA,
-            status: if exit_code == 0 {
-                "healthy"
-            } else if exit_code == DoctorExitCode::NoInput.as_i32() {
-                "no_workspace"
-            } else {
-                "findings_present"
-            },
-            exit_code,
-            beads_dir_present,
-            db_present: beads.join("beads.db").is_file(),
-            jsonl_present: beads.join("issues.jsonl").is_file()
-                || beads.join("beads.jsonl").is_file(),
-            merge_artifacts_present: false, // computed inside line; cheap re-derive omitted
-            orphan_write_lock: beads.join(".write.lock").exists(),
-            orphan_sync_lock: beads.join(".sync.lock").exists(),
-            elapsed_ms,
-            line: line.to_string(),
-        };
-        if let Ok(json) = serde_json::to_string_pretty(&payload) {
+        if let Ok(json) = serde_json::to_string_pretty(payload) {
             println!("{json}");
         }
     } else {
-        println!("{line}");
+        println!("{}", payload.line);
     }
 }
 
@@ -2026,6 +2023,32 @@ mod tests {
             dur.as_millis()
         );
         let _ = elapsed_pre;
+    }
+
+    #[test]
+    fn doctor_health_output_uses_resolved_repo_root_state() {
+        let tmp = unique_temp_root("health-json-root");
+        let repo = tmp.path().join("repo");
+        let unrelated = tmp.path().join("unrelated");
+        let beads = repo.join(".beads");
+        fs::create_dir_all(&beads).unwrap();
+        fs::create_dir_all(unrelated.join(".beads")).unwrap();
+        fs::write(beads.join("beads.db"), b"sqlite header...").unwrap();
+        fs::write(beads.join("issues.jsonl"), b"{}\n").unwrap();
+        fs::write(beads.join("MERGE_HEAD"), b"pending merge").unwrap();
+        fs::write(beads.join(".write.lock"), b"").unwrap();
+
+        let output = build_health_output(&repo, Instant::now());
+
+        assert_eq!(output.status, "findings_present");
+        assert!(output.beads_dir_present);
+        assert!(output.db_present);
+        assert!(output.jsonl_present);
+        assert!(output.merge_artifacts_present);
+        assert!(output.orphan_write_lock);
+        assert!(!output.orphan_sync_lock);
+        assert!(output.line.contains("merge_artifacts=present"));
+        assert!(output.line.contains("write_lock=present"));
     }
 
     #[test]
