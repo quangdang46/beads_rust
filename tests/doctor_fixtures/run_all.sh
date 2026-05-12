@@ -16,6 +16,9 @@
 #   SKIP — space-separated fixture names to skip
 #   ONLY — space-separated allowlist of fixture names; everything else skipped
 #   FAIL_FAST — if "1" (default), exit on first failure; if "0", run all
+#   REPLAY_IDEMPOTENCE — if "1", run --repair a second time and require
+#                        newly-created replay run actions to be empty
+#   REPLAY_IDEMPOTENCE_SKIP — space-separated fixture names to skip for replay
 
 set -uo pipefail
 
@@ -64,6 +67,12 @@ contains() {
     local needle="$1"; shift
     for item in "$@"; do [ "$item" = "$needle" ] && return 0; done
     return 1
+}
+
+list_run_ids() {
+    local runs_dir="$1"
+    [ -d "$runs_dir" ] || return 0
+    find "$runs_dir" -maxdepth 1 -mindepth 1 -type d -exec basename {} \; | sort
 }
 
 # Parse allowlist/blocklist
@@ -179,21 +188,19 @@ run_fixture() {
             skip_replay=1
         fi
         if [ "$skip_replay" -eq 0 ]; then
-            local before_run_count
-            before_run_count="$(find "$tmp/.doctor/runs" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l || echo 0)"
-            # Trim potential whitespace from wc -l output for the [
-            # comparison below (BSD/Linux wc differ on padding).
-            before_run_count="${before_run_count//[[:space:]]/}"
+            local runs_dir="$tmp/.doctor/runs"
+            local before_runs="$diag/replay_runs.before"
+            local after_runs="$diag/replay_runs.after"
+            list_run_ids "$runs_dir" > "$before_runs"
             ( cd "$tmp" && "${doctor_env[@]}" "$TOOL_BIN" doctor --repair --json ) \
                 > "$diag/repair_replay.json" 2> "$diag/repair_replay.stderr" || true
-            local after_run_count
-            after_run_count="$(find "$tmp/.doctor/runs" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l || echo 0)"
-            after_run_count="${after_run_count//[[:space:]]/}"
-            if [ "${after_run_count:-0}" -gt "${before_run_count:-0}" ]; then
-                local newest_run
-                newest_run="$(find "$tmp/.doctor/runs" -maxdepth 1 -mindepth 1 -type d \
-                              -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | awk '{print $2}')"
-                if [ -n "$newest_run" ] && [ -f "$newest_run/actions.jsonl" ]; then
+            list_run_ids "$runs_dir" > "$after_runs"
+            local new_run_ids=()
+            mapfile -t new_run_ids < <(comm -13 "$before_runs" "$after_runs")
+            local new_run_id
+            for new_run_id in "${new_run_ids[@]}"; do
+                local newest_run="$runs_dir/$new_run_id"
+                if [ -f "$newest_run/actions.jsonl" ]; then
                     local replay_action_count
                     replay_action_count="$(grep -c -v '^[[:space:]]*$' "$newest_run/actions.jsonl" 2>/dev/null || echo 0)"
                     replay_action_count="${replay_action_count//[[:space:]]/}"
@@ -205,7 +212,7 @@ run_fixture() {
                         return 1
                     fi
                 fi
-            fi
+            done
         fi
     fi
 
