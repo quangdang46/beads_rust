@@ -591,6 +591,10 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
         "fm-state_files-recovery-artifacts-orphaned",
     ),
     (
+        "db.recovery_artifacts.aged",
+        "fm-state_files-recovery-artifacts-orphaned",
+    ),
+    (
         "db.recoverable_anomalies",
         "fm-caches_indexes-blocked-cache-stale",
     ),
@@ -1515,6 +1519,49 @@ fn check_recovery_artifacts(
     Ok(())
 }
 
+/// Pass-4 cycle 3 — detector for `fm-state_files-recovery-artifacts-orphaned`.
+///
+/// Parallel to `check_recovery_artifacts` (which is information-only and
+/// surfaces ALL preserved artifacts). This narrower check fires only when
+/// at least one artifact is older than `RECOVERY_AGED_TTL_DAYS`. The
+/// distinction matters because operators commonly keep recent recovery
+/// backups for forensic value; auto-quarantining recent artifacts would
+/// destroy that value. Aged artifacts past the TTL are the orphan class
+/// the doctor offers to clean up via `--repair`.
+fn check_recovery_artifacts_aged(
+    beads_dir: &Path,
+    db_path: &Path,
+    checks: &mut Vec<CheckResult>,
+) -> Result<()> {
+    let aged = recovery_artifacts_aged(beads_dir, db_path)?;
+    if aged.is_empty() {
+        push_check(
+            checks,
+            "db.recovery_artifacts.aged",
+            CheckStatus::Ok,
+            None,
+            None,
+        );
+        return Ok(());
+    }
+    let display: Vec<String> = aged.iter().map(|p| p.display().to_string()).collect();
+    push_check(
+        checks,
+        "db.recovery_artifacts.aged",
+        CheckStatus::Warn,
+        Some(format!(
+            "{} recovery artifact(s) older than {} days — eligible for quarantine via --repair",
+            aged.len(),
+            RECOVERY_AGED_TTL_DAYS
+        )),
+        Some(serde_json::json!({
+            "artifacts": display,
+            "ttl_days": RECOVERY_AGED_TTL_DAYS,
+        })),
+    );
+    Ok(())
+}
+
 fn db_family_prefix(db_path: &Path) -> &str {
     db_path
         .file_name()
@@ -1551,6 +1598,41 @@ fn recovery_artifacts_for_db_family(beads_dir: &Path, db_path: &Path) -> Result<
     artifacts.sort();
     artifacts.dedup();
     Ok(artifacts)
+}
+
+/// Default TTL (in days) used by the aged-recovery-artifact detector +
+/// quarantine fixer. Pass-4 cycle 3 introduces this knob as a hard-coded
+/// constant; making it configurable via `metadata.json` is deferred to a
+/// follow-up cycle. 30 days matches the pass-1 archaeology spec
+/// (`fm-state_files-recovery-artifacts-orphaned`).
+const RECOVERY_AGED_TTL_DAYS: u64 = 30;
+
+/// Subset of `recovery_artifacts_for_db_family` whose mtime is older than
+/// `now - RECOVERY_AGED_TTL_DAYS`. Pure: no mutations, only `fs::metadata`
+/// calls. Entries whose mtime cannot be read are SKIPPED (we don't want to
+/// auto-quarantine artifacts we can't reason about).
+fn recovery_artifacts_aged(beads_dir: &Path, db_path: &Path) -> Result<Vec<PathBuf>> {
+    use std::time::{Duration, SystemTime};
+    let all = recovery_artifacts_for_db_family(beads_dir, db_path)?;
+    let threshold = Duration::from_secs(RECOVERY_AGED_TTL_DAYS * 24 * 60 * 60);
+    let now = SystemTime::now();
+    let mut aged = Vec::new();
+    for path in all {
+        let Ok(meta) = fs::metadata(&path) else {
+            continue;
+        };
+        let Ok(mtime) = meta.modified() else {
+            continue;
+        };
+        if now
+            .duration_since(mtime)
+            .map(|age| age > threshold)
+            .unwrap_or(false)
+        {
+            aged.push(path);
+        }
+    }
+    Ok(aged)
 }
 
 fn is_failed_jsonl_rebuild_artifact(path: &Path) -> bool {
@@ -4893,6 +4975,108 @@ fn fix_startup_cache_entries_if_warned(
     quarantined > 0
 }
 
+/// Pass-4 cycle 3 — fixer for `fm-state_files-recovery-artifacts-orphaned`.
+///
+/// When `--repair` is passed and `db.recovery_artifacts.aged` is Warn,
+/// move every past-TTL recovery artifact (per `recovery_artifacts_aged`)
+/// into `<run-dir>/quarantine/.beads/.br_recovery/<filename>` via
+/// [`chokepoint::mutate(Op::Rename)`]. RECENT artifacts (younger than
+/// `RECOVERY_AGED_TTL_DAYS`) are PRESERVED IN PLACE — operators
+/// commonly need recent backups for forensic value. Per AGENTS.md
+/// RULE 1, the fixer NEVER unlinks; rename means `doctor undo
+/// <run-id>` byte-reverses the quarantine.
+///
+/// Returns `true` if at least one aged artifact was quarantined.
+fn fix_recovery_artifacts_aged_if_warned(
+    beads_dir: &Path,
+    db_path: &Path,
+    report: &DoctorReport,
+    ctx: &OutputContext,
+    session: Option<&mut DoctorRepairSession>,
+) -> bool {
+    let has_warning = report
+        .checks
+        .iter()
+        .any(|c| c.name == "db.recovery_artifacts.aged" && c.status == CheckStatus::Warn);
+    if !has_warning {
+        return false;
+    }
+    let Some(session) = session else {
+        if !ctx.is_json() {
+            ctx.warning(
+                "Skipping recovery-artifact quarantine: no doctor repair session (run-dir creation failed)",
+            );
+        }
+        return false;
+    };
+
+    let aged = match recovery_artifacts_aged(beads_dir, db_path) {
+        Ok(items) => items,
+        Err(err) => {
+            if !ctx.is_json() {
+                ctx.warning(&format!(
+                    "Failed to enumerate aged recovery artifacts: {err}"
+                ));
+            }
+            return false;
+        }
+    };
+    if aged.is_empty() {
+        return false;
+    }
+
+    session.set_fixer("doctor.recovery_artifacts_aged_quarantine");
+    let mut quarantined = 0_usize;
+    for source in &aged {
+        let Some(name) = source.file_name() else {
+            continue;
+        };
+        // Preserve the .br_recovery/ subdirectory hint in the quarantine
+        // layout so an operator inspecting the run-dir can tell which
+        // artifacts came from the recovery dir vs which were bare
+        // .bad_<TS> siblings. The destination always lives under
+        // .doctor/ (in scope) regardless of source location.
+        let dest = session
+            .run
+            .root
+            .join("quarantine")
+            .join(".beads")
+            .join(".br_recovery")
+            .join(name);
+        match chokepoint::mutate(&session.ctx, source, Op::Rename { to: dest.clone() }) {
+            Ok(result) if result.ok => {
+                quarantined += 1;
+            }
+            Ok(_) => {
+                if !ctx.is_json() {
+                    ctx.warning(&format!(
+                        "Aged-artifact quarantine no-op for {}",
+                        source.display()
+                    ));
+                }
+            }
+            Err(err) => {
+                if !ctx.is_json() {
+                    ctx.warning(&format!("Failed to quarantine {}: {err}", source.display()));
+                }
+            }
+        }
+    }
+
+    if quarantined > 0 && !ctx.is_json() {
+        ctx.info(&format!(
+            "Quarantined {quarantined} aged recovery artifact(s) under {}",
+            session
+                .run
+                .root
+                .join("quarantine/.beads/.br_recovery")
+                .display()
+        ));
+    }
+
+    quarantined > 0
+}
+
 fn read_root_gitignore_content(gitignore_path: &Path) -> Result<Option<String>> {
     let metadata = match fs::symlink_metadata(gitignore_path) {
         Ok(metadata) => metadata,
@@ -5886,6 +6070,7 @@ fn checkpoint_and_snapshot_repair_indexes(db_path: &Path, snapshot_path: &Path) 
         }
     }
 
+    ensure_repair_indexes_snapshot_target_safe(snapshot_path)?;
     std::fs::copy(db_path, snapshot_path).map_err(|err| BeadsError::Internal {
         message: format!(
             "doctor --repair-indexes: pre-snapshot backup failed ({}): {err}",
@@ -5918,6 +6103,31 @@ fn checkpoint_and_snapshot_repair_indexes(db_path: &Path, snapshot_path: &Path) 
         }
     }
     Ok(())
+}
+
+fn ensure_repair_indexes_snapshot_target_safe(snapshot_path: &Path) -> Result<()> {
+    match fs::symlink_metadata(snapshot_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(BeadsError::Internal {
+            message: format!(
+                "doctor --repair-indexes: refusing to write pre-snapshot backup through symlink {}",
+                snapshot_path.display(),
+            ),
+        }),
+        Ok(metadata) if !metadata.file_type().is_file() => Err(BeadsError::Internal {
+            message: format!(
+                "doctor --repair-indexes: refusing to overwrite non-file pre-snapshot target {}",
+                snapshot_path.display(),
+            ),
+        }),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(BeadsError::Internal {
+            message: format!(
+                "doctor --repair-indexes: failed to inspect pre-snapshot target {}: {err}",
+                snapshot_path.display(),
+            ),
+        }),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6193,6 +6403,14 @@ fn inspect_doctor_database(
             checks,
             "db.recovery_artifacts",
             "Failed to inspect preserved recovery artifacts",
+            &err,
+        );
+    }
+    if let Err(err) = check_recovery_artifacts_aged(beads_dir, db_path, checks) {
+        push_inspection_error(
+            checks,
+            "db.recovery_artifacts.aged",
+            "Failed to inspect aged recovery artifacts",
             &err,
         );
     }
@@ -6539,11 +6757,32 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     } else {
         false
     };
-    // Suppress unused warning for both variables while downstream readers
+
+    // Pass-4 cycle 3: quarantine past-TTL recovery artifacts. The fixer
+    // PRESERVES recent recovery backups (operators commonly need them
+    // for forensic value) and only moves artifacts older than
+    // RECOVERY_AGED_TTL_DAYS into the run-dir quarantine.
+    let recovery_aged_repaired = if args.repair {
+        let repaired = fix_recovery_artifacts_aged_if_warned(
+            &beads_dir,
+            &paths.db_path,
+            &initial.report,
+            ctx,
+            session.as_mut(),
+        );
+        if repaired {
+            initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+        }
+        repaired
+    } else {
+        false
+    };
+    // Suppress unused warnings for the variables while downstream readers
     // catch up. Keeps the `--repair` flow consistent with
     // gitignore_repaired without adding a synthetic consumer.
     let _ = merge_artifacts_repaired;
     let _ = startup_cache_repaired;
+    let _ = recovery_aged_repaired;
 
     if !args.repair {
         if args.quick {
@@ -11153,6 +11392,124 @@ version = "2026-05-11-abc123"
             "must fail before writing a new DB snapshot at {}",
             snapshot_path.display(),
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_and_snapshot_repair_indexes_refuses_symlinked_snapshot_target() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        storage
+            .create_issue(&sample_issue("bd-snapshot-symlink", "test"), "test")
+            .unwrap();
+        drop(storage);
+
+        let outside = TempDir::new().unwrap();
+        let outside_target = outside.path().join("must-not-overwrite");
+        fs::write(&outside_target, b"preserve me").unwrap();
+
+        let snapshot_path = db_path.with_extension("db.pre-repair-indexes");
+        symlink(&outside_target, &snapshot_path).unwrap();
+
+        let err = checkpoint_and_snapshot_repair_indexes(&db_path, &snapshot_path)
+            .expect_err("symlinked pre-snapshot target must fail closed");
+        let message = err.to_string();
+        assert!(
+            message.contains("refusing to write pre-snapshot backup through symlink"),
+            "unexpected error: {message}",
+        );
+        assert_eq!(
+            fs::read(&outside_target).unwrap(),
+            b"preserve me",
+            "snapshot creation must not write through the symlink target"
+        );
+        assert!(
+            fs::symlink_metadata(&snapshot_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "refused snapshot symlink should be left in place for operator inspection"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_fix_recovery_artifacts_aged_is_idempotent_no_op_on_second_call() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        storage
+            .create_issue(&sample_issue("bd-aged-recovery", "test"), "test")
+            .unwrap();
+        drop(storage);
+
+        let recovery_dir = beads_dir.join(".br_recovery");
+        fs::create_dir_all(&recovery_dir).unwrap();
+        let aged = recovery_dir.join("beads.db.20250101T000000Z");
+        let recent = recovery_dir.join("beads.db.20260512T000000Z");
+        let bad_sibling = beads_dir.join("beads.db.bad_20250101T000000Z");
+        fs::copy(&db_path, &aged).unwrap();
+        fs::copy(&db_path, &recent).unwrap();
+        fs::copy(&db_path, &bad_sibling).unwrap();
+
+        for path in [&aged, &bad_sibling] {
+            let status = Command::new("touch")
+                .args(["-d", "60 days ago"])
+                .arg(path)
+                .status()
+                .unwrap();
+            assert!(status.success(), "touch failed for {}", path.display());
+        }
+
+        let report = DoctorReport {
+            ok: false,
+            workspace_health: None,
+            reliability_audit: None,
+            checks: vec![CheckResult {
+                name: "db.recovery_artifacts.aged".to_string(),
+                status: CheckStatus::Warn,
+                message: None,
+                details: None,
+            }],
+        };
+        let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Json, false, true);
+        let mut session = DoctorRepairSession::new(tmp.path(), /* dry_run = */ false)
+            .expect("session must build");
+
+        assert!(fix_recovery_artifacts_aged_if_warned(
+            &beads_dir,
+            &db_path,
+            &report,
+            &ctx,
+            Some(&mut session),
+        ));
+        assert!(!aged.exists());
+        assert!(!bad_sibling.exists());
+        assert!(
+            recent.is_file(),
+            "recent recovery artifacts must remain in place"
+        );
+
+        let actions_before = fs::read_to_string(&session.run.actions_file).unwrap();
+        assert_eq!(actions_before.matches("\"op\":\"rename\"").count(), 2);
+        assert!(!fix_recovery_artifacts_aged_if_warned(
+            &beads_dir,
+            &db_path,
+            &report,
+            &ctx,
+            Some(&mut session),
+        ));
+        let actions_after = fs::read_to_string(&session.run.actions_file).unwrap();
+        assert_eq!(actions_after, actions_before, "second pass must be a no-op");
     }
 
     #[test]

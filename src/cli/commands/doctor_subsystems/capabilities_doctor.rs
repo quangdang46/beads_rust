@@ -259,6 +259,7 @@ fn build_detector_registry() -> Vec<DetectorEntry> {
         ("db.open", "state_files", "error", true),
         ("db.sidecars", "state_files", "warn", true),
         ("db.recovery_artifacts", "state_files", "info", true),
+        ("db.recovery_artifacts.aged", "state_files", "warn", true),
         ("schema.tables", "schemas", "error", true),
         ("schema.columns", "schemas", "error", true),
         ("schema.inspect", "schemas", "error", true),
@@ -321,6 +322,13 @@ fn build_fixer_registry() -> Vec<FixerEntry> {
             true,
             true,
             &["startup_cache.health"],
+        ),
+        (
+            "doctor.recovery_artifacts_aged_quarantine",
+            "state_files",
+            true,
+            true,
+            &["db.recovery_artifacts.aged"],
         ),
         (
             "doctor.repair_recoverable_db_state",
