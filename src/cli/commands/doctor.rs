@@ -244,8 +244,14 @@ impl FixerFilter {
 
 const FM_BLOCKED_CACHE_STALE: &str = "fm-caches_indexes-blocked-cache-stale";
 const FM_PARTIAL_INDEX_STALE: &str = "fm-caches_indexes-partial-index-stale";
+const FM_JSONL_ROW_COUNT_MISMATCH: &str = "fm-state_files-jsonl-row-count-mismatch";
+const FM_EMPTY_OR_TRUNCATED_DATABASE: &str = "fm-state_files-empty-or-truncated-database";
 const FM_SQLITE_PAGE_MALFORMED: &str = "fm-state_files-sqlite-page-malformed";
 const FM_WAL_SHM_SIDECAR_ORPHAN: &str = "fm-state_files-wal-shm-sidecar-orphan";
+const FM_MISSING_REQUIRED_TABLE: &str = "fm-schemas-missing-required-table";
+const FM_MISSING_REQUIRED_COLUMN: &str = "fm-schemas-missing-required-column";
+const JSONL_REBUILD_FILTERED_REASON: &str =
+    "JSONL rebuild filtered out by --only/--skip (no rebuild-addressed FM allowed)";
 
 fn now_ns_for_session() -> u128 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -618,12 +624,12 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
         "fm-state_files-merge-artifact-stuck",
     ),
     ("startup_cache.health", "fm-configs-startup-cache-poisoned"),
-    ("sync_jsonl_path", "fm-state_files-jsonl-row-count-mismatch"),
+    ("sync_jsonl_path", FM_JSONL_ROW_COUNT_MISMATCH),
     (
         "sync_conflict_markers",
         "fm-state_files-jsonl-conflict-markers",
     ),
-    ("db.exists", "fm-state_files-empty-or-truncated-database"),
+    ("db.exists", FM_EMPTY_OR_TRUNCATED_DATABASE),
     ("db.open", FM_SQLITE_PAGE_MALFORMED),
     ("db.sidecars", FM_WAL_SHM_SIDECAR_ORPHAN),
     (
@@ -639,18 +645,15 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
         "fm-caches_indexes-export-hash-cache-divergence",
     ),
     ("db.recoverable_anomalies", FM_BLOCKED_CACHE_STALE),
-    (
-        "counts.db_vs_jsonl",
-        "fm-state_files-jsonl-row-count-mismatch",
-    ),
+    ("counts.db_vs_jsonl", FM_JSONL_ROW_COUNT_MISMATCH),
     ("sync.metadata", "fm-state_files-dirty-flag-divergence"),
     ("sqlite.integrity_check", FM_SQLITE_PAGE_MALFORMED),
     ("sqlite3.integrity_check", FM_SQLITE_PAGE_MALFORMED),
     ("db.write_probe", FM_SQLITE_PAGE_MALFORMED),
     ("db.null_defaults", "fm-schemas-missing-required-column"),
     // schemas
-    ("schema.tables", "fm-schemas-missing-required-table"),
-    ("schema.columns", "fm-schemas-missing-required-column"),
+    ("schema.tables", FM_MISSING_REQUIRED_TABLE),
+    ("schema.columns", FM_MISSING_REQUIRED_COLUMN),
     ("schema.inspect", "fm-schemas-issue-column-order-divergence"),
     // configs
     ("beads_dir", "fm-configs-metadata-json-stale"),
@@ -1105,6 +1108,19 @@ fn filter_allows_recoverable_db_state_repair(
 ) -> bool {
     (has_blocked_cache_rebuild && filter.allows(FM_BLOCKED_CACHE_STALE))
         || (has_sidecar_anomaly && filter.allows(FM_WAL_SHM_SIDECAR_ORPHAN))
+}
+
+fn filter_allows_jsonl_rebuild(filter: &FixerFilter) -> bool {
+    [
+        FM_JSONL_ROW_COUNT_MISMATCH,
+        FM_EMPTY_OR_TRUNCATED_DATABASE,
+        FM_SQLITE_PAGE_MALFORMED,
+        FM_MISSING_REQUIRED_TABLE,
+        FM_MISSING_REQUIRED_COLUMN,
+        FM_BLOCKED_CACHE_STALE,
+    ]
+    .iter()
+    .any(|fm| filter.allows(fm))
 }
 
 /// Return true if any integrity check reported non-benign page corruption
@@ -7383,6 +7399,39 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         emit_recovery_audit_record(&recovery_audit);
     }
 
+    // Pass-5 cycle 3: gate the broad JSONL rebuild path on the
+    // FixerFilter. The rebuild addresses multiple FMs simultaneously
+    // (db.open, counts.db_vs_jsonl, schema.tables, schema.columns,
+    // blocked_cache_* rebuild). If `--only` is set and excludes ALL of
+    // them, the operator has explicitly opted out of this remediation class.
+    // Check the filter BEFORE JSONL path and repeat-repair preflights so an
+    // excluded rebuild is reported as a filter refusal, not as a missing-input
+    // or stale-failure artifact problem for work the caller did not ask us to do.
+    if !filter_allows_jsonl_rebuild(&fixer_filter) {
+        let recovery_audit = early_repair.prepend_actions_to_audit(jsonl_rebuild_audit_record(
+            "doctor.jsonl_rebuild",
+            "refused",
+            None,
+            Some(JSONL_REBUILD_FILTERED_REASON.to_string()),
+        ));
+        emit_recovery_audit_record(&recovery_audit);
+        if ctx.is_json() {
+            ctx.json(&serde_json::json!({
+                "ok": false,
+                "exit_code": DoctorExitCode::RefusedUnsafe.as_i32(),
+                "code": DoctorExitCode::RefusedUnsafe.as_str(),
+                "report": initial.report,
+                "repaired": early_repair.applied(),
+                "recovery_audit": recovery_audit,
+                "message": "JSONL rebuild refused: filtered out by --only/--skip",
+            }));
+        } else {
+            print_report(&initial.report, ctx)?;
+            ctx.error("Refusing JSONL rebuild: filtered out by --only/--skip");
+        }
+        std::process::exit(DoctorExitCode::RefusedUnsafe.as_i32());
+    }
+
     let Some(jsonl_path) = initial.jsonl_path.as_ref() else {
         let recovery_audit = early_repair.prepend_actions_to_audit(jsonl_rebuild_audit_record(
             "doctor.jsonl_rebuild",
@@ -8355,6 +8404,36 @@ mod tests {
             false,
             true
         ));
+    }
+
+    #[test]
+    fn test_jsonl_rebuild_filter_matches_addressed_fms() {
+        for fm in [
+            FM_JSONL_ROW_COUNT_MISMATCH,
+            FM_EMPTY_OR_TRUNCATED_DATABASE,
+            FM_SQLITE_PAGE_MALFORMED,
+            FM_MISSING_REQUIRED_TABLE,
+            FM_MISSING_REQUIRED_COLUMN,
+            FM_BLOCKED_CACHE_STALE,
+        ] {
+            let filter = FixerFilter::from_args(&[fm.to_string()], &[]);
+            assert!(
+                filter_allows_jsonl_rebuild(&filter),
+                "JSONL rebuild should run for addressed FM {fm}"
+            );
+        }
+
+        let sidecar_only = FixerFilter::from_args(&[FM_WAL_SHM_SIDECAR_ORPHAN.to_string()], &[]);
+        assert!(!filter_allows_jsonl_rebuild(&sidecar_only));
+
+        let skip_page = FixerFilter::from_args(&[], &[FM_SQLITE_PAGE_MALFORMED.to_string()]);
+        assert!(filter_allows_jsonl_rebuild(&skip_page));
+
+        let only_page_skip_page = FixerFilter::from_args(
+            &[FM_SQLITE_PAGE_MALFORMED.to_string()],
+            &[FM_SQLITE_PAGE_MALFORMED.to_string()],
+        );
+        assert!(!filter_allows_jsonl_rebuild(&only_page_skip_page));
     }
 
     #[test]
