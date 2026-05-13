@@ -252,6 +252,7 @@ fn build_detector_registry() -> Vec<DetectorEntry> {
         ("write_lock", "concurrency_primitives", "warn", true),
         ("jsonl.parse", "state_files", "error", true),
         ("jsonl.merge_artifacts", "state_files", "warn", true),
+        ("startup_cache.health", "configs", "warn", true),
         ("sync_jsonl_path", "state_files", "warn", true),
         ("sync_conflict_markers", "state_files", "error", true),
         ("db.exists", "state_files", "error", true),
@@ -313,6 +314,13 @@ fn build_fixer_registry() -> Vec<FixerEntry> {
             true,
             true,
             &["jsonl.merge_artifacts"],
+        ),
+        (
+            "doctor.startup_cache_quarantine",
+            "configs",
+            true,
+            true,
+            &["startup_cache.health"],
         ),
         (
             "doctor.repair_recoverable_db_state",

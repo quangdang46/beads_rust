@@ -3791,6 +3791,102 @@ fn startup_cache_path(cache_dir: &Path, key: &str) -> PathBuf {
     cache_dir.join(format!("startup-{key}.json"))
 }
 
+/// Doctor-facing view of one poisoned startup-cache file. Pass-4 cycle 2:
+/// the cache types themselves stay private to this module; this struct is
+/// the narrow surface the doctor walks.
+#[derive(Debug, Clone)]
+pub struct PoisonedStartupCacheFile {
+    pub path: PathBuf,
+    pub kind: PoisonedStartupCacheKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum PoisonedStartupCacheKind {
+    /// The file exists but cannot be opened or read (corrupt FS, partial
+    /// write, perms drift).
+    Unreadable { error: String },
+    /// The file is readable but doesn't parse as a `StartupCacheRecord` — the
+    /// most common cause of silent cache misses with an on-disk artifact left
+    /// behind. We carry a short raw excerpt so the operator (or agent) has
+    /// something to triage.
+    ParseError { error: String, raw_excerpt: String },
+}
+
+/// Inspect the current workspace's startup-cache file and return it if it is
+/// poisoned (unreadable or unparseable). Used by `br doctor` (detector) and
+/// the `--repair` quarantine fixer.
+///
+/// This intentionally checks only the exact cache key the production startup
+/// path would read for `beads_dir` + `db_override`. Other `startup-*.json`
+/// files in the cache directory may belong to unrelated workspaces and must
+/// not make this workspace's doctor report noisy.
+#[must_use]
+pub fn doctor_inspect_startup_cache(
+    beads_dir: &Path,
+    db_override: Option<&PathBuf>,
+) -> Vec<PoisonedStartupCacheFile> {
+    doctor_inspect_startup_cache_at(&startup_cache_dir_from_env(), beads_dir, db_override)
+}
+
+#[must_use]
+pub(crate) fn doctor_inspect_startup_cache_at(
+    cache_dir: &Path,
+    beads_dir: &Path,
+    db_override: Option<&PathBuf>,
+) -> Vec<PoisonedStartupCacheFile> {
+    let path = doctor_startup_cache_path_at(cache_dir, beads_dir, db_override);
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(err) => {
+            return vec![PoisonedStartupCacheFile {
+                path,
+                kind: PoisonedStartupCacheKind::Unreadable {
+                    error: err.to_string(),
+                },
+            }];
+        }
+    };
+
+    if let Err(err) = serde_json::from_str::<StartupCacheRecord>(&contents) {
+        let raw_excerpt: String = contents.chars().take(256).collect();
+        return vec![PoisonedStartupCacheFile {
+            path,
+            kind: PoisonedStartupCacheKind::ParseError {
+                error: err.to_string(),
+                raw_excerpt,
+            },
+        }];
+    }
+
+    Vec::new()
+}
+
+/// Resolved startup-cache directory, exported so the doctor's repair flow
+/// can extend its `write_scopes` to include the cache dir without
+/// reaching for private cache internals.
+#[must_use]
+pub fn doctor_startup_cache_dir() -> PathBuf {
+    startup_cache_dir_from_env()
+}
+
+/// Resolved startup-cache file for the current workspace key.
+#[must_use]
+pub fn doctor_startup_cache_path(beads_dir: &Path, db_override: Option<&PathBuf>) -> PathBuf {
+    doctor_startup_cache_path_at(&startup_cache_dir_from_env(), beads_dir, db_override)
+}
+
+#[must_use]
+pub(crate) fn doctor_startup_cache_path_at(
+    cache_dir: &Path,
+    beads_dir: &Path,
+    db_override: Option<&PathBuf>,
+) -> PathBuf {
+    let witness = StartupCacheWitness::capture(beads_dir, db_override);
+    let key = startup_cache_key(beads_dir, &witness);
+    startup_cache_path(cache_dir, &key)
+}
+
 fn startup_cache_env_witness() -> Vec<(String, Option<String>)> {
     let mut keys = vec![
         "BEADS_AUTO_START_DAEMON".to_string(),

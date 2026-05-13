@@ -577,6 +577,7 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
         "jsonl.merge_artifacts",
         "fm-state_files-merge-artifact-stuck",
     ),
+    ("startup_cache.health", "fm-configs-startup-cache-poisoned"),
     ("sync_jsonl_path", "fm-state_files-jsonl-row-count-mismatch"),
     (
         "sync_conflict_markers",
@@ -3134,6 +3135,65 @@ fn check_merge_artifacts(beads_dir: &Path, checks: &mut Vec<CheckResult>) -> Res
     Ok(())
 }
 
+/// Pass-4 cycle 2: detector for `fm-configs-startup-cache-poisoned`.
+///
+/// Checks the exact startup-cache file the production read path would use for
+/// this workspace (`try_read_startup_cache` in `src/config/mod.rs`) and emits
+/// Warn when that file is unreadable or fails to deserialize as a
+/// `StartupCacheRecord`. These are the cache failures the production read path
+/// silently swallows via `.ok()?` — the file stays on disk poisoning future
+/// invocations until something cleans it up.
+///
+/// The detector is intentionally NARROWER than the full pass-1 spec (it
+/// does not surface version/key/witness/semantic drift). Those cases
+/// auto-recover on the next normal br invocation and would be noisy to
+/// flag. Corrupt-on-disk is the case the operator can't recover from
+/// without intervention.
+fn check_startup_cache(
+    beads_dir: &Path,
+    db_override: Option<&PathBuf>,
+    checks: &mut Vec<CheckResult>,
+) {
+    let poisoned = config::doctor_inspect_startup_cache(beads_dir, db_override);
+    if poisoned.is_empty() {
+        push_check(checks, "startup_cache.health", CheckStatus::Ok, None, None);
+        return;
+    }
+    let cache_dir = config::doctor_startup_cache_dir();
+    let files: Vec<serde_json::Value> = poisoned
+        .iter()
+        .map(|p| {
+            let (kind, error) = match &p.kind {
+                config::PoisonedStartupCacheKind::Unreadable { error } => {
+                    ("unreadable", error.clone())
+                }
+                config::PoisonedStartupCacheKind::ParseError { error, .. } => {
+                    ("parse_error", error.clone())
+                }
+            };
+            serde_json::json!({
+                "path": p.path.to_string_lossy(),
+                "kind": kind,
+                "error": error,
+            })
+        })
+        .collect();
+    push_check(
+        checks,
+        "startup_cache.health",
+        CheckStatus::Warn,
+        Some(format!(
+            "{} poisoned startup-cache file(s) under {}",
+            poisoned.len(),
+            cache_dir.display()
+        )),
+        Some(serde_json::json!({
+            "poisoned": files,
+            "cache_dir": cache_dir.to_string_lossy(),
+        })),
+    );
+}
+
 /// Check whether the project root `.gitignore` contains a pattern that would
 /// hide `.beads/.gitignore`, preventing git from reading br's ignore rules.
 /// This commonly happens during bd-to-br migration where the old `.gitignore`
@@ -4715,6 +4775,124 @@ fn fix_merge_artifacts_if_warned(
     quarantined > 0
 }
 
+/// Pass-4 cycle 2 — fixer for `fm-configs-startup-cache-poisoned`.
+///
+/// When `--repair` is passed and `startup_cache.health` is Warn, move the
+/// poisoned current-key `startup-*.json` file from the resolved cache dir
+/// into `<run-dir>/quarantine/startup-cache/<filename>` via
+/// [`chokepoint::mutate(Op::Rename)`]. The cache dir lives OUTSIDE the
+/// default workspace (`$XDG_CACHE_HOME/beads/startup/` or similar),
+/// so the fixer extends `session.ctx.capabilities.write_scopes` to
+/// include the resolved cache dir for the duration of the call. Per
+/// AGENTS.md RULE 1, the fixer renames — never unlinks; `doctor undo`
+/// byte-reverses the move.
+///
+/// Returns `true` if at least one poisoned file was quarantined.
+fn fix_startup_cache_if_warned(
+    beads_dir: &Path,
+    db_override: Option<&PathBuf>,
+    report: &DoctorReport,
+    ctx: &OutputContext,
+    session: Option<&mut DoctorRepairSession>,
+) -> bool {
+    let poisoned = config::doctor_inspect_startup_cache(beads_dir, db_override);
+    let cache_dir = config::doctor_startup_cache_dir();
+    fix_startup_cache_entries_if_warned(&poisoned, &cache_dir, report, ctx, session)
+}
+
+fn fix_startup_cache_entries_if_warned(
+    poisoned: &[config::PoisonedStartupCacheFile],
+    cache_dir: &Path,
+    report: &DoctorReport,
+    ctx: &OutputContext,
+    session: Option<&mut DoctorRepairSession>,
+) -> bool {
+    let has_warning = report
+        .checks
+        .iter()
+        .any(|c| c.name == "startup_cache.health" && c.status == CheckStatus::Warn);
+    if !has_warning {
+        return false;
+    }
+    let Some(session) = session else {
+        if !ctx.is_json() {
+            ctx.warning(
+                "Skipping startup-cache quarantine: no doctor repair session (run-dir creation failed)",
+            );
+        }
+        return false;
+    };
+
+    if poisoned.is_empty() {
+        // Detector saw poisoning but it cleared between report and fix —
+        // nothing to do.
+        return false;
+    }
+
+    // The cache dir is outside the default workspace scope ({.beads/,
+    // .doctor/}). Authorize the mutation by appending the resolved
+    // cache dir to the session's write_scopes. The chokepoint's
+    // `ensure_in_scope` accepts any path whose canonical form starts
+    // with a registered scope, so a single push is enough.
+    if !session
+        .ctx
+        .capabilities
+        .write_scopes
+        .iter()
+        .any(|s| s == cache_dir)
+    {
+        session
+            .ctx
+            .capabilities
+            .write_scopes
+            .push(cache_dir.to_path_buf());
+    }
+
+    session.set_fixer("doctor.startup_cache_quarantine");
+    let mut quarantined = 0_usize;
+    for entry in poisoned {
+        let Some(name) = entry.path.file_name() else {
+            continue;
+        };
+        let dest = session
+            .run
+            .root
+            .join("quarantine")
+            .join("startup-cache")
+            .join(name);
+        match chokepoint::mutate(&session.ctx, &entry.path, Op::Rename { to: dest.clone() }) {
+            Ok(result) if result.ok => {
+                quarantined += 1;
+            }
+            Ok(_) => {
+                if !ctx.is_json() {
+                    ctx.warning(&format!(
+                        "Startup-cache quarantine no-op for {}",
+                        entry.path.display()
+                    ));
+                }
+            }
+            Err(err) => {
+                if !ctx.is_json() {
+                    ctx.warning(&format!(
+                        "Failed to quarantine {}: {err}",
+                        entry.path.display()
+                    ));
+                }
+            }
+        }
+    }
+
+    if quarantined > 0 && !ctx.is_json() {
+        ctx.info(&format!(
+            "Quarantined {quarantined} poisoned startup-cache file(s) under {}",
+            session.run.root.join("quarantine/startup-cache").display()
+        ));
+    }
+
+    quarantined > 0
+}
+
 fn read_root_gitignore_content(gitignore_path: &Path) -> Result<Option<String>> {
     let metadata = match fs::symlink_metadata(gitignore_path) {
         Ok(metadata) => metadata,
@@ -5890,13 +6068,37 @@ fn quote_sql_identifier(name: &str) -> String {
     quoted
 }
 
+#[cfg(test)]
 fn collect_doctor_report(beads_dir: &Path, paths: &config::ConfigPaths) -> Result<DoctorRun> {
     collect_doctor_report_with_mode(beads_dir, paths, DoctorInspectionMode::Full)
 }
 
+#[cfg(test)]
 fn collect_doctor_report_with_mode(
     beads_dir: &Path,
     paths: &config::ConfigPaths,
+    mode: DoctorInspectionMode,
+) -> Result<DoctorRun> {
+    collect_doctor_report_with_mode_and_db_override(beads_dir, paths, None, mode)
+}
+
+fn collect_doctor_report_for_cli(
+    beads_dir: &Path,
+    paths: &config::ConfigPaths,
+    cli: &config::CliOverrides,
+) -> Result<DoctorRun> {
+    collect_doctor_report_with_mode_and_db_override(
+        beads_dir,
+        paths,
+        cli.db.as_ref(),
+        DoctorInspectionMode::Full,
+    )
+}
+
+fn collect_doctor_report_with_mode_and_db_override(
+    beads_dir: &Path,
+    paths: &config::ConfigPaths,
+    db_override: Option<&PathBuf>,
     mode: DoctorInspectionMode,
 ) -> Result<DoctorRun> {
     let mut checks = Vec::new();
@@ -5910,6 +6112,7 @@ fn collect_doctor_report_with_mode(
     check_binary_version_mismatch(beads_dir, &mut checks);
     check_orphaned_write_lock(beads_dir, &mut checks);
     check_routes_targets_resolve(beads_dir, &mut checks);
+    check_startup_cache(beads_dir, db_override, &mut checks);
 
     let (jsonl_path, jsonl_count) = inspect_doctor_jsonl(beads_dir, paths, &mut checks);
     inspect_doctor_database(
@@ -6247,7 +6450,12 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     } else {
         DoctorInspectionMode::Full
     };
-    let mut initial = collect_doctor_report_with_mode(&beads_dir, &paths, inspection_mode)?;
+    let mut initial = collect_doctor_report_with_mode_and_db_override(
+        &beads_dir,
+        &paths,
+        cli.db.as_ref(),
+        inspection_mode,
+    )?;
 
     // WP6: --robot-triage short-circuits the flat run with a single
     // `br.doctor.triage.v1` envelope. Read-only; no further dispatch.
@@ -6290,7 +6498,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         let repaired =
             fix_root_gitignore_if_warned(&beads_dir, &initial.report, ctx, session.as_mut());
         if repaired {
-            initial = collect_doctor_report(&beads_dir, &paths)?;
+            initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
         }
         repaired
     } else {
@@ -6306,16 +6514,36 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         let repaired =
             fix_merge_artifacts_if_warned(&beads_dir, &initial.report, ctx, session.as_mut());
         if repaired {
-            initial = collect_doctor_report(&beads_dir, &paths)?;
+            initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
         }
         repaired
     } else {
         false
     };
-    // Suppress unused warning for the variable when downstream readers
-    // haven't been wired yet. This keeps `--repair` flow consistent with
-    // the gitignore_repaired pattern without adding a synthetic consumer.
+
+    // Pass-4 cycle 2: auto-quarantine poisoned startup-cache files. The
+    // cache lives outside the default workspace, so the fixer extends
+    // the session's write_scopes to include the resolved cache dir.
+    let startup_cache_repaired = if args.repair {
+        let repaired = fix_startup_cache_if_warned(
+            &beads_dir,
+            cli.db.as_ref(),
+            &initial.report,
+            ctx,
+            session.as_mut(),
+        );
+        if repaired {
+            initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+        }
+        repaired
+    } else {
+        false
+    };
+    // Suppress unused warning for both variables while downstream readers
+    // catch up. Keeps the `--repair` flow consistent with
+    // gitignore_repaired without adding a synthetic consumer.
     let _ = merge_artifacts_repaired;
+    let _ = startup_cache_repaired;
 
     if !args.repair {
         if args.quick {
@@ -6370,7 +6598,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 repair_via_vacuum(&paths.db_path, &mut local_repair, session.as_mut());
             }
 
-            let post_warning_repair = collect_doctor_report(&beads_dir, &paths)?;
+            let post_warning_repair = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
             let verified = warning_repair_verified(
                 &post_warning_repair.report,
                 has_blocked_cache_rebuild,
@@ -6471,7 +6699,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     }
 
     let mut after_local_repair = if local_repair.applied() {
-        collect_doctor_report(&beads_dir, &paths)?
+        collect_doctor_report_for_cli(&beads_dir, &paths, cli)?
     } else {
         initial.clone()
     };
@@ -6491,7 +6719,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         );
         repair_via_vacuum(&paths.db_path, &mut local_repair, session.as_mut());
         if local_repair.vacuumed {
-            after_local_repair = collect_doctor_report(&beads_dir, &paths)?;
+            after_local_repair = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
         }
     }
 
@@ -6615,7 +6843,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         }
     };
 
-    let post_repair = collect_doctor_report(&beads_dir, &paths)?;
+    let post_repair = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
     let post_repair_verified = repair_report_verified(&post_repair.report);
     let verification_failure_marker = if post_repair_verified {
         None
@@ -7560,6 +7788,74 @@ mod tests {
         let actions = fs::read_to_string(&session.run.actions_file).unwrap_or_default();
         let rename_count = actions.matches("\"op\":\"rename\"").count();
         assert_eq!(rename_count, 0, "no actions expected: {actions:?}");
+    }
+
+    #[test]
+    fn test_fix_startup_cache_quarantines_poisoned_files_via_chokepoint() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let cache_dir = temp.path().join("startup-cache");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&cache_dir).unwrap();
+
+        let current_cache = config::doctor_startup_cache_path_at(&cache_dir, &beads_dir, None);
+        fs::write(&current_cache, "not-json-at-all\n").unwrap();
+        let unrelated_cache = cache_dir.join("startup-deadbeef.json");
+        fs::write(&unrelated_cache, "also-not-json\n").unwrap();
+
+        let poisoned = config::doctor_inspect_startup_cache_at(&cache_dir, &beads_dir, None);
+        assert_eq!(poisoned.len(), 1);
+        assert_eq!(poisoned[0].path, current_cache);
+
+        let report = DoctorReport {
+            ok: false,
+            workspace_health: None,
+            reliability_audit: None,
+            checks: vec![CheckResult {
+                name: "startup_cache.health".to_string(),
+                status: CheckStatus::Warn,
+                message: None,
+                details: None,
+            }],
+        };
+        let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Json, false, true);
+        let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
+            .expect("session must build");
+
+        assert!(fix_startup_cache_entries_if_warned(
+            &poisoned,
+            &cache_dir,
+            &report,
+            &ctx,
+            Some(&mut session),
+        ));
+
+        assert!(!current_cache.exists());
+        assert!(
+            unrelated_cache.is_file(),
+            "unrelated cache key must not be quarantined"
+        );
+        assert!(
+            session
+                .run
+                .root
+                .join("quarantine/startup-cache")
+                .join(current_cache.file_name().unwrap())
+                .is_file()
+        );
+
+        let after = config::doctor_inspect_startup_cache_at(&cache_dir, &beads_dir, None);
+        assert!(after.is_empty());
+        let actions_before = fs::read_to_string(&session.run.actions_file).unwrap();
+        assert!(!fix_startup_cache_entries_if_warned(
+            &after,
+            &cache_dir,
+            &report,
+            &ctx,
+            Some(&mut session),
+        ));
+        let actions_after = fs::read_to_string(&session.run.actions_file).unwrap();
+        assert_eq!(actions_after, actions_before, "second pass must be a no-op");
     }
 
     #[cfg(unix)]
