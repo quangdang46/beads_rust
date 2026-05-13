@@ -274,7 +274,13 @@ where
                 self.main_weight = self.main_weight.saturating_sub(entry.weight);
             }
         }
+        self.remove_resident_queue_refs(key);
         Some(entry.value)
+    }
+
+    fn remove_resident_queue_refs(&mut self, key: &K) {
+        self.small.retain(|candidate| candidate != key);
+        self.main.retain(|candidate| candidate != key);
     }
 
     fn insert_resident(&mut self, key: K, value: V, weight: usize, segment: S3FifoSegment) {
@@ -559,6 +565,21 @@ mod tests {
         assert_eq!(cache.len(), 8);
         assert_eq!(cache.current_weight(), 8);
         assert!(cache.stats().evictions > 0);
+    }
+
+    #[test]
+    fn replacing_resident_entry_removes_stale_queue_slots() {
+        let mut cache = S3FifoCache::new(2);
+
+        assert_eq!(cache.put("a", "A1", 1), S3FifoAdmission::Stored);
+        assert_eq!(cache.put("b", "B", 1), S3FifoAdmission::Stored);
+        assert_eq!(cache.put("a", "A2", 1), S3FifoAdmission::Replaced);
+        assert_eq!(cache.put("c", "C", 1), S3FifoAdmission::Stored);
+
+        assert_eq!(cache.get(&"a"), Some(&"A2"));
+        assert!(!cache.contains_key(&"b"));
+        assert_eq!(cache.get(&"c"), Some(&"C"));
+        assert!(cache.current_weight() <= cache.config().max_weight);
     }
 
     #[test]

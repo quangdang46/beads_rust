@@ -2671,8 +2671,10 @@ pub struct VersionArgs {
 /// `ls`, `undo`, `explain`).
 #[derive(Args, Debug, Clone, Default)]
 pub struct DoctorArgs {
-    /// Attempt to repair detected issues (rebuilds DB from JSONL)
-    #[arg(long)]
+    /// Attempt to repair detected issues (rebuilds DB from JSONL).
+    /// `--fix` is a visible alias used by doctor repair specs and
+    /// fixture skeletons.
+    #[arg(long, visible_alias = "fix")]
     pub repair: bool,
 
     /// REINDEX-only recovery for the partial-index stale-entry class
@@ -3039,6 +3041,30 @@ mod tests {
     fn test_ready_assignee_conflicts_with_unassigned() {
         let err = Cli::try_parse_from(["br", "ready", "--assignee", "alice", "--unassigned"])
             .expect_err("ready filters should conflict");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn test_doctor_fix_alias_parses_as_repair() {
+        let cli = Cli::parse_from([
+            "br",
+            "doctor",
+            "--fix",
+            "--only",
+            "fm-state_files-merge-artifact-stuck",
+        ]);
+        let Commands::Doctor(args) = cli.command else {
+            panic!("expected doctor command");
+        };
+
+        assert!(args.repair);
+        assert_eq!(args.only, vec!["fm-state_files-merge-artifact-stuck"]);
+    }
+
+    #[test]
+    fn test_doctor_fix_alias_conflicts_with_repair_indexes() {
+        let err = Cli::try_parse_from(["br", "doctor", "--fix", "--repair-indexes"])
+            .expect_err("--fix must share --repair's repair-index conflict");
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
