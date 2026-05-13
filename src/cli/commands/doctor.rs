@@ -339,30 +339,6 @@ fn jsonl_rebuild_audit_record(
     }
 }
 
-fn no_op_repair_audit_record(repaired_gitignore: bool) -> RecoveryAuditRecord {
-    let applied_actions = if repaired_gitignore {
-        vec!["gitignore_repaired".to_string()]
-    } else {
-        Vec::new()
-    };
-    RecoveryAuditRecord {
-        phase: "doctor.noop".to_string(),
-        action: "repair".to_string(),
-        outcome: if repaired_gitignore {
-            "gitignore_repaired".to_string()
-        } else {
-            "nothing_to_repair".to_string()
-        },
-        reason: None,
-        applied_actions,
-        quarantined_artifacts: Vec::new(),
-        verified_backups: Vec::new(),
-        imported: None,
-        skipped: None,
-        fk_violations_cleaned: None,
-    }
-}
-
 fn emit_recovery_audit_record(record: &RecoveryAuditRecord) {
     let applied_actions = record.applied_actions.join(",");
     tracing::info!(
@@ -1337,17 +1313,11 @@ fn is_offending_root_gitignore_pattern(line: &str) -> bool {
         && ROOT_GITIGNORE_OFFENDING_PATTERNS.contains(&trimmed)
 }
 
-fn repair_outcome_message(
-    gitignore_repaired: bool,
+fn repair_outcome_message_from_parts(
+    mut messages: Vec<String>,
     local_repair: Option<&LocalRepairResult>,
     incomplete_attempt_message: Option<&str>,
 ) -> String {
-    let mut messages = Vec::new();
-
-    if gitignore_repaired {
-        messages.push(ROOT_GITIGNORE_REPAIR_MESSAGE.to_string());
-    }
-
     if let Some(repair) = local_repair {
         if repair.applied() {
             messages.push(local_repair_message(repair));
@@ -1360,6 +1330,101 @@ fn repair_outcome_message(
         NO_OP_REPAIR_MESSAGE.to_string()
     } else {
         messages.join(" ")
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EarlyRepairSummary {
+    gitignore: bool,
+    merge_artifacts: bool,
+    startup_cache: bool,
+    recovery_aged: bool,
+    export_hash: bool,
+}
+
+impl EarlyRepairSummary {
+    fn applied(self) -> bool {
+        self.gitignore
+            || self.merge_artifacts
+            || self.startup_cache
+            || self.recovery_aged
+            || self.export_hash
+    }
+
+    fn action_labels(self) -> Vec<String> {
+        let mut actions = Vec::new();
+        if self.gitignore {
+            actions.push("gitignore_repaired".to_string());
+        }
+        if self.merge_artifacts {
+            actions.push("merge_artifacts_quarantined".to_string());
+        }
+        if self.startup_cache {
+            actions.push("startup_cache_quarantined".to_string());
+        }
+        if self.recovery_aged {
+            actions.push("recovery_artifacts_aged_quarantined".to_string());
+        }
+        if self.export_hash {
+            actions.push("export_hash_cache_recomputed".to_string());
+        }
+        actions
+    }
+
+    fn messages(self) -> Vec<String> {
+        let mut messages = Vec::new();
+        if self.gitignore {
+            messages.push(ROOT_GITIGNORE_REPAIR_MESSAGE.to_string());
+        }
+        if self.merge_artifacts {
+            messages.push("Quarantined stuck merge artifacts.".to_string());
+        }
+        if self.startup_cache {
+            messages.push("Quarantined poisoned startup-cache files.".to_string());
+        }
+        if self.recovery_aged {
+            messages.push("Quarantined aged recovery artifacts.".to_string());
+        }
+        if self.export_hash {
+            messages.push("Recomputed metadata.jsonl_content_hash.".to_string());
+        }
+        messages
+    }
+
+    fn audit_record(self) -> RecoveryAuditRecord {
+        let applied_actions = self.action_labels();
+        let outcome = match applied_actions.as_slice() {
+            [] => "nothing_to_repair".to_string(),
+            [action] => action.clone(),
+            _ => "repairs_applied".to_string(),
+        };
+        let phase = if applied_actions.is_empty() {
+            "doctor.noop"
+        } else {
+            "doctor.early_repair"
+        };
+        RecoveryAuditRecord {
+            phase: phase.to_string(),
+            action: "repair".to_string(),
+            outcome,
+            reason: None,
+            applied_actions,
+            quarantined_artifacts: Vec::new(),
+            verified_backups: Vec::new(),
+            imported: None,
+            skipped: None,
+            fk_violations_cleaned: None,
+        }
+    }
+
+    fn prepend_actions_to_audit(self, mut record: RecoveryAuditRecord) -> RecoveryAuditRecord {
+        let mut early_actions = self.action_labels();
+        if early_actions.is_empty() {
+            return record;
+        }
+        early_actions.append(&mut record.applied_actions);
+        record.applied_actions = early_actions;
+        record
     }
 }
 
@@ -6955,13 +7020,13 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     } else {
         false
     };
-    // Suppress unused warnings for the variables while downstream readers
-    // catch up. Keeps the `--repair` flow consistent with
-    // gitignore_repaired without adding a synthetic consumer.
-    let _ = merge_artifacts_repaired;
-    let _ = startup_cache_repaired;
-    let _ = recovery_aged_repaired;
-    let _ = export_hash_repaired;
+    let early_repair = EarlyRepairSummary {
+        gitignore: gitignore_repaired,
+        merge_artifacts: merge_artifacts_repaired,
+        startup_cache: startup_cache_repaired,
+        recovery_aged: recovery_aged_repaired,
+        export_hash: export_hash_repaired,
+    };
 
     if !args.repair {
         if args.quick {
@@ -7022,12 +7087,12 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 has_blocked_cache_rebuild,
                 has_partial_index_warnings,
             );
-            let repair_message = repair_outcome_message(
-                gitignore_repaired,
+            let repair_message = repair_outcome_message_from_parts(
+                early_repair.messages(),
                 Some(&local_repair),
                 has_partial_index_warnings.then_some(REINDEX_INCOMPLETE_MESSAGE),
             );
-            let recovery_audit = local_repair_audit_record(
+            let recovery_audit = early_repair.prepend_actions_to_audit(local_repair_audit_record(
                 "doctor.warn_repair",
                 if verified {
                     "verified"
@@ -7045,13 +7110,13 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                         "local warning repair did not clear all requested warnings".to_string()
                     }
                 }),
-            );
+            ));
             emit_recovery_audit_record(&recovery_audit);
             if verified {
                 if ctx.is_json() {
                     ctx.json(&serde_json::json!({
                         "report": initial.report,
-                        "repaired": gitignore_repaired || local_repair.applied(),
+                        "repaired": early_repair.applied() || local_repair.applied(),
                         "local_repair": local_repair,
                         "recovery_audit": recovery_audit,
                         "message": repair_message,
@@ -7074,18 +7139,22 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 );
             }
         } else {
-            let recovery_audit = no_op_repair_audit_record(gitignore_repaired);
+            let recovery_audit = early_repair.audit_record();
             emit_recovery_audit_record(&recovery_audit);
             if ctx.is_json() {
                 ctx.json(&serde_json::json!({
                     "report": initial.report,
-                    "repaired": gitignore_repaired,
+                    "repaired": early_repair.applied(),
                     "recovery_audit": recovery_audit,
-                    "message": repair_outcome_message(gitignore_repaired, None, None)
+                    "message": repair_outcome_message_from_parts(early_repair.messages(), None, None)
                 }));
             } else {
                 print_report(&initial.report, ctx)?;
-                ctx.info(&repair_outcome_message(gitignore_repaired, None, None));
+                ctx.info(&repair_outcome_message_from_parts(
+                    early_repair.messages(),
+                    None,
+                    None,
+                ));
             }
             return Ok(());
         }
@@ -7149,12 +7218,12 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         // declaring success.
         let write_probe_ok = write_probe_after_repair(&paths.db_path);
         if !write_probe_ok {
-            let recovery_audit = local_repair_audit_record(
+            let recovery_audit = early_repair.prepend_actions_to_audit(local_repair_audit_record(
                 "doctor.local_repair",
                 "write_probe_failed",
                 &local_repair,
                 Some("rollback-only write probe failed after local repair".to_string()),
-            );
+            ));
             emit_recovery_audit_record(&recovery_audit);
             tracing::warn!(
                 "Post-repair write probe failed — local repair insufficient, \
@@ -7162,15 +7231,22 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             );
             // Don't return early — fall through to JSONL rebuild below.
         } else {
-            let repair_message =
-                repair_outcome_message(gitignore_repaired, Some(&local_repair), None);
-            let recovery_audit =
-                local_repair_audit_record("doctor.local_repair", "verified", &local_repair, None);
+            let repair_message = repair_outcome_message_from_parts(
+                early_repair.messages(),
+                Some(&local_repair),
+                None,
+            );
+            let recovery_audit = early_repair.prepend_actions_to_audit(local_repair_audit_record(
+                "doctor.local_repair",
+                "verified",
+                &local_repair,
+                None,
+            ));
             emit_recovery_audit_record(&recovery_audit);
             if ctx.is_json() {
                 ctx.json(&serde_json::json!({
                     "report": initial.report,
-                    "repaired": gitignore_repaired || local_repair.applied(),
+                    "repaired": early_repair.applied() || local_repair.applied(),
                     "local_repair": local_repair,
                     "recovery_audit": recovery_audit,
                     "message": repair_message,
@@ -7191,22 +7267,22 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         } else {
             "local repair did not clear doctor errors"
         };
-        let recovery_audit = local_repair_audit_record(
+        let recovery_audit = early_repair.prepend_actions_to_audit(local_repair_audit_record(
             "doctor.local_repair",
             "needs_jsonl_rebuild",
             &local_repair,
             Some(reason.to_string()),
-        );
+        ));
         emit_recovery_audit_record(&recovery_audit);
     }
 
     let Some(jsonl_path) = initial.jsonl_path.as_ref() else {
-        let recovery_audit = jsonl_rebuild_audit_record(
+        let recovery_audit = early_repair.prepend_actions_to_audit(jsonl_rebuild_audit_record(
             "doctor.jsonl_rebuild",
             "refused",
             None,
             Some("no JSONL file found to rebuild from".to_string()),
-        );
+        ));
         emit_recovery_audit_record(&recovery_audit);
         return Err(BeadsError::Config(
             "Cannot repair: no JSONL file found to rebuild from".to_string(),
@@ -7218,12 +7294,12 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         &paths.db_path,
         args.allow_repeated_repair,
     )? {
-        let recovery_audit = jsonl_rebuild_audit_record(
+        let recovery_audit = early_repair.prepend_actions_to_audit(jsonl_rebuild_audit_record(
             "doctor.jsonl_rebuild",
             "refused",
             None,
             Some(reason.clone()),
-        );
+        ));
         emit_recovery_audit_record(&recovery_audit);
         return Err(BeadsError::Config(reason));
     }
@@ -7243,12 +7319,12 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         Ok(result) => result,
         Err(err) => {
             let outcome = jsonl_rebuild_failure_outcome(&err);
-            let recovery_audit = jsonl_rebuild_audit_record(
+            let recovery_audit = early_repair.prepend_actions_to_audit(jsonl_rebuild_audit_record(
                 "doctor.jsonl_rebuild",
                 outcome,
                 None,
                 Some(err.to_string()),
-            );
+            ));
             emit_recovery_audit_record(&recovery_audit);
             if outcome == "refused" {
                 return Err(err);
@@ -7280,7 +7356,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             path.display()
         )
     });
-    let recovery_audit = jsonl_rebuild_audit_record(
+    let recovery_audit = early_repair.prepend_actions_to_audit(jsonl_rebuild_audit_record(
         "doctor.jsonl_rebuild",
         if post_repair_verified {
             "verified"
@@ -7289,7 +7365,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         },
         Some(&repair_result),
         verification_failure_reason.clone(),
-    );
+    ));
     emit_recovery_audit_record(&recovery_audit);
 
     if ctx.is_json() {
@@ -8343,14 +8419,60 @@ mod tests {
 
     #[test]
     fn test_repair_outcome_message_combines_gitignore_and_incomplete_reindex() {
-        let message = repair_outcome_message(
-            true,
+        let message = repair_outcome_message_from_parts(
+            vec![ROOT_GITIGNORE_REPAIR_MESSAGE.to_string()],
             Some(&LocalRepairResult::default()),
             Some(REINDEX_INCOMPLETE_MESSAGE),
         );
 
         assert!(message.contains(ROOT_GITIGNORE_REPAIR_MESSAGE));
         assert!(message.contains(REINDEX_INCOMPLETE_MESSAGE));
+    }
+
+    #[test]
+    fn test_early_repair_summary_reports_export_hash_repairs() {
+        let summary = EarlyRepairSummary {
+            gitignore: false,
+            merge_artifacts: false,
+            startup_cache: false,
+            recovery_aged: false,
+            export_hash: true,
+        };
+
+        assert!(summary.applied());
+        assert_eq!(
+            summary.action_labels(),
+            vec!["export_hash_cache_recomputed".to_string()]
+        );
+        assert_eq!(
+            repair_outcome_message_from_parts(summary.messages(), None, None),
+            "Recomputed metadata.jsonl_content_hash."
+        );
+        let audit = summary.audit_record();
+        assert_eq!(audit.phase, "doctor.early_repair");
+        assert_eq!(audit.outcome, "export_hash_cache_recomputed");
+        assert_eq!(
+            audit.applied_actions,
+            vec!["export_hash_cache_recomputed".to_string()]
+        );
+
+        let local_repair = LocalRepairResult {
+            blocked_cache_rebuilt: true,
+            ..LocalRepairResult::default()
+        };
+        let combined_audit = summary.prepend_actions_to_audit(local_repair_audit_record(
+            "doctor.local_repair",
+            "verified",
+            &local_repair,
+            None,
+        ));
+        assert_eq!(
+            combined_audit.applied_actions,
+            vec![
+                "export_hash_cache_recomputed".to_string(),
+                "blocked_cache_rebuilt".to_string()
+            ]
+        );
     }
 
     #[test]

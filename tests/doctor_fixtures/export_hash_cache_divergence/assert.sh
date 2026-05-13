@@ -55,6 +55,17 @@ case "$stage" in
       echo "ASSERT FAIL[$stage]: stored hash still 'deadbeef-poisoned' after --repair" >&2
       exit 1
     fi
+    if [ -f "$target_dir/_diag/repair.json" ]; then
+      jq -e '
+        .repaired == true
+        and (.message | contains("metadata.jsonl_content_hash"))
+        and (.recovery_audit.applied_actions | index("export_hash_cache_recomputed"))
+      ' "$target_dir/_diag/repair.json" >/dev/null || {
+        echo "ASSERT FAIL[$stage]: repair output did not report export-hash repair" >&2
+        cat "$target_dir/_diag/repair.json" >&2
+        exit 1
+      }
+    fi
     # SACRED INVARIANT: the JSONL bytes are byte-identical to the
     # pre-corruption state. The fixer must NEVER touch JSONL.
     jsonl_now=$(sha256sum .beads/issues.jsonl | awk '{print $1}')

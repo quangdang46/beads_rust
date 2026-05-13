@@ -308,7 +308,7 @@ type FixerRow = (
     &'static [&'static str],
 );
 
-fn chokepoint_fixer_rows() -> &'static [FixerRow] {
+fn early_chokepoint_fixer_rows() -> &'static [FixerRow] {
     &[
         (
             "doctor.gitignore_repair",
@@ -345,25 +345,6 @@ fn chokepoint_fixer_rows() -> &'static [FixerRow] {
             true,
             &["db.export_hash_cache"],
         ),
-        (
-            "doctor.repair_database_from_jsonl",
-            "state_files",
-            true,
-            true,
-            &[
-                "db.open",
-                "counts.db_vs_jsonl",
-                "schema.tables",
-                "schema.columns",
-            ],
-        ),
-        (
-            "doctor.repair_database_sidecars",
-            "state_files",
-            true,
-            true,
-            &["db.sidecars"],
-        ),
     ]
 }
 
@@ -389,6 +370,30 @@ fn legacy_fixer_rows() -> &'static [FixerRow] {
             true,
             false,
             &["sqlite.integrity_check", "sqlite3.integrity_check"],
+        ),
+    ]
+}
+
+fn rebuild_fixer_rows() -> &'static [FixerRow] {
+    &[
+        (
+            "doctor.repair_database_from_jsonl",
+            "state_files",
+            true,
+            true,
+            &[
+                "db.open",
+                "counts.db_vs_jsonl",
+                "schema.tables",
+                "schema.columns",
+            ],
+        ),
+        (
+            "doctor.repair_database_sidecars",
+            "state_files",
+            true,
+            true,
+            &["db.sidecars"],
         ),
     ]
 }
@@ -425,9 +430,10 @@ fn fixer_entry_from_row(row: &FixerRow) -> FixerEntry {
 
 fn build_fixer_registry() -> Vec<FixerEntry> {
     // (id, subsystem, auto_fixable, mutates_via_chokepoint, addressed_findings)
-    chokepoint_fixer_rows()
+    early_chokepoint_fixer_rows()
         .iter()
         .chain(legacy_fixer_rows())
+        .chain(rebuild_fixer_rows())
         .chain(refuse_gate_fixer_rows())
         .map(fixer_entry_from_row)
         .collect()
@@ -554,6 +560,24 @@ mod tests {
         assert_eq!(detector("jsonl.merge_artifacts").severity_default, "warn");
         assert_eq!(detector("schema.inspect").severity_default, "error");
         let fixer_ids: Vec<&str> = caps.fixers.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(
+            fixer_ids,
+            vec![
+                "doctor.gitignore_repair",
+                "doctor.merge_artifact_quarantine",
+                "doctor.startup_cache_quarantine",
+                "doctor.recovery_artifacts_aged_quarantine",
+                "doctor.export_hash_cache_repair",
+                "doctor.repair_recoverable_db_state",
+                "doctor.repair_partial_indexes",
+                "doctor.repair_via_vacuum",
+                "doctor.repair_database_from_jsonl",
+                "doctor.repair_database_sidecars",
+                "refuse_gates.schema_version_downgrade",
+                "refuse_gates.recovery_fingerprint_integrity",
+            ],
+            "fixer registry order is part of the stable capabilities JSON"
+        );
         for required in &[
             "doctor.gitignore_repair",
             "doctor.merge_artifact_quarantine",
