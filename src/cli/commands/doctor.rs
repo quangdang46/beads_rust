@@ -242,6 +242,11 @@ impl FixerFilter {
     }
 }
 
+const FM_BLOCKED_CACHE_STALE: &str = "fm-caches_indexes-blocked-cache-stale";
+const FM_PARTIAL_INDEX_STALE: &str = "fm-caches_indexes-partial-index-stale";
+const FM_SQLITE_PAGE_MALFORMED: &str = "fm-state_files-sqlite-page-malformed";
+const FM_WAL_SHM_SIDECAR_ORPHAN: &str = "fm-state_files-wal-shm-sidecar-orphan";
+
 fn now_ns_for_session() -> u128 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -619,8 +624,8 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
         "fm-state_files-jsonl-conflict-markers",
     ),
     ("db.exists", "fm-state_files-empty-or-truncated-database"),
-    ("db.open", "fm-state_files-sqlite-page-malformed"),
-    ("db.sidecars", "fm-state_files-wal-shm-sidecar-orphan"),
+    ("db.open", FM_SQLITE_PAGE_MALFORMED),
+    ("db.sidecars", FM_WAL_SHM_SIDECAR_ORPHAN),
     (
         "db.recovery_artifacts",
         "fm-state_files-recovery-artifacts-orphaned",
@@ -633,24 +638,15 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
         "db.export_hash_cache",
         "fm-caches_indexes-export-hash-cache-divergence",
     ),
-    (
-        "db.recoverable_anomalies",
-        "fm-caches_indexes-blocked-cache-stale",
-    ),
+    ("db.recoverable_anomalies", FM_BLOCKED_CACHE_STALE),
     (
         "counts.db_vs_jsonl",
         "fm-state_files-jsonl-row-count-mismatch",
     ),
     ("sync.metadata", "fm-state_files-dirty-flag-divergence"),
-    (
-        "sqlite.integrity_check",
-        "fm-state_files-sqlite-page-malformed",
-    ),
-    (
-        "sqlite3.integrity_check",
-        "fm-state_files-sqlite-page-malformed",
-    ),
-    ("db.write_probe", "fm-state_files-sqlite-page-malformed"),
+    ("sqlite.integrity_check", FM_SQLITE_PAGE_MALFORMED),
+    ("sqlite3.integrity_check", FM_SQLITE_PAGE_MALFORMED),
+    ("db.write_probe", FM_SQLITE_PAGE_MALFORMED),
     ("db.null_defaults", "fm-schemas-missing-required-column"),
     // schemas
     ("schema.tables", "fm-schemas-missing-required-table"),
@@ -1100,6 +1096,15 @@ fn report_has_sidecar_anomaly(report: &DoctorReport) -> bool {
         .checks
         .iter()
         .any(|check| check.name == "db.sidecars" && matches!(check.status, CheckStatus::Error))
+}
+
+fn filter_allows_recoverable_db_state_repair(
+    filter: &FixerFilter,
+    has_blocked_cache_rebuild: bool,
+    has_sidecar_anomaly: bool,
+) -> bool {
+    (has_blocked_cache_rebuild && filter.allows(FM_BLOCKED_CACHE_STALE))
+        || (has_sidecar_anomaly && filter.allows(FM_WAL_SHM_SIDECAR_ORPHAN))
 }
 
 /// Return true if any integrity check reported non-benign page corruption
@@ -7132,9 +7137,17 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     let mut local_repair = LocalRepairResult::default();
 
     if initial.report.ok {
-        let has_blocked_cache_rebuild = report_has_blocked_cache_rebuild_finding(&initial.report);
-        let has_partial_index_warnings = report_has_partial_index_warnings(&initial.report);
-        let has_warn_page_anomalies = report_has_warn_level_page_anomaly(&initial.report);
+        // Pass-5 cycle 2: legacy repair_* paths now consult the
+        // FixerFilter. AND-ing the predicate against `filter.allows(...)`
+        // makes downstream `if has_X` branches treat a filter-excluded
+        // FM as "no finding to repair", which keeps the
+        // local_repair_audit_record's `verified` invariant intact.
+        let has_blocked_cache_rebuild = report_has_blocked_cache_rebuild_finding(&initial.report)
+            && fixer_filter.allows(FM_BLOCKED_CACHE_STALE);
+        let has_partial_index_warnings = report_has_partial_index_warnings(&initial.report)
+            && fixer_filter.allows(FM_PARTIAL_INDEX_STALE);
+        let has_warn_page_anomalies = report_has_warn_level_page_anomaly(&initial.report)
+            && fixer_filter.allows(FM_SQLITE_PAGE_MALFORMED);
 
         // Even when there are no errors, planned deferred cache rebuilds and
         // integrity warnings can be repaired. Run those local repairs when
@@ -7238,9 +7251,18 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         }
     }
 
+    // Pass-5 cycle 2: gate the post-failure fallback repair_* paths on
+    // the FixerFilter. AND the predicate against `filter.allows(...)`
+    // so the audit chain naturally treats filter-excluded FMs as
+    // "no finding to act on".
+    let has_blocked_cache_rebuild = report_has_blocked_cache_rebuild_finding(&initial.report);
+    let has_sidecar_anomaly = report_has_sidecar_anomaly(&initial.report);
     if !local_repair.applied()
-        && (report_has_blocked_cache_rebuild_finding(&initial.report)
-            || report_has_sidecar_anomaly(&initial.report))
+        && filter_allows_recoverable_db_state_repair(
+            &fixer_filter,
+            has_blocked_cache_rebuild,
+            has_sidecar_anomaly,
+        )
     {
         local_repair = repair_recoverable_db_state(
             &beads_dir,
@@ -7251,7 +7273,10 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     }
 
     // Also attempt REINDEX if partial-index warnings are present alongside errors.
-    if !local_repair.indexes_reindexed && report_has_partial_index_warnings(&initial.report) {
+    if !local_repair.indexes_reindexed
+        && fixer_filter.allows(FM_PARTIAL_INDEX_STALE)
+        && report_has_partial_index_warnings(&initial.report)
+    {
         repair_partial_indexes(&paths.db_path, &mut local_repair, session.as_mut());
     }
 
@@ -7259,7 +7284,8 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     // B-tree pages) caused by frankensqlite's B-tree layer differences with
     // C sqlite3 (#237, #245).  VACUUM rewrites every page from scratch, so
     // it fixes both index and table corruption.
-    if report_has_page_corruption(&initial.report) {
+    if fixer_filter.allows(FM_SQLITE_PAGE_MALFORMED) && report_has_page_corruption(&initial.report)
+    {
         repair_via_vacuum(&paths.db_path, &mut local_repair, session.as_mut());
     }
 
@@ -7277,7 +7303,10 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     // page-level residue that VACUUM resolves cleanly. Run VACUUM once to
     // compact, and re-collect the report.  Guarded by `!local_repair.vacuumed`
     // so we never loop.
-    if !local_repair.vacuumed && report_has_warn_level_page_anomaly(&after_local_repair.report) {
+    if !local_repair.vacuumed
+        && fixer_filter.allows(FM_SQLITE_PAGE_MALFORMED)
+        && report_has_warn_level_page_anomaly(&after_local_repair.report)
+    {
         tracing::info!(
             path = %paths.db_path.display(),
             "Post-repair report has WARN-level page anomalies; running VACUUM to clean up orphaned pages"
@@ -8292,6 +8321,40 @@ mod tests {
         assert!(filter.allows("fm-a"));
         assert!(filter.allows("fm-b"));
         assert!(!filter.allows("fm-c"));
+    }
+
+    #[test]
+    fn test_recoverable_db_state_filter_preserves_sidecar_fm() {
+        let sidecar_only = FixerFilter::from_args(&[FM_WAL_SHM_SIDECAR_ORPHAN.to_string()], &[]);
+        assert!(filter_allows_recoverable_db_state_repair(
+            &sidecar_only,
+            false,
+            true
+        ));
+        assert!(!filter_allows_recoverable_db_state_repair(
+            &sidecar_only,
+            true,
+            false
+        ));
+
+        let blocked_cache_only = FixerFilter::from_args(&[FM_BLOCKED_CACHE_STALE.to_string()], &[]);
+        assert!(filter_allows_recoverable_db_state_repair(
+            &blocked_cache_only,
+            true,
+            false
+        ));
+        assert!(!filter_allows_recoverable_db_state_repair(
+            &blocked_cache_only,
+            false,
+            true
+        ));
+
+        let skip_sidecar = FixerFilter::from_args(&[], &[FM_WAL_SHM_SIDECAR_ORPHAN.to_string()]);
+        assert!(!filter_allows_recoverable_db_state_repair(
+            &skip_sidecar,
+            false,
+            true
+        ));
     }
 
     #[test]
