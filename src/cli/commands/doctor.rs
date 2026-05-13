@@ -623,6 +623,7 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
         "jsonl.merge_artifacts",
         "fm-state_files-merge-artifact-stuck",
     ),
+    ("base_jsonl", "fm-state_files-base-jsonl-missing-or-stale"),
     ("startup_cache.health", "fm-configs-startup-cache-poisoned"),
     ("sync_jsonl_path", FM_JSONL_ROW_COUNT_MISMATCH),
     (
@@ -3430,6 +3431,111 @@ fn check_merge_artifacts(beads_dir: &Path, checks: &mut Vec<CheckResult>) -> Res
         );
     }
     Ok(())
+}
+
+/// Pass-5 cycle 4: detector for `fm-state_files-base-jsonl-missing-or-stale`.
+///
+/// The `.beads/beads.base.jsonl` file is the canonical 3-way merge anchor
+/// `br sync --merge` reads when reconciling a remote with a local
+/// workspace. The pass-1 archaeology covers three failure shapes:
+/// (a) symlinked anchor (security risk — an attacker shape per
+///     git_sha:401c0495);
+/// (b) anchor older than the live `.beads/issues.jsonl` (stale anchor
+///     produces incorrect 3-way merges);
+/// (c) anchor missing despite a prior sync flush (post-flush
+///     workspaces should have an anchor).
+///
+/// Pass-5 cycle 4 implements (a) and (b). Case (c) requires reading
+/// `metadata.last_export` from the DB which couples the detector to the
+/// DB open path; deferred to a later cycle. Detect-only — no fixer is
+/// landed in this cycle because regenerating the anchor is an operator
+/// decision (typically `br sync --flush-only` re-derives it).
+fn check_base_jsonl(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
+    let base_path = beads_dir.join("beads.base.jsonl");
+    let meta = match fs::symlink_metadata(&base_path) {
+        Ok(m) => m,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            // Missing-on-fresh-clone is legitimate. Without DB access at
+            // this layer we cannot distinguish "fresh" from "post-flush
+            // missing", so report Ok and let case (c) land in a future
+            // cycle.
+            push_check(checks, "base_jsonl", CheckStatus::Ok, None, None);
+            return;
+        }
+        Err(err) => {
+            push_check(
+                checks,
+                "base_jsonl",
+                CheckStatus::Warn,
+                Some(format!(
+                    "Could not inspect {}: {err}",
+                    base_path.display()
+                )),
+                Some(serde_json::json!({
+                    "path": base_path.display().to_string(),
+                    "kind": "unreadable",
+                })),
+            );
+            return;
+        }
+    };
+
+    // (a) Symlink → reject outright. Symlinked merge anchors are an
+    // attacker shape: a malicious actor could point the anchor at any
+    // file on disk and `br sync --merge` would diff against it.
+    if meta.file_type().is_symlink() {
+        push_check(
+            checks,
+            "base_jsonl",
+            CheckStatus::Warn,
+            Some(format!(
+                "{} is a symlink — refusing to trust it as a merge anchor",
+                base_path.display()
+            )),
+            Some(serde_json::json!({
+                "path": base_path.display().to_string(),
+                "kind": "symlink",
+            })),
+        );
+        return;
+    }
+
+    // (b) Stale anchor: base mtime older than live JSONL mtime AND the
+    // live JSONL is non-empty. A stale anchor leaks the wrong base into
+    // 3-way merges. We compare only file mtimes (no content hash) at
+    // this layer to keep the detector pure-stat.
+    let live = beads_dir.join("issues.jsonl");
+    let Ok(live_meta) = fs::symlink_metadata(&live) else {
+        push_check(checks, "base_jsonl", CheckStatus::Ok, None, None);
+        return;
+    };
+    if !live_meta.is_file() || live_meta.len() == 0 {
+        push_check(checks, "base_jsonl", CheckStatus::Ok, None, None);
+        return;
+    }
+    let (Ok(base_mtime), Ok(live_mtime)) = (meta.modified(), live_meta.modified()) else {
+        push_check(checks, "base_jsonl", CheckStatus::Ok, None, None);
+        return;
+    };
+    if base_mtime < live_mtime {
+        push_check(
+            checks,
+            "base_jsonl",
+            CheckStatus::Warn,
+            Some(format!(
+                "Merge anchor {} is older than the live JSONL — 3-way merges will diff against stale state",
+                base_path.display()
+            )),
+            Some(serde_json::json!({
+                "path": base_path.display().to_string(),
+                "kind": "stale",
+                "live_jsonl": live.display().to_string(),
+            })),
+        );
+        return;
+    }
+
+    push_check(checks, "base_jsonl", CheckStatus::Ok, None, None);
 }
 
 /// Pass-4 cycle 2: detector for `fm-configs-startup-cache-poisoned`.
@@ -6613,6 +6719,7 @@ fn collect_doctor_report_with_mode_and_db_override(
 ) -> Result<DoctorRun> {
     let mut checks = Vec::new();
     check_merge_artifacts(beads_dir, &mut checks)?;
+    check_base_jsonl(beads_dir, &mut checks);
     check_root_gitignore(beads_dir, &mut checks);
     check_routes_jsonl(beads_dir, &mut checks);
     check_rust_log_noisy(&mut checks);

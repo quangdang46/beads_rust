@@ -12,8 +12,9 @@
 //!    [`CURRENT_SCHEMA_VERSION`]. A doctor that doesn't understand the
 //!    schema must not "repair" it.
 //! 2. [`gate_recovery_fingerprint_integrity`] — walks
-//!    `.beads/.br_recovery/` and refuses if any backup artifact has
-//!    diverged from its recorded fingerprint. Diverged backups are a
+//!    the active database family's `.br_recovery/` directory and refuses
+//!    if any backup artifact has diverged from its recorded fingerprint.
+//!    Diverged backups are a
 //!    sign of out-of-band tampering and the doctor must not overwrite
 //!    them.
 //!
@@ -106,14 +107,20 @@ pub fn gate_schema_version_downgrade(db_path: &Path) -> GateOutcome {
 }
 
 /// Refuse if any recovery backup artifact has diverged from its
-/// recorded fingerprint. Walks `<beads_dir>/.br_recovery/` and any
-/// `*.fingerprint.json` files emitted by the recovery primitives.
+/// recorded fingerprint. Walks the active database family's recovery
+/// directory and any `*.fingerprint.json` files emitted by the recovery
+/// primitives.
 ///
 /// In WP1 this gate is conservative: if there is no recovery directory
 /// (the common case for healthy workspaces), the gate allows.
 #[must_use]
 pub fn gate_recovery_fingerprint_integrity(beads_dir: &Path) -> GateOutcome {
     let recovery_dir = beads_dir.join(".br_recovery");
+    gate_recovery_fingerprint_integrity_in_dir(&recovery_dir)
+}
+
+#[must_use]
+fn gate_recovery_fingerprint_integrity_in_dir(recovery_dir: &Path) -> GateOutcome {
     if !recovery_dir.exists() {
         return GateOutcome::Allow;
     }
@@ -235,7 +242,8 @@ pub fn run_all(beads_dir: &Path, db_path: &Path) -> GateOutcome {
     if downgrade.is_refused() {
         return downgrade;
     }
-    gate_recovery_fingerprint_integrity(beads_dir)
+    let recovery_dir = crate::config::recovery_dir_for_db_path(db_path, beads_dir);
+    gate_recovery_fingerprint_integrity_in_dir(&recovery_dir)
 }
 
 /// Surfaces the recovery directory used by the integrity gate. Useful
@@ -346,6 +354,41 @@ mod tests {
                 assert_eq!(arr.len(), 1);
             }
             GateOutcome::Allow => panic!("must refuse on fingerprint mismatch"),
+        }
+    }
+
+    #[test]
+    fn run_all_scans_recovery_dir_for_active_db_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        let external_db_dir = tmp.path().join("external-db");
+        let external_db = external_db_dir.join("custom.db");
+        let recovery = external_db_dir.join(".br_recovery");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&recovery).unwrap();
+        write_fake_sqlite_db(&external_db, 0);
+
+        let artifact = recovery.join("custom.db.bak");
+        fs::write(&artifact, b"actual bytes").unwrap();
+        let fingerprint = serde_json::json!({
+            "artifact": "custom.db.bak",
+            "sha256": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        });
+        fs::write(
+            recovery.join("custom.db.bak.fingerprint.json"),
+            serde_json::to_string_pretty(&fingerprint).unwrap(),
+        )
+        .unwrap();
+
+        let outcome = run_all(&beads_dir, &external_db);
+        match outcome {
+            GateOutcome::Refuse { evidence, .. } => {
+                assert_eq!(evidence["gate"], "recovery_fingerprint_integrity");
+                assert_eq!(evidence["recovery_dir"], recovery.display().to_string());
+            }
+            GateOutcome::Allow => {
+                panic!("must refuse mismatched fingerprints beside the active db path")
+            }
         }
     }
 }
