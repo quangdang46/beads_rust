@@ -308,6 +308,13 @@ fn build_fixer_registry() -> Vec<FixerEntry> {
             &["gitignore.beads_inner", "gitignore.root"],
         ),
         (
+            "doctor.merge_artifact_quarantine",
+            "state_files",
+            true,
+            true,
+            &["jsonl.merge_artifacts"],
+        ),
+        (
             "doctor.repair_recoverable_db_state",
             "caches_indexes",
             true,
@@ -498,6 +505,7 @@ mod tests {
         let fixer_ids: Vec<&str> = caps.fixers.iter().map(|f| f.id.as_str()).collect();
         for required in &[
             "doctor.gitignore_repair",
+            "doctor.merge_artifact_quarantine",
             "doctor.repair_via_vacuum",
             "doctor.repair_database_from_jsonl",
             "refuse_gates.schema_version_downgrade",

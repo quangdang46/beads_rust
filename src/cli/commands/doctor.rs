@@ -575,14 +575,13 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
     ("jsonl.parse", "fm-state_files-jsonl-malformed-utf8"),
     (
         "jsonl.merge_artifacts",
-        "fm-state_files-jsonl-conflict-markers",
+        "fm-state_files-merge-artifact-stuck",
     ),
     ("sync_jsonl_path", "fm-state_files-jsonl-row-count-mismatch"),
     (
         "sync_conflict_markers",
         "fm-state_files-jsonl-conflict-markers",
     ),
-    ("merge_artifacts", "fm-state_files-merge-artifact-stuck"),
     ("db.exists", "fm-state_files-empty-or-truncated-database"),
     ("db.open", "fm-state_files-sqlite-page-malformed"),
     ("db.sidecars", "fm-state_files-wal-shm-sidecar-orphan"),
@@ -3106,6 +3105,13 @@ fn check_merge_artifacts(beads_dir: &Path, checks: &mut Vec<CheckResult>) -> Res
         let Some(name) = name.to_str() else {
             continue;
         };
+        // `beads.base.jsonl` is the canonical 3-way merge anchor written
+        // by `br sync --merge` (see sync/mod.rs:5035). It is NOT a stuck
+        // temp artifact — the fixer and detector must both treat it as
+        // protected so a clean workspace doesn't get falsely flagged.
+        if name == "beads.base.jsonl" {
+            continue;
+        }
         if name.contains(".base.jsonl")
             || name.contains(".left.jsonl")
             || name.contains(".right.jsonl")
@@ -4593,6 +4599,120 @@ fn fix_root_gitignore_if_warned(
         }
         true
     }
+}
+
+/// Pass-4 cycle 1 — fixer for `fm-state_files-merge-artifact-stuck`.
+///
+/// When `--repair` is passed and the `jsonl.merge_artifacts` warning is
+/// present, quarantine each stuck `.beads/<name>.{base,left,right}.jsonl`
+/// (excluding the canonical `beads.base.jsonl` sync anchor) by renaming
+/// it through the [`chokepoint::mutate`] into
+/// `<run-dir>/quarantine/.beads/<name>`.
+///
+/// Per AGENTS.md RULE 1 ("no file deletion without express permission"):
+/// the fixer NEVER unlinks. It uses [`Op::Rename`] so `doctor undo
+/// <run-id>` reverses the quarantine by un-renaming the bytes back into
+/// place. The chokepoint records the rename target in `actions.jsonl`
+/// alongside before/after hashes so the inverse is byte-deterministic.
+///
+/// Returns `true` if at least one artifact was quarantined.
+fn fix_merge_artifacts_if_warned(
+    beads_dir: &Path,
+    report: &DoctorReport,
+    ctx: &OutputContext,
+    session: Option<&mut DoctorRepairSession>,
+) -> bool {
+    let has_warning = report
+        .checks
+        .iter()
+        .any(|c| c.name == "jsonl.merge_artifacts" && c.status == CheckStatus::Warn);
+    if !has_warning {
+        return false;
+    }
+    let Some(session) = session else {
+        if !ctx.is_json() {
+            ctx.warning(
+                "Skipping merge-artifact quarantine: no doctor repair session (run-dir creation failed)",
+            );
+        }
+        return false;
+    };
+
+    let mut artifacts: Vec<PathBuf> = Vec::new();
+    let entries = match beads_dir.read_dir() {
+        Ok(entries) => entries,
+        Err(err) => {
+            if !ctx.is_json() {
+                ctx.warning(&format!(
+                    "Skipping merge-artifact quarantine: could not read {}: {err}",
+                    beads_dir.display()
+                ));
+            }
+            return false;
+        }
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        // The canonical 3-way merge anchor is sacred — never quarantine it
+        // (sync/mod.rs writes this for legitimate merges).
+        if name == "beads.base.jsonl" {
+            continue;
+        }
+        if name.contains(".base.jsonl")
+            || name.contains(".left.jsonl")
+            || name.contains(".right.jsonl")
+        {
+            artifacts.push(entry.path());
+        }
+    }
+
+    if artifacts.is_empty() {
+        return false;
+    }
+
+    session.set_fixer("doctor.merge_artifact_quarantine");
+    let mut quarantined = 0_usize;
+    for source in &artifacts {
+        let Some(name) = source.file_name() else {
+            continue;
+        };
+        let dest = session
+            .run
+            .root
+            .join("quarantine")
+            .join(".beads")
+            .join(name);
+        match chokepoint::mutate(&session.ctx, source, Op::Rename { to: dest.clone() }) {
+            Ok(result) if result.ok => {
+                quarantined += 1;
+            }
+            Ok(_) => {
+                if !ctx.is_json() {
+                    ctx.warning(&format!(
+                        "Merge-artifact quarantine no-op for {}",
+                        source.display()
+                    ));
+                }
+            }
+            Err(err) => {
+                if !ctx.is_json() {
+                    ctx.warning(&format!("Failed to quarantine {}: {err}", source.display()));
+                }
+            }
+        }
+    }
+
+    if quarantined > 0 && !ctx.is_json() {
+        ctx.info(&format!(
+            "Quarantined {quarantined} stuck merge artifact(s) under {}",
+            session.run.root.join("quarantine/.beads").display()
+        ));
+    }
+
+    quarantined > 0
 }
 
 fn read_root_gitignore_content(gitignore_path: &Path) -> Result<Option<String>> {
@@ -6177,6 +6297,26 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         false
     };
 
+    // Pass-4 cycle 1: auto-quarantine stuck merge artifacts under --repair.
+    // Per AGENTS.md RULE 1 (no-delete) and the repair-spec for
+    // fm-state_files-merge-artifact-stuck, the fixer moves the artifacts
+    // into <run-dir>/quarantine/.beads/ via the chokepoint so
+    // `doctor undo` can byte-reverse the move.
+    let merge_artifacts_repaired = if args.repair {
+        let repaired =
+            fix_merge_artifacts_if_warned(&beads_dir, &initial.report, ctx, session.as_mut());
+        if repaired {
+            initial = collect_doctor_report(&beads_dir, &paths)?;
+        }
+        repaired
+    } else {
+        false
+    };
+    // Suppress unused warning for the variable when downstream readers
+    // haven't been wired yet. This keeps `--repair` flow consistent with
+    // the gitignore_repaired pattern without adding a synthetic consumer.
+    let _ = merge_artifacts_repaired;
+
     if !args.repair {
         if args.quick {
             // Phase 8: drop the slow detectors so pre-commit / CI can
@@ -7303,6 +7443,123 @@ mod tests {
         let after_check =
             find_check(&report_after.report.checks, "gitignore.beads_inner").expect("status");
         assert!(matches!(after_check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn test_fix_merge_artifacts_quarantines_via_chokepoint() {
+        // Pass-4 cycle 1: the fixer must MOVE stuck artifacts into the
+        // run-dir quarantine via Op::Rename (never delete), and the
+        // post-repair detector must report ok.
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        let _storage = SqliteStorage::open(&db_path).unwrap();
+        fs::write(
+            &jsonl_path,
+            format!(
+                "{}\n",
+                serde_json::to_string(&sample_issue("bd-test01", "Valid issue")).unwrap()
+            ),
+        )
+        .unwrap();
+        // Plant the merge artifacts.
+        fs::write(beads_dir.join("issues.base.jsonl"), b"").unwrap();
+        fs::write(beads_dir.join("issues.left.jsonl"), b"").unwrap();
+        fs::write(beads_dir.join("issues.right.jsonl"), b"").unwrap();
+        // The canonical anchor must NOT be touched.
+        fs::write(beads_dir.join("beads.base.jsonl"), b"canonical-anchor").unwrap();
+
+        let paths = config::ConfigPaths {
+            beads_dir: beads_dir.clone(),
+            db_path,
+            jsonl_path,
+            metadata: config::Metadata::default(),
+        };
+
+        let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
+            .expect("session must build");
+        let report_before = collect_doctor_report(&beads_dir, &paths).expect("doctor report");
+        let before_check = find_check(&report_before.report.checks, "jsonl.merge_artifacts")
+            .expect("merge_artifacts check");
+        assert!(matches!(before_check.status, CheckStatus::Warn));
+
+        let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Json, false, true);
+        assert!(fix_merge_artifacts_if_warned(
+            &beads_dir,
+            &report_before.report,
+            &ctx,
+            Some(&mut session),
+        ));
+
+        // Source artifacts gone.
+        assert!(!beads_dir.join("issues.base.jsonl").exists());
+        assert!(!beads_dir.join("issues.left.jsonl").exists());
+        assert!(!beads_dir.join("issues.right.jsonl").exists());
+        // Canonical anchor untouched.
+        assert_eq!(
+            fs::read(beads_dir.join("beads.base.jsonl")).unwrap(),
+            b"canonical-anchor"
+        );
+        // Quarantine populated.
+        let q = session.run.root.join("quarantine/.beads");
+        assert!(q.join("issues.base.jsonl").is_file());
+        assert!(q.join("issues.left.jsonl").is_file());
+        assert!(q.join("issues.right.jsonl").is_file());
+
+        // actions.jsonl records three rename ops.
+        let actions = fs::read_to_string(&session.run.actions_file).unwrap();
+        let rename_count = actions
+            .lines()
+            .filter(|l| l.contains("\"op\":\"rename\""))
+            .count();
+        assert_eq!(rename_count, 3, "actions.jsonl: {actions}");
+
+        // Re-detect: status returns to ok.
+        let report_after = collect_doctor_report(&beads_dir, &paths).expect("doctor report");
+        let after_check = find_check(&report_after.report.checks, "jsonl.merge_artifacts")
+            .expect("merge_artifacts check");
+        assert!(
+            matches!(after_check.status, CheckStatus::Ok),
+            "post-repair status must be ok, got {:?}",
+            after_check.status
+        );
+    }
+
+    #[test]
+    fn test_fix_merge_artifacts_is_idempotent_no_op_on_second_call() {
+        // The idempotence contract: a second --repair against a clean
+        // workspace must find nothing to quarantine (no actions emitted).
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        let _storage = SqliteStorage::open(&db_path).unwrap();
+        fs::write(&jsonl_path, b"").unwrap();
+
+        let paths = config::ConfigPaths {
+            beads_dir: beads_dir.clone(),
+            db_path,
+            jsonl_path,
+            metadata: config::Metadata::default(),
+        };
+        let report = collect_doctor_report(&beads_dir, &paths).expect("doctor report");
+        let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Json, false, true);
+        let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
+            .expect("session must build");
+
+        // No artifacts present → no warning → fixer returns false.
+        assert!(!fix_merge_artifacts_if_warned(
+            &beads_dir,
+            &report.report,
+            &ctx,
+            Some(&mut session),
+        ));
+        let actions = fs::read_to_string(&session.run.actions_file).unwrap_or_default();
+        let rename_count = actions.matches("\"op\":\"rename\"").count();
+        assert_eq!(rename_count, 0, "no actions expected: {actions:?}");
     }
 
     #[cfg(unix)]
