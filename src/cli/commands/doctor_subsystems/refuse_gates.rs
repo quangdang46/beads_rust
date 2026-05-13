@@ -317,19 +317,22 @@ mod tests {
         write_fake_sqlite_db(&db_path, 9999);
 
         let outcome = gate_schema_version_downgrade(&db_path);
-        match outcome {
-            GateOutcome::Refuse {
-                code,
-                reason,
-                evidence,
-            } => {
-                assert_eq!(code, DoctorExitCode::RefusedUnsafe.as_i32());
-                assert!(reason.contains("schema_version"));
-                assert_eq!(evidence["gate"], "schema_version_downgrade");
-                assert_eq!(evidence["db_schema_version"], 9999);
-            }
-            GateOutcome::Allow => panic!("must refuse newer-on-disk schema"),
-        }
+        assert!(
+            matches!(outcome, GateOutcome::Refuse { .. }),
+            "must refuse newer-on-disk schema"
+        );
+        let GateOutcome::Refuse {
+            code,
+            reason,
+            evidence,
+        } = outcome
+        else {
+            return;
+        };
+        assert_eq!(code, DoctorExitCode::RefusedUnsafe.as_i32());
+        assert!(reason.contains("schema_version"));
+        assert_eq!(evidence["gate"], "schema_version_downgrade");
+        assert_eq!(evidence["db_schema_version"], 9999);
     }
 
     #[test]
@@ -387,15 +390,17 @@ mod tests {
         .unwrap();
 
         let outcome = gate_recovery_fingerprint_integrity(&beads_dir);
-        match outcome {
-            GateOutcome::Refuse { code, evidence, .. } => {
-                assert_eq!(code, DoctorExitCode::RefusedUnsafe.as_i32());
-                assert_eq!(evidence["gate"], "recovery_fingerprint_integrity");
-                let arr = evidence["mismatched_artifacts"].as_array().expect("array");
-                assert_eq!(arr.len(), 1);
-            }
-            GateOutcome::Allow => panic!("must refuse on fingerprint mismatch"),
-        }
+        assert!(
+            matches!(outcome, GateOutcome::Refuse { .. }),
+            "must refuse on fingerprint mismatch"
+        );
+        let GateOutcome::Refuse { code, evidence, .. } = outcome else {
+            return;
+        };
+        assert_eq!(code, DoctorExitCode::RefusedUnsafe.as_i32());
+        assert_eq!(evidence["gate"], "recovery_fingerprint_integrity");
+        let arr = evidence["mismatched_artifacts"].as_array().expect("array");
+        assert_eq!(arr.len(), 1);
     }
 
     #[test]
@@ -422,15 +427,15 @@ mod tests {
         .unwrap();
 
         let outcome = run_all(&beads_dir, &external_db);
-        match outcome {
-            GateOutcome::Refuse { evidence, .. } => {
-                assert_eq!(evidence["gate"], "recovery_fingerprint_integrity");
-                assert_eq!(evidence["recovery_dir"], recovery.display().to_string());
-            }
-            GateOutcome::Allow => {
-                panic!("must refuse mismatched fingerprints beside the active db path")
-            }
-        }
+        assert!(
+            matches!(outcome, GateOutcome::Refuse { .. }),
+            "must refuse mismatched fingerprints beside the active db path"
+        );
+        let GateOutcome::Refuse { evidence, .. } = outcome else {
+            return;
+        };
+        assert_eq!(evidence["gate"], "recovery_fingerprint_integrity");
+        assert_eq!(evidence["recovery_dir"], recovery.display().to_string());
     }
 
     #[test]
@@ -454,19 +459,21 @@ mod tests {
         .unwrap();
 
         let outcome = gate_recovery_fingerprint_integrity(&beads_dir);
-        match outcome {
-            GateOutcome::Refuse { evidence, .. } => {
-                assert_eq!(evidence["gate"], "recovery_fingerprint_integrity");
-                let arr = evidence["mismatched_artifacts"].as_array().expect("array");
-                assert_eq!(arr.len(), 1);
-                assert!(
-                    arr[0]["reason"]
-                        .as_str()
-                        .is_some_and(|reason| reason.contains("inside the recovery directory")),
-                    "unexpected evidence: {evidence}"
-                );
-            }
-            GateOutcome::Allow => panic!("must refuse artifact path traversal"),
-        }
+        assert!(
+            matches!(outcome, GateOutcome::Refuse { .. }),
+            "must refuse artifact path traversal"
+        );
+        let GateOutcome::Refuse { evidence, .. } = outcome else {
+            return;
+        };
+        assert_eq!(evidence["gate"], "recovery_fingerprint_integrity");
+        let arr = evidence["mismatched_artifacts"].as_array().expect("array");
+        assert_eq!(arr.len(), 1);
+        assert!(
+            arr[0]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("inside the recovery directory")),
+            "unexpected evidence: {evidence}"
+        );
     }
 }
