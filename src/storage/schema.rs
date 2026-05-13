@@ -2737,6 +2737,11 @@ mod tests {
             "created_by",
             "updated_at",
             "source_repo",
+            // Pins the v10 column-add: a legacy `(id, title)`-only table opened
+            // by a v10+ binary must end up with `source_repo_path` present, so
+            // the live INSERT/UPDATE SQL emitted by the storage layer doesn't
+            // crash with "no such column" on the very next write.
+            "source_repo_path",
             "compaction_level",
             "sender",
             "is_template",
