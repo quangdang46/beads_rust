@@ -2715,6 +2715,28 @@ pub struct DoctorArgs {
     #[arg(long)]
     pub quick: bool,
 
+    /// Pass-5 cycle 1: with `--repair`, only run fixers whose FM
+    /// identifier matches one of the supplied values. Accepts
+    /// comma-separated lists and repeated `--only` flags. Empty list
+    /// means "run all fixers" (existing behavior). FM identifiers are
+    /// the `fm-<subsystem>-<slug>` form from the capabilities
+    /// envelope's `finding_id_map`. Currently respected by the
+    /// chokepointed fixers (gitignore_repair, merge_artifact_quarantine,
+    /// startup_cache_quarantine, recovery_artifacts_aged_quarantine,
+    /// export_hash_cache_repair); legacy `repair_*` paths run
+    /// unconditionally.
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    pub only: Vec<String>,
+
+    /// Pass-5 cycle 1: with `--repair`, skip the listed fixers even when
+    /// their finding would otherwise fire. Accepts comma-separated
+    /// lists and repeated `--skip` flags. Useful when an operator
+    /// wants the doctor to run everything except one known-flaky
+    /// path. Applied after `--only` filtering (so `--only A --skip A`
+    /// effectively disables A).
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    pub skip: Vec<String>,
+
     /// Optional WP6 subcommand. When `None`, the flat doctor handler
     /// (above) runs as it always has.
     #[command(subcommand)]

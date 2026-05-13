@@ -183,6 +183,65 @@ impl DoctorRepairSession {
 }
 
 #[allow(dead_code)] // Used by DoctorRepairSession once the scaffold is wired into repair flow.
+/// Pass-5 cycle 1: per-FM filter for `--repair --only`/`--skip`.
+///
+/// Each chokepointed fixer takes the active filter and consults
+/// `allows(fm_id)` before running. The filter is built once at the top
+/// of `execute()` from `args.only` and `args.skip`. Empty `only` means
+/// "all fixers eligible"; `skip` always subtracts from the eligible set.
+///
+/// Stable contract: FM identifiers are the `fm-<subsystem>-<slug>` form
+/// advertised in the capabilities envelope's `finding_id_map`. Unknown
+/// names in `only`/`skip` are NOT rejected — the filter is lenient so
+/// callers can preconfigure invocations against future fixers.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct FixerFilter {
+    only: Vec<String>,
+    skip: Vec<String>,
+}
+
+impl FixerFilter {
+    pub(crate) fn from_args(only: &[String], skip: &[String]) -> Self {
+        Self {
+            only: only
+                .iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            skip: skip
+                .iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+        }
+    }
+
+    /// Returns true when `fm_id` should run under the current filter.
+    #[must_use]
+    pub(crate) fn allows(&self, fm_id: &str) -> bool {
+        if !self.only.is_empty() && !self.only.iter().any(|s| s == fm_id) {
+            return false;
+        }
+        if self.skip.iter().any(|s| s == fm_id) {
+            return false;
+        }
+        true
+    }
+
+    /// Whether the filter has any non-empty `--only` allowlist. Used by
+    /// the legacy-path tracing to log when filtering is in effect.
+    #[must_use]
+    pub(crate) fn has_only(&self) -> bool {
+        !self.only.is_empty()
+    }
+
+    /// Whether the filter has any non-empty `--skip` blocklist.
+    #[must_use]
+    pub(crate) fn has_skip(&self) -> bool {
+        !self.skip.is_empty()
+    }
+}
+
 fn now_ns_for_session() -> u128 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -6935,91 +6994,110 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         return execute_repair_indexes(&beads_dir, &paths, ctx, args, cli);
     }
 
+    // Pass-5 cycle 1: per-FM filter built from --only/--skip flags.
+    // The 5 chokepointed fixers below consult the filter; legacy
+    // repair_* paths run unconditionally for now.
+    let fixer_filter = FixerFilter::from_args(&args.only, &args.skip);
+
     // Auto-fix root .gitignore if --repair is passed and the warning is present.
-    let gitignore_repaired = if args.repair {
-        let repaired =
-            fix_root_gitignore_if_warned(&beads_dir, &initial.report, ctx, session.as_mut());
-        if repaired {
-            initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
-        }
-        repaired
-    } else {
-        false
-    };
+    let gitignore_repaired =
+        if args.repair && fixer_filter.allows("fm-configs-gitignore-leaking-beads") {
+            let repaired =
+                fix_root_gitignore_if_warned(&beads_dir, &initial.report, ctx, session.as_mut());
+            if repaired {
+                initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+            }
+            repaired
+        } else {
+            false
+        };
 
     // Pass-4 cycle 1: auto-quarantine stuck merge artifacts under --repair.
     // Per AGENTS.md RULE 1 (no-delete) and the repair-spec for
     // fm-state_files-merge-artifact-stuck, the fixer moves the artifacts
     // into <run-dir>/quarantine/.beads/ via the chokepoint so
     // `doctor undo` can byte-reverse the move.
-    let merge_artifacts_repaired = if args.repair {
-        let repaired =
-            fix_merge_artifacts_if_warned(&beads_dir, &initial.report, ctx, session.as_mut());
-        if repaired {
-            initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
-        }
-        repaired
-    } else {
-        false
-    };
+    let merge_artifacts_repaired =
+        if args.repair && fixer_filter.allows("fm-state_files-merge-artifact-stuck") {
+            let repaired =
+                fix_merge_artifacts_if_warned(&beads_dir, &initial.report, ctx, session.as_mut());
+            if repaired {
+                initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+            }
+            repaired
+        } else {
+            false
+        };
 
     // Pass-4 cycle 2: auto-quarantine poisoned startup-cache files. The
     // cache lives outside the default workspace, so the fixer extends
     // the session's write_scopes to include the resolved cache dir.
-    let startup_cache_repaired = if args.repair {
-        let repaired = fix_startup_cache_if_warned(
-            &beads_dir,
-            cli.db.as_ref(),
-            &initial.report,
-            ctx,
-            session.as_mut(),
-        );
-        if repaired {
-            initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
-        }
-        repaired
-    } else {
-        false
-    };
+    let startup_cache_repaired =
+        if args.repair && fixer_filter.allows("fm-configs-startup-cache-poisoned") {
+            let repaired = fix_startup_cache_if_warned(
+                &beads_dir,
+                cli.db.as_ref(),
+                &initial.report,
+                ctx,
+                session.as_mut(),
+            );
+            if repaired {
+                initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+            }
+            repaired
+        } else {
+            false
+        };
 
     // Pass-4 cycle 3: quarantine past-TTL recovery artifacts. The fixer
     // PRESERVES recent recovery backups (operators commonly need them
     // for forensic value) and only moves artifacts older than
     // RECOVERY_AGED_TTL_DAYS into the run-dir quarantine.
-    let recovery_aged_repaired = if args.repair {
-        let repaired = fix_recovery_artifacts_aged_if_warned(
-            &beads_dir,
-            &paths.db_path,
-            &initial.report,
-            ctx,
-            session.as_mut(),
-        );
-        if repaired {
-            initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
-        }
-        repaired
-    } else {
-        false
-    };
+    let recovery_aged_repaired =
+        if args.repair && fixer_filter.allows("fm-state_files-recovery-artifacts-orphaned") {
+            let repaired = fix_recovery_artifacts_aged_if_warned(
+                &beads_dir,
+                &paths.db_path,
+                &initial.report,
+                ctx,
+                session.as_mut(),
+            );
+            if repaired {
+                initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+            }
+            repaired
+        } else {
+            false
+        };
 
     // Pass-4 cycle 4: recompute metadata.jsonl_content_hash from the
     // authoritative JSONL on disk if the cached value has drifted.
     // JSONL is NEVER mutated; only the cache row updates.
-    let export_hash_repaired = if args.repair {
-        let repaired = fix_export_hash_cache_divergence_if_warned(
-            &paths.db_path,
-            initial.jsonl_path.as_deref(),
-            &initial.report,
-            ctx,
-            session.as_mut(),
+    let export_hash_repaired =
+        if args.repair && fixer_filter.allows("fm-caches_indexes-export-hash-cache-divergence") {
+            let repaired = fix_export_hash_cache_divergence_if_warned(
+                &paths.db_path,
+                initial.jsonl_path.as_deref(),
+                &initial.report,
+                ctx,
+                session.as_mut(),
+            );
+            if repaired {
+                initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+            }
+            repaired
+        } else {
+            false
+        };
+
+    if args.repair && (fixer_filter.has_only() || fixer_filter.has_skip()) {
+        tracing::info!(
+            target: "br::doctor::filter",
+            only = ?args.only,
+            skip = ?args.skip,
+            "doctor --repair filter active"
         );
-        if repaired {
-            initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
-        }
-        repaired
-    } else {
-        false
-    };
+    }
     let early_repair = EarlyRepairSummary {
         gitignore: gitignore_repaired,
         merge_artifacts: merge_artifacts_repaired,
@@ -8165,6 +8243,55 @@ mod tests {
         let after_check =
             find_check(&report_after.report.checks, "gitignore.beads_inner").expect("status");
         assert!(matches!(after_check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn test_fixer_filter_empty_allows_everything() {
+        // Pass-5 cycle 1: default (no --only/--skip) accepts every FM.
+        let filter = FixerFilter::default();
+        assert!(filter.allows("fm-anything"));
+        assert!(filter.allows("fm-state_files-merge-artifact-stuck"));
+        assert!(!filter.has_only());
+        assert!(!filter.has_skip());
+    }
+
+    #[test]
+    fn test_fixer_filter_only_allowlist() {
+        // --only A,B → A and B run; C is blocked.
+        let filter = FixerFilter::from_args(&["fm-a".to_string(), "fm-b".to_string()], &[]);
+        assert!(filter.allows("fm-a"));
+        assert!(filter.allows("fm-b"));
+        assert!(!filter.allows("fm-c"));
+        assert!(filter.has_only());
+    }
+
+    #[test]
+    fn test_fixer_filter_skip_blocklist() {
+        // --skip X → X is blocked; everything else runs.
+        let filter = FixerFilter::from_args(&[], &["fm-blocked".to_string()]);
+        assert!(filter.allows("fm-other"));
+        assert!(!filter.allows("fm-blocked"));
+        assert!(filter.has_skip());
+    }
+
+    #[test]
+    fn test_fixer_filter_skip_overrides_only() {
+        // --only A --skip A → A is blocked (skip subtracts from only).
+        let filter = FixerFilter::from_args(&["fm-a".to_string()], &["fm-a".to_string()]);
+        assert!(!filter.allows("fm-a"));
+    }
+
+    #[test]
+    fn test_fixer_filter_trims_whitespace_and_drops_empties() {
+        // Whitespace + empty strings from comma-split are normalized
+        // away so `--only ,fm-a, ,fm-b,` works.
+        let filter = FixerFilter::from_args(
+            &["  fm-a  ".to_string(), String::new(), " fm-b".to_string()],
+            &[],
+        );
+        assert!(filter.allows("fm-a"));
+        assert!(filter.allows("fm-b"));
+        assert!(!filter.allows("fm-c"));
     }
 
     #[test]
@@ -11554,6 +11681,8 @@ version = "2026-05-11-abc123"
             dry_run: false,
             robot_triage: false,
             quick: false,
+            only: Vec::new(),
+            skip: Vec::new(),
             subcommand: None,
         };
         let ctx = OutputContext::from_flags(false, true, true);
@@ -11630,6 +11759,8 @@ version = "2026-05-11-abc123"
             dry_run: false,
             robot_triage: false,
             quick: false,
+            only: Vec::new(),
+            skip: Vec::new(),
             subcommand: None,
         };
         let ctx = OutputContext::from_flags(false, true, true);
@@ -11913,6 +12044,8 @@ version = "2026-05-11-abc123"
             dry_run: false,
             robot_triage: false,
             quick: false,
+            only: Vec::new(),
+            skip: Vec::new(),
             subcommand: None,
         };
         let ctx = OutputContext::from_flags(false, true, true);
@@ -11964,6 +12097,8 @@ version = "2026-05-11-abc123"
             dry_run: false,
             robot_triage: false,
             quick: false,
+            only: Vec::new(),
+            skip: Vec::new(),
             subcommand: None,
         };
         let ctx = OutputContext::from_flags(false, true, true);
@@ -12016,6 +12151,8 @@ version = "2026-05-11-abc123"
             dry_run: true,
             robot_triage: false,
             quick: false,
+            only: Vec::new(),
+            skip: Vec::new(),
             subcommand: None,
         };
         let ctx = OutputContext::from_flags(false, true, true);
