@@ -8,7 +8,7 @@ use crate::error::{BeadsError, Result};
 use crate::model::{IssueType, Priority, Status};
 use crate::util::content_hash_from_parts;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 9;
+pub const CURRENT_SCHEMA_VERSION: i32 = 10;
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 
 /// The complete SQL schema for the beads database.
@@ -1466,6 +1466,30 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
     // run_pre_schema_migrations() via ensure_columns(). Repeating ALTER TABLE
     // here can create duplicate column definitions on some engines.
 
+    // v10: Ensure source_repo_path column is present on the issues table
+    // (beads_rust#289) for migration paths that call `run_migrations` directly
+    // and therefore skip `run_pre_schema_migrations`/`ensure_columns`. Without
+    // this guard, a direct v9 -> v10 migration could stamp user_version=10 with
+    // the column still missing, and the next open would fast-path past schema
+    // setup and start hitting "no such column: source_repo_path" on every
+    // INSERT/UPDATE.
+    //
+    // Idempotent: skipped when the column already exists. The ADD COLUMN
+    // appends at the end, matching SCHEMA_SQL and EXPECTED_ISSUE_COLUMN_ORDER.
+    // If the pre-schema path rebuilt `issues`, skip this check: the rebuilt
+    // table already has the current shape, and fsqlite's in-memory schema cache
+    // may not be refreshed enough for a second column probe.
+    if !issues_rebuilt
+        && user_version < 10
+        && table_exists(conn, "issues")
+        && !column_exists(conn, "issues", "source_repo_path")
+    {
+        tracing::info!(
+            "Migrating database to schema version 10 (source_repo_path on issues - beads_rust#289)"
+        );
+        conn.execute("ALTER TABLE issues ADD COLUMN source_repo_path TEXT")?;
+    }
+
     // Migration: Add missing indexes for bd parity
     // These use IF NOT EXISTS so they're safe to run multiple times
     execute_batch(
@@ -2069,6 +2093,100 @@ mod tests {
             .query_row("SELECT typeof(notes) FROM issues WHERE id = 'bd-null'")
             .unwrap();
         assert_ne!(row.get(0).and_then(SqliteValue::as_text), Some("null"));
+    }
+
+    #[test]
+    fn test_v10_migration_adds_source_repo_path_when_missing() {
+        // Regression for beads_rust#289: a v9 database stamped with
+        // user_version=9 (no source_repo_path column yet) MUST get the column
+        // back when migrated by a v10+ binary. Without an explicit v10
+        // migration, direct migration callers can stamp the DB current while
+        // leaving every subsequent INSERT to hit "no such column".
+        //
+        // This test simulates a v9 layout by creating the issues table
+        // without source_repo_path and stamping user_version=9, then asserts
+        // that the direct migration hook heals the column.
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("legacy_v9.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+
+        // Hand-build the canonical v9 issues table: all the columns that
+        // existed before #289 landed, in the canonical EXPECTED order, but
+        // intentionally missing the source_repo_path tail column.
+        execute_batch(
+            &conn,
+            r"
+            CREATE TABLE issues (
+                id TEXT PRIMARY KEY,
+                content_hash TEXT,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                design TEXT NOT NULL DEFAULT '',
+                acceptance_criteria TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'open',
+                priority INTEGER NOT NULL DEFAULT 2,
+                issue_type TEXT NOT NULL DEFAULT 'task',
+                assignee TEXT,
+                owner TEXT DEFAULT '',
+                estimated_minutes INTEGER,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                created_by TEXT DEFAULT '',
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                closed_at DATETIME,
+                close_reason TEXT DEFAULT '',
+                closed_by_session TEXT DEFAULT '',
+                due_at DATETIME,
+                defer_until DATETIME,
+                external_ref TEXT,
+                source_system TEXT DEFAULT '',
+                source_repo TEXT NOT NULL DEFAULT '.',
+                deleted_at DATETIME,
+                deleted_by TEXT DEFAULT '',
+                delete_reason TEXT DEFAULT '',
+                original_type TEXT DEFAULT '',
+                compaction_level INTEGER DEFAULT 0,
+                compacted_at DATETIME,
+                compacted_at_commit TEXT,
+                original_size INTEGER,
+                sender TEXT DEFAULT '',
+                ephemeral INTEGER NOT NULL DEFAULT 0,
+                pinned INTEGER NOT NULL DEFAULT 0,
+                is_template INTEGER NOT NULL DEFAULT 0
+            );
+            ",
+        )
+        .expect("seed v9 issues table");
+
+        // Stamp the legacy version so the open-path would otherwise
+        // short-circuit and skip migrations.
+        conn.execute("PRAGMA user_version = 9")
+            .expect("stamp legacy user_version");
+
+        assert!(
+            !column_exists(&conn, "issues", "source_repo_path"),
+            "precondition: legacy v9 table must not have source_repo_path"
+        );
+
+        run_migrations_atomic(&conn, 9, 10).expect("v10 migration must succeed on v9 layout");
+
+        assert!(
+            column_exists(&conn, "issues", "source_repo_path"),
+            "source_repo_path column should be present after schema upgrade"
+        );
+
+        // The user_version stamp must advance to the new CURRENT version so
+        // future opens take the fast path safely.
+        let stamped = conn
+            .query_row("PRAGMA user_version")
+            .ok()
+            .and_then(|row| row.get(0).and_then(SqliteValue::as_integer))
+            .unwrap_or(-1);
+        assert_eq!(
+            stamped,
+            i64::from(CURRENT_SCHEMA_VERSION),
+            "user_version should reflect CURRENT_SCHEMA_VERSION after migration"
+        );
     }
 
     #[test]
