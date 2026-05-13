@@ -439,6 +439,53 @@ fn e2e_dependency_errors() {
 }
 
 #[test]
+fn e2e_dep_add_blocks_ignores_non_blocking_cycle_edges() {
+    let _log = common::test_log("e2e_dep_add_blocks_ignores_non_blocking_cycle_edges");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let issue_a = run_br(&workspace, ["create", "Issue A"], "create_a");
+    assert!(
+        issue_a.status.success(),
+        "create A failed: {}",
+        issue_a.stderr
+    );
+    let id_a = parse_created_id(&issue_a.stdout);
+
+    let issue_b = run_br(&workspace, ["create", "Issue B"], "create_b");
+    assert!(
+        issue_b.status.success(),
+        "create B failed: {}",
+        issue_b.stderr
+    );
+    let id_b = parse_created_id(&issue_b.stdout);
+
+    let related = run_br(
+        &workspace,
+        ["dep", "add", &id_a, &id_b, "--type", "related"],
+        "dep_related",
+    );
+    assert!(
+        related.status.success(),
+        "related dep add failed: {}",
+        related.stderr
+    );
+
+    let blocks = run_br(
+        &workspace,
+        ["dep", "add", &id_b, &id_a, "--type", "blocks"],
+        "dep_blocks",
+    );
+    assert!(
+        blocks.status.success(),
+        "blocking dep should ignore non-blocking related edge: {}",
+        blocks.stderr
+    );
+}
+
+#[test]
 fn e2e_sync_invalid_orphans() {
     let _log = common::test_log("e2e_sync_invalid_orphans");
     let workspace = BrWorkspace::new();

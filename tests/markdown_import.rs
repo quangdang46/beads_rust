@@ -351,6 +351,48 @@ task
 }
 
 #[test]
+fn test_markdown_import_unresolved_item_parent_skips_only_that_issue() {
+    let workspace = BrWorkspace::new();
+
+    let output = run_br(&workspace, ["init"], "init_unresolved_item_parent");
+    assert!(output.status.success(), "init failed");
+
+    let md_path = workspace.root.join("issues.md");
+    let content = r"## Child with missing parent
+### Parent
+does-not-exist
+
+## Independent import
+### Type
+task
+";
+    fs::write(&md_path, content).expect("write md");
+
+    let output = run_br(
+        &workspace,
+        ["create", "--file", "issues.md", "--json"],
+        "create_unresolved_item_parent",
+    );
+    assert!(
+        output.status.success(),
+        "one bad item parent should not abort the import: {}",
+        output.stderr
+    );
+    assert!(
+        output
+            .stderr
+            .contains("Failed to resolve parent for Child with missing parent"),
+        "stderr should explain skipped parent resolution: {}",
+        output.stderr
+    );
+
+    let payload = extract_json_payload(&output.stdout);
+    let issues: Vec<Value> = serde_json::from_str(&payload).expect("json parse");
+    assert_eq!(issues.len(), 1);
+    assert_eq!(issues[0]["title"].as_str(), Some("Independent import"));
+}
+
+#[test]
 fn test_markdown_import_rejects_external_ref_argument() {
     let workspace = BrWorkspace::new();
 

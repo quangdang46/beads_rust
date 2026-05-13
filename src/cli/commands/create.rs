@@ -847,7 +847,17 @@ fn execute_import(
                 deferred_parent_ref = Some(p_trimmed.to_string());
                 None
             } else {
-                Some(resolve_issue_id(storage, &id_resolver, p)?)
+                match resolve_issue_id(storage, &id_resolver, p) {
+                    Ok(id) => Some(id),
+                    Err(err) => {
+                        eprintln!(
+                            "✗ Failed to resolve parent for {}: {}",
+                            create_display_text(&title),
+                            err
+                        );
+                        continue;
+                    }
+                }
             }
         } else {
             None
