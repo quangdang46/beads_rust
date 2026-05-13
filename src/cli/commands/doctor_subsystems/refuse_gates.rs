@@ -23,7 +23,7 @@
 #![allow(dead_code)] // WP1 foundation; consumed by WP3-WP12.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -165,6 +165,131 @@ struct FingerprintMismatch {
     reason: String,
 }
 
+fn push_fingerprint_mismatch(
+    out: &mut Vec<FingerprintMismatch>,
+    artifact: impl Into<String>,
+    fingerprint: &Path,
+    reason: impl Into<String>,
+) {
+    out.push(FingerprintMismatch {
+        artifact: artifact.into(),
+        fingerprint: fingerprint.display().to_string(),
+        reason: reason.into(),
+    });
+}
+
+fn recovery_relative_artifact_path(recovery_dir: &Path, target_rel: &str) -> Option<PathBuf> {
+    let target_rel_path = Path::new(target_rel);
+    if target_rel_path.is_absolute()
+        || target_rel_path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::Prefix(_) | Component::RootDir
+            )
+        })
+    {
+        return None;
+    }
+    Some(recovery_dir.join(target_rel_path))
+}
+
+fn is_regular_hashed_artifact(
+    out: &mut Vec<FingerprintMismatch>,
+    target: &Path,
+    fingerprint: &Path,
+) -> bool {
+    match fs::symlink_metadata(target) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() || !file_type.is_file() {
+                push_fingerprint_mismatch(
+                    out,
+                    target.display().to_string(),
+                    fingerprint,
+                    "fingerprint artifact with sha256 must be a regular file",
+                );
+                return false;
+            }
+            true
+        }
+        Err(e) => {
+            push_fingerprint_mismatch(
+                out,
+                target.display().to_string(),
+                fingerprint,
+                format!("could not inspect artifact: {e}"),
+            );
+            false
+        }
+    }
+}
+
+fn scan_fingerprint_file(
+    out: &mut Vec<FingerprintMismatch>,
+    recovery_dir: &Path,
+    path: &Path,
+) -> std::io::Result<()> {
+    let fp_text = fs::read_to_string(path)?;
+    let fp: serde_json::Value = match serde_json::from_str(&fp_text) {
+        Ok(v) => v,
+        Err(e) => {
+            push_fingerprint_mismatch(
+                out,
+                path.display().to_string(),
+                path,
+                format!("could not parse fingerprint json: {e}"),
+            );
+            return Ok(());
+        }
+    };
+    let Some(target_rel) = fp.get("artifact").and_then(|v| v.as_str()) else {
+        return Ok(());
+    };
+    let Some(target) = recovery_relative_artifact_path(recovery_dir, target_rel) else {
+        push_fingerprint_mismatch(
+            out,
+            target_rel.to_string(),
+            path,
+            "fingerprint artifact path must stay inside the recovery directory",
+        );
+        return Ok(());
+    };
+    let expected_sha = fp
+        .get("sha256")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    if expected_sha.is_empty() {
+        // Symlink / dir fingerprints have no sha; skip.
+        return Ok(());
+    }
+    if !is_regular_hashed_artifact(out, &target, path) {
+        return Ok(());
+    }
+    let bytes = match fs::read(&target) {
+        Ok(b) => b,
+        Err(e) => {
+            push_fingerprint_mismatch(
+                out,
+                target.display().to_string(),
+                path,
+                format!("could not read artifact: {e}"),
+            );
+            return Ok(());
+        }
+    };
+    let actual = hex_encode(&Sha256::digest(&bytes));
+    if actual.as_str().ne(expected_sha.as_str()) {
+        push_fingerprint_mismatch(
+            out,
+            target.display().to_string(),
+            path,
+            format!("sha256 mismatch (expected {expected_sha}, found {actual})"),
+        );
+    }
+    Ok(())
+}
+
 fn scan_fingerprints(recovery_dir: &Path) -> std::io::Result<Vec<FingerprintMismatch>> {
     let mut out = Vec::new();
     let entries = match fs::read_dir(recovery_dir) {
@@ -173,8 +298,7 @@ fn scan_fingerprints(recovery_dir: &Path) -> std::io::Result<Vec<FingerprintMism
         Err(e) => return Err(e),
     };
     for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
+        let path = entry?.path();
         // Recurse one level for nested recovery dirs.
         if path.is_dir() {
             out.extend(scan_fingerprints(&path)?);
@@ -183,93 +307,8 @@ fn scan_fingerprints(recovery_dir: &Path) -> std::io::Result<Vec<FingerprintMism
         let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
             continue;
         };
-        if !name.ends_with(".fingerprint.json") {
-            continue;
-        }
-        let fp_text = fs::read_to_string(&path)?;
-        let fp: serde_json::Value = match serde_json::from_str(&fp_text) {
-            Ok(v) => v,
-            Err(e) => {
-                out.push(FingerprintMismatch {
-                    artifact: path.display().to_string(),
-                    fingerprint: path.display().to_string(),
-                    reason: format!("could not parse fingerprint json: {e}"),
-                });
-                continue;
-            }
-        };
-        let Some(target_rel) = fp.get("artifact").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let target_rel_path = Path::new(target_rel);
-        if target_rel_path.is_absolute()
-            || target_rel_path.components().any(|component| {
-                matches!(
-                    component,
-                    std::path::Component::ParentDir
-                        | std::path::Component::Prefix(_)
-                        | std::path::Component::RootDir
-                )
-            })
-        {
-            out.push(FingerprintMismatch {
-                artifact: target_rel.to_string(),
-                fingerprint: path.display().to_string(),
-                reason: "fingerprint artifact path must stay inside the recovery directory"
-                    .to_string(),
-            });
-            continue;
-        }
-        let target = recovery_dir.join(target_rel_path);
-        let expected_sha = fp
-            .get("sha256")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        if expected_sha.is_empty() {
-            // Symlink / dir fingerprints have no sha; skip.
-            continue;
-        }
-        match fs::symlink_metadata(&target) {
-            Ok(metadata) => {
-                let file_type = metadata.file_type();
-                if file_type.is_symlink() || !file_type.is_file() {
-                    out.push(FingerprintMismatch {
-                        artifact: target.display().to_string(),
-                        fingerprint: path.display().to_string(),
-                        reason: "fingerprint artifact with sha256 must be a regular file"
-                            .to_string(),
-                    });
-                    continue;
-                }
-            }
-            Err(e) => {
-                out.push(FingerprintMismatch {
-                    artifact: target.display().to_string(),
-                    fingerprint: path.display().to_string(),
-                    reason: format!("could not inspect artifact: {e}"),
-                });
-                continue;
-            }
-        }
-        let bytes = match fs::read(&target) {
-            Ok(b) => b,
-            Err(e) => {
-                out.push(FingerprintMismatch {
-                    artifact: target.display().to_string(),
-                    fingerprint: path.display().to_string(),
-                    reason: format!("could not read artifact: {e}"),
-                });
-                continue;
-            }
-        };
-        let actual = hex_encode(&Sha256::digest(&bytes));
-        if actual.as_str().ne(expected_sha.as_str()) {
-            out.push(FingerprintMismatch {
-                artifact: target.display().to_string(),
-                fingerprint: path.display().to_string(),
-                reason: format!("sha256 mismatch (expected {expected_sha}, found {actual})"),
-            });
+        if name.ends_with(".fingerprint.json") {
+            scan_fingerprint_file(&mut out, recovery_dir, &path)?;
         }
     }
     Ok(out)
