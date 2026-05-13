@@ -260,6 +260,7 @@ fn build_detector_registry() -> Vec<DetectorEntry> {
         ("db.sidecars", "state_files", "warn", true),
         ("db.recovery_artifacts", "state_files", "info", true),
         ("db.recovery_artifacts.aged", "state_files", "warn", true),
+        ("db.export_hash_cache", "caches_indexes", "warn", true),
         ("schema.tables", "schemas", "error", true),
         ("schema.columns", "schemas", "error", true),
         ("schema.inspect", "schemas", "error", true),
@@ -299,6 +300,7 @@ fn build_detector_registry() -> Vec<DetectorEntry> {
 /// `mutate()` chokepoint (per WP1+WP3 contract); `false` flags the
 /// few legacy paths that still bypass the chokepoint (see
 /// `beads_rust-8fud` for the migration plan).
+#[allow(clippy::too_many_lines)]
 fn build_fixer_registry() -> Vec<FixerEntry> {
     // (id, subsystem, auto_fixable, mutates_via_chokepoint, addressed_findings)
     let rows: &[(&str, &str, bool, bool, &[&str])] = &[
@@ -329,6 +331,13 @@ fn build_fixer_registry() -> Vec<FixerEntry> {
             true,
             true,
             &["db.recovery_artifacts.aged"],
+        ),
+        (
+            "doctor.export_hash_cache_repair",
+            "caches_indexes",
+            true,
+            true,
+            &["db.export_hash_cache"],
         ),
         (
             "doctor.repair_recoverable_db_state",

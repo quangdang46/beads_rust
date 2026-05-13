@@ -595,6 +595,10 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
         "fm-state_files-recovery-artifacts-orphaned",
     ),
     (
+        "db.export_hash_cache",
+        "fm-caches_indexes-export-hash-cache-divergence",
+    ),
+    (
         "db.recoverable_anomalies",
         "fm-caches_indexes-blocked-cache-stale",
     ),
@@ -2570,6 +2574,72 @@ fn check_integrity(conn: &Connection, checks: &mut Vec<CheckResult>) {
             Some(messages.join("; ")),
             (messages.len() > 1).then(|| serde_json::json!({ "messages": messages })),
         );
+    }
+}
+
+/// Pass-4 cycle 4 — detector for `fm-caches_indexes-export-hash-cache-divergence`.
+///
+/// Compares the value of `metadata.jsonl_content_hash` (the cached
+/// top-level JSONL fingerprint) against the current
+/// `compute_jsonl_hash(jsonl_path)`. The JSONL on disk is authoritative;
+/// the cache is derived. A mismatch means a `br sync` write completed
+/// but did not finalize the cache update (or an external edit landed
+/// without notifying the cache).
+///
+/// Narrow scope: this check only flags the TOP-LEVEL hash row. Per-issue
+/// `export_hashes` divergence is handled by the existing JSONL→DB
+/// rebuild path (`repair_database_from_jsonl`). The pass-1 spec
+/// envisioned both surfaces; pass-4 cycle 4 lands just the simpler one
+/// because the rebuild path already covers per-issue cases.
+fn check_export_hash_cache_divergence(
+    conn: &Connection,
+    jsonl_path: Option<&Path>,
+    checks: &mut Vec<CheckResult>,
+) {
+    let Some(jsonl) = jsonl_path else {
+        push_check(checks, "db.export_hash_cache", CheckStatus::Ok, None, None);
+        return;
+    };
+    if !jsonl.is_file() {
+        push_check(checks, "db.export_hash_cache", CheckStatus::Ok, None, None);
+        return;
+    }
+    let stored = match conn.query("SELECT value FROM metadata WHERE key='jsonl_content_hash'") {
+        Ok(rows) => rows
+            .first()
+            .and_then(|row| row.values().first().cloned())
+            .and_then(|v| match v {
+                SqliteValue::Text(s) => Some(s.to_string()),
+                _ => None,
+            }),
+        Err(_) => None,
+    };
+    let Ok(computed) = crate::sync::compute_jsonl_hash(jsonl) else {
+        // JSONL unreadable: a different FM owns this surface.
+        push_check(checks, "db.export_hash_cache", CheckStatus::Ok, None, None);
+        return;
+    };
+    match stored.as_deref() {
+        Some(s) if s == computed => {
+            push_check(checks, "db.export_hash_cache", CheckStatus::Ok, None, None);
+        }
+        Some(s) => {
+            push_check(
+                checks,
+                "db.export_hash_cache",
+                CheckStatus::Warn,
+                Some("Top-level JSONL content hash in `metadata` differs from computed hash. Cache is stale; doctor --repair will recompute.".to_string()),
+                Some(serde_json::json!({
+                    "stored_top_hash": s,
+                    "computed_top_hash": computed,
+                })),
+            );
+        }
+        None => {
+            // No cached row at all — first sync hasn't run yet. Not a
+            // failure mode for this FM.
+            push_check(checks, "db.export_hash_cache", CheckStatus::Ok, None, None);
+        }
     }
 }
 
@@ -5077,6 +5147,91 @@ fn fix_recovery_artifacts_aged_if_warned(
     quarantined > 0
 }
 
+/// Pass-4 cycle 4 — fixer for `fm-caches_indexes-export-hash-cache-divergence`.
+///
+/// When `db.export_hash_cache` is Warn under `--repair`, recompute
+/// `compute_jsonl_hash(jsonl_path)` and update the
+/// `metadata.jsonl_content_hash` row to match. Routes through
+/// [`chokepoint::mutate(Op::DbExec)`] with `affected_tables=["metadata"]`
+/// and `affected_predicate="key='jsonl_content_hash'"` so the
+/// pre-state is snapshotted as a JSON row and `doctor undo` can
+/// restore the original cache value byte-deterministically.
+///
+/// JSONL on disk is NEVER touched — the cache is derived from the
+/// JSONL, never the other way around. The fixer ASSERTS this contract
+/// by refusing to run if `jsonl_path` is missing (returns false).
+/// The database path is the same resolved path inspected by the detector;
+/// callers may use a configured DB filename instead of `.beads/beads.db`.
+///
+/// Returns `true` if the cache row was updated.
+fn fix_export_hash_cache_divergence_if_warned(
+    db_path: &Path,
+    jsonl_path: Option<&Path>,
+    report: &DoctorReport,
+    ctx: &OutputContext,
+    session: Option<&mut DoctorRepairSession>,
+) -> bool {
+    let has_warning = report
+        .checks
+        .iter()
+        .any(|c| c.name == "db.export_hash_cache" && c.status == CheckStatus::Warn);
+    if !has_warning {
+        return false;
+    }
+    let Some(jsonl) = jsonl_path else {
+        if !ctx.is_json() {
+            ctx.warning(
+                "Skipping export-hash-cache repair: no JSONL path available (authoritative source missing)",
+            );
+        }
+        return false;
+    };
+    let Some(session) = session else {
+        if !ctx.is_json() {
+            ctx.warning(
+                "Skipping export-hash-cache repair: no doctor repair session (run-dir creation failed)",
+            );
+        }
+        return false;
+    };
+
+    let Ok(computed) = crate::sync::compute_jsonl_hash(jsonl).inspect_err(|err| {
+        if !ctx.is_json() {
+            ctx.warning(&format!(
+                "Skipping export-hash-cache repair: failed to compute current JSONL hash: {err}"
+            ));
+        }
+    }) else {
+        return false;
+    };
+
+    session.set_fixer("doctor.export_hash_cache_repair");
+    let op = Op::DbExec {
+        sql: "UPDATE metadata SET value = ?1 WHERE key = 'jsonl_content_hash'".to_string(),
+        args: vec![chokepoint::DbArg::Text(computed.clone())],
+        affected_tables: vec!["metadata".to_string()],
+        affected_predicate: Some("key = 'jsonl_content_hash'".to_string()),
+    };
+    match chokepoint::mutate(&session.ctx, db_path, op) {
+        Ok(result) if result.ok => {
+            if !ctx.is_json() {
+                ctx.info(&format!(
+                    "Recomputed metadata.jsonl_content_hash = {}",
+                    &computed[..16.min(computed.len())]
+                ));
+            }
+            true
+        }
+        Ok(_) => false,
+        Err(err) => {
+            if !ctx.is_json() {
+                ctx.warning(&format!("Failed to repair export-hash cache: {err}"));
+            }
+            false
+        }
+    }
+}
+
 fn read_root_gitignore_content(gitignore_path: &Path) -> Result<Option<String>> {
     let metadata = match fs::symlink_metadata(gitignore_path) {
         Ok(metadata) => metadata,
@@ -6466,6 +6621,10 @@ fn inspect_existing_doctor_database(
         }
         check_null_defaults(&conn, checks);
         check_integrity(&conn, checks);
+        // Pass-4 cycle 4: detect metadata.jsonl_content_hash drift vs
+        // the JSONL on disk. Uses the SNAPSHOT connection so the live
+        // DB family (incl. SHM/WAL sidecars) is undisturbed.
+        check_export_hash_cache_divergence(&conn, jsonl_path, checks);
         // beads_rust-m3mi: audit-suspect close_reasons (warn level)
         check_suspect_close_reasons(&conn, checks);
         if mode == DoctorInspectionMode::Full {
@@ -6777,12 +6936,32 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     } else {
         false
     };
+
+    // Pass-4 cycle 4: recompute metadata.jsonl_content_hash from the
+    // authoritative JSONL on disk if the cached value has drifted.
+    // JSONL is NEVER mutated; only the cache row updates.
+    let export_hash_repaired = if args.repair {
+        let repaired = fix_export_hash_cache_divergence_if_warned(
+            &paths.db_path,
+            initial.jsonl_path.as_deref(),
+            &initial.report,
+            ctx,
+            session.as_mut(),
+        );
+        if repaired {
+            initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+        }
+        repaired
+    } else {
+        false
+    };
     // Suppress unused warnings for the variables while downstream readers
     // catch up. Keeps the `--repair` flow consistent with
     // gitignore_repaired without adding a synthetic consumer.
     let _ = merge_artifacts_repaired;
     let _ = startup_cache_repaired;
     let _ = recovery_aged_repaired;
+    let _ = export_hash_repaired;
 
     if !args.repair {
         if args.quick {
@@ -11510,6 +11689,71 @@ version = "2026-05-11-abc123"
         ));
         let actions_after = fs::read_to_string(&session.run.actions_file).unwrap();
         assert_eq!(actions_after, actions_before, "second pass must be a no-op");
+    }
+
+    #[test]
+    fn test_fix_export_hash_cache_uses_resolved_database_path() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let default_db = beads_dir.join("beads.db");
+        let custom_db = beads_dir.join("custom.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::write(&jsonl_path, br#"{"id":"custom-db-path"}"#).unwrap();
+
+        let mut default_storage = SqliteStorage::open(&default_db).unwrap();
+        default_storage
+            .set_metadata(
+                crate::sync::METADATA_JSONL_CONTENT_HASH,
+                "default-db-must-not-change",
+            )
+            .unwrap();
+        drop(default_storage);
+
+        let mut custom_storage = SqliteStorage::open(&custom_db).unwrap();
+        custom_storage
+            .set_metadata(crate::sync::METADATA_JSONL_CONTENT_HASH, "custom-db-stale")
+            .unwrap();
+        drop(custom_storage);
+
+        let report = DoctorReport {
+            ok: false,
+            workspace_health: None,
+            reliability_audit: None,
+            checks: vec![CheckResult {
+                name: "db.export_hash_cache".to_string(),
+                status: CheckStatus::Warn,
+                message: None,
+                details: None,
+            }],
+        };
+        let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Json, false, true);
+        let mut session = DoctorRepairSession::new(tmp.path(), /* dry_run = */ false)
+            .expect("session must build");
+        let expected_hash = crate::sync::compute_jsonl_hash(&jsonl_path).unwrap();
+
+        assert!(fix_export_hash_cache_divergence_if_warned(
+            &custom_db,
+            Some(&jsonl_path),
+            &report,
+            &ctx,
+            Some(&mut session),
+        ));
+
+        let custom_storage = SqliteStorage::open(&custom_db).unwrap();
+        assert_eq!(
+            custom_storage
+                .get_metadata(crate::sync::METADATA_JSONL_CONTENT_HASH)
+                .unwrap(),
+            Some(expected_hash)
+        );
+        let default_storage = SqliteStorage::open(&default_db).unwrap();
+        assert_eq!(
+            default_storage
+                .get_metadata(crate::sync::METADATA_JSONL_CONTENT_HASH)
+                .unwrap(),
+            Some("default-db-must-not-change".to_string())
+        );
     }
 
     #[test]
