@@ -4653,7 +4653,9 @@ mod tests {
             .expect("depends_on should be array");
         assert!(
             depends_on.iter().any(|dep| {
-                dep["id"].as_str() == Some("external:api:auth")
+                dep["id"]
+                    .as_str()
+                    .is_some_and(|id| id.eq("external:api:auth"))
                     && dep["dep_type"].as_str() == Some("blocks")
             }),
             "MCP list should include external dependency: {list}"
