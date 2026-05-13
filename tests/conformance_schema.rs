@@ -712,6 +712,8 @@ const KNOWN_BD_ONLY_COLUMNS: &[&str] = &[
 const KNOWN_BR_ONLY_COLUMNS: &[&str] = &[
     // source_repo: br has this for multi-repo tracking
     "source_repo",
+    // source_repo_path: br tracks the absolute canonical workspace path
+    "source_repo_path",
 ];
 
 /// Known type differences between br and bd that are acceptable.

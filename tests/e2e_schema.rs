@@ -1156,7 +1156,7 @@ fn normalize_issue_example_snapshot(value: &mut Value) {
                     "created_by" => {
                         *child = Value::String("<ACTOR>".to_string());
                     }
-                    "source_repo" => {
+                    "source_repo" | "source_repo_path" => {
                         *child = Value::String("<SOURCE_REPO>".to_string());
                     }
                     "depends_on_id" | "id" | "issue_id" => {

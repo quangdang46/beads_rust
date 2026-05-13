@@ -670,6 +670,7 @@ impl Issue {
             || self.external_ref != other.external_ref
             || self.source_system != other.source_system
             || self.source_repo != other.source_repo
+            || self.source_repo_path != other.source_repo_path
             || self.deleted_at != other.deleted_at
             || self.deleted_by != other.deleted_by
             || self.delete_reason != other.delete_reason
@@ -1567,6 +1568,19 @@ mod tests {
         issue2.due_at = Some(Utc.timestamp_opt(1_800_000_000, 0).unwrap());
 
         assert!(!issue1.sync_equals(&issue2));
+    }
+
+    #[test]
+    fn test_issue_sync_equals_detects_source_repo_path_changes() {
+        let mut issue1 = create_test_issue();
+        issue1.source_repo = Some("widget_engine".to_string());
+        issue1.source_repo_path = Some("/data/projects/widget_engine".to_string());
+
+        let mut issue2 = issue1.clone();
+        issue2.source_repo_path = Some("/data/projects/alternate/widget_engine".to_string());
+
+        assert!(!issue1.sync_equals(&issue2));
+        assert!(!issue2.sync_equals(&issue1));
     }
 
     #[test]

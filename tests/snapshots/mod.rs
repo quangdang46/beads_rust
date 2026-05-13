@@ -561,13 +561,13 @@ pub fn normalize_json(json: &Value) -> Value {
                         Value::String("TIMESTAMP".to_string())
                     }
                     "content_hash" => Value::String("HASH".to_string()),
-                    // Normalize source_repo: br resolves "." to the absolute
+                    // Normalize source_repo/source_repo_path: br resolves "." to the absolute
                     // path of the workspace; under tempdir-based tests this is
                     // a randomly-named ".tmpXXXXXX" path, so the snapshot must
                     // collapse it back to a stable token. (Issue surfaced by
                     // beads_rust-l6xl audit; PC-RECOVERY-adjacent: not a
                     // safety problem, just a snapshot determinism gap.)
-                    "source_repo" => {
+                    "source_repo" | "source_repo_path" => {
                         if let Value::String(_) = value {
                             Value::String("SOURCE_REPO".to_string())
                         } else {
