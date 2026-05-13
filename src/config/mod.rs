@@ -755,6 +755,13 @@ fn quarantine_truncated_wal_sidecar(db_path: &Path, beads_dir: &Path) {
     if !meta.is_file() {
         return;
     }
+    // A 0-byte WAL is the documented post-`PRAGMA wal_checkpoint(TRUNCATE)`
+    // state — SqliteStorage::Drop runs that pragma on every mutating
+    // invocation, so quarantining the empty file would re-pathologize the
+    // healthy hand-off between two well-behaved processes (#291).
+    if meta.len() == 0 {
+        return;
+    }
     if meta.len() >= 32 {
         return;
     }
@@ -7889,6 +7896,35 @@ routing:
             fs::read(shm_backup).expect("read quarantined shm"),
             b"sidecar shared memory",
             "quarantined shm bytes must remain inspectable"
+        );
+    }
+
+    #[test]
+    fn quarantine_truncated_wal_sidecar_leaves_zero_byte_wal_in_place() {
+        // Regression for beads_rust#291. A 0-byte WAL is the documented
+        // post-`PRAGMA wal_checkpoint(TRUNCATE)` resting state, which
+        // SqliteStorage::Drop runs on every mutating br invocation. The
+        // pre-fix heuristic quarantined that healthy hand-off as corruption
+        // and flooded `.beads/.br_recovery/` with empty-file artifacts at
+        // ~1 entry / 2 invocations on multi-agent repos.
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let wal_path = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
+        let shm_path = PathBuf::from(format!("{}-shm", db_path.to_string_lossy()));
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        fs::write(&db_path, b"db").expect("write db");
+        fs::write(&wal_path, b"").expect("write 0-byte wal");
+        fs::write(&shm_path, b"live shm").expect("write shm");
+
+        quarantine_truncated_wal_sidecar(&db_path, &beads_dir);
+
+        assert!(wal_path.is_file(), "0-byte wal should remain live");
+        assert!(shm_path.is_file(), "shm should remain live with 0-byte wal");
+        assert!(
+            !recovery_dir_for_db_path(&db_path, &beads_dir).exists(),
+            "0-byte wal should not create a recovery quarantine"
         );
     }
 
