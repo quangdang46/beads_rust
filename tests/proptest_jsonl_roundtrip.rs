@@ -113,6 +113,7 @@ fn make_issue(
         external_ref,
         source_system,
         source_repo: Some(".".to_string()),
+        source_repo_path: None,
         deleted_at: None,
         deleted_by: None,
         delete_reason: None,

@@ -409,7 +409,7 @@ impl ReadyIssueProjection {
                          due_at, defer_until, external_ref, source_system, source_repo,
                          deleted_at, deleted_by, delete_reason, original_type,
                          compaction_level, compacted_at, compacted_at_commit, original_size,
-                         sender, ephemeral, pinned, is_template"
+                         sender, ephemeral, pinned, is_template, source_repo_path"
             }
             Self::Command => {
                 r"SELECT id, title, description, acceptance_criteria, notes, status, priority,
@@ -441,7 +441,7 @@ impl SearchIssueProjection {
                          due_at, defer_until, external_ref, source_system, source_repo,
                          deleted_at, deleted_by, delete_reason, original_type,
                          compaction_level, compacted_at, compacted_at_commit, original_size,
-                         sender, ephemeral, pinned, is_template
+                         sender, ephemeral, pinned, is_template, source_repo_path
                   FROM issues
                   WHERE 1=1"
             }
@@ -472,7 +472,7 @@ impl BlockedIssueProjection {
                      i.due_at, i.defer_until, i.external_ref, i.source_system, i.source_repo,
                      i.deleted_at, i.deleted_by, i.delete_reason, i.original_type, i.compaction_level,
                      i.compacted_at, i.compacted_at_commit, i.original_size, i.sender, i.ephemeral,
-                     i.pinned, i.is_template,
+                     i.pinned, i.is_template, i.source_repo_path,
                      bc.blocked_by"
             }
             Self::Command => {
@@ -491,7 +491,7 @@ impl BlockedIssueProjection {
                      due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                      compacted_at, compacted_at_commit, original_size, sender, ephemeral,
-                     pinned, is_template"
+                     pinned, is_template, source_repo_path"
             }
             Self::Command => {
                 r"SELECT id, title, description, status, priority, issue_type,
@@ -502,7 +502,9 @@ impl BlockedIssueProjection {
 
     const fn cached_blocked_by_index(self) -> usize {
         match self {
-            Self::Full => 36,
+            // Bumped from 36 → 37 after `source_repo_path` was appended
+            // to the Full SELECT at position 36 (beads_rust#289).
+            Self::Full => 37,
             Self::Command => 9,
         }
     }
@@ -1982,10 +1984,10 @@ impl SqliteStorage {
                     status, priority, issue_type, assignee, owner, estimated_minutes,
                     created_at, created_by, updated_at, closed_at, close_reason,
                     closed_by_session, due_at, defer_until, external_ref, source_system,
-                    source_repo, deleted_at, deleted_by, delete_reason, original_type,
+                    source_repo, source_repo_path, deleted_at, deleted_by, delete_reason, original_type,
                     compaction_level, compacted_at, compacted_at_commit, original_size,
                     sender, ephemeral, pinned, is_template
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 &[
                     SqliteValue::from(issue.id.as_str()),
                     SqliteValue::from(content_hash.as_str()),
@@ -2011,6 +2013,7 @@ impl SqliteStorage {
                     issue.external_ref.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
                     SqliteValue::from(issue.source_system.as_deref().unwrap_or("")),
                     SqliteValue::from(issue.source_repo.as_deref().unwrap_or(".")),
+                    issue.source_repo_path.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
                     deleted_at_str.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
                     SqliteValue::from(issue.deleted_by.as_deref().unwrap_or("")),
                     SqliteValue::from(issue.delete_reason.as_deref().unwrap_or("")),
@@ -2499,6 +2502,21 @@ impl SqliteStorage {
                     val.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
                 );
             }
+            if let Some(ref val) = updates.source_repo {
+                // `source_repo` is NOT NULL DEFAULT '.' so an explicit clear
+                // must fall back to "." rather than SQL NULL — otherwise the
+                // schema's NOT NULL constraint rejects the write.
+                let next = val.clone().unwrap_or_else(|| ".".to_string());
+                issue.source_repo = Some(next.clone());
+                add_update("source_repo", SqliteValue::from(next.as_str()));
+            }
+            if let Some(ref val) = updates.source_repo_path {
+                issue.source_repo_path.clone_from(val);
+                add_update(
+                    "source_repo_path",
+                    val.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+                );
+            }
             // Use empty string instead of NULL for bd compatibility
             if let Some(ref val) = updates.close_reason {
                 issue.close_reason.clone_from(val);
@@ -2849,7 +2867,7 @@ impl SqliteStorage {
                    due_at, defer_until, external_ref, source_system, source_repo,
                    deleted_at, deleted_by, delete_reason, original_type,
                    compaction_level, compacted_at, compacted_at_commit, original_size,
-                   sender, ephemeral, pinned, is_template
+                   sender, ephemeral, pinned, is_template, source_repo_path
             FROM issues
             WHERE id = ?
         ";
@@ -2889,7 +2907,7 @@ impl SqliteStorage {
                          due_at, defer_until, external_ref, source_system, source_repo,
                          deleted_at, deleted_by, delete_reason, original_type,
                          compaction_level, compacted_at, compacted_at_commit, original_size,
-                         sender, ephemeral, pinned, is_template
+                         sender, ephemeral, pinned, is_template, source_repo_path
                   FROM issues WHERE id IN ({})",
                 placeholders.join(",")
             );
@@ -3025,7 +3043,7 @@ impl SqliteStorage {
                      due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type,
                      compaction_level, compacted_at, compacted_at_commit, original_size,
-                     sender, ephemeral, pinned, is_template",
+                     sender, ephemeral, pinned, is_template, source_repo_path",
         );
 
         let mut params: Vec<SqliteValue> = Vec::new();
@@ -3214,7 +3232,7 @@ impl SqliteStorage {
                          due_at, defer_until, external_ref, source_system, source_repo,
                          deleted_at, deleted_by, delete_reason, original_type,
                          compaction_level, compacted_at, compacted_at_commit, original_size,
-                         sender, ephemeral, pinned, is_template
+                         sender, ephemeral, pinned, is_template, source_repo_path
                   FROM issues
                   WHERE {status_filter}
                     AND (is_template = 0 OR is_template IS NULL)
@@ -3670,7 +3688,7 @@ impl SqliteStorage {
     pub fn list_stats_issues(&self) -> Result<Vec<StatsIssueRow>> {
         let rows = self.conn.query(
             r"SELECT id, status, priority, issue_type, assignee, created_at, closed_at,
-                     defer_until, ephemeral, pinned, is_template
+                     defer_until, ephemeral, pinned, is_template, source_repo_path
               FROM issues",
         )?;
         let mut issues = Vec::with_capacity(rows.len());
@@ -3688,7 +3706,7 @@ impl SqliteStorage {
     pub fn list_stats_summary_issues(&self) -> Result<Vec<StatsIssueRow>> {
         let rows = self.conn.query(
             r"SELECT id, status, issue_type, created_at, closed_at,
-                     defer_until, ephemeral, pinned, is_template
+                     defer_until, ephemeral, pinned, is_template, source_repo_path
               FROM issues",
         )?;
         let mut issues = Vec::with_capacity(rows.len());
@@ -8528,7 +8546,7 @@ impl SqliteStorage {
                            due_at, defer_until, external_ref, source_system, source_repo,
                            deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                            compacted_at, compacted_at_commit, original_size, sender, ephemeral,
-                           pinned, is_template
+                           pinned, is_template, source_repo_path
                     FROM issues
                     WHERE (ephemeral = 0 OR ephemeral IS NULL)
                       AND id NOT LIKE '%-wisp-%'
@@ -9192,6 +9210,12 @@ impl SqliteStorage {
             ephemeral: get_bool(33),
             pinned: get_bool(34),
             is_template: get_bool(35),
+            // Position 36 lands after `is_template` in the Full SELECT
+            // and before `bc.blocked_by` in the BlockedIssue::Full
+            // variant; the cached_blocked_by_index was bumped to 37
+            // in lock-step so the projection-specific blocked-by
+            // accessor still finds the right column.
+            source_repo_path: get_non_empty_str(36),
             labels: vec![],
             dependencies: vec![],
             comments: vec![],
@@ -9243,6 +9267,7 @@ impl SqliteStorage {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -9306,6 +9331,7 @@ impl SqliteStorage {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -9369,6 +9395,7 @@ impl SqliteStorage {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -9426,6 +9453,7 @@ impl SqliteStorage {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -9489,6 +9517,7 @@ impl SqliteStorage {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -9546,6 +9575,7 @@ impl SqliteStorage {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -9853,6 +9883,14 @@ pub struct IssueUpdate {
     pub due_at: Option<Option<DateTime<Utc>>>,
     pub defer_until: Option<Option<DateTime<Utc>>>,
     pub external_ref: Option<Option<String>>,
+    /// Override the source-repo display name (typically the repo basename).
+    /// `Some(Some(s))` sets it to `s`; `Some(None)` resets it to the
+    /// schema default "." because the column is `NOT NULL`.
+    pub source_repo: Option<Option<String>>,
+    /// Override the canonical filesystem path of the repo containing `.beads`.
+    /// See #289. Use `update --source-repo-path` for ad-hoc repair after a
+    /// repo is moved/copied to a new machine.
+    pub source_repo_path: Option<Option<String>>,
     pub closed_at: Option<Option<DateTime<Utc>>>,
     pub close_reason: Option<Option<String>>,
     pub closed_by_session: Option<Option<String>>,
@@ -9888,6 +9926,8 @@ impl IssueUpdate {
             && self.due_at.is_none()
             && self.defer_until.is_none()
             && self.external_ref.is_none()
+            && self.source_repo.is_none()
+            && self.source_repo_path.is_none()
             && self.closed_at.is_none()
             && self.close_reason.is_none()
             && self.closed_by_session.is_none()
@@ -11040,7 +11080,7 @@ impl SqliteStorage {
                      due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                      compacted_at, compacted_at_commit, original_size, sender, ephemeral,
-                     pinned, is_template
+                     pinned, is_template, source_repo_path
                FROM issues WHERE external_ref = ?",
             &[SqliteValue::from(external_ref)],
         ) {
@@ -11063,7 +11103,7 @@ impl SqliteStorage {
                      due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                      compacted_at, compacted_at_commit, original_size, sender, ephemeral,
-                     pinned, is_template
+                     pinned, is_template, source_repo_path
                FROM issues WHERE content_hash = ?",
             &[SqliteValue::from(content_hash)],
         ) {
@@ -11136,6 +11176,10 @@ impl SqliteStorage {
                 .map_or(SqliteValue::Null, SqliteValue::from),
             SqliteValue::from(issue.source_system.as_deref().unwrap_or("")),
             SqliteValue::from(issue.source_repo.as_deref().unwrap_or(".")),
+            issue
+                .source_repo_path
+                .as_deref()
+                .map_or(SqliteValue::Null, SqliteValue::from),
             timestamps
                 .deleted_at
                 .as_deref()
@@ -11165,7 +11209,7 @@ impl SqliteStorage {
         issue: &Issue,
         timestamps: &ImportIssueTimestampStrings,
     ) -> Result<usize> {
-        let mut insert_params = Vec::with_capacity(36);
+        let mut insert_params = Vec::with_capacity(37);
         insert_params.push(SqliteValue::from(issue.id.as_str()));
         insert_params.extend(Self::import_issue_field_values(issue, timestamps));
 
@@ -11174,12 +11218,12 @@ impl SqliteStorage {
                 id, content_hash, title, description, design, acceptance_criteria, notes,
                 status, priority, issue_type, assignee, owner, estimated_minutes,
                 created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
-                due_at, defer_until, external_ref, source_system, source_repo,
+                due_at, defer_until, external_ref, source_system, source_repo, source_repo_path,
                 deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                 compacted_at, compacted_at_commit, original_size, sender, ephemeral,
                 pinned, is_template
             ) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )",
             &insert_params,
         )?;
@@ -11201,8 +11245,8 @@ impl SqliteStorage {
                 issue_type = ?, assignee = ?, owner = ?, estimated_minutes = ?,
                 created_at = ?, created_by = ?, updated_at = ?, closed_at = ?,
                 close_reason = ?, closed_by_session = ?, due_at = ?, defer_until = ?,
-                external_ref = ?, source_system = ?, source_repo = ?, deleted_at = ?,
-                deleted_by = ?, delete_reason = ?, original_type = ?, compaction_level = ?,
+                external_ref = ?, source_system = ?, source_repo = ?, source_repo_path = ?,
+                deleted_at = ?, deleted_by = ?, delete_reason = ?, original_type = ?, compaction_level = ?,
                 compacted_at = ?, compacted_at_commit = ?, original_size = ?, sender = ?,
                 ephemeral = ?, pinned = ?, is_template = ?
               WHERE id = ?",
@@ -11904,6 +11948,7 @@ mod tests {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -12142,6 +12187,7 @@ mod tests {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -12852,6 +12898,58 @@ mod tests {
         assert_eq!(updated.priority, Priority::HIGH);
         assert_eq!(updated.assignee.as_deref(), Some("alice"));
         assert_eq!(updated.description.as_deref(), Some("New description"));
+    }
+
+    #[test]
+    fn test_update_issue_writes_source_repo_path() {
+        // Regression for #289: `br update --source-repo-path PATH` must
+        // round-trip through SQLite. Without writing to the column, the
+        // installed checkpoint would silently lose the value on every
+        // create-then-update cycle.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 5, 1, 0, 0, 0).unwrap();
+        let issue = make_issue(
+            "bd-srp",
+            "source_repo_path RT",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+
+        let updates = IssueUpdate {
+            source_repo: Some(Some("widget_engine".to_string())),
+            source_repo_path: Some(Some("/data/projects/widget_engine".to_string())),
+            ..IssueUpdate::default()
+        };
+        let updated = storage.update_issue("bd-srp", &updates, "tester").unwrap();
+        assert_eq!(updated.source_repo.as_deref(), Some("widget_engine"));
+        assert_eq!(
+            updated.source_repo_path.as_deref(),
+            Some("/data/projects/widget_engine")
+        );
+
+        // Read back through a fresh fetch to prove it persisted (not just
+        // returned from the in-memory `Issue` the update builder mutates).
+        let reread = storage.get_issue("bd-srp").unwrap().unwrap();
+        assert_eq!(reread.source_repo.as_deref(), Some("widget_engine"));
+        assert_eq!(
+            reread.source_repo_path.as_deref(),
+            Some("/data/projects/widget_engine")
+        );
+
+        // Clear path: passing an empty string through `optional_string_field`
+        // sets the inner Option to None, which should write SQL NULL.
+        let clear = IssueUpdate {
+            source_repo_path: Some(None),
+            ..IssueUpdate::default()
+        };
+        let cleared = storage.update_issue("bd-srp", &clear, "tester").unwrap();
+        assert!(cleared.source_repo_path.is_none());
+        let reread = storage.get_issue("bd-srp").unwrap().unwrap();
+        assert!(reread.source_repo_path.is_none());
     }
 
     #[test]
@@ -14781,6 +14879,7 @@ mod tests {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -14860,6 +14959,7 @@ mod tests {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -14933,6 +15033,7 @@ mod tests {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -15063,6 +15164,7 @@ mod tests {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -15566,6 +15668,7 @@ mod tests {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -19987,7 +20090,8 @@ mod tests {
                 sender TEXT,
                 ephemeral INTEGER,
                 pinned INTEGER,
-                is_template INTEGER
+                is_template INTEGER,
+                source_repo_path TEXT
             );
             CREATE TABLE blocked_issues_cache (
                 issue_id TEXT PRIMARY KEY,

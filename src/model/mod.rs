@@ -520,9 +520,24 @@ pub struct Issue {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_system: Option<String>,
 
-    /// Source repository for multi-repo support.
+    /// Source repository for multi-repo support — basename of the
+    /// canonicalized parent of `.beads/`. Stable across clones of the
+    /// same repo on different machines (different absolute paths
+    /// produce the same basename). See [`canonical_source_repo`] in
+    /// `cli::commands::create`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_repo: Option<String>,
+
+    /// Absolute canonical path of the source repository. Distinct from
+    /// `source_repo`: this field uniquely identifies the workspace on
+    /// the machine that produced the issue, which is what multi-repo
+    /// fleet automation needs to route beads back to the right
+    /// directory (see beads_rust#289). Two clones of the same repo
+    /// under `~/Developer/foo` vs `~/Developer/scratch/foo` collide on
+    /// `source_repo` but disagree here. Optional — older databases and
+    /// hand-edited JSONL records without this field are valid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_repo_path: Option<String>,
 
     // Tombstone fields
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -593,6 +608,7 @@ impl Default for Issue {
             defer_until: None,
             external_ref: None,
             source_system: None,
+            source_repo_path: None,
             source_repo: None,
             deleted_at: None,
             deleted_by: None,
@@ -911,6 +927,7 @@ mod tests {
             due_at: None,
             defer_until: None,
             external_ref: None,
+            source_repo_path: None,
             source_system: None,
             source_repo: None,
             deleted_at: None,
@@ -1371,6 +1388,7 @@ mod tests {
             closed_by_session: None,
             due_at: None,
             defer_until: None,
+            source_repo_path: None,
             external_ref: None,
             source_system: None,
             source_repo: None,

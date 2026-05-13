@@ -35,6 +35,7 @@ fn make_open_issue(suffix: &str, title: &str, priority: Priority) -> Issue {
         external_ref: None,
         source_system: None,
         source_repo: Some(".".to_string()),
+        source_repo_path: None,
         deleted_at: None,
         deleted_by: None,
         delete_reason: None,

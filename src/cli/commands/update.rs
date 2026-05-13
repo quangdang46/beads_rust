@@ -877,6 +877,8 @@ fn build_update(args: &UpdateArgs, actor: &str, claim_exclusive: bool) -> Result
         due_at,
         defer_until,
         external_ref: optional_string_field(args.external_ref.as_deref()),
+        source_repo: optional_string_field(args.source_repo.as_deref()),
+        source_repo_path: optional_string_field(args.source_repo_path.as_deref()),
         closed_at,
         close_reason,
         closed_by_session,

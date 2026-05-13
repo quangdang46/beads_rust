@@ -55,6 +55,11 @@ pub const SCHEMA_SQL: &str = r"
         ephemeral INTEGER NOT NULL DEFAULT 0,
         pinned INTEGER NOT NULL DEFAULT 0,
         is_template INTEGER NOT NULL DEFAULT 0,
+        -- source_repo_path is appended at the end (after is_template) to match
+        -- the position SQLite assigns to ALTER TABLE ADD COLUMN on existing DBs.
+        -- This keeps `EXPECTED_ISSUE_COLUMN_ORDER` consistent for both freshly-
+        -- created and migrated databases. See #289 for context.
+        source_repo_path TEXT,
         CHECK (
             (status = 'closed' AND closed_at IS NOT NULL) OR
             (status = 'tombstone') OR
@@ -660,6 +665,9 @@ const ISSUE_COLUMNS: &[(&str, &str)] = &[
     ("ephemeral", "INTEGER NOT NULL DEFAULT 0"),
     ("pinned", "INTEGER NOT NULL DEFAULT 0"),
     ("is_template", "INTEGER NOT NULL DEFAULT 0"),
+    // Appended at the end so SQLite's ALTER TABLE ADD COLUMN on existing DBs
+    // produces the same final column order as a fresh SCHEMA_SQL build.
+    ("source_repo_path", "TEXT"),
 ];
 
 const DEPENDENCY_COLUMNS: &[(&str, &str)] = &[
@@ -772,6 +780,7 @@ const EXPECTED_ISSUE_COLUMN_ORDER: &[&str] = &[
     "ephemeral",
     "pinned",
     "is_template",
+    "source_repo_path",
 ];
 
 /// Check whether the issues table has columns in the expected order.
@@ -2078,10 +2087,19 @@ mod tests {
             .and_then(SqliteValue::as_text)
             .expect("issues table SQL should be present");
 
+        // Use trailing space to disambiguate from `source_repo_path` (which
+        // contains `source_repo` as a prefix). The column declaration is
+        // `source_repo TEXT ...`, so the space-suffixed form matches the
+        // canonical declaration site exactly once.
         assert_eq!(
-            issues_sql.matches("source_repo").count(),
+            issues_sql.matches("source_repo ").count(),
             1,
             "issues table SQL should define source_repo exactly once"
+        );
+        assert_eq!(
+            issues_sql.matches("source_repo_path ").count(),
+            1,
+            "issues table SQL should define source_repo_path exactly once"
         );
         assert_eq!(
             issues_sql.matches("is_template").count(),

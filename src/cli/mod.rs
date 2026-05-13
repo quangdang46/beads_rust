@@ -1197,6 +1197,16 @@ pub struct UpdateArgs {
     #[arg(long)]
     pub external_ref: Option<String>,
 
+    /// Override `source_repo` (display name; usually the repo's basename, e.g. `widget_engine`)
+    #[arg(long = "source-repo")]
+    pub source_repo: Option<String>,
+
+    /// Override `source_repo_path` (absolute path to the directory containing
+    /// the `.beads` folder; populates the canonical filesystem location of the
+    /// repo for cross-machine sync awareness — see #289)
+    #[arg(long = "source-repo-path")]
+    pub source_repo_path: Option<String>,
+
     /// Set `closed_by_session` when closing
     #[arg(long)]
     pub session: Option<String>,

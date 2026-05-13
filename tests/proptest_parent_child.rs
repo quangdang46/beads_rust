@@ -39,6 +39,7 @@ fn make_test_issue(id: &str) -> Issue {
         external_ref: None,
         source_system: None,
         source_repo: None,
+        source_repo_path: None,
         deleted_at: None,
         deleted_by: None,
         delete_reason: None,
