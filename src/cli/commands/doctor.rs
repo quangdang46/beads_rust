@@ -8431,6 +8431,83 @@ mod tests {
     }
 
     #[test]
+    fn test_check_base_jsonl_missing_is_ok() {
+        // Missing on fresh clone is legitimate; report Ok.
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let mut checks = Vec::new();
+        check_base_jsonl(&beads_dir, &mut checks);
+        let check = find_check(&checks, "base_jsonl").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+    }
+
+    #[test]
+    fn test_check_base_jsonl_stale_anchor_warns() {
+        // base.jsonl mtime < live JSONL mtime → warn stale.
+        // Use std::fs::FileTimes to deterministically backdate the base
+        // anchor rather than relying on real-time sleeps (which are
+        // flaky on coarse-mtime filesystems).
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let base = beads_dir.join("beads.base.jsonl");
+        let live = beads_dir.join("issues.jsonl");
+        fs::write(&base, b"{\"id\":\"bd-old\"}\n").unwrap();
+        fs::write(&live, b"{\"id\":\"bd-new\"}\n").unwrap();
+
+        let two_hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        let times = std::fs::FileTimes::new()
+            .set_accessed(two_hours_ago)
+            .set_modified(two_hours_ago);
+        let base_file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&base)
+            .unwrap();
+        base_file.set_times(times).unwrap();
+        drop(base_file);
+
+        let mut checks = Vec::new();
+        check_base_jsonl(&beads_dir, &mut checks);
+        let check = find_check(&checks, "base_jsonl").expect("check present");
+        assert!(
+            matches!(check.status, CheckStatus::Warn),
+            "{check:?} should be Warn for stale anchor"
+        );
+        let kind = check
+            .details
+            .as_ref()
+            .and_then(|d| d.get("kind"))
+            .and_then(|v| v.as_str());
+        assert_eq!(kind, Some("stale"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_base_jsonl_symlink_warns() {
+        // Symlinked anchor → warn (security risk per 401c0495).
+        use std::os::unix::fs::symlink;
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let outside = temp.path().join("outside.jsonl");
+        fs::write(&outside, b"{\"id\":\"bd-outside\"}\n").unwrap();
+        symlink(&outside, beads_dir.join("beads.base.jsonl")).unwrap();
+
+        let mut checks = Vec::new();
+        check_base_jsonl(&beads_dir, &mut checks);
+        let check = find_check(&checks, "base_jsonl").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn));
+        let kind = check
+            .details
+            .as_ref()
+            .and_then(|d| d.get("kind"))
+            .and_then(|v| v.as_str());
+        assert_eq!(kind, Some("symlink"));
+    }
+
+    #[test]
     fn test_fixer_filter_empty_allows_everything() {
         // Pass-5 cycle 1: default (no --only/--skip) accepts every FM.
         let filter = FixerFilter::default();
