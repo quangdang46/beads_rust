@@ -3467,10 +3467,7 @@ fn check_base_jsonl(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
                 checks,
                 "base_jsonl",
                 CheckStatus::Warn,
-                Some(format!(
-                    "Could not inspect {}: {err}",
-                    base_path.display()
-                )),
+                Some(format!("Could not inspect {}: {err}", base_path.display())),
                 Some(serde_json::json!({
                     "path": base_path.display().to_string(),
                     "kind": "unreadable",
@@ -8461,10 +8458,7 @@ mod tests {
         let times = std::fs::FileTimes::new()
             .set_accessed(two_hours_ago)
             .set_modified(two_hours_ago);
-        let base_file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&base)
-            .unwrap();
+        let base_file = std::fs::OpenOptions::new().write(true).open(&base).unwrap();
         base_file.set_times(times).unwrap();
         drop(base_file);
 

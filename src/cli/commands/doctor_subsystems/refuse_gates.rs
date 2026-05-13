@@ -124,7 +124,7 @@ fn gate_recovery_fingerprint_integrity_in_dir(recovery_dir: &Path) -> GateOutcom
     if !recovery_dir.exists() {
         return GateOutcome::Allow;
     }
-    let mismatches = match scan_fingerprints(&recovery_dir) {
+    let mismatches = match scan_fingerprints(recovery_dir) {
         Ok(v) => v,
         Err(e) => {
             return GateOutcome::Refuse {
@@ -201,7 +201,26 @@ fn scan_fingerprints(recovery_dir: &Path) -> std::io::Result<Vec<FingerprintMism
         let Some(target_rel) = fp.get("artifact").and_then(|v| v.as_str()) else {
             continue;
         };
-        let target = recovery_dir.join(target_rel);
+        let target_rel_path = Path::new(target_rel);
+        if target_rel_path.is_absolute()
+            || target_rel_path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::Prefix(_)
+                        | std::path::Component::RootDir
+                )
+            })
+        {
+            out.push(FingerprintMismatch {
+                artifact: target_rel.to_string(),
+                fingerprint: path.display().to_string(),
+                reason: "fingerprint artifact path must stay inside the recovery directory"
+                    .to_string(),
+            });
+            continue;
+        }
+        let target = recovery_dir.join(target_rel_path);
         let expected_sha = fp
             .get("sha256")
             .and_then(|v| v.as_str())
@@ -210,6 +229,28 @@ fn scan_fingerprints(recovery_dir: &Path) -> std::io::Result<Vec<FingerprintMism
         if expected_sha.is_empty() {
             // Symlink / dir fingerprints have no sha; skip.
             continue;
+        }
+        match fs::symlink_metadata(&target) {
+            Ok(metadata) => {
+                let file_type = metadata.file_type();
+                if file_type.is_symlink() || !file_type.is_file() {
+                    out.push(FingerprintMismatch {
+                        artifact: target.display().to_string(),
+                        fingerprint: path.display().to_string(),
+                        reason: "fingerprint artifact with sha256 must be a regular file"
+                            .to_string(),
+                    });
+                    continue;
+                }
+            }
+            Err(e) => {
+                out.push(FingerprintMismatch {
+                    artifact: target.display().to_string(),
+                    fingerprint: path.display().to_string(),
+                    reason: format!("could not inspect artifact: {e}"),
+                });
+                continue;
+            }
         }
         let bytes = match fs::read(&target) {
             Ok(b) => b,
@@ -223,7 +264,7 @@ fn scan_fingerprints(recovery_dir: &Path) -> std::io::Result<Vec<FingerprintMism
             }
         };
         let actual = hex_encode(&Sha256::digest(&bytes));
-        if actual != expected_sha {
+        if actual.as_str().ne(expected_sha.as_str()) {
             out.push(FingerprintMismatch {
                 artifact: target.display().to_string(),
                 fingerprint: path.display().to_string(),
@@ -389,6 +430,43 @@ mod tests {
             GateOutcome::Allow => {
                 panic!("must refuse mismatched fingerprints beside the active db path")
             }
+        }
+    }
+
+    #[test]
+    fn recovery_fingerprint_integrity_refuses_artifact_path_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        let recovery = beads_dir.join(".br_recovery");
+        fs::create_dir_all(&recovery).unwrap();
+
+        let outside = beads_dir.join("outside.bin");
+        fs::write(&outside, b"outside bytes").unwrap();
+        let outside_sha = hex_encode(&Sha256::digest(b"outside bytes"));
+        let fingerprint = serde_json::json!({
+            "artifact": "../outside.bin",
+            "sha256": outside_sha,
+        });
+        fs::write(
+            recovery.join("escape.fingerprint.json"),
+            serde_json::to_string_pretty(&fingerprint).unwrap(),
+        )
+        .unwrap();
+
+        let outcome = gate_recovery_fingerprint_integrity(&beads_dir);
+        match outcome {
+            GateOutcome::Refuse { evidence, .. } => {
+                assert_eq!(evidence["gate"], "recovery_fingerprint_integrity");
+                let arr = evidence["mismatched_artifacts"].as_array().expect("array");
+                assert_eq!(arr.len(), 1);
+                assert!(
+                    arr[0]["reason"]
+                        .as_str()
+                        .is_some_and(|reason| reason.contains("inside the recovery directory")),
+                    "unexpected evidence: {evidence}"
+                );
+            }
+            GateOutcome::Allow => panic!("must refuse artifact path traversal"),
         }
     }
 }
