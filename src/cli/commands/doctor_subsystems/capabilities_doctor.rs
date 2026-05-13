@@ -300,10 +300,16 @@ fn build_detector_registry() -> Vec<DetectorEntry> {
 /// `mutate()` chokepoint (per WP1+WP3 contract); `false` flags the
 /// few legacy paths that still bypass the chokepoint (see
 /// `beads_rust-8fud` for the migration plan).
-#[allow(clippy::too_many_lines)]
-fn build_fixer_registry() -> Vec<FixerEntry> {
-    // (id, subsystem, auto_fixable, mutates_via_chokepoint, addressed_findings)
-    let rows: &[(&str, &str, bool, bool, &[&str])] = &[
+type FixerRow = (
+    &'static str,
+    &'static str,
+    bool,
+    bool,
+    &'static [&'static str],
+);
+
+fn chokepoint_fixer_rows() -> &'static [FixerRow] {
+    &[
         (
             "doctor.gitignore_repair",
             "configs",
@@ -340,6 +346,30 @@ fn build_fixer_registry() -> Vec<FixerEntry> {
             &["db.export_hash_cache"],
         ),
         (
+            "doctor.repair_database_from_jsonl",
+            "state_files",
+            true,
+            true,
+            &[
+                "db.open",
+                "counts.db_vs_jsonl",
+                "schema.tables",
+                "schema.columns",
+            ],
+        ),
+        (
+            "doctor.repair_database_sidecars",
+            "state_files",
+            true,
+            true,
+            &["db.sidecars"],
+        ),
+    ]
+}
+
+fn legacy_fixer_rows() -> &'static [FixerRow] {
+    &[
+        (
             "doctor.repair_recoverable_db_state",
             "caches_indexes",
             true,
@@ -360,25 +390,11 @@ fn build_fixer_registry() -> Vec<FixerEntry> {
             false,
             &["sqlite.integrity_check", "sqlite3.integrity_check"],
         ),
-        (
-            "doctor.repair_database_from_jsonl",
-            "state_files",
-            true,
-            true,
-            &[
-                "db.open",
-                "counts.db_vs_jsonl",
-                "schema.tables",
-                "schema.columns",
-            ],
-        ),
-        (
-            "doctor.repair_database_sidecars",
-            "state_files",
-            true,
-            true,
-            &["db.sidecars"],
-        ),
+    ]
+}
+
+fn refuse_gate_fixer_rows() -> &'static [FixerRow] {
+    &[
         (
             "refuse_gates.schema_version_downgrade",
             "schemas",
@@ -393,17 +409,27 @@ fn build_fixer_registry() -> Vec<FixerEntry> {
             false,
             &["db.recovery_artifacts"],
         ),
-    ];
-    rows.iter()
-        .map(
-            |(id, subsystem, auto_fixable, mutates, addressed)| FixerEntry {
-                id: (*id).to_string(),
-                subsystem: (*subsystem).to_string(),
-                auto_fixable: *auto_fixable,
-                mutates: *mutates,
-                addressed_findings: addressed.iter().map(|s| (*s).to_string()).collect(),
-            },
-        )
+    ]
+}
+
+fn fixer_entry_from_row(row: &FixerRow) -> FixerEntry {
+    let (id, subsystem, auto_fixable, mutates, addressed) = *row;
+    FixerEntry {
+        id: id.to_string(),
+        subsystem: subsystem.to_string(),
+        auto_fixable,
+        mutates,
+        addressed_findings: addressed.iter().map(|s| (*s).to_string()).collect(),
+    }
+}
+
+fn build_fixer_registry() -> Vec<FixerEntry> {
+    // (id, subsystem, auto_fixable, mutates_via_chokepoint, addressed_findings)
+    chokepoint_fixer_rows()
+        .iter()
+        .chain(legacy_fixer_rows())
+        .chain(refuse_gate_fixer_rows())
+        .map(fixer_entry_from_row)
         .collect()
 }
 
