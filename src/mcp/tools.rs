@@ -2505,9 +2505,16 @@ fn manage_dependencies_add_json(
         .map_err(beads_to_mcp)?;
 
     require_valid_issue(storage, id)?;
-    require_valid_issue(storage, depends_on)?;
+    if depends_on.starts_with("external:") {
+        if let Some(err) = detect_placeholder(depends_on) {
+            return Err(err);
+        }
+    } else {
+        require_valid_issue(storage, depends_on)?;
+    }
 
     if dep_type.is_blocking()
+        && !depends_on.starts_with("external:")
         && storage
             .would_create_cycle(id, depends_on, true)
             .map_err(beads_to_mcp)?
@@ -2710,7 +2717,7 @@ impl ToolHandler for ManageDependenciesTool {
                     },
                     "depends_on": {
                         "type": "string",
-                        "description": "Target issue ID (required for add/remove). Must be a real ID."
+                        "description": "Target issue ID or external:<project>:<capability> reference (required for add/remove)."
                     },
                     "dep_type": {
                         "type": "string",
@@ -4604,6 +4611,67 @@ mod tests {
                 dep.depends_on_id == second && dep.dep_type == DependencyType::Related
             })
         );
+    }
+
+    #[test]
+    fn manage_dependencies_allows_external_targets() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        insert_test_issue(&state, "br-mcp-external-src", "external dependency source");
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let tool = ManageDependenciesTool::new(Arc::clone(&state));
+
+        let add = content_json(
+            &tool
+                .call(
+                    &ctx,
+                    json!({
+                        "action": "add",
+                        "id": "br-mcp-external-src",
+                        "depends_on": "external:api:auth",
+                        "dep_type": "blocks"
+                    }),
+                )
+                .expect("add external dependency"),
+        );
+        assert_eq!(add["added"].as_bool(), Some(true));
+        assert_eq!(add["to"].as_str(), Some("external:api:auth"));
+
+        let list = content_json(
+            &tool
+                .call(
+                    &ctx,
+                    json!({
+                        "action": "list",
+                        "id": "br-mcp-external-src",
+                    }),
+                )
+                .expect("list dependencies"),
+        );
+        let depends_on = list["depends_on"]
+            .as_array()
+            .expect("depends_on should be array");
+        assert!(
+            depends_on.iter().any(|dep| {
+                dep["id"].as_str() == Some("external:api:auth")
+                    && dep["dep_type"].as_str() == Some("blocks")
+            }),
+            "MCP list should include external dependency: {list}"
+        );
+
+        let remove = content_json(
+            &tool
+                .call(
+                    &ctx,
+                    json!({
+                        "action": "remove",
+                        "id": "br-mcp-external-src",
+                        "depends_on": "external:api:auth",
+                    }),
+                )
+                .expect("remove external dependency"),
+        );
+        assert_eq!(remove["removed"].as_bool(), Some(true));
     }
 
     #[test]
