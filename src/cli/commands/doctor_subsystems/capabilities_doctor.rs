@@ -253,6 +253,12 @@ fn build_detector_registry() -> Vec<DetectorEntry> {
         ("jsonl.parse", "state_files", "error", true),
         ("jsonl.merge_artifacts", "state_files", "warn", true),
         ("base_jsonl", "state_files", "warn", true),
+        (
+            "base_jsonl.missing_post_flush",
+            "state_files",
+            "warn",
+            false,
+        ),
         ("startup_cache.health", "configs", "warn", true),
         ("sync_jsonl_path", "state_files", "warn", true),
         ("sync_conflict_markers", "state_files", "error", true),

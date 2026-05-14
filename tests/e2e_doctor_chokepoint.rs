@@ -1230,6 +1230,88 @@ fn chokepoint_refuse_gate_blocks_downgrade() {
     );
 }
 
+/// `br doctor --repair-indexes` is narrower than `--repair`, but it still
+/// mutates SQLite index b-trees. It must therefore honor the same WP1
+/// refuse-unsafe gates before snapshotting or running REINDEX.
+#[test]
+fn chokepoint_repair_indexes_refuse_gate_blocks_downgrade() {
+    let tmp = TempDir::new().expect("tempdir");
+    let root = tmp.path().to_path_buf();
+
+    br_init(&root);
+
+    let db_path = root.join(".beads").join("beads.db");
+    assert!(
+        db_path.is_file(),
+        "br init must produce {}",
+        db_path.display()
+    );
+
+    let bumped: u32 = 9_999;
+    {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&db_path)
+            .expect("open beads.db for header patch");
+        let mut magic = [0_u8; 16];
+        f.read_exact(&mut magic).expect("read sqlite magic");
+        assert_eq!(
+            &magic, b"SQLite format 3\0",
+            "test fixture is not a SQLite file: {magic:?}"
+        );
+        f.seek(SeekFrom::Start(60)).expect("seek to user_version");
+        f.write_all(&bumped.to_be_bytes())
+            .expect("patch user_version");
+        f.sync_data().expect("fsync patched header");
+    }
+
+    let pre_state = hash_workspace(&root);
+
+    let bin_path = env!("CARGO_BIN_EXE_br");
+    let output = std::process::Command::new(bin_path)
+        .args(["doctor", "--repair-indexes", "--json"])
+        .current_dir(&root)
+        .env("RUST_LOG", "error")
+        .env("BR_NO_AUTOFLUSH", "1")
+        .env_remove("BD_DB")
+        .env_remove("BEADS_DB")
+        .output()
+        .expect("invoke br doctor --repair-indexes");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "expected exit 4 RefusedUnsafe; got {:?}\nstdout={stdout}\nstderr={stderr}",
+        output.status.code()
+    );
+
+    let parsed = parse_trailing_json(&stdout);
+    assert_eq!(parsed["ok"], Value::Bool(false));
+    assert_eq!(parsed["exit_code"], Value::from(4));
+    assert_eq!(parsed["code"], Value::String("refused_unsafe".into()));
+    assert_eq!(
+        parsed["gate"],
+        Value::String("schema_version_downgrade".into()),
+        "envelope must name the gate; full payload={parsed}"
+    );
+    assert_eq!(
+        parsed["evidence"]["db_schema_version"],
+        Value::from(bumped),
+        "evidence must echo the planted schema version"
+    );
+
+    let post_state = hash_workspace(&root);
+    assert_eq!(
+        pre_state, post_state,
+        "refused --repair-indexes must leave the workspace untouched"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Test 11 (Phase-10 cold-prober follow-through, bead `beads_rust-s7nx`):
 // `br doctor` (flat, no --repair) in a directory that does not contain a

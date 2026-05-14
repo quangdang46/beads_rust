@@ -631,6 +631,10 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
         "fm-state_files-merge-artifact-stuck",
     ),
     ("base_jsonl", "fm-state_files-base-jsonl-missing-or-stale"),
+    (
+        "base_jsonl.missing_post_flush",
+        "fm-state_files-base-jsonl-missing-or-stale",
+    ),
     ("startup_cache.health", "fm-configs-startup-cache-poisoned"),
     ("sync_jsonl_path", FM_JSONL_ROW_COUNT_MISMATCH),
     (
@@ -2808,6 +2812,77 @@ fn check_export_hash_cache_divergence(
             // No cached row at all — first sync hasn't run yet. Not a
             // failure mode for this FM.
             push_check(checks, "db.export_hash_cache", CheckStatus::Ok, None, None);
+        }
+    }
+}
+
+/// Pass-5 cycle 7: DB-aware detector for the "missing-post-flush" subset
+/// of `fm-state_files-base-jsonl-missing-or-stale`.
+///
+/// The file-based `check_base_jsonl` (in collect_doctor_report) can't
+/// distinguish "missing on a fresh clone, no merges yet" from
+/// "missing AFTER a sync flush has run". The former is legitimate;
+/// the latter means the merge anchor was lost. This check reads
+/// `metadata.last_export_time` from the snapshot connection and emits
+/// Warn if that value is set AND `.beads/beads.base.jsonl` doesn't
+/// exist on disk. Closes the third subset of the FM that cycles 4-6
+/// deferred (operator regen still happens via the cycle 6 fixer if
+/// they also have a live JSONL — the missing-post-flush check just
+/// surfaces the discrepancy as a warning the operator can address).
+fn check_base_jsonl_missing_post_flush(
+    conn: &Connection,
+    beads_dir: &Path,
+    checks: &mut Vec<CheckResult>,
+) {
+    let anchor = beads_dir.join("beads.base.jsonl");
+    // Cheap fast-path: if the anchor exists (any kind: regular,
+    // symlink, etc.) the file-based check already handled it.
+    if fs::symlink_metadata(&anchor).is_ok() {
+        push_check(
+            checks,
+            "base_jsonl.missing_post_flush",
+            CheckStatus::Ok,
+            None,
+            None,
+        );
+        return;
+    }
+    let last_export = match conn.query("SELECT value FROM metadata WHERE key='last_export_time'") {
+        Ok(rows) => rows
+            .first()
+            .and_then(|row| row.values().first().cloned())
+            .and_then(|v| match v {
+                SqliteValue::Text(s) => Some(s.to_string()),
+                _ => None,
+            }),
+        Err(_) => None,
+    };
+    match last_export {
+        Some(stamp) if !stamp.is_empty() => {
+            push_check(
+                checks,
+                "base_jsonl.missing_post_flush",
+                CheckStatus::Warn,
+                Some(format!(
+                    "Merge anchor {} is missing despite metadata.last_export_time={stamp} — sync flush should have produced one",
+                    anchor.display()
+                )),
+                Some(serde_json::json!({
+                    "anchor": anchor.display().to_string(),
+                    "last_export_time": stamp,
+                    "kind": "missing_post_flush",
+                })),
+            );
+        }
+        _ => {
+            // No prior export → fresh workspace; missing is legitimate.
+            push_check(
+                checks,
+                "base_jsonl.missing_post_flush",
+                CheckStatus::Ok,
+                None,
+                None,
+            );
         }
     }
 }
@@ -7088,6 +7163,14 @@ fn inspect_existing_doctor_database(
         // the JSONL on disk. Uses the SNAPSHOT connection so the live
         // DB family (incl. SHM/WAL sidecars) is undisturbed.
         check_export_hash_cache_divergence(&conn, jsonl_path, checks);
+        // Pass-5 cycle 7: missing-post-flush anchor (DB-aware variant of
+        // the file-based base_jsonl check). Uses metadata.last_export_time
+        // to distinguish fresh-clone-missing from post-flush-missing.
+        // The anchor file is checked at the REAL beads_dir (db_path's
+        // parent), not the snapshot dir, because the missing-on-disk
+        // condition must reference the live workspace.
+        let real_beads_dir = db_path.parent().unwrap_or(db_path);
+        check_base_jsonl_missing_post_flush(&conn, real_beads_dir, checks);
         // beads_rust-m3mi: audit-suspect close_reasons (warn level)
         check_suspect_close_reasons(&conn, checks);
         if mode == DoctorInspectionMode::Full {
@@ -7285,6 +7368,14 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         }
     }
 
+    // --repair-indexes (#288): REINDEX-only recovery path, strictly
+    // narrower than --repair. It must run before live report collection
+    // because report collection opens the DB; refuse-unsafe gates need
+    // to inspect the pre-open on-disk state.
+    if args.repair_indexes && !args.robot_triage {
+        return execute_repair_indexes(&beads_dir, &paths, ctx, args, cli);
+    }
+
     let inspection_mode = if args.quick && !args.repair && !args.robot_triage {
         DoctorInspectionMode::Quick
     } else {
@@ -7324,14 +7415,6 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     } else {
         None
     };
-
-    // --repair-indexes (#288): REINDEX-only recovery path, strictly
-    // narrower than --repair. Runs before the read-only return so
-    // operators get the repair result instead of the pre-repair
-    // findings.
-    if args.repair_indexes {
-        return execute_repair_indexes(&beads_dir, &paths, ctx, args, cli);
-    }
 
     // Pass-5 cycle 1: per-FM filter built from --only/--skip flags.
     // The 5 chokepointed fixers below consult the filter; legacy
@@ -8979,6 +9062,53 @@ mod tests {
         ));
         // Anchor preserved.
         assert_eq!(fs::read(&anchor).unwrap(), b"{\"id\":\"bd-anchor\"}\n");
+    }
+
+    #[test]
+    fn test_check_base_jsonl_missing_post_flush_warns_after_export() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        storage
+            .set_metadata(
+                crate::sync::METADATA_LAST_EXPORT_TIME,
+                "2026-05-01T00:00:00Z",
+            )
+            .unwrap();
+        drop(storage);
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let mut checks = Vec::new();
+        check_base_jsonl_missing_post_flush(&conn, &beads_dir, &mut checks);
+
+        let check = find_check(&checks, "base_jsonl.missing_post_flush").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn));
+        assert_eq!(
+            check
+                .details
+                .as_ref()
+                .and_then(|details| details.get("kind"))
+                .and_then(serde_json::Value::as_str),
+            Some("missing_post_flush")
+        );
+    }
+
+    #[test]
+    fn test_check_base_jsonl_missing_post_flush_allows_fresh_missing_anchor() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        let _storage = SqliteStorage::open(&db_path).unwrap();
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let mut checks = Vec::new();
+        check_base_jsonl_missing_post_flush(&conn, &beads_dir, &mut checks);
+
+        let check = find_check(&checks, "base_jsonl.missing_post_flush").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok));
     }
 
     #[test]
