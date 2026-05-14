@@ -259,6 +259,7 @@ fn build_detector_registry() -> Vec<DetectorEntry> {
             "warn",
             false,
         ),
+        ("dirty_bitmap", "caches_indexes", "warn", false),
         ("startup_cache.health", "configs", "warn", true),
         ("sync_jsonl_path", "state_files", "warn", true),
         ("sync_conflict_markers", "state_files", "error", true),

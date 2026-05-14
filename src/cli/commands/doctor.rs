@@ -635,6 +635,7 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
         "base_jsonl.missing_post_flush",
         "fm-state_files-base-jsonl-missing-or-stale",
     ),
+    ("dirty_bitmap", "fm-caches_indexes-dirty-bitmap-divergence"),
     ("startup_cache.health", "fm-configs-startup-cache-poisoned"),
     ("sync_jsonl_path", FM_JSONL_ROW_COUNT_MISMATCH),
     (
@@ -2885,6 +2886,66 @@ fn check_base_jsonl_missing_post_flush(
             );
         }
     }
+}
+
+/// Pass-5 cycle 8: detector for `fm-caches_indexes-dirty-bitmap-divergence`.
+///
+/// The `dirty_issues` table tracks which issues need re-export. Its
+/// schema declares an FK with `ON DELETE CASCADE` so orphans
+/// shouldn't normally exist, but if FK enforcement was off when
+/// issues were deleted (or a partial-rebuild path bypassed the FK
+/// pragma), orphan rows can linger and cause incremental export
+/// to attempt rewriting non-existent records. Detect-only: the
+/// repair path is already covered by the existing
+/// `repair_database_from_jsonl` rebuild, which truncates
+/// `dirty_issues` and rebuilds from authoritative state.
+fn check_dirty_bitmap_divergence(conn: &Connection, checks: &mut Vec<CheckResult>) {
+    let Ok(rows) = conn.query(
+        "SELECT COUNT(*) FROM dirty_issues d LEFT JOIN issues i ON d.issue_id = i.id WHERE i.id IS NULL",
+    ) else {
+        // dirty_issues missing → upstream schema check covers it.
+        push_check(checks, "dirty_bitmap", CheckStatus::Ok, None, None);
+        return;
+    };
+    let orphan_count = rows
+        .first()
+        .and_then(|row| row.values().first().cloned())
+        .and_then(|v| match v {
+            SqliteValue::Integer(n) => Some(n),
+            _ => None,
+        })
+        .unwrap_or(0);
+    if orphan_count == 0 {
+        push_check(checks, "dirty_bitmap", CheckStatus::Ok, None, None);
+        return;
+    }
+    // Sample up to 5 orphan ids for the operator.
+    let sample: Vec<String> = match conn.query(
+        "SELECT d.issue_id FROM dirty_issues d LEFT JOIN issues i ON d.issue_id = i.id WHERE i.id IS NULL LIMIT 5",
+    ) {
+        Ok(rows) => rows
+            .iter()
+            .filter_map(|row| row.values().first().cloned())
+            .filter_map(|v| match v {
+                SqliteValue::Text(s) => Some(s.to_string()),
+                _ => None,
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    push_check(
+        checks,
+        "dirty_bitmap",
+        CheckStatus::Warn,
+        Some(format!(
+            "{orphan_count} orphan row(s) in dirty_issues — issue_id has no matching issues row (FK guard probably bypassed during a delete)"
+        )),
+        Some(serde_json::json!({
+            "orphan_count": orphan_count,
+            "sample_issue_ids": sample,
+            "remediation": "br doctor --repair triggers a JSONL rebuild that truncates dirty_issues",
+        })),
+    );
 }
 
 fn push_recoverable_anomalies_check(checks: &mut Vec<CheckResult>, findings: &[String]) {
@@ -7171,6 +7232,10 @@ fn inspect_existing_doctor_database(
         // condition must reference the live workspace.
         let real_beads_dir = db_path.parent().unwrap_or(db_path);
         check_base_jsonl_missing_post_flush(&conn, real_beads_dir, checks);
+        // Pass-5 cycle 8: detect orphan rows in dirty_issues (FK
+        // CASCADE bypassed). Uses the snapshot connection so live DB
+        // family is undisturbed.
+        check_dirty_bitmap_divergence(&conn, checks);
         // beads_rust-m3mi: audit-suspect close_reasons (warn level)
         check_suspect_close_reasons(&conn, checks);
         if mode == DoctorInspectionMode::Full {
@@ -9109,6 +9174,61 @@ mod tests {
 
         let check = find_check(&checks, "base_jsonl.missing_post_flush").expect("check present");
         assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn test_check_dirty_bitmap_clean_workspace_ok() {
+        // No orphan rows in dirty_issues → check returns Ok.
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let _storage = SqliteStorage::open(&db_path).unwrap();
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let mut checks = Vec::new();
+        check_dirty_bitmap_divergence(&conn, &mut checks);
+        let check = find_check(&checks, "dirty_bitmap").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+    }
+
+    #[test]
+    fn test_check_dirty_bitmap_orphan_row_warns() {
+        // Insert an orphan into dirty_issues with FK guard disabled,
+        // then assert the detector finds it and reports kind details.
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let _storage = SqliteStorage::open(&db_path).unwrap();
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        // Disable FK enforcement so the orphan insert succeeds.
+        let _ = conn.execute("PRAGMA foreign_keys = OFF");
+        conn.execute_with_params(
+            "INSERT INTO dirty_issues(issue_id, marked_at) VALUES (?1, ?2)",
+            &[
+                SqliteValue::Text("bd-orphan-1".into()),
+                SqliteValue::Text("2026-05-14T00:00:00Z".into()),
+            ],
+        )
+        .unwrap();
+
+        let mut checks = Vec::new();
+        check_dirty_bitmap_divergence(&conn, &mut checks);
+        let check = find_check(&checks, "dirty_bitmap").expect("check present");
+        assert!(
+            matches!(check.status, CheckStatus::Warn),
+            "{check:?} should be Warn"
+        );
+        let orphan_count = check
+            .details
+            .as_ref()
+            .and_then(|d| d.get("orphan_count"))
+            .and_then(serde_json::Value::as_i64);
+        assert_eq!(orphan_count, Some(1));
+        let sample = check
+            .details
+            .as_ref()
+            .and_then(|d| d.get("sample_issue_ids"))
+            .and_then(|v| v.as_array())
+            .map(Vec::len)
+            .unwrap_or(0);
+        assert_eq!(sample, 1);
     }
 
     #[test]

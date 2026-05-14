@@ -6440,7 +6440,14 @@ mod tests {
         let issue = make_test_issue("bd-scan-error", "Dirty issue");
         storage.create_issue(&issue, "tester").unwrap();
 
-        let err = auto_flush(&mut storage, &beads_dir, &jsonl_path, false, HistoryConfig::default()).unwrap_err();
+        let err = auto_flush(
+            &mut storage,
+            &beads_dir,
+            &jsonl_path,
+            false,
+            HistoryConfig::default(),
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("directory")
                 || err.to_string().contains("Is a directory")
@@ -6467,7 +6474,14 @@ mod tests {
         let issue = make_test_issue("bd-auto-flush-path", "Dirty issue");
         storage.create_issue(&issue, "tester").unwrap();
 
-        let err = auto_flush(&mut storage, &beads_dir, &outside_jsonl_path, false, HistoryConfig::default()).unwrap_err();
+        let err = auto_flush(
+            &mut storage,
+            &beads_dir,
+            &outside_jsonl_path,
+            false,
+            HistoryConfig::default(),
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("outside the beads directory"),
             "unexpected error: {err}"
@@ -7777,7 +7791,14 @@ mod tests {
         let issue = make_test_issue("bd-noop", "No-op dirty marker");
         storage.create_issue(&issue, "test").unwrap();
 
-        let first = auto_flush(&mut storage, &beads_dir, &output_path, false, HistoryConfig::default()).unwrap();
+        let first = auto_flush(
+            &mut storage,
+            &beads_dir,
+            &output_path,
+            false,
+            HistoryConfig::default(),
+        )
+        .unwrap();
         assert!(first.flushed);
         let before = fs::read_to_string(&output_path).unwrap();
 
@@ -7785,7 +7806,14 @@ mod tests {
             .replace_dirty_issue_marker("bd-noop", "manual-dirty-marker")
             .unwrap();
 
-        let second = auto_flush(&mut storage, &beads_dir, &output_path, false, HistoryConfig::default()).unwrap();
+        let second = auto_flush(
+            &mut storage,
+            &beads_dir,
+            &output_path,
+            false,
+            HistoryConfig::default(),
+        )
+        .unwrap();
         assert!(
             !second.flushed,
             "byte-identical dirty markers should not rewrite JSONL"
