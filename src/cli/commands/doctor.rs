@@ -2951,6 +2951,12 @@ fn check_orphan_tmp_files(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
         if !is_tmp_shape {
             continue;
         }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
+        }
         let Ok(meta) = entry.metadata() else {
             continue;
         };
@@ -2965,6 +2971,7 @@ fn check_orphan_tmp_files(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
             orphans.push(name.to_string());
         }
     }
+    orphans.sort();
     if orphans.is_empty() {
         push_check(checks, "tmp_files_orphan", CheckStatus::Ok, None, None);
     } else {
@@ -10130,6 +10137,71 @@ mod tests {
         check_orphan_tmp_files(&beads_dir, &mut checks);
         let check = find_check(&checks, "tmp_files_orphan").expect("check present");
         assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_orphan_tmp_files_ignores_symlinked_tmp_names() {
+        // A symlink named like an atomic-write tmp must not be reported
+        // based on its target's mtime. The detector is scoped to real
+        // files under `.beads/`, not external targets reached through
+        // symlinks.
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let target = temp.path().join("outside-target");
+        fs::write(&target, b"old outside target").unwrap();
+        let two_hours_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 60 * 60);
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&target)
+            .unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(two_hours_ago))
+            .unwrap();
+        drop(f);
+        symlink(&target, beads_dir.join("issues.jsonl.99999.tmp")).unwrap();
+
+        let mut checks = Vec::new();
+        check_orphan_tmp_files(&beads_dir, &mut checks);
+        let check = find_check(&checks, "tmp_files_orphan").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+    }
+
+    #[test]
+    fn test_check_orphan_tmp_files_reports_files_sorted() {
+        // Stable robot output matters for agents diffing doctor results.
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let two_hours_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 60 * 60);
+        for name in ["z.tmp", "a.tmp"] {
+            let tmp_path = beads_dir.join(name);
+            fs::write(&tmp_path, b"partial write").unwrap();
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&tmp_path)
+                .unwrap();
+            f.set_times(std::fs::FileTimes::new().set_modified(two_hours_ago))
+                .unwrap();
+        }
+
+        let mut checks = Vec::new();
+        check_orphan_tmp_files(&beads_dir, &mut checks);
+        let check = find_check(&checks, "tmp_files_orphan").expect("check present");
+        let files: Vec<&str> = check
+            .details
+            .as_ref()
+            .and_then(|d| d.get("files"))
+            .and_then(|v| v.as_array())
+            .expect("files array")
+            .iter()
+            .map(|v| v.as_str().expect("file name string"))
+            .collect();
+        assert_eq!(files, ["a.tmp", "z.tmp"]);
     }
 
     #[test]
