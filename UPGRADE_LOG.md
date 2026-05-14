@@ -4,7 +4,7 @@
 
 ## Summary
 
-- **Updated:** 0 | **Skipped:** 0 | **Failed:** 0 | **Blocked:** 0
+- **Updated:** 1 | **Skipped:** 0 | **Failed:** 0 | **Blocked:** 2
 
 ## Discovery
 
@@ -19,7 +19,13 @@
 
 - **Breaking:** None found for this project usage. This is a `clap` 4.x completion crate patch/minor-compatible bump; existing `unstable-dynamic` feature remains available.
 - **Migration:** Manifest version only.
-- **Tests:** Pending.
+- **Tests:** `cargo test --lib --all-features` via RCH passed: 2157 passed, 0 failed, 7 ignored.
+
+### Build metadata warnings: vergen git defaults
+
+- **Issue:** RCH and package-style builds can have no usable `.git` metadata, causing `vergen-gix` to emit `VERGEN_GIT_* set to default` build warnings.
+- **Migration:** Only emit git build metadata when `.git/HEAD` exists; package/non-git builds still emit build timestamp, target triple, and rustc version without warning.
+- **Tests:** `cargo check --all-targets --all-features` via RCH passed after the first fix but still showed git-default warnings; stricter `.git/HEAD` follow-up pending.
 
 ## Blockers / Needs Attention
 

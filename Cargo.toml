@@ -118,7 +118,7 @@ signal-hook = "0.3"
 vergen-gix = { version = "9.1", features = ["build", "cargo", "rustc"] }
 
 [dev-dependencies]
-assert_cmd = "2.2.1"
+assert_cmd = "2.2.2"
 predicates = "3.1.4"
 criterion = { version = "0.8.2", features = ["html_reports"] }
 walkdir = "2.5"
