@@ -645,6 +645,10 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
         "fm-permissions-config-yaml-mode-leaks-secrets",
     ),
     ("br_path_dupes", "fm-external_artifacts-multiple-br-in-path"),
+    (
+        "gitignore.beads_inner_present",
+        "fm-configs-gitignore-leaking-beads",
+    ),
     ("startup_cache.health", "fm-configs-startup-cache-poisoned"),
     ("sync_jsonl_path", FM_JSONL_ROW_COUNT_MISMATCH),
     (
@@ -2897,6 +2901,87 @@ fn check_base_jsonl_missing_post_flush(
                 None,
             );
         }
+    }
+}
+
+/// Pass-5 cycle 13: detector for the inner-gitignore-present subset of
+/// `fm-configs-gitignore-leaking-beads`.
+///
+/// Warns when `.beads/.gitignore` is missing (the workspace can leak
+/// transient state like `.write.lock` into git history) OR exists but
+/// doesn't list expected ephemeral patterns. Complements the existing
+/// `gitignore.beads_inner` check, which only validates that the ROOT
+/// `.gitignore` doesn't shadow this file.
+///
+/// Detect-only — operators may have intentionally pruned their
+/// inner `.gitignore` for compliance workflows; auto-rewriting would
+/// stomp their decisions.
+fn check_inner_gitignore_present(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
+    const EXPECTED_PATTERNS: &[&str] = &[".write.lock", "*.tmp"];
+    let path = beads_dir.join(".gitignore");
+    let Ok(contents) = fs::read_to_string(&path) else {
+        if path.exists() {
+            // Unreadable but present (perms issue?) — leave to the
+            // permissions check.
+            push_check(
+                checks,
+                "gitignore.beads_inner_present",
+                CheckStatus::Ok,
+                None,
+                None,
+            );
+            return;
+        }
+        push_check(
+            checks,
+            "gitignore.beads_inner_present",
+            CheckStatus::Warn,
+            Some(format!(
+                "{} is missing; transient .beads/ state can leak into git history",
+                path.display()
+            )),
+            Some(serde_json::json!({
+                "path": path.display().to_string(),
+                "kind": "missing",
+                "expected_patterns": EXPECTED_PATTERNS,
+                "remediation": format!(
+                    "Create {} with at least: {}",
+                    path.display(),
+                    EXPECTED_PATTERNS.join(", ")
+                ),
+            })),
+        );
+        return;
+    };
+    let missing: Vec<&str> = EXPECTED_PATTERNS
+        .iter()
+        .copied()
+        .filter(|needle| !contents.lines().map(str::trim).any(|line| line == *needle))
+        .collect();
+    if missing.is_empty() {
+        push_check(
+            checks,
+            "gitignore.beads_inner_present",
+            CheckStatus::Ok,
+            None,
+            None,
+        );
+    } else {
+        push_check(
+            checks,
+            "gitignore.beads_inner_present",
+            CheckStatus::Warn,
+            Some(format!(
+                "{} exists but is missing expected pattern(s): {}",
+                path.display(),
+                missing.join(", ")
+            )),
+            Some(serde_json::json!({
+                "path": path.display().to_string(),
+                "kind": "incomplete",
+                "missing_patterns": missing,
+            })),
+        );
     }
 }
 
@@ -7358,6 +7443,8 @@ fn collect_doctor_report_with_mode_and_db_override(
     // Pass-5 cycle 12: multiple `br` binaries on $PATH (env-based,
     // not workspace-scoped).
     check_multiple_br_in_path(&mut checks);
+    // Pass-5 cycle 13: .beads/.gitignore present + expected patterns.
+    check_inner_gitignore_present(beads_dir, &mut checks);
     check_root_gitignore(beads_dir, &mut checks);
     check_routes_jsonl(beads_dir, &mut checks);
     check_rust_log_noisy(&mut checks);
@@ -9704,6 +9791,72 @@ mod tests {
         let path_var = format!("{}:{}", real_dir.display(), link_dir.display());
         let found = br_binaries_in_path_str(&path_var);
         assert_eq!(found.len(), 1, "canonical dedup expected: {found:?}");
+    }
+
+    #[test]
+    fn test_check_inner_gitignore_present_missing_warns() {
+        // Pass-5 cycle 13: no .beads/.gitignore at all → warn kind="missing".
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let mut checks = Vec::new();
+        check_inner_gitignore_present(&beads_dir, &mut checks);
+        let check = find_check(&checks, "gitignore.beads_inner_present").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
+        assert_eq!(
+            check
+                .details
+                .as_ref()
+                .and_then(|d| d.get("kind"))
+                .and_then(|v| v.as_str()),
+            Some("missing")
+        );
+    }
+
+    #[test]
+    fn test_check_inner_gitignore_present_complete_ok() {
+        // Complete .gitignore with all expected patterns → ok.
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::write(beads_dir.join(".gitignore"), b".write.lock\n*.tmp\n").unwrap();
+
+        let mut checks = Vec::new();
+        check_inner_gitignore_present(&beads_dir, &mut checks);
+        let check = find_check(&checks, "gitignore.beads_inner_present").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+    }
+
+    #[test]
+    fn test_check_inner_gitignore_present_incomplete_warns() {
+        // Has .gitignore but missing one expected pattern → warn kind="incomplete".
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        // Only .write.lock, missing *.tmp.
+        fs::write(beads_dir.join(".gitignore"), b".write.lock\n").unwrap();
+
+        let mut checks = Vec::new();
+        check_inner_gitignore_present(&beads_dir, &mut checks);
+        let check = find_check(&checks, "gitignore.beads_inner_present").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn));
+        assert_eq!(
+            check
+                .details
+                .as_ref()
+                .and_then(|d| d.get("kind"))
+                .and_then(|v| v.as_str()),
+            Some("incomplete")
+        );
+        let missing = check
+            .details
+            .as_ref()
+            .and_then(|d| d.get("missing_patterns"))
+            .and_then(|v| v.as_array())
+            .map(Vec::len)
+            .unwrap_or(0);
+        assert_eq!(missing, 1);
     }
 
     #[test]
