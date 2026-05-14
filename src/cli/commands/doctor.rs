@@ -636,6 +636,10 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
         "fm-state_files-base-jsonl-missing-or-stale",
     ),
     ("dirty_bitmap", "fm-caches_indexes-dirty-bitmap-divergence"),
+    (
+        "doctor.runs_dir",
+        "fm-observability-doctor-runs-dir-grows-unbounded",
+    ),
     ("startup_cache.health", "fm-configs-startup-cache-poisoned"),
     ("sync_jsonl_path", FM_JSONL_ROW_COUNT_MISMATCH),
     (
@@ -2888,6 +2892,64 @@ fn check_base_jsonl_missing_post_flush(
                 None,
             );
         }
+    }
+}
+
+/// Pass-5 cycle 10: detector for
+/// `fm-observability-doctor-runs-dir-grows-unbounded`.
+///
+/// The doctor's own `.doctor/runs/<run-id>/` directories accumulate
+/// every time `--repair` runs. Long-running workspaces can pile up
+/// thousands of run-dirs, complicating `doctor undo` audits and using
+/// inodes. This check warns when the count exceeds
+/// `DOCTOR_RUNS_THRESHOLD` (50).
+///
+/// Detect-only by design: the doctor cannot prune its own audit
+/// history without explicit operator consent. Operators clean up by
+/// hand or via `find .doctor/runs/ -maxdepth 1 -mtime +N -exec mv {}
+/// quarantine/`. Auto-pruning would corrupt the chokepoint contract
+/// because subsequent `doctor undo <run-id>` calls would fail
+/// silently on pruned run-ids.
+const DOCTOR_RUNS_THRESHOLD: usize = 50;
+
+fn check_doctor_runs_dir_size(repo_root: &Path, checks: &mut Vec<CheckResult>) {
+    let runs_dir = repo_root.join(".doctor").join("runs");
+    let entries = match fs::read_dir(&runs_dir) {
+        Ok(e) => e,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            push_check(checks, "doctor.runs_dir", CheckStatus::Ok, None, None);
+            return;
+        }
+        Err(_) => {
+            // Unreadable runs dir is suspicious but a different FM owns
+            // permissions issues; emit Ok here and let the permissions
+            // detectors carry the signal.
+            push_check(checks, "doctor.runs_dir", CheckStatus::Ok, None, None);
+            return;
+        }
+    };
+    let run_count = entries
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .count();
+    if run_count > DOCTOR_RUNS_THRESHOLD {
+        push_check(
+            checks,
+            "doctor.runs_dir",
+            CheckStatus::Warn,
+            Some(format!(
+                "{run_count} run directories accumulated in {}; consider pruning (operator-driven; doctor cannot auto-prune its own audit history)",
+                runs_dir.display()
+            )),
+            Some(serde_json::json!({
+                "runs_dir": runs_dir.display().to_string(),
+                "run_count": run_count,
+                "threshold": DOCTOR_RUNS_THRESHOLD,
+                "remediation": "Operator: review and prune via `find .doctor/runs/ -maxdepth 1 -mtime +30 | xargs mv -t .doctor/runs/quarantine/`",
+            })),
+        );
+    } else {
+        push_check(checks, "doctor.runs_dir", CheckStatus::Ok, None, None);
     }
 }
 
@@ -7099,6 +7161,9 @@ fn collect_doctor_report_with_mode_and_db_override(
     let mut checks = Vec::new();
     check_merge_artifacts(beads_dir, &mut checks)?;
     check_base_jsonl(beads_dir, &mut checks);
+    // Pass-5 cycle 10: doctor's own runs dir size (operator-prunable).
+    let repo_root = beads_dir.parent().unwrap_or(beads_dir);
+    check_doctor_runs_dir_size(repo_root, &mut checks);
     check_root_gitignore(beads_dir, &mut checks);
     check_routes_jsonl(beads_dir, &mut checks);
     check_rust_log_noisy(&mut checks);
@@ -9263,6 +9328,52 @@ mod tests {
             .map(Vec::len)
             .unwrap_or(0);
         assert_eq!(sample, 1);
+    }
+
+    #[test]
+    fn test_check_doctor_runs_dir_below_threshold_ok() {
+        // Few run dirs → Ok.
+        let temp = TempDir::new().unwrap();
+        let runs = temp.path().join(".doctor").join("runs");
+        fs::create_dir_all(&runs).unwrap();
+        for i in 0..5 {
+            fs::create_dir_all(runs.join(format!("run-{i}"))).unwrap();
+        }
+        let mut checks = Vec::new();
+        check_doctor_runs_dir_size(temp.path(), &mut checks);
+        let check = find_check(&checks, "doctor.runs_dir").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn test_check_doctor_runs_dir_above_threshold_warns() {
+        // >threshold run dirs → Warn with count.
+        let temp = TempDir::new().unwrap();
+        let runs = temp.path().join(".doctor").join("runs");
+        fs::create_dir_all(&runs).unwrap();
+        for i in 0..(DOCTOR_RUNS_THRESHOLD + 5) {
+            fs::create_dir_all(runs.join(format!("run-{i}"))).unwrap();
+        }
+        let mut checks = Vec::new();
+        check_doctor_runs_dir_size(temp.path(), &mut checks);
+        let check = find_check(&checks, "doctor.runs_dir").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn));
+        let run_count = check
+            .details
+            .as_ref()
+            .and_then(|d| d.get("run_count"))
+            .and_then(serde_json::Value::as_u64);
+        assert_eq!(run_count, Some((DOCTOR_RUNS_THRESHOLD + 5) as u64));
+    }
+
+    #[test]
+    fn test_check_doctor_runs_dir_missing_is_ok() {
+        // No .doctor/runs at all → Ok (fresh workspace).
+        let temp = TempDir::new().unwrap();
+        let mut checks = Vec::new();
+        check_doctor_runs_dir_size(temp.path(), &mut checks);
+        let check = find_check(&checks, "doctor.runs_dir").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok));
     }
 
     #[test]
