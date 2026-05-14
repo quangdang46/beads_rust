@@ -14,9 +14,9 @@ use serde_json::json;
 use std::collections::HashSet;
 
 use crate::model::{Issue, IssueType, Status};
-use crate::storage::{ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage};
+use crate::storage::{ListFilters, SqliteStorage};
 
-use super::{BeadsState, to_mcp};
+use super::{BeadsState, mcp_ready_issues, to_mcp};
 
 // ---------------------------------------------------------------------------
 // Display limits — extracted from magic numbers for maintainability
@@ -115,10 +115,8 @@ fn unassigned_context(storage: &SqliteStorage) -> McpResult<String> {
 }
 
 /// Gather ready-issues context as a formatted string.
-fn ready_context(storage: &SqliteStorage) -> McpResult<String> {
-    let ready = storage
-        .get_ready_issues(&ReadyFilters::default(), ReadySortPolicy::Hybrid)
-        .map_err(to_mcp)?;
+fn ready_context(state: &BeadsState, storage: &SqliteStorage) -> McpResult<String> {
+    let ready = mcp_ready_issues(state, storage)?;
     if ready.is_empty() {
         return Ok("No ready issues.".into());
     }
@@ -278,7 +276,7 @@ impl PromptHandler for TriagePrompt {
             parts.push(deferred_context(&storage)?);
         }
         if focus == "all" {
-            parts.push(ready_context(&storage)?);
+            parts.push(ready_context(&self.0, &storage)?);
         }
 
         Ok(vec![
@@ -349,9 +347,7 @@ impl PromptHandler for StatusReportPrompt {
         let active = storage.count_active_issues().map_err(to_mcp)?;
         let labels = storage.get_unique_labels_with_counts().map_err(to_mcp)?;
         let blocked = storage.get_blocked_issues().map_err(to_mcp)?;
-        let ready = storage
-            .get_ready_issues(&ReadyFilters::default(), ReadySortPolicy::Hybrid)
-            .map_err(to_mcp)?;
+        let ready = mcp_ready_issues(&self.0, &storage)?;
 
         let in_progress_filters = ListFilters {
             statuses: Some(vec![Status::InProgress]),
@@ -471,10 +467,8 @@ fn bottleneck_context(storage: &SqliteStorage) -> McpResult<String> {
 }
 
 /// Identify quick wins: high-priority, ready, with low estimated effort.
-fn quick_wins_context(storage: &SqliteStorage) -> McpResult<String> {
-    let ready = storage
-        .get_ready_issues(&ReadyFilters::default(), ReadySortPolicy::Hybrid)
-        .map_err(to_mcp)?;
+fn quick_wins_context(state: &BeadsState, storage: &SqliteStorage) -> McpResult<String> {
+    let ready = mcp_ready_issues(state, storage)?;
 
     if ready.is_empty() {
         return Ok("No quick wins available — no ready issues.".into());
@@ -569,9 +563,7 @@ impl PromptHandler for PlanNextWorkPrompt {
         let total = storage.count_all_issues().map_err(to_mcp)?;
         let active = storage.count_active_issues().map_err(to_mcp)?;
         let blocked = storage.get_blocked_issues().map_err(to_mcp)?;
-        let ready = storage
-            .get_ready_issues(&ReadyFilters::default(), ReadySortPolicy::Hybrid)
-            .map_err(to_mcp)?;
+        let ready = mcp_ready_issues(&self.0, &storage)?;
 
         let mut parts: Vec<String> = Vec::new();
 
@@ -590,10 +582,10 @@ impl PromptHandler for PlanNextWorkPrompt {
             parts.push(blocked_context(&storage)?);
         }
         if goal == "balanced" || goal == "quick-wins" {
-            parts.push(quick_wins_context(&storage)?);
+            parts.push(quick_wins_context(&self.0, &storage)?);
         }
         if goal == "balanced" {
-            parts.push(ready_context(&storage)?);
+            parts.push(ready_context(&self.0, &storage)?);
         }
 
         let instruction = match goal {

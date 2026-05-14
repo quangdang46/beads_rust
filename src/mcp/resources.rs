@@ -17,9 +17,9 @@ use crate::cli::commands::coordination::build_coordination_status_without_snapsh
 use crate::coordination::ClaimOwnerKind;
 use crate::error::StructuredError;
 use crate::model::{Event, Issue, Status};
-use crate::storage::{ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage};
+use crate::storage::{ListFilters, SqliteStorage};
 
-use super::{BeadsState, to_mcp};
+use super::{BeadsState, mcp_ready_issues, to_mcp};
 
 fn read_project_config(storage: &SqliteStorage) -> McpResult<HashMap<String, String>> {
     storage.get_all_config().map_err(to_mcp)
@@ -473,28 +473,23 @@ impl ResourceHandler for ReadyIssuesResource {
     }
 
     fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        cached_resource_json(
-            &self.0,
-            "beads://issues/ready",
-            "resource:issues_ready".to_string(),
-            |storage| {
-                let ready = storage
-                    .get_ready_issues(&ReadyFilters::default(), ReadySortPolicy::Hybrid)
-                    .map_err(to_mcp)?;
+        let storage = self.0.open_read_storage().map_err(to_mcp)?;
+        let ready = mcp_ready_issues(&self.0, &storage)?;
 
-                Ok(json!({
-                    "count": ready.len(),
-                    "issues": ready.iter().map(|issue| {
-                        json!({
-                            "id": issue.id,
-                            "title": issue.title,
-                            "priority": issue.priority,
-                            "type": issue.issue_type,
-                        })
-                    }).collect::<Vec<_>>(),
-                }))
-            },
-        )
+        Ok(resource_json(
+            "beads://issues/ready",
+            &json!({
+                "count": ready.len(),
+                "issues": ready.iter().map(|issue| {
+                    json!({
+                        "id": issue.id,
+                        "title": issue.title,
+                        "priority": issue.priority,
+                        "type": issue.issue_type,
+                    })
+                }).collect::<Vec<_>>(),
+            }),
+        ))
     }
 }
 
@@ -1183,6 +1178,36 @@ mod tests {
             .expect("read ready resource after witness mismatch");
         let second = resource_text_json(&second_content);
         assert_eq!(second["count"].as_u64(), Some(2));
+    }
+
+    #[test]
+    fn ready_resource_excludes_unsatisfied_external_blockers() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_resource_state(&temp, true);
+        insert_resource_issue(
+            &state,
+            "br-ready-external-blocked",
+            "externally blocked ready candidate",
+        );
+        insert_resource_issue(&state, "br-ready-local", "local ready candidate");
+        let mut storage = SqliteStorage::open(&state.db_path).expect("open storage");
+        storage
+            .add_dependency(
+                "br-ready-external-blocked",
+                "external:missing:capability",
+                "blocks",
+                "mcp-resource-test",
+            )
+            .expect("add external dependency");
+        drop(storage);
+
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let resource = ReadyIssuesResource::new(Arc::clone(&state));
+        let content = resource.read(&ctx).expect("read ready resource");
+        let ready = resource_text_json(&content);
+
+        assert_eq!(ready["count"].as_u64(), Some(1));
+        assert_eq!(ready["issues"][0]["id"], "br-ready-local");
     }
 
     #[test]

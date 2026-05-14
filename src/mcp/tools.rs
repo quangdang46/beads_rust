@@ -17,10 +17,10 @@ use serde_json::{Value, json};
 
 use crate::error::{BeadsError, ErrorCode, StructuredError};
 use crate::model::{Comment, DependencyType, Issue, IssueType, Priority, Status};
-use crate::storage::{IssueUpdate, ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage};
+use crate::storage::{IssueUpdate, ListFilters, SqliteStorage};
 use crate::validation::{CommentValidator, IssueValidator, LabelValidator};
 
-use super::BeadsState;
+use super::{BeadsState, mcp_ready_issues};
 
 // ---------------------------------------------------------------------------
 // Constants — pre-computed sets for O(1) placeholder detection
@@ -2832,10 +2832,7 @@ fn project_overview_json(state: &BeadsState, storage: &SqliteStorage) -> McpResu
     let blocked = storage.get_blocked_issues().map_err(beads_to_mcp)?;
     let dirty = storage.get_dirty_issue_count().map_err(beads_to_mcp)?;
 
-    let ready_filters = ReadyFilters::default();
-    let ready = storage
-        .get_ready_issues(&ready_filters, ReadySortPolicy::Hybrid)
-        .map_err(beads_to_mcp)?;
+    let ready = mcp_ready_issues(state, storage)?;
 
     // In-progress and deferred counts
     let in_progress_filters = ListFilters {
@@ -2962,9 +2959,8 @@ impl ToolHandler for ProjectOverviewTool {
 
     fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
         let _ = args;
-        let result = cached_read_json(&self.0, "tool:project_overview".to_string(), |storage| {
-            project_overview_json(&self.0, storage)
-        })?;
+        let storage = self.0.open_read_storage().map_err(beads_to_mcp)?;
+        let result = project_overview_json(&self.0, &storage)?;
         Ok(vec![Content::text(result.to_string())])
     }
 }
@@ -3070,6 +3066,36 @@ mod tests {
             .expect("fresh project overview after witness mismatch");
         let second = content_json(&second_content);
         assert_eq!(second["counts"]["total"].as_u64(), Some(2));
+    }
+
+    #[test]
+    fn project_overview_excludes_unsatisfied_external_blockers_from_ready() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        insert_test_issue(
+            &state,
+            "br-mcp-external-blocked-ready",
+            "externally blocked overview candidate",
+        );
+        insert_test_issue(&state, "br-mcp-local-ready", "local overview candidate");
+        let mut storage = SqliteStorage::open(&state.db_path).expect("open storage");
+        storage
+            .add_dependency(
+                "br-mcp-external-blocked-ready",
+                "external:missing:capability",
+                "blocks",
+                "mcp-test",
+            )
+            .expect("add external dependency");
+        drop(storage);
+
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let tool = ProjectOverviewTool::new(Arc::clone(&state));
+        let content = tool.call(&ctx, json!({})).expect("project overview");
+        let overview = content_json(&content);
+
+        assert_eq!(overview["counts"]["ready"].as_u64(), Some(1));
+        assert_eq!(overview["ready_issues"][0]["id"], "br-mcp-local-ready");
     }
 
     #[test]
