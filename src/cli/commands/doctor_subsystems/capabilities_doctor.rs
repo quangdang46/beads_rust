@@ -346,6 +346,13 @@ fn early_chokepoint_fixer_rows() -> &'static [FixerRow] {
             true,
             &["db.export_hash_cache"],
         ),
+        (
+            "doctor.base_jsonl_symlink_quarantine",
+            "state_files",
+            true,
+            true,
+            &["base_jsonl"],
+        ),
     ]
 }
 

@@ -5480,6 +5480,90 @@ fn fix_export_hash_cache_divergence_if_warned(
     }
 }
 
+/// Pass-5 cycle 5 — fixer for the SYMLINK subset of
+/// `fm-state_files-base-jsonl-missing-or-stale`.
+///
+/// When the doctor's `base_jsonl` check warns with `details.kind ==
+/// "symlink"`, the fixer renames the symlinked anchor into
+/// `<run-dir>/quarantine/.beads/beads.base.jsonl` via
+/// [`chokepoint::mutate(Op::Rename)`]. Per AGENTS.md RULE 1: rename,
+/// never delete. The chokepoint snapshots the symlink target itself
+/// (just the symlink bytes — the target's content is intentionally NOT
+/// followed) so `doctor undo` reinstates the symlink at its original
+/// path.
+///
+/// Scope of this cycle: SYMLINK case only. The stale-anchor case stays
+/// detect-only because regenerating the anchor is operationally what
+/// `br sync --flush-only` already does — having the doctor duplicate
+/// that behavior would add a second authoritative path for the same
+/// derivation, complicating the chokepoint's "fix did not eliminate
+/// the finding" verify step under partial filesystems.
+///
+/// Returns `true` if the symlinked anchor was quarantined.
+fn fix_base_jsonl_symlink_if_warned(
+    beads_dir: &Path,
+    report: &DoctorReport,
+    ctx: &OutputContext,
+    session: Option<&mut DoctorRepairSession>,
+) -> bool {
+    // Locate the base_jsonl Warn whose details.kind == "symlink".
+    let symlink_finding = report.checks.iter().find(|c| {
+        c.name == "base_jsonl"
+            && c.status == CheckStatus::Warn
+            && c.details
+                .as_ref()
+                .and_then(|d| d.get("kind"))
+                .and_then(|v| v.as_str())
+                == Some("symlink")
+    });
+    let Some(_) = symlink_finding else {
+        return false;
+    };
+    let Some(session) = session else {
+        if !ctx.is_json() {
+            ctx.warning(
+                "Skipping base-jsonl symlink quarantine: no doctor repair session (run-dir creation failed)",
+            );
+        }
+        return false;
+    };
+
+    let source = beads_dir.join("beads.base.jsonl");
+    // Re-confirm symlink at fix time (TOCTOU defense — if the operator
+    // moved the symlink between detect and fix, we want to no-op
+    // rather than mutate an unintended target).
+    match fs::symlink_metadata(&source) {
+        Ok(meta) if meta.file_type().is_symlink() => {}
+        _ => return false,
+    }
+
+    let dest = session
+        .run
+        .root
+        .join("quarantine")
+        .join(".beads")
+        .join("beads.base.jsonl");
+    session.set_fixer("doctor.base_jsonl_symlink_quarantine");
+    match chokepoint::mutate(&session.ctx, &source, Op::Rename { to: dest.clone() }) {
+        Ok(result) if result.ok => {
+            if !ctx.is_json() {
+                ctx.info(&format!(
+                    "Quarantined symlinked merge anchor to {}",
+                    dest.display()
+                ));
+            }
+            true
+        }
+        Ok(_) => false,
+        Err(err) => {
+            if !ctx.is_json() {
+                ctx.warning(&format!("Failed to quarantine base.jsonl symlink: {err}"));
+            }
+            false
+        }
+    }
+}
+
 fn read_root_gitignore_content(gitignore_path: &Path) -> Result<Option<String>> {
     let metadata = match fs::symlink_metadata(gitignore_path) {
         Ok(metadata) => metadata,
@@ -7215,6 +7299,24 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             false
         };
 
+    // Pass-5 cycle 5: quarantine symlinked merge anchor under --repair.
+    // Only the SYMLINK subset of fm-state_files-base-jsonl-missing-or-stale
+    // is auto-fixed; the stale-anchor subset stays detect-only because
+    // regenerating the anchor is what `br sync --flush-only` already does.
+    let base_jsonl_symlink_repaired = if args.repair
+        && fixer_filter.allows("fm-state_files-base-jsonl-missing-or-stale")
+    {
+        let repaired =
+            fix_base_jsonl_symlink_if_warned(&beads_dir, &initial.report, ctx, session.as_mut());
+        if repaired {
+            initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+        }
+        repaired
+    } else {
+        false
+    };
+    let _ = base_jsonl_symlink_repaired;
+
     if args.repair && (fixer_filter.has_only() || fixer_filter.has_skip()) {
         tracing::info!(
             target: "br::doctor::filter",
@@ -8499,6 +8601,73 @@ mod tests {
             .and_then(|d| d.get("kind"))
             .and_then(|v| v.as_str());
         assert_eq!(kind, Some("symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_fix_base_jsonl_symlink_quarantines_via_chokepoint() {
+        // Pass-5 cycle 5: the fixer must MOVE the symlinked anchor into
+        // the run-dir quarantine via Op::Rename. The target the symlink
+        // pointed at must be UNDISTURBED.
+        use std::os::unix::fs::symlink;
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let outside = temp.path().join("outside.jsonl");
+        fs::write(&outside, b"{\"id\":\"bd-outside\"}\n").unwrap();
+        let symlink_path = beads_dir.join("beads.base.jsonl");
+        symlink(&outside, &symlink_path).unwrap();
+        // The live JSONL must also exist for the detect path to run.
+        fs::write(beads_dir.join("issues.jsonl"), b"{}\n").unwrap();
+
+        let mut report = DoctorReport {
+            ok: false,
+            workspace_health: "degraded".into(),
+            checks: Vec::new(),
+            reliability_audit: None,
+        };
+        check_base_jsonl(&beads_dir, &mut report.checks);
+        assert!(report.checks.iter().any(|c| c.name == "base_jsonl"
+            && matches!(c.status, CheckStatus::Warn)));
+
+        let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
+            .expect("session must build");
+        let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Json, false, true);
+        assert!(fix_base_jsonl_symlink_if_warned(
+            &beads_dir,
+            &report,
+            &ctx,
+            Some(&mut session),
+        ));
+
+        // Symlink quarantined.
+        assert!(
+            fs::symlink_metadata(&symlink_path).is_err()
+                || !fs::symlink_metadata(&symlink_path)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+        );
+        // Quarantine populated.
+        let q = session.run.root.join("quarantine/.beads/beads.base.jsonl");
+        assert!(
+            fs::symlink_metadata(&q).is_ok(),
+            "quarantine should hold the moved symlink (or its target bytes), got: {q:?}"
+        );
+        // The target the symlink pointed at must be untouched.
+        assert_eq!(
+            fs::read(&outside).unwrap(),
+            b"{\"id\":\"bd-outside\"}\n",
+            "symlink target's bytes must not be modified"
+        );
+
+        // actions.jsonl records one rename op.
+        let actions = fs::read_to_string(&session.run.actions_file).unwrap();
+        let rename_count = actions
+            .lines()
+            .filter(|l| l.contains("\"op\":\"rename\""))
+            .count();
+        assert_eq!(rename_count, 1, "actions.jsonl: {actions}");
     }
 
     #[test]
