@@ -8622,9 +8622,9 @@ mod tests {
 
         let mut report = DoctorReport {
             ok: false,
-            workspace_health: "degraded".into(),
-            checks: Vec::new(),
+            workspace_health: Some("degraded".to_string()),
             reliability_audit: None,
+            checks: Vec::new(),
         };
         check_base_jsonl(&beads_dir, &mut report.checks);
         assert!(report.checks.iter().any(|c| c.name == "base_jsonl"
