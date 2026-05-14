@@ -15,15 +15,15 @@ This changelog is organized by capability rather than diff order. Each version s
 
 ---
 
-## v0.2.8 -- 2026-05-14 (Prepared; release blocked)
+## v0.2.8 -- 2026-05-14 (Release)
 
-This version prepares the dependency-refresh release and validates the packaged crate, but the final public release is blocked until the local `fastmcp_rust` `0.3.1` crate family is published to crates.io.
+This version refreshes the dependency stack, including the local `/dp` FastMCP and frankensqlite libraries now published on crates.io, and tightens storage reliability around the updated SQLite engine.
 
 ### Dependency Updates
 
 - Updated the fsqlite stack used by storage and sync paths to the latest published local versions: `fsqlite*` `0.1.3` and `fsqlite-vfs` `0.1.4`.
 - Confirmed the direct dependency set is otherwise current with `cargo outdated --root-deps-only`.
-- Left `fastmcp-rust` on the latest crates.io-published version because the newer local `0.3.1` release cannot be consumed by a crates.io-publishable `beads_rust` package until it is published upstream.
+- Updated `fastmcp-rust` and its FastMCP crate family to `0.3.1`.
 
 ### Reliability
 

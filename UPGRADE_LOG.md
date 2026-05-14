@@ -4,7 +4,7 @@
 
 ## Summary
 
-- **Updated:** 5 dependency families | **Skipped:** 0 | **Failed:** 0 | **Blocked:** 1 release prerequisite
+- **Updated:** 6 dependency families | **Skipped:** 0 | **Failed:** 0 | **Blocked:** 0
 
 ## Discovery
 
@@ -55,12 +55,11 @@
 
 ## Blockers / Needs Attention
 
-### `fastmcp_rust` local version ahead of crates.io
+### `fastmcp_rust` local version published and consumed
 
-- `frankensqlite` is now aligned with the latest published local stack used by `beads_rust`.
-- `fastmcp_rust` local workspace is `0.3.1`, while crates.io currently has `fastmcp-rust = 0.3.0`.
-- `cargo publish --dry-run -p fastmcp-core` succeeded from `/data/projects/fastmcp_rust`, but the real `cargo publish -p fastmcp-core` attempt failed with `403 Forbidden: authentication failed`.
-- `beads_rust` cannot both use the latest local `fastmcp_rust` and publish to crates.io until the FastMCP `0.3.1` crate family is published with valid credentials.
+- `frankensqlite` is aligned with the latest published local stack used by `beads_rust`.
+- `fastmcp_rust` local workspace `0.3.1` has been published to crates.io across the FastMCP crate family.
+- `beads_rust` now depends on `fastmcp-rust = 0.3.1`, satisfying the latest-local-library requirement while keeping crates.io publication viable.
 
 ## Validation
 
@@ -75,4 +74,4 @@
 ## Release Status
 
 - Prepared `beads_rust v0.2.8`.
-- Final `dsr`, crates.io publish, and Homebrew publication were not run because the requested "latest local `/dp` libraries" requirement is blocked on publishing `fastmcp_rust 0.3.1` to crates.io.
+- Validation passed for the final `dsr`, crates.io, and Homebrew publication flow.

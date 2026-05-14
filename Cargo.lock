@@ -1334,9 +1334,9 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-client"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a3c70e738b7e9c84d36a42276d227320c54d1aa05f66422547e33098cac9d11"
+checksum = "7f2130a9a5627e21a7e4633e74abbcbff92fb18929e9c6317dc411c4e9f84cd5"
 dependencies = [
  "asupersync",
  "dirs",
@@ -1351,9 +1351,9 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-console"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c4cf768416a781319456ada5fad2ac6da60f341e77d7144ab0e43a650686741"
+checksum = "6fbda76a1fec1542ef9dbe132351b471f5ea6dec069aca3cb0bd9d921ed4b229"
 dependencies = [
  "fastmcp-core",
  "fastmcp-protocol",
@@ -1370,9 +1370,9 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-core"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdbd1ede4a907063dbb6e00930f50e54c3c17528770381991c824ceb48b8d41c"
+checksum = "55259f2528ccea39ca836d6a8fdff0818b0bec048e8450e73d5f4ae0aa316e63"
 dependencies = [
  "asupersync",
  "log",
@@ -1382,9 +1382,9 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-derive"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72bb97d75fa28ae6da28f96ff773d3c50a6b2685c0cdc5792894cde3971f9cc7"
+checksum = "e0f0d2a69dc60117a4d8d9fc95b8f9c97cd3dd74544e66c77eff5e0d51fbbc2c"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1393,9 +1393,9 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-protocol"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d6086e751dc8f37328adb85a2fb582a382a1dd71caff8c8be358999f804116c"
+checksum = "f61ed11a61d1149edc7cdbfe82978e06933305351b5e82cc875142ee0fd4fc26"
 dependencies = [
  "base64",
  "fastmcp-core",
@@ -1406,9 +1406,9 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-rust"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06abae73b159266b6d27feea8fd4436a00c459b6053cb264ce9b88e61942da60"
+checksum = "bee14b4918c6844150e9e96d97fb805291c4d2214d737dbc803fdc13f4055a2b"
 dependencies = [
  "asupersync",
  "fastmcp-client",
@@ -1423,9 +1423,9 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-server"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1e2cb023ec8257a3f997dbeb2e7fd308f65996d87e1373bf10e8c8f5c9e1f13"
+checksum = "e889c13394b7223c31b4b820d6fcec4eac34a38178e77c51dd54db616f37dbd5"
 dependencies = [
  "asupersync",
  "base64",
@@ -1445,9 +1445,9 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-transport"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "023dbaf2c2f9f75994431fcca73f040e6aa4303cbbb2f9b6af0462598d9ea245"
+checksum = "25096b6dc32b63f219d4380f65c1ef21b1336ba592a8204748dbb49d1896a0cf"
 dependencies = [
  "asupersync",
  "fastmcp-core",
