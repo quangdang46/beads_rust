@@ -649,6 +649,10 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
         "gitignore.beads_inner_present",
         "fm-configs-gitignore-leaking-beads",
     ),
+    (
+        "permissions.jsonl_world_writable",
+        "fm-permissions-jsonl-world-writable",
+    ),
     ("startup_cache.health", "fm-configs-startup-cache-poisoned"),
     ("sync_jsonl_path", FM_JSONL_ROW_COUNT_MISMATCH),
     (
@@ -2902,6 +2906,69 @@ fn check_base_jsonl_missing_post_flush(
             );
         }
     }
+}
+
+/// Pass-5 cycle 14: detector for
+/// `fm-permissions-jsonl-world-writable`.
+///
+/// Warns when `.beads/issues.jsonl` has the world-write bit (`0o002`)
+/// set. A world-writable JSONL data file is a real security concern —
+/// any local user could inject malicious issues that subsequent
+/// `br sync --flush-only` reads back into the DB. Detect-only —
+/// operator may have intentional permissive perms (shared workspace,
+/// CI scratch space). On non-Unix targets this is a no-op.
+fn check_jsonl_world_writable(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
+    let path = beads_dir.join("issues.jsonl");
+    let Ok(meta) = fs::symlink_metadata(&path) else {
+        push_check(
+            checks,
+            "permissions.jsonl_world_writable",
+            CheckStatus::Ok,
+            None,
+            None,
+        );
+        return;
+    };
+    if meta.file_type().is_symlink() {
+        push_check(
+            checks,
+            "permissions.jsonl_world_writable",
+            CheckStatus::Ok,
+            None,
+            None,
+        );
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode();
+        if (mode & 0o002) != 0 {
+            push_check(
+                checks,
+                "permissions.jsonl_world_writable",
+                CheckStatus::Warn,
+                Some(format!(
+                    "{} is world-writable (mode {:o}); anyone could inject issues that `br sync` reimports",
+                    path.display(),
+                    mode & 0o777
+                )),
+                Some(serde_json::json!({
+                    "path": path.display().to_string(),
+                    "mode_octal": format!("{:o}", mode & 0o777),
+                    "remediation": format!("chmod o-w {}", path.display()),
+                })),
+            );
+            return;
+        }
+    }
+    push_check(
+        checks,
+        "permissions.jsonl_world_writable",
+        CheckStatus::Ok,
+        None,
+        None,
+    );
 }
 
 /// Pass-5 cycle 13: detector for the inner-gitignore-present subset of
@@ -7445,6 +7512,8 @@ fn collect_doctor_report_with_mode_and_db_override(
     check_multiple_br_in_path(&mut checks);
     // Pass-5 cycle 13: .beads/.gitignore present + expected patterns.
     check_inner_gitignore_present(beads_dir, &mut checks);
+    // Pass-5 cycle 14: .beads/issues.jsonl world-writable security check.
+    check_jsonl_world_writable(beads_dir, &mut checks);
     check_root_gitignore(beads_dir, &mut checks);
     check_routes_jsonl(beads_dir, &mut checks);
     check_rust_log_noisy(&mut checks);
@@ -9857,6 +9926,58 @@ mod tests {
             .map(Vec::len)
             .unwrap_or(0);
         assert_eq!(missing, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_jsonl_world_writable_warns_on_world_writable() {
+        // Pass-5 cycle 14: world-writable mode → warn.
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let jsonl = beads_dir.join("issues.jsonl");
+        fs::write(&jsonl, b"{}\n").unwrap();
+        let mut perms = fs::metadata(&jsonl).unwrap().permissions();
+        perms.set_mode(0o666); // world-writable
+        fs::set_permissions(&jsonl, perms).unwrap();
+
+        let mut checks = Vec::new();
+        check_jsonl_world_writable(&beads_dir, &mut checks);
+        let check = find_check(&checks, "permissions.jsonl_world_writable").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_jsonl_world_writable_ok_when_mode_0644() {
+        // Mode 0644 (world-readable but not world-writable) → ok.
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let jsonl = beads_dir.join("issues.jsonl");
+        fs::write(&jsonl, b"{}\n").unwrap();
+        let mut perms = fs::metadata(&jsonl).unwrap().permissions();
+        perms.set_mode(0o644);
+        fs::set_permissions(&jsonl, perms).unwrap();
+
+        let mut checks = Vec::new();
+        check_jsonl_world_writable(&beads_dir, &mut checks);
+        let check = find_check(&checks, "permissions.jsonl_world_writable").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+    }
+
+    #[test]
+    fn test_check_jsonl_world_writable_missing_is_ok() {
+        // No issues.jsonl at all → ok (other checks own the missing case).
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let mut checks = Vec::new();
+        check_jsonl_world_writable(&beads_dir, &mut checks);
+        let check = find_check(&checks, "permissions.jsonl_world_writable").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok));
     }
 
     #[test]

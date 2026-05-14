@@ -269,6 +269,12 @@ fn build_detector_registry() -> Vec<DetectorEntry> {
         ),
         ("br_path_dupes", "external_artifacts", "warn", true),
         ("gitignore.beads_inner_present", "configs", "warn", true),
+        (
+            "permissions.jsonl_world_writable",
+            "permissions",
+            "warn",
+            true,
+        ),
         ("startup_cache.health", "configs", "warn", true),
         ("sync_jsonl_path", "state_files", "warn", true),
         ("sync_conflict_markers", "state_files", "error", true),
