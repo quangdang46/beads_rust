@@ -491,7 +491,12 @@ fn emit_concurrency_lost(beads_dir: &Path, err: &BeadsError, ctx: &OutputContext
 ///
 /// The caller is expected to follow this with
 /// `process::exit(DoctorExitCode::RefusedUnsafe.as_i32())`.
-fn emit_refused_unsafe(reason: &str, evidence: &serde_json::Value, ctx: &OutputContext) {
+fn emit_refused_unsafe(
+    operation: &str,
+    reason: &str,
+    evidence: &serde_json::Value,
+    ctx: &OutputContext,
+) {
     let gate_name = evidence
         .get("gate")
         .and_then(serde_json::Value::as_str)
@@ -521,7 +526,9 @@ fn emit_refused_unsafe(reason: &str, evidence: &serde_json::Value, ctx: &OutputC
             "recovery_audit": recovery_audit,
         }));
     } else {
-        ctx.error(&format!("Refusing --repair: {reason} (gate={gate_name})"));
+        ctx.error(&format!(
+            "Refusing {operation}: {reason} (gate={gate_name})"
+        ));
     }
 }
 
@@ -1422,6 +1429,7 @@ struct EarlyRepairSummary {
     recovery_aged: bool,
     export_hash: bool,
     base_jsonl_symlink: bool,
+    base_jsonl_stale: bool,
 }
 
 impl EarlyRepairSummary {
@@ -1432,6 +1440,7 @@ impl EarlyRepairSummary {
             || self.recovery_aged
             || self.export_hash
             || self.base_jsonl_symlink
+            || self.base_jsonl_stale
     }
 
     fn action_labels(self) -> Vec<String> {
@@ -1453,6 +1462,9 @@ impl EarlyRepairSummary {
         }
         if self.base_jsonl_symlink {
             actions.push("base_jsonl_symlink_quarantined".to_string());
+        }
+        if self.base_jsonl_stale {
+            actions.push("base_jsonl_anchor_regenerated".to_string());
         }
         actions
     }
@@ -1476,6 +1488,9 @@ impl EarlyRepairSummary {
         }
         if self.base_jsonl_symlink {
             messages.push("Quarantined symlinked merge anchor.".to_string());
+        }
+        if self.base_jsonl_stale {
+            messages.push("Regenerated stale merge anchor from current JSONL.".to_string());
         }
         messages
     }
@@ -3455,9 +3470,8 @@ fn check_merge_artifacts(beads_dir: &Path, checks: &mut Vec<CheckResult>) -> Res
 ///
 /// Pass-5 cycle 4 implements (a) and (b). Case (c) requires reading
 /// `metadata.last_export` from the DB which couples the detector to the
-/// DB open path; deferred to a later cycle. Detect-only — no fixer is
-/// landed in this cycle because regenerating the anchor is an operator
-/// decision (typically `br sync --flush-only` re-derives it).
+/// DB open path; deferred to a later cycle. The symlink and stale subsets
+/// are repaired by the pass-5 fixers below.
 fn check_base_jsonl(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
     let base_path = beads_dir.join("beads.base.jsonl");
     let meta = match fs::symlink_metadata(&base_path) {
@@ -5572,6 +5586,102 @@ fn fix_base_jsonl_symlink_if_warned(
     }
 }
 
+/// Pass-5 cycle 6 — fixer for the STALE subset of
+/// `fm-state_files-base-jsonl-missing-or-stale`.
+///
+/// When the doctor's `base_jsonl` check warns with `details.kind ==
+/// "stale"`, regenerate `.beads/beads.base.jsonl` from the current
+/// `.beads/issues.jsonl` bytes via [`chokepoint::mutate(Op::WriteFile)`].
+/// This is exactly what `br sync --flush-only` produces as a side
+/// effect of a clean export; the doctor surfaces it as a named repair
+/// so operators don't need to remember which sync command rewrites
+/// the merge anchor.
+///
+/// Combined with cycle 5's symlink quarantine, this completes
+/// Tier B → Tier A for both detector-emitted subsets of the FM. The
+/// chokepoint snapshots the pre-fix anchor bytes as the verbatim
+/// backup so `doctor undo` restores the stale anchor byte-for-byte
+/// (occasionally useful when the operator wants to compare against
+/// the prior anchor for forensics).
+///
+/// Returns `true` if the stale anchor was regenerated.
+fn fix_base_jsonl_stale_if_warned(
+    beads_dir: &Path,
+    report: &DoctorReport,
+    ctx: &OutputContext,
+    session: Option<&mut DoctorRepairSession>,
+) -> bool {
+    let stale_finding = report.checks.iter().find(|c| {
+        c.name == "base_jsonl"
+            && c.status == CheckStatus::Warn
+            && c.details
+                .as_ref()
+                .and_then(|d| d.get("kind"))
+                .and_then(|v| v.as_str())
+                == Some("stale")
+    });
+    if stale_finding.is_none() {
+        return false;
+    }
+    let Some(session) = session else {
+        if !ctx.is_json() {
+            ctx.warning(
+                "Skipping base-jsonl regeneration: no doctor repair session (run-dir creation failed)",
+            );
+        }
+        return false;
+    };
+
+    let live = beads_dir.join("issues.jsonl");
+    let anchor = beads_dir.join("beads.base.jsonl");
+    let live_bytes = match fs::read(&live) {
+        Ok(b) => b,
+        Err(err) => {
+            if !ctx.is_json() {
+                ctx.warning(&format!(
+                    "Skipping base-jsonl regeneration: cannot read {}: {err}",
+                    live.display()
+                ));
+            }
+            return false;
+        }
+    };
+    // Defensive: never regenerate from an empty JSONL (would silently
+    // truncate the anchor and lose any forensic value). The detector
+    // already skips when live is empty, but re-check at fix time
+    // (TOCTOU defense).
+    if live_bytes.is_empty() {
+        return false;
+    }
+
+    session.set_fixer("doctor.base_jsonl_regen");
+    match chokepoint::mutate(
+        &session.ctx,
+        &anchor,
+        Op::WriteFile {
+            content: live_bytes,
+            mode: None,
+        },
+    ) {
+        Ok(result) if result.ok => {
+            if !ctx.is_json() {
+                ctx.info(&format!(
+                    "Regenerated merge anchor {} from current JSONL",
+                    anchor.display()
+                ));
+            }
+            true
+        }
+        Ok(_) => false,
+        Err(err) => {
+            if !ctx.is_json() {
+                ctx.warning(&format!("Failed to regenerate base.jsonl anchor: {err}"));
+            }
+            false
+        }
+    }
+}
+
 fn read_root_gitignore_content(gitignore_path: &Path) -> Result<Option<String>> {
     let metadata = match fs::symlink_metadata(gitignore_path) {
         Ok(metadata) => metadata,
@@ -6416,6 +6526,18 @@ fn execute_repair_indexes(
         }
     };
 
+    match refuse_gates::run_all(beads_dir, &paths.db_path) {
+        GateOutcome::Allow => {}
+        GateOutcome::Refuse {
+            code: _,
+            reason,
+            evidence,
+        } => {
+            emit_refused_unsafe("--repair-indexes", &reason, &evidence, ctx);
+            std::process::exit(DoctorExitCode::RefusedUnsafe.as_i32());
+        }
+    }
+
     // Pre-snapshot backup. Same shape `--repair` uses: copy the live
     // DB to a sidecar before mutating, restore on any failure inside
     // the REINDEX transaction. The snapshot path lives next to the
@@ -7157,7 +7279,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 reason,
                 evidence,
             } => {
-                emit_refused_unsafe(&reason, &evidence, ctx);
+                emit_refused_unsafe("--repair", &reason, &evidence, ctx);
                 std::process::exit(DoctorExitCode::RefusedUnsafe.as_i32());
             }
         }
@@ -7309,8 +7431,8 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
 
     // Pass-5 cycle 5: quarantine symlinked merge anchor under --repair.
     // Only the SYMLINK subset of fm-state_files-base-jsonl-missing-or-stale
-    // is auto-fixed; the stale-anchor subset stays detect-only because
-    // regenerating the anchor is what `br sync --flush-only` already does.
+    // is auto-fixed; the stale-anchor subset is regenerated from the
+    // live JSONL bytes by cycle 6's fixer below.
     let base_jsonl_symlink_repaired = if args.repair
         && fixer_filter.allows("fm-state_files-base-jsonl-missing-or-stale")
     {
@@ -7323,6 +7445,22 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     } else {
         false
     };
+
+    // Pass-5 cycle 6: regenerate the merge anchor from the current
+    // live JSONL when the detector reports it as stale. Combined with
+    // cycle 5's symlink quarantine, this completes Tier B → Tier A for
+    // both detector-emitted subsets of the FM.
+    let base_jsonl_stale_repaired =
+        if args.repair && fixer_filter.allows("fm-state_files-base-jsonl-missing-or-stale") {
+            let repaired =
+                fix_base_jsonl_stale_if_warned(&beads_dir, &initial.report, ctx, session.as_mut());
+            if repaired {
+                initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+            }
+            repaired
+        } else {
+            false
+        };
 
     if args.repair && (fixer_filter.has_only() || fixer_filter.has_skip()) {
         tracing::info!(
@@ -7339,6 +7477,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         recovery_aged: recovery_aged_repaired,
         export_hash: export_hash_repaired,
         base_jsonl_symlink: base_jsonl_symlink_repaired,
+        base_jsonl_stale: base_jsonl_stale_repaired,
     };
 
     if !args.repair {
@@ -8738,6 +8877,111 @@ mod tests {
     }
 
     #[test]
+    fn test_fix_base_jsonl_stale_regen_writes_live_bytes() {
+        // Pass-5 cycle 6: stale anchor (older mtime, regular file)
+        // gets regenerated from current JSONL bytes via Op::WriteFile.
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let anchor = beads_dir.join("beads.base.jsonl");
+        let live = beads_dir.join("issues.jsonl");
+        fs::write(&anchor, b"{\"id\":\"bd-old\"}\n").unwrap();
+        fs::write(&live, b"{\"id\":\"bd-new-1\"}\n{\"id\":\"bd-new-2\"}\n").unwrap();
+
+        // Backdate the anchor so the detector flags it stale.
+        let two_hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        let anchor_file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&anchor)
+            .unwrap();
+        anchor_file
+            .set_times(std::fs::FileTimes::new().set_modified(two_hours_ago))
+            .unwrap();
+        drop(anchor_file);
+
+        let mut report = DoctorReport {
+            ok: false,
+            workspace_health: Some("degraded".to_string()),
+            reliability_audit: None,
+            checks: Vec::new(),
+        };
+        check_base_jsonl(&beads_dir, &mut report.checks);
+        let check = find_check(&report.checks, "base_jsonl").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn));
+        let kind = check
+            .details
+            .as_ref()
+            .and_then(|d| d.get("kind"))
+            .and_then(|v| v.as_str());
+        assert_eq!(kind, Some("stale"));
+
+        let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
+            .expect("session must build");
+        let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Text, false, true);
+        assert!(fix_base_jsonl_stale_if_warned(
+            &beads_dir,
+            &report,
+            &ctx,
+            Some(&mut session),
+        ));
+
+        // Anchor now contains the live JSONL bytes.
+        assert_eq!(
+            fs::read(&anchor).unwrap(),
+            fs::read(&live).unwrap(),
+            "regenerated anchor must equal live JSONL bytes"
+        );
+
+        // actions.jsonl records one write_file op.
+        let actions = fs::read_to_string(&session.run.actions_file).unwrap();
+        let write_count = actions
+            .lines()
+            .filter(|l| l.contains("\"op\":\"write_file\""))
+            .count();
+        assert_eq!(write_count, 1, "actions.jsonl: {actions}");
+    }
+
+    #[test]
+    fn test_fix_base_jsonl_stale_refuses_empty_live_jsonl() {
+        // TOCTOU defense: never regenerate from an empty live JSONL
+        // (would silently truncate the anchor).
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let anchor = beads_dir.join("beads.base.jsonl");
+        fs::write(&anchor, b"{\"id\":\"bd-anchor\"}\n").unwrap();
+        // Live JSONL is empty (could happen mid-restore).
+        fs::write(beads_dir.join("issues.jsonl"), b"").unwrap();
+
+        // Synthesize a stale-finding report so the fixer is invoked.
+        let mut report = DoctorReport {
+            ok: false,
+            workspace_health: Some("degraded".to_string()),
+            reliability_audit: None,
+            checks: Vec::new(),
+        };
+        push_check(
+            &mut report.checks,
+            "base_jsonl",
+            CheckStatus::Warn,
+            Some("synthetic stale".to_string()),
+            Some(serde_json::json!({"kind": "stale"})),
+        );
+
+        let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
+            .expect("session must build");
+        let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Text, false, true);
+        assert!(!fix_base_jsonl_stale_if_warned(
+            &beads_dir,
+            &report,
+            &ctx,
+            Some(&mut session),
+        ));
+        // Anchor preserved.
+        assert_eq!(fs::read(&anchor).unwrap(), b"{\"id\":\"bd-anchor\"}\n");
+    }
+
+    #[test]
     fn test_fixer_filter_empty_allows_everything() {
         // Pass-5 cycle 1: default (no --only/--skip) accepts every FM.
         let filter = FixerFilter::default();
@@ -9121,6 +9365,7 @@ mod tests {
             recovery_aged: false,
             export_hash: true,
             base_jsonl_symlink: false,
+            base_jsonl_stale: false,
         };
 
         assert!(summary.applied());
@@ -9168,6 +9413,7 @@ mod tests {
             recovery_aged: false,
             export_hash: false,
             base_jsonl_symlink: true,
+            base_jsonl_stale: false,
         };
 
         assert!(summary.applied());
@@ -9185,6 +9431,36 @@ mod tests {
         assert_eq!(
             audit.applied_actions,
             vec!["base_jsonl_symlink_quarantined".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_early_repair_summary_reports_base_jsonl_stale_regen() {
+        let summary = EarlyRepairSummary {
+            gitignore: false,
+            merge_artifacts: false,
+            startup_cache: false,
+            recovery_aged: false,
+            export_hash: false,
+            base_jsonl_symlink: false,
+            base_jsonl_stale: true,
+        };
+
+        assert!(summary.applied());
+        assert_eq!(
+            summary.action_labels(),
+            vec!["base_jsonl_anchor_regenerated".to_string()]
+        );
+        assert_eq!(
+            repair_outcome_message_from_parts(summary.messages(), None, None),
+            "Regenerated stale merge anchor from current JSONL."
+        );
+        let audit = summary.audit_record();
+        assert_eq!(audit.phase, "doctor.early_repair");
+        assert_eq!(audit.outcome, "base_jsonl_anchor_regenerated");
+        assert_eq!(
+            audit.applied_actions,
+            vec!["base_jsonl_anchor_regenerated".to_string()]
         );
     }
 
