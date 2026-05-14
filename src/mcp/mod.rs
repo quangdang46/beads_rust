@@ -428,11 +428,31 @@ impl BeadsState {
 
     fn flush_dirty_storage(&self, storage: &mut SqliteStorage) -> fastmcp_rust::McpResult<()> {
         let dirty_before_flush = storage.get_dirty_issue_count().map_err(to_mcp)?;
+        // Honor `sync.history_enabled: false` (#293) — load the merged config
+        // layer so MCP-mediated mutations don't create `.br_history/` when the
+        // operator has disabled it. Falls back to the default (enabled) if the
+        // config load itself fails — we'd rather flush with history than refuse
+        // the flush, since refusing leaves the dirty row stuck.
+        let history_config = config::load_config(
+            &self.beads_dir,
+            Some(storage),
+            &config::CliOverrides::default(),
+        )
+        .ok()
+        .map(|layer| {
+            let mut cfg = crate::sync::history::HistoryConfig::default();
+            if let Some(enabled) = config::history_enabled_from_layer(&layer) {
+                cfg.enabled = enabled;
+            }
+            cfg
+        })
+        .unwrap_or_default();
         let flush_result = crate::sync::auto_flush(
             storage,
             &self.beads_dir,
             &self.jsonl_path,
             self.allow_external_jsonl,
+            history_config,
         )
         .map_err(|err| auto_flush_mcp_error(&self.beads_dir, &self.jsonl_path, err))?;
 

@@ -2516,6 +2516,7 @@ impl OpenStorageResult {
             });
         }
 
+        let history_config = self.resolved_history_config();
         let export_config = ExportConfig {
             // When needs_flush is set (e.g. after purge_issue), force must be
             // true even if there are also dirty issues from related mutations
@@ -2527,6 +2528,7 @@ impl OpenStorageResult {
             beads_dir: Some(self.paths.beads_dir.clone()),
             allow_external_jsonl: self.allow_external_jsonl,
             show_progress: false,
+            history: history_config,
             ..Default::default()
         };
 
