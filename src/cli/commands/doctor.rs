@@ -653,6 +653,7 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
         "permissions.jsonl_world_writable",
         "fm-permissions-jsonl-world-writable",
     ),
+    ("tmp_files_orphan", "fm-state_files-orphan-tmp-files"),
     ("startup_cache.health", "fm-configs-startup-cache-poisoned"),
     ("sync_jsonl_path", FM_JSONL_ROW_COUNT_MISMATCH),
     (
@@ -2905,6 +2906,84 @@ fn check_base_jsonl_missing_post_flush(
                 None,
             );
         }
+    }
+}
+
+/// Pass-5 cycle 15: detector for
+/// `fm-state_files-orphan-tmp-files`.
+///
+/// Walks `.beads/` for `*.tmp` and `*.tmp.<digits>` files left behind
+/// by interrupted atomic-rename writes. Anything older than 1 hour is
+/// almost certainly orphaned (in-flight tmps live milliseconds). Detect-
+/// only — auto-cleanup risks deleting a tmp from an actively-writing
+/// peer process on a slow filesystem (e.g., NFS-backed workspaces).
+const ORPHAN_TMP_AGE_THRESHOLD_SECS: u64 = 60 * 60;
+
+// case_sensitive_file_extension_comparisons fires on `name.ends_with(".tmp")`
+// because clippy prefers Path::extension(). We deliberately match exact-case
+// `.tmp` (BR's atomic-write writers produce lowercase) and the secondary
+// `*.tmp.<digits>` shape doesn't have `.tmp` as the Path extension.
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
+fn check_orphan_tmp_files(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
+    use std::time::{Duration, SystemTime};
+    let Ok(entries) = fs::read_dir(beads_dir) else {
+        push_check(checks, "tmp_files_orphan", CheckStatus::Ok, None, None);
+        return;
+    };
+    let now = SystemTime::now();
+    let threshold = Duration::from_secs(ORPHAN_TMP_AGE_THRESHOLD_SECS);
+    let mut orphans: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        let name_os = entry.file_name();
+        let Some(name) = name_os.to_str() else {
+            continue;
+        };
+        // Match common atomic-write tmp shapes:
+        //   issues.jsonl.<pid>.tmp
+        //   foo.tmp
+        //   foo.tmp.<digits>
+        let is_tmp_shape = name.ends_with(".tmp")
+            || (name.contains(".tmp.")
+                && name
+                    .rsplit('.')
+                    .next()
+                    .is_some_and(|s| s.chars().all(|c| c.is_ascii_digit())));
+        if !is_tmp_shape {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let Ok(mtime) = meta.modified() else {
+            continue;
+        };
+        if now
+            .duration_since(mtime)
+            .map(|age| age > threshold)
+            .unwrap_or(false)
+        {
+            orphans.push(name.to_string());
+        }
+    }
+    if orphans.is_empty() {
+        push_check(checks, "tmp_files_orphan", CheckStatus::Ok, None, None);
+    } else {
+        push_check(
+            checks,
+            "tmp_files_orphan",
+            CheckStatus::Warn,
+            Some(format!(
+                "{} orphan tmp file(s) older than {}s under {}",
+                orphans.len(),
+                ORPHAN_TMP_AGE_THRESHOLD_SECS,
+                beads_dir.display()
+            )),
+            Some(serde_json::json!({
+                "files": orphans,
+                "age_threshold_secs": ORPHAN_TMP_AGE_THRESHOLD_SECS,
+                "remediation": "Verify no peer process is writing, then manually remove the tmp files",
+            })),
+        );
     }
 }
 
@@ -7514,6 +7593,8 @@ fn collect_doctor_report_with_mode_and_db_override(
     check_inner_gitignore_present(beads_dir, &mut checks);
     // Pass-5 cycle 14: .beads/issues.jsonl world-writable security check.
     check_jsonl_world_writable(beads_dir, &mut checks);
+    // Pass-5 cycle 15: orphan *.tmp files from interrupted atomic writes.
+    check_orphan_tmp_files(beads_dir, &mut checks);
     check_root_gitignore(beads_dir, &mut checks);
     check_routes_jsonl(beads_dir, &mut checks);
     check_rust_log_noisy(&mut checks);
@@ -9977,6 +10058,77 @@ mod tests {
         let mut checks = Vec::new();
         check_jsonl_world_writable(&beads_dir, &mut checks);
         let check = find_check(&checks, "permissions.jsonl_world_writable").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn test_check_orphan_tmp_files_old_tmp_warns() {
+        // Pass-5 cycle 15: a tmp file backdated >1 hour → warn.
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let tmp_path = beads_dir.join("issues.jsonl.99999.tmp");
+        fs::write(&tmp_path, b"partial write").unwrap();
+        // Backdate beyond the 1-hour threshold.
+        let two_hours_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 60 * 60);
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&tmp_path)
+            .unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(two_hours_ago))
+            .unwrap();
+        drop(f);
+
+        let mut checks = Vec::new();
+        check_orphan_tmp_files(&beads_dir, &mut checks);
+        let check = find_check(&checks, "tmp_files_orphan").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
+        let files = check
+            .details
+            .as_ref()
+            .and_then(|d| d.get("files"))
+            .and_then(|v| v.as_array())
+            .map(Vec::len)
+            .unwrap_or(0);
+        assert_eq!(files, 1);
+    }
+
+    #[test]
+    fn test_check_orphan_tmp_files_fresh_tmp_ok() {
+        // Fresh tmp (current mtime) is not orphan — could be an in-flight write.
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::write(beads_dir.join("issues.jsonl.123.tmp"), b"fresh").unwrap();
+
+        let mut checks = Vec::new();
+        check_orphan_tmp_files(&beads_dir, &mut checks);
+        let check = find_check(&checks, "tmp_files_orphan").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+    }
+
+    #[test]
+    fn test_check_orphan_tmp_files_ignores_non_tmp_files() {
+        // Plain `.jsonl` shouldn't match the tmp pattern even if old.
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let jsonl = beads_dir.join("issues.jsonl");
+        fs::write(&jsonl, b"{}\n").unwrap();
+        let two_hours_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 60 * 60);
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&jsonl)
+            .unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(two_hours_ago))
+            .unwrap();
+        drop(f);
+
+        let mut checks = Vec::new();
+        check_orphan_tmp_files(&beads_dir, &mut checks);
+        let check = find_check(&checks, "tmp_files_orphan").expect("check present");
         assert!(matches!(check.status, CheckStatus::Ok));
     }
 
