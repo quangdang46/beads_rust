@@ -36,6 +36,9 @@ failure handling.
   source build after artifact verification fails; the regression test now uses
   a local file URL so release-preparation runs do not block on network fallback
   behavior.
+- Package-manager manifest templates now track the DSR-published
+  `br-<version>-<platform>` archive names and current `v0.2.10` checksums, so
+  future manifest automation does not keep looking for stale `br-v...` assets.
 
 ### Validation
 
@@ -43,6 +46,8 @@ failure handling.
   allocator fix from `v0.2.9`, and a focused
   `cargo check --target x86_64-pc-windows-gnu --release` pass covering the
   Windows doctor portability fix.
+- Post-release fresh-eyes validation also checked the Homebrew/Scoop/AUR
+  manifest templates against the published DSR assets.
 
 ## v0.2.9 -- 2026-05-14 (Crates.io, superseded)
 

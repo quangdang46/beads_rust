@@ -22,6 +22,7 @@
 - **Migration:** Repointed the local `serde_yml` crate alias to the maintained `serde_norway` package, updated the lockfile to patched `rand 0.8.6`, and stopped enabling `rich_rust`'s `syntax` feature because `br` does not use its exported syntax helper in command flows.
 - **Windows follow-up:** `v0.2.9` removed the MinGW `mimalloc` failure, then the Windows release target exposed Unix-only doctor permission/symlink code. `v0.2.10` gates those POSIX paths and adds conservative non-Unix fallbacks.
 - **Installer follow-up:** The full release-preparation suite exposed that an explicit checksum mismatch could fall through to source-build fallback. `install.sh` now treats artifact verification failure as fatal, and the checksum-mismatch regression test uses a local file URL instead of a live release download.
+- **Package manifest follow-up:** A fresh-eyes pass found that the checked-in Homebrew, Scoop, and AUR manifest templates still referenced stale `br-v<version>` asset names and placeholder checksums even though DSR publishes the installer-compatible `br-<version>-<platform>` archives. The templates and update workflow now use the current asset names, fail fast on missing checksum downloads, and validate SHA256 values before writing manifest outputs.
 - **Tests:** Full all-features release-preparation suite passed after the dependency remediation; `cargo check --target x86_64-pc-windows-gnu --release` passed after the doctor portability fix.
 
 ### clap_complete: 4.5.66 -> 4.6.5

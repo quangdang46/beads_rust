@@ -278,10 +278,10 @@ fn test_cargo_metadata() {
 /// ahead of Cargo.toml" rather than requiring exact equality, which would
 /// otherwise fail on every pre-release commit.
 #[test]
-fn test_version_consistency() {
-    fn parse_version(raw: &str, source: &str) -> semver::Version {
+fn test_version_consistency() -> Result<(), String> {
+    fn parse_version(raw: &str, source: &str) -> Result<semver::Version, String> {
         semver::Version::parse(raw.trim())
-            .unwrap_or_else(|e| panic!("{source} version '{raw}' is not valid semver: {e}"))
+            .map_err(|err| format!("{source} version '{raw}' is not valid semver: {err}"))
     }
 
     let cargo_toml = fs::read_to_string("Cargo.toml").expect("Failed to read Cargo.toml");
@@ -290,8 +290,7 @@ fn test_version_consistency() {
         .find(|line| line.starts_with("version = "))
         .and_then(|line| line.split('"').nth(1))
         .expect("Could not find version in Cargo.toml");
-    let cargo_version =
-        semver::Version::parse(cargo_version_str).expect("Cargo.toml version must be valid semver");
+    let cargo_version = parse_version(cargo_version_str, "Cargo.toml")?;
 
     let formula_path = Path::new("packaging/homebrew/br.rb");
     if formula_path.exists() {
@@ -304,7 +303,7 @@ fn test_version_consistency() {
                     .and_then(|rest| rest.strip_suffix('"'))
             })
             .expect("Homebrew formula missing `version \"…\"` line");
-        let manifest_version = parse_version(raw, "Homebrew formula");
+        let manifest_version = parse_version(raw, "Homebrew formula")?;
         assert!(
             manifest_version <= cargo_version,
             "Homebrew formula version {manifest_version} is ahead of Cargo.toml {cargo_version}"
@@ -316,10 +315,11 @@ fn test_version_consistency() {
         let scoop = fs::read_to_string(scoop_path).expect("Failed to read Scoop manifest");
         let scoop_json: serde_json::Value =
             serde_json::from_str(&scoop).expect("Invalid Scoop JSON");
-        let scoop_version_str = scoop_json["version"]
-            .as_str()
+        let scoop_version_str = scoop_json
+            .get("version")
+            .and_then(serde_json::Value::as_str)
             .expect("Scoop manifest missing `version`");
-        let scoop_version = parse_version(scoop_version_str, "Scoop manifest");
+        let scoop_version = parse_version(scoop_version_str, "Scoop manifest")?;
         assert!(
             scoop_version <= cargo_version,
             "Scoop manifest version {scoop_version} is ahead of Cargo.toml {cargo_version}"
@@ -333,10 +333,74 @@ fn test_version_consistency() {
             .lines()
             .find_map(|line| line.trim().strip_prefix("pkgver="))
             .expect("PKGBUILD missing `pkgver=` line");
-        let manifest_version = parse_version(raw, "PKGBUILD");
+        let manifest_version = parse_version(raw, "PKGBUILD")?;
         assert!(
             manifest_version <= cargo_version,
             "PKGBUILD pkgver {manifest_version} is ahead of Cargo.toml {cargo_version}"
         );
     }
+
+    Ok(())
+}
+
+/// Package-manager manifests must follow the artifact names that DSR publishes.
+///
+/// `br-v<version>-...` was the older GitHub Actions naming convention. DSR
+/// publishes installer-compatible archives as `br-<version>-<platform>...`, so
+/// a stale `br-v...` URL makes package-manager automation look for assets that
+/// do not exist on the release.
+#[test]
+fn test_package_manifests_use_dsr_asset_names() {
+    for path in [
+        "packaging/homebrew/br.rb",
+        "packaging/scoop/br.json",
+        "packaging/aur/PKGBUILD",
+    ] {
+        let content = fs::read_to_string(path).expect("Failed to read package manifest");
+        assert!(
+            !content.contains("PLACEHOLDER_"),
+            "{path} must not ship placeholder checksums"
+        );
+        assert!(
+            !content.contains("br-v"),
+            "{path} must use DSR br-<version> asset names, not stale br-v names"
+        );
+    }
+
+    let formula =
+        fs::read_to_string("packaging/homebrew/br.rb").expect("Failed to read Homebrew formula");
+    assert!(formula.contains("br-#{version}-darwin_arm64.tar.gz"));
+    assert!(formula.contains("br-#{version}-darwin_amd64.tar.gz"));
+    assert!(formula.contains("br-#{version}-linux_arm64.tar.gz"));
+    assert!(formula.contains("br-#{version}-linux_amd64.tar.gz"));
+
+    let scoop = fs::read_to_string("packaging/scoop/br.json").expect("Failed to read Scoop file");
+    assert!(scoop.contains("br-$version-windows_amd64.zip"));
+
+    let pkgbuild = fs::read_to_string("packaging/aur/PKGBUILD").expect("Failed to read PKGBUILD");
+    assert!(pkgbuild.contains("br-${pkgver}-linux_amd64.tar.gz"));
+    assert!(pkgbuild.contains("br-${pkgver}-linux_arm64.tar.gz"));
+}
+
+#[test]
+fn test_update_package_manifests_workflow_uses_current_checksums() {
+    let workflow = fs::read_to_string(".github/workflows/update-package-manifests.yml")
+        .expect("Failed to read update-package-manifests workflow");
+
+    assert!(
+        workflow.contains(r#"FILE="br-${VERSION}-${platform}.${ext}.sha256""#),
+        "workflow must download the DSR-published checksum sidecars"
+    );
+    assert!(
+        !workflow.contains("br-v${VERSION}"),
+        "workflow must not look for stale br-v checksum sidecars"
+    );
+    assert!(
+        workflow.contains("curl -fsSL"),
+        "checksum download must fail fast instead of saving a 404 body"
+    );
+    assert!(
+        workflow.contains("Invalid SHA256"),
+        "workflow must validate checksum file contents before updating manifests"
+    );
 }
