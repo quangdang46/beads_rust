@@ -2206,10 +2206,13 @@ fn repair_recoverable_db_state(
     db_path: &Path,
     report: &DoctorReport,
     mut session: Option<&mut DoctorRepairSession>,
+    fixer_filter: &FixerFilter,
 ) -> LocalRepairResult {
     let mut repair = LocalRepairResult::default();
 
-    if report_has_sidecar_anomaly(report) {
+    if report_has_sidecar_anomaly(report)
+        && fixer_filter.allows("fm-state_files-wal-shm-sidecar-orphan")
+    {
         repair_database_sidecars(beads_dir, db_path, &mut repair, session.as_deref_mut());
     }
 
@@ -7676,6 +7679,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                     &paths.db_path,
                     &initial.report,
                     session.as_mut(),
+                    &fixer_filter,
                 )
             } else {
                 LocalRepairResult::default()
@@ -7786,6 +7790,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             &paths.db_path,
             &initial.report,
             session.as_mut(),
+            &fixer_filter,
         );
     }
 
@@ -10319,7 +10324,13 @@ mod tests {
             }],
         };
 
-        let repair = repair_recoverable_db_state(temp.path(), &db_path, &report, None);
+        let repair = repair_recoverable_db_state(
+            temp.path(),
+            &db_path,
+            &report,
+            None,
+            &FixerFilter::default(),
+        );
 
         assert!(repair.blocked_cache_rebuilt);
         let storage = SqliteStorage::open(&db_path).unwrap();
@@ -10369,7 +10380,13 @@ mod tests {
             }],
         };
 
-        let repair = repair_recoverable_db_state(temp.path(), &db_path, &report, None);
+        let repair = repair_recoverable_db_state(
+            temp.path(),
+            &db_path,
+            &report,
+            None,
+            &FixerFilter::default(),
+        );
 
         assert!(repair.blocked_cache_rebuilt);
         let storage = SqliteStorage::open(&db_path).unwrap();
@@ -10470,7 +10487,13 @@ mod tests {
             }],
         };
 
-        let repair = repair_recoverable_db_state(&beads_dir, &db_path, &report, None);
+        let repair = repair_recoverable_db_state(
+            &beads_dir,
+            &db_path,
+            &report,
+            None,
+            &FixerFilter::default(),
+        );
         assert!(
             !repair.quarantined_artifacts.is_empty(),
             "expected local repair to quarantine the orphan SHM sidecar"
@@ -10518,7 +10541,13 @@ mod tests {
             }],
         };
 
-        let repair = repair_recoverable_db_state(&beads_dir, &db_path, &report, None);
+        let repair = repair_recoverable_db_state(
+            &beads_dir,
+            &db_path,
+            &report,
+            None,
+            &FixerFilter::default(),
+        );
         assert!(
             repair.quarantined_artifacts.is_empty(),
             "WAL should not be quarantined for a Warn-level sidecar check"
@@ -11019,7 +11048,13 @@ mod tests {
             checks: Vec::new(),
         };
 
-        let local_repair = repair_recoverable_db_state(&beads_dir, &db_path, &report, None);
+        let local_repair = repair_recoverable_db_state(
+            &beads_dir,
+            &db_path,
+            &report,
+            None,
+            &FixerFilter::default(),
+        );
         assert!(!local_repair.blocked_cache_rebuilt);
     }
 
