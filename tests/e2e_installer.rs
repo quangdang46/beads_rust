@@ -376,35 +376,49 @@ fn e2e_installer_checksum_mismatch_fails() {
     }
 
     let temp = TempDir::new().expect("temp dir");
+    let archive = temp.path().join("br-v0.0.0-linux_amd64.tar.gz");
+    fs::write(&archive, b"not a release archive").expect("write fake archive");
 
     // Provide a bad checksum - installer should fail
     let bad_checksum = "0000000000000000000000000000000000000000000000000000000000000000";
+    let artifact_url = format!("file://{}", archive.display());
 
     let output = run_installer(
         &temp,
-        &["--checksum", bad_checksum, "--quiet"],
+        &[
+            "--version",
+            "v0.0.0",
+            "--artifact-url",
+            &artifact_url,
+            "--checksum",
+            bad_checksum,
+            "--quiet",
+            "--skip-skills",
+        ],
         HashMap::new(),
     );
 
-    // With a bad checksum, the installer should fail during verification
-    // unless it can't download the file at all (which is also a failure mode)
-    // Either way, the install should NOT succeed silently
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    // The installer might fail at download stage (no version) or checksum stage
-    // Both are acceptable - we just don't want silent success with bad checksum
-    if output.status.success() {
-        // If it somehow succeeded, verify the binary wasn't installed
-        let binary_path = temp.path().join("bin").join("br");
-        if binary_path.exists() {
-            // If binary exists, it should be because checksum was skipped (no release found)
-            // In production with --checksum flag, this would be a test failure
-            eprintln!(
-                "Note: Install succeeded but checksum flag was provided. stdout={stdout}, stderr={stderr}"
-            );
-        }
-    }
+    assert!(
+        !output.status.success(),
+        "installer must fail closed on checksum mismatch; stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("Checksum mismatch"),
+        "stderr should explain the checksum mismatch; stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("Release artifact verification failed"),
+        "stderr should not fall back to source build after verification failure; stdout={stdout}, stderr={stderr}"
+    );
+
+    let binary_path = temp.path().join("bin").join("br");
+    assert!(
+        !binary_path.exists(),
+        "checksum mismatch must not install a binary"
+    );
 }
 
 // ============================================================================

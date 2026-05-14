@@ -15,10 +15,40 @@ This changelog is organized by capability rather than diff order. Each version s
 
 ---
 
-## v0.2.9 -- 2026-05-14 (Release)
+## v0.2.10 -- 2026-05-14 (Release)
 
-This version supersedes `v0.2.8` by restoring the Windows release build after
-the dependency refresh.
+This version supersedes `v0.2.9` by fixing the remaining Windows release-build
+portability issue in the doctor subsystem and tightening installer integrity
+failure handling.
+
+### Release Fixes
+
+- Kept the `mimalloc` Windows exclusion from `v0.2.9`, which removed the
+  MinGW `libmimalloc-sys` C build failure.
+- Gated POSIX-only doctor permission checks behind Unix `cfg`s and added
+  conservative non-Unix handling for repair backups, chmod-style operations,
+  symlink creation, and undo artifact permissions so the Windows release target
+  compiles again.
+- Re-cut the release after `v0.2.9` had already been published to crates.io,
+  because crates.io package versions are immutable and the Windows doctor
+  portability fix changes the release source.
+- Installer checksum mismatches now fail closed instead of falling back to a
+  source build after artifact verification fails; the regression test now uses
+  a local file URL so release-preparation runs do not block on network fallback
+  behavior.
+
+### Validation
+
+- `v0.2.10` validation includes the dependency-update checks from `v0.2.8`, the
+  allocator fix from `v0.2.9`, and a focused
+  `cargo check --target x86_64-pc-windows-gnu --release` pass covering the
+  Windows doctor portability fix.
+
+## v0.2.9 -- 2026-05-14 (Crates.io, superseded)
+
+This version superseded `v0.2.8` by removing the dependency-level Windows
+allocator failure after the dependency refresh, but was itself superseded by
+`v0.2.10` for a separate doctor portability fix.
 
 ### Release Fixes
 
@@ -32,7 +62,8 @@ the dependency refresh.
 ### Validation
 
 - `v0.2.9` validation includes the same dependency-update checks as `v0.2.8`,
-  plus a Windows release-build retry proving the MinGW allocator failure is gone.
+  plus a Windows release-build retry proving the MinGW allocator failure was
+  replaced by a separate doctor portability issue.
 
 ## v0.2.8 -- 2026-05-14 (Crates.io, superseded)
 

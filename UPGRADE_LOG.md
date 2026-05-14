@@ -16,11 +16,13 @@
 
 ## Updates
 
-### Audit warning remediation for v0.2.9
+### Audit warning and Windows release remediation for v0.2.10
 
 - **Issue:** `cargo audit` reported advisory warnings for `serde_yml`/`libyml`, `rand 0.8.5`, and `syntect` transitive crates pulled in through `rich_rust/full`.
 - **Migration:** Repointed the local `serde_yml` crate alias to the maintained `serde_norway` package, updated the lockfile to patched `rand 0.8.6`, and stopped enabling `rich_rust`'s `syntax` feature because `br` does not use its exported syntax helper in command flows.
-- **Tests:** Full all-features release-preparation suite passed after this remediation.
+- **Windows follow-up:** `v0.2.9` removed the MinGW `mimalloc` failure, then the Windows release target exposed Unix-only doctor permission/symlink code. `v0.2.10` gates those POSIX paths and adds conservative non-Unix fallbacks.
+- **Installer follow-up:** The full release-preparation suite exposed that an explicit checksum mismatch could fall through to source-build fallback. `install.sh` now treats artifact verification failure as fatal, and the checksum-mismatch regression test uses a local file URL instead of a live release download.
+- **Tests:** Full all-features release-preparation suite passed after the dependency remediation; `cargo check --target x86_64-pc-windows-gnu --release` passed after the doctor portability fix.
 
 ### clap_complete: 4.5.66 -> 4.6.5
 
@@ -75,10 +77,10 @@
 - `cargo fmt --check` passed.
 - `git diff --check` passed.
 - `cargo test --all-features --no-fail-fast` passed, including doctests.
-- `cargo audit` passed with no advisory warnings after the v0.2.9 remediation.
-- `cargo publish --dry-run --locked` passed for `beads_rust v0.2.9`.
+- `cargo audit` passed with no advisory warnings after the v0.2.10 remediation.
+- `cargo publish --dry-run --locked` passed for `beads_rust v0.2.10`.
 
 ## Release Status
 
-- Prepared `beads_rust v0.2.9`.
-- `v0.2.9` supersedes `v0.2.8`; `v0.2.8` was already published to crates.io before the Windows release-build fix.
+- Prepared `beads_rust v0.2.10`.
+- `v0.2.10` supersedes `v0.2.9`; `v0.2.9` was already published to crates.io before the doctor portability fix.

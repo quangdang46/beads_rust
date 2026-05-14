@@ -54,7 +54,7 @@ static TS_FULL_RE: LazyLock<Regex> = LazyLock::new(|| {
 static DATE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\d{4}-\d{2}-\d{2}").expect("date regex"));
 static VERSION_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\((?:HEAD|[A-Za-z0-9._/-]+)@[a-f0-9]+\)").expect("version regex")
+    Regex::new(r"\s+\((?:HEAD|[A-Za-z0-9._/-]+)@[a-f0-9]+\)").expect("version regex")
 });
 /// The build profile label embedded in `br --version` output, e.g., `(dev)`
 /// or `(release)`.  Snapshot tests may run under either profile depending on
@@ -445,9 +445,7 @@ fn normalize_text_with_log(text: &str, config: &TextNormConfig) -> (String, Vec<
 
     // 9. Mask git hashes and build-profile labels (dev / release)
     if config.mask_git_hashes && VERSION_RE.is_match(&normalized) {
-        normalized = VERSION_RE
-            .replace_all(&normalized, "(BRANCH@GIT_HASH)")
-            .to_string();
+        normalized = VERSION_RE.replace_all(&normalized, "").to_string();
         log.push("git_hashes".to_string());
     }
     if config.mask_git_hashes && BUILD_PROFILE_RE.is_match(&normalized) {
@@ -748,9 +746,9 @@ mod golden_snapshot_tests {
 
     #[test]
     fn test_mask_git_hash() {
-        let input = "Version 0.1.0 (main@abc1234)";
+        let input = "br version 0.1.0 (dev) (main@abc1234)";
         let snapshot = TextSnapshot::golden(input);
-        assert!(snapshot.normalized.contains("(BRANCH@GIT_HASH)"));
+        assert_eq!(snapshot.normalized, "br version X.Y.Z (BUILD)");
         assert!(!snapshot.normalized.contains("abc1234"));
     }
 

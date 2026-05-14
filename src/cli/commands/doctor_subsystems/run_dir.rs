@@ -40,7 +40,6 @@
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -53,6 +52,42 @@ use crate::error::BeadsError;
 pub const ENV_RUNS_DIR: &str = "BR_DOCTOR_RUNS_DIR";
 
 static RUN_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(unix)]
+fn create_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn create_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    let resolved_target = link
+        .parent()
+        .map_or_else(|| target.to_path_buf(), |parent| parent.join(target));
+    if resolved_target.is_dir() {
+        std::os::windows::fs::symlink_dir(target, link)
+    } else {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn create_symlink(_target: &Path, _link: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "doctor: symlink creation is not supported on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn make_executable(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
 
 /// Concrete handles for the artifact directory of a single run.
 #[derive(Debug, Clone)]
@@ -190,7 +225,6 @@ fn generate_run_id(repo_root: &Path) -> String {
 /// Atomically point `latest_link` at `target`. If the link already
 /// exists, replace it via tmp-symlink + rename.
 fn update_latest_symlink(latest_link: &Path, target: &Path) -> Result<(), BeadsError> {
-    use std::os::unix::fs::symlink;
     if let Some(parent) = latest_link.parent() {
         fs::create_dir_all(parent).map_err(BeadsError::Io)?;
     }
@@ -220,7 +254,7 @@ fn update_latest_symlink(latest_link: &Path, target: &Path) -> Result<(), BeadsE
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(BeadsError::Io(e)),
     }
-    symlink(&rel_target, &tmp).map_err(BeadsError::Io)?;
+    create_symlink(&rel_target, &tmp).map_err(BeadsError::Io)?;
     // `fs::rename` over an existing symlink atomically replaces it on
     // Unix.
     fs::rename(&tmp, latest_link).map_err(BeadsError::Io)?;
@@ -371,12 +405,11 @@ echo "undo complete for run {run_id}" >&2
     );
 
     fs::write(&run.undo_script, script).map_err(BeadsError::Io)?;
-    fs::set_permissions(&run.undo_script, fs::Permissions::from_mode(0o755))
-        .map_err(BeadsError::Io)?;
+    make_executable(&run.undo_script).map_err(BeadsError::Io)?;
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::collections::HashSet;
@@ -588,7 +621,7 @@ mod tests {
         // catches it.
         let src = include_str!("run_dir.rs");
         let production_section = src
-            .split("#[cfg(test)]")
+            .split("\nmod tests {")
             .next()
             .expect("run_dir.rs must have a non-test section");
         assert!(

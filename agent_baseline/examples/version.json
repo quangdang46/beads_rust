@@ -1,8 +1,6 @@
 {
-  "version": "0.2.9",
+  "version": "0.2.10",
   "build": "<build>",
-  "commit": "<commit>",
-  "branch": "<branch>",
   "rust_version": "<rust_version>",
   "target": "<target>",
   "features": [

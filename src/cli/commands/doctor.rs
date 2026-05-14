@@ -4285,6 +4285,7 @@ fn rust_log_default_volume() -> RustLogVolume {
 ///   effect; the spec calls for a future `Op::ProbeOnly` chokepoint
 ///   channel we have not yet shipped — `beads_rust-probe-only` is the
 ///   tracking work).
+#[cfg(unix)]
 fn check_permissions_beads_dir(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
     use std::os::unix::fs::PermissionsExt;
 
@@ -4539,6 +4540,34 @@ fn push_metadata_json_missing(checks: &mut Vec<CheckResult>) {
                 .to_string(),
         ),
         None,
+    );
+}
+
+#[cfg(not(unix))]
+fn check_permissions_beads_dir(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
+    if !beads_dir.exists() {
+        push_check(
+            checks,
+            "permissions.beads_dir",
+            CheckStatus::Ok,
+            Some(format!(
+                "{} not stat-able; deferring to beads_dir check",
+                beads_dir.display(),
+            )),
+            None,
+        );
+        return;
+    }
+
+    push_check(
+        checks,
+        "permissions.beads_dir",
+        CheckStatus::Ok,
+        Some("POSIX user-write bit check is not applicable on this platform".to_string()),
+        Some(serde_json::json!({
+            "beads_dir": beads_dir.display().to_string(),
+            "platform": std::env::consts::OS,
+        })),
     );
 }
 
@@ -8103,7 +8132,7 @@ fn emit_flat_robot_triage(report: &DoctorReport) {
     emit_robot_triage(&envelope);
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::health::{AnomalyClass, WorkspaceHealth};

@@ -46,6 +46,21 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::output::OutputContext;
 
+#[cfg(unix)]
+fn metadata_mode(metadata: &fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode()
+}
+
+#[cfg(not(unix))]
+fn metadata_mode(metadata: &fs::Metadata) -> u32 {
+    if metadata.permissions().readonly() {
+        0o444
+    } else {
+        0o666
+    }
+}
+
 /// Top-level dispatcher for `br doctor <subcommand>`. Resolves the
 /// repo root via `config::discover_optional_beads_dir_with_cli` and
 /// hands off to the per-subcommand handler.
@@ -940,10 +955,7 @@ fn restore_one(
         };
     }
 
-    let mode = fs::metadata(&backup).ok().map(|m| {
-        use std::os::unix::fs::PermissionsExt;
-        m.permissions().mode()
-    });
+    let mode = fs::metadata(&backup).ok().map(|m| metadata_mode(&m));
     match chokepoint::mutate(
         ctx,
         &target,
@@ -1442,10 +1454,9 @@ fn restore_rename(
             };
         }
 
-        let mode = fs::metadata(backup).ok().map(|metadata| {
-            use std::os::unix::fs::PermissionsExt;
-            metadata.permissions().mode()
-        });
+        let mode = fs::metadata(backup)
+            .ok()
+            .map(|metadata| metadata_mode(&metadata));
         return match chokepoint::mutate(
             ctx,
             &target,
@@ -1953,7 +1964,7 @@ pub fn emit_robot_triage(envelope: &TriageEnvelope) {
 // tests
 // =============================================================================
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::time::Instant;

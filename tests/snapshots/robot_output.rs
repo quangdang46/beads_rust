@@ -39,8 +39,9 @@ static SCORE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#""(score|urgency|urgency_norm)"\s*:\s*-?[0-9]+(?:\.[0-9]+)?"#)
         .expect("score regex")
 });
-static BV_VERSION_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#""version"\s*:\s*"v\d+\.\d+\.\d+""#).expect("bv version regex"));
+static BV_VERSION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#""version"\s*:\s*"v\d+\.\d+\.\d+(?:[-+][^"]*)?""#).expect("bv version regex")
+});
 static GRAPH_ROOT_FIRST_USAGE_HINT_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#""usage_hints"\s*:\s*\[\s*"--graph-root (?:\\u003c|<)id(?:\\u003e|>) - [^"]+",\s*"#,
@@ -200,6 +201,16 @@ fn normalize_bv_usage_hints_removes_graph_root_hint_in_any_array_position() {
     for (raw, expected) in cases {
         assert_eq!(normalize_bv_usage_hints(&raw), expected);
     }
+}
+
+#[test]
+fn normalize_bv_robot_output_masks_semver_pseudo_versions() {
+    let raw = r#"{"version":"v0.0.0-20260325195524-5f7fec28b24d","id":"bd-one"}"#;
+
+    assert_eq!(
+        normalize_bv_robot_output(raw),
+        r#"{"version":"BV_VERSION","id":"bd-one"}"#
+    );
 }
 
 #[test]

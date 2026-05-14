@@ -68,7 +68,6 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -84,6 +83,71 @@ use crate::util::hex_encode;
 /// [`ActionRecord::before_hash`].
 const SHA256_EMPTY_PREFIXED: &str =
     "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+#[cfg(unix)]
+fn metadata_mode(meta: &fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode()
+}
+
+#[cfg(not(unix))]
+fn metadata_mode(meta: &fs::Metadata) -> u32 {
+    if meta.permissions().readonly() {
+        0o444
+    } else {
+        0o666
+    }
+}
+
+#[cfg(unix)]
+fn apply_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn apply_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+    let mut perms = fs::metadata(path)?.permissions();
+    perms.set_readonly(mode & 0o200 == 0);
+    fs::set_permissions(path, perms)
+}
+
+#[cfg(unix)]
+fn copy_source_permissions(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let meta = fs::metadata(src)?;
+    apply_mode(dst, metadata_mode(&meta))
+}
+
+#[cfg(not(unix))]
+fn copy_source_permissions(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let meta = fs::metadata(src)?;
+    fs::set_permissions(dst, meta.permissions())
+}
+
+#[cfg(unix)]
+fn create_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn create_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    let resolved_target = link
+        .parent()
+        .map_or_else(|| target.to_path_buf(), |parent| parent.join(target));
+    if resolved_target.is_dir() {
+        std::os::windows::fs::symlink_dir(target, link)
+    } else {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn create_symlink(_target: &Path, _link: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "doctor: symlink creation is not supported on this platform",
+    ))
+}
 
 /// One disk-mutating operation the chokepoint can execute.
 ///
@@ -417,8 +481,7 @@ fn copy_verbatim_with_perms(src: &Path, dst: &Path) -> std::io::Result<()> {
         fs::create_dir_all(parent)?;
     }
     fs::copy(src, dst)?;
-    let meta = fs::metadata(src)?;
-    fs::set_permissions(dst, fs::Permissions::from_mode(meta.permissions().mode()))?;
+    copy_source_permissions(src, dst)?;
     Ok(())
 }
 
@@ -433,8 +496,7 @@ fn write_verbatim_backup(src: &Path, dst: &Path, bytes: &[u8]) -> std::io::Resul
         fs::create_dir_all(parent)?;
     }
     fs::write(dst, bytes)?;
-    let meta = fs::metadata(src)?;
-    fs::set_permissions(dst, fs::Permissions::from_mode(meta.permissions().mode()))?;
+    copy_source_permissions(src, dst)?;
     Ok(())
 }
 
@@ -548,7 +610,7 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
     let backup = ctx.run_dir.join("backups").join(rel);
     let existing_mode = if before_bytes_or_missing.is_some() {
         match fs::metadata(path) {
-            Ok(meta) => Some(meta.permissions().mode()),
+            Ok(meta) => Some(metadata_mode(&meta)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(BeadsError::Io(e)),
         }
@@ -1132,12 +1194,7 @@ fn run_db_migrate(
         fs::create_dir_all(parent).map_err(BeadsError::Io)?;
     }
     fs::copy(db_path, &snapshot_path).map_err(BeadsError::Io)?;
-    let meta = fs::metadata(db_path).map_err(BeadsError::Io)?;
-    fs::set_permissions(
-        &snapshot_path,
-        fs::Permissions::from_mode(meta.permissions().mode()),
-    )
-    .map_err(BeadsError::Io)?;
+    copy_source_permissions(db_path, &snapshot_path).map_err(BeadsError::Io)?;
 
     // (2) Verify PRAGMA user_version matches `from`. If the precondition
     //     gate fails we discard the snapshot and refuse — leaving no
@@ -1217,8 +1274,7 @@ fn execute_atomic(
             let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
             tmp.write_all(&content)?;
             tmp.as_file().sync_data()?;
-            let perms = fs::Permissions::from_mode(mode.unwrap_or(0o644));
-            fs::set_permissions(tmp.path(), perms)?;
+            apply_mode(tmp.path(), mode.unwrap_or(0o644))?;
             tmp.persist(path)
                 .map_err(|e| std::io::Error::other(e.error.to_string()))?;
             fsync_dir(parent)?;
@@ -1249,7 +1305,7 @@ fn execute_atomic(
             // window; default to 0o644 if the file did not exist
             // at backup time.
             let mode = existing_mode.unwrap_or(0o644);
-            fs::set_permissions(tmp.path(), fs::Permissions::from_mode(mode))?;
+            apply_mode(tmp.path(), mode)?;
             tmp.persist(path)
                 .map_err(|e| std::io::Error::other(e.error.to_string()))?;
             fsync_dir(parent)?;
@@ -1272,10 +1328,9 @@ fn execute_atomic(
             }
         }
         Op::Chmod { mode } => {
-            fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+            apply_mode(path, mode)?;
         }
         Op::SymlinkAtomic { target } => {
-            use std::os::unix::fs::symlink;
             let basename = path
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
@@ -1296,7 +1351,7 @@ fn execute_atomic(
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
             }
-            symlink(target, &tmp)?;
+            create_symlink(&target, &tmp)?;
             fs::rename(&tmp, path)?;
             fsync_dir(parent)?;
         }
@@ -1449,11 +1504,12 @@ where
     outcome
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use fsqlite::Connection;
     use std::io::BufRead;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
     /// Build a [`MutateContext`] rooted at `tmp` with a fresh

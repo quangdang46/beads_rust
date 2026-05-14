@@ -1131,7 +1131,9 @@ fn normalize_schema_snapshot(value: &mut Value) {
 #[cfg(feature = "self_update")]
 fn normalize_version_snapshot(value: &mut Value) {
     if let Some(object) = value.as_object_mut() {
-        for key in ["branch", "build", "commit", "rust_version", "target"] {
+        object.remove("branch");
+        object.remove("commit");
+        for key in ["build", "rust_version", "target"] {
             if object.contains_key(key) {
                 object.insert(key.to_string(), Value::String(format!("<{key}>")));
             }

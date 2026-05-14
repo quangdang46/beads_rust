@@ -1417,7 +1417,7 @@ download_release() {
         fi
     fi
 
-    verify_archive_checksum "$TMP/$archive_name" "$archive_name" "$expected" || return 1
+    verify_archive_checksum "$TMP/$archive_name" "$archive_name" "$expected" || return 2
 
     # Extract
     log_step "Extracting..."
@@ -1615,6 +1615,11 @@ main() {
             if [ "$downloaded" -eq 0 ]; then
                 if download_release "$platform"; then
                     downloaded=1
+                else
+                    local download_status=$?
+                    if [ "$download_status" -eq 2 ]; then
+                        die "Release artifact verification failed"
+                    fi
                 fi
             fi
             if [ "$downloaded" -eq 0 ]; then
