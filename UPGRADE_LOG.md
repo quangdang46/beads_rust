@@ -4,7 +4,7 @@
 
 ## Summary
 
-- **Updated:** 1 | **Skipped:** 0 | **Failed:** 0 | **Blocked:** 2
+- **Updated:** 2 | **Skipped:** 0 | **Failed:** 0 | **Blocked:** 2
 
 ## Discovery
 
@@ -24,8 +24,14 @@
 ### Build metadata warnings: vergen git defaults
 
 - **Issue:** RCH and package-style builds can have no usable `.git` metadata, causing `vergen-gix` to emit `VERGEN_GIT_* set to default` build warnings.
-- **Migration:** Only emit git build metadata when `.git/HEAD` exists; package/non-git builds still emit build timestamp, target triple, and rustc version without warning.
+- **Migration:** Only emit git build metadata when `.git/HEAD` exists and a read-only `git rev-parse --is-inside-work-tree` probe confirms a usable work tree; package/non-git builds still emit build timestamp, target triple, and rustc version without warning.
 - **Tests:** `cargo check --all-targets --all-features` via RCH passed after the first fix but still showed git-default warnings; stricter `.git/HEAD` follow-up pending.
+
+### assert_cmd: 2.2.1 -> 2.2.2
+
+- **Breaking:** None found. Patch release in the same 2.x testing helper line.
+- **Migration:** Manifest version only.
+- **Tests:** `cargo test --lib --all-features` via RCH passed: 2157 passed, 0 failed, 7 ignored.
 
 ## Blockers / Needs Attention
 

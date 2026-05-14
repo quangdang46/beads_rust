@@ -3,6 +3,7 @@
 //! Uses vergen-gix to embed build information into the binary.
 
 use std::path::Path;
+use std::process::Command;
 use vergen_gix::{BuildBuilder, CargoBuilder, Emitter, GixBuilder, RustcBuilder};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -16,7 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .add_instructions(&cargo)?
         .add_instructions(&rustc)?;
 
-    if Path::new(".git/HEAD").is_file() {
+    if Path::new(".git/HEAD").is_file() && is_inside_git_work_tree() {
         let gix = GixBuilder::default()
             .branch(true)
             .sha(true)
@@ -29,4 +30,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     emitter.emit()?;
 
     Ok(())
+}
+
+fn is_inside_git_work_tree() -> bool {
+    let output = Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output();
+
+    matches!(
+        output,
+        Ok(output) if output.status.success() && output.stdout == b"true\n"
+    )
 }
