@@ -15,7 +15,26 @@ This changelog is organized by capability rather than diff order. Each version s
 
 ---
 
-## v0.2.8 -- 2026-05-14 (Release)
+## v0.2.9 -- 2026-05-14 (Release)
+
+This version supersedes `v0.2.8` by restoring the Windows release build after
+the dependency refresh.
+
+### Release Fixes
+
+- Kept `mimalloc` enabled for Linux and macOS builds, but removed it from
+  Windows builds so the MinGW release target no longer fails inside
+  `libmimalloc-sys`' bundled C build.
+- Re-cut the release after `v0.2.8` had already been published to crates.io,
+  because crates.io package versions are immutable and the Windows build fix
+  changes the release source.
+
+### Validation
+
+- `v0.2.9` validation includes the same dependency-update checks as `v0.2.8`,
+  plus a Windows release-build retry proving the MinGW allocator failure is gone.
+
+## v0.2.8 -- 2026-05-14 (Crates.io, superseded)
 
 This version refreshes the dependency stack, including the local `/dp` FastMCP and frankensqlite libraries now published on crates.io, and tightens storage reliability around the updated SQLite engine.
 

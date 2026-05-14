@@ -13,6 +13,7 @@ use std::ffi::OsStr;
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 
+#[cfg(not(windows))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

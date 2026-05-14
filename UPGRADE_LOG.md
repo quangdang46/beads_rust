@@ -16,6 +16,12 @@
 
 ## Updates
 
+### Audit warning remediation for v0.2.9
+
+- **Issue:** `cargo audit` reported advisory warnings for `serde_yml`/`libyml`, `rand 0.8.5`, and `syntect` transitive crates pulled in through `rich_rust/full`.
+- **Migration:** Repointed the local `serde_yml` crate alias to the maintained `serde_norway` package, updated the lockfile to patched `rand 0.8.6`, and stopped enabling `rich_rust`'s `syntax` feature because `br` does not use its exported syntax helper in command flows.
+- **Tests:** Full all-features release-preparation suite passed after this remediation.
+
 ### clap_complete: 4.5.66 -> 4.6.5
 
 - **Breaking:** None found for this project usage. This is a `clap` 4.x completion crate patch/minor-compatible bump; existing `unstable-dynamic` feature remains available.
@@ -69,9 +75,10 @@
 - `cargo fmt --check` passed.
 - `git diff --check` passed.
 - `cargo test --all-features --no-fail-fast` passed, including doctests.
-- `cargo publish --dry-run --locked --allow-dirty` passed for `beads_rust v0.2.8`.
+- `cargo audit` passed with no advisory warnings after the v0.2.9 remediation.
+- `cargo publish --dry-run --locked` passed for `beads_rust v0.2.9`.
 
 ## Release Status
 
-- Prepared `beads_rust v0.2.8`.
-- Validation passed for the final `dsr`, crates.io, and Homebrew publication flow.
+- Prepared `beads_rust v0.2.9`.
+- `v0.2.9` supersedes `v0.2.8`; `v0.2.8` was already published to crates.io before the Windows release-build fix.
