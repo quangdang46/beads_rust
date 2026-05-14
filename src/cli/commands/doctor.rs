@@ -1421,6 +1421,7 @@ struct EarlyRepairSummary {
     startup_cache: bool,
     recovery_aged: bool,
     export_hash: bool,
+    base_jsonl_symlink: bool,
 }
 
 impl EarlyRepairSummary {
@@ -1430,6 +1431,7 @@ impl EarlyRepairSummary {
             || self.startup_cache
             || self.recovery_aged
             || self.export_hash
+            || self.base_jsonl_symlink
     }
 
     fn action_labels(self) -> Vec<String> {
@@ -1448,6 +1450,9 @@ impl EarlyRepairSummary {
         }
         if self.export_hash {
             actions.push("export_hash_cache_recomputed".to_string());
+        }
+        if self.base_jsonl_symlink {
+            actions.push("base_jsonl_symlink_quarantined".to_string());
         }
         actions
     }
@@ -1468,6 +1473,9 @@ impl EarlyRepairSummary {
         }
         if self.export_hash {
             messages.push("Recomputed metadata.jsonl_content_hash.".to_string());
+        }
+        if self.base_jsonl_symlink {
+            messages.push("Quarantined symlinked merge anchor.".to_string());
         }
         messages
     }
@@ -7315,7 +7323,6 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     } else {
         false
     };
-    let _ = base_jsonl_symlink_repaired;
 
     if args.repair && (fixer_filter.has_only() || fixer_filter.has_skip()) {
         tracing::info!(
@@ -7331,6 +7338,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         startup_cache: startup_cache_repaired,
         recovery_aged: recovery_aged_repaired,
         export_hash: export_hash_repaired,
+        base_jsonl_symlink: base_jsonl_symlink_repaired,
     };
 
     if !args.repair {
@@ -9112,6 +9120,7 @@ mod tests {
             startup_cache: false,
             recovery_aged: false,
             export_hash: true,
+            base_jsonl_symlink: false,
         };
 
         assert!(summary.applied());
@@ -9147,6 +9156,35 @@ mod tests {
                 "export_hash_cache_recomputed".to_string(),
                 "blocked_cache_rebuilt".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn test_early_repair_summary_reports_base_jsonl_symlink_quarantine() {
+        let summary = EarlyRepairSummary {
+            gitignore: false,
+            merge_artifacts: false,
+            startup_cache: false,
+            recovery_aged: false,
+            export_hash: false,
+            base_jsonl_symlink: true,
+        };
+
+        assert!(summary.applied());
+        assert_eq!(
+            summary.action_labels(),
+            vec!["base_jsonl_symlink_quarantined".to_string()]
+        );
+        assert_eq!(
+            repair_outcome_message_from_parts(summary.messages(), None, None),
+            "Quarantined symlinked merge anchor."
+        );
+        let audit = summary.audit_record();
+        assert_eq!(audit.phase, "doctor.early_repair");
+        assert_eq!(audit.outcome, "base_jsonl_symlink_quarantined");
+        assert_eq!(
+            audit.applied_actions,
+            vec!["base_jsonl_symlink_quarantined".to_string()]
         );
     }
 
