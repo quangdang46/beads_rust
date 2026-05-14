@@ -4,7 +4,7 @@
 
 ## Summary
 
-- **Updated:** 2 | **Skipped:** 0 | **Failed:** 0 | **Blocked:** 2
+- **Updated:** 4 | **Skipped:** 0 | **Failed:** 0 | **Blocked:** 2
 
 ## Discovery
 
@@ -25,12 +25,24 @@
 
 - **Issue:** RCH and package-style builds can have no usable `.git` metadata, causing `vergen-gix` to emit `VERGEN_GIT_* set to default` build warnings.
 - **Migration:** Only emit git build metadata when `.git/HEAD` exists and a read-only `git rev-parse --is-inside-work-tree` probe confirms a usable work tree; package/non-git builds still emit build timestamp, target triple, and rustc version without warning.
-- **Tests:** `cargo check --all-targets --all-features` via RCH passed after the first fix but still showed git-default warnings; stricter `.git/HEAD` follow-up pending.
+- **Tests:** `cargo test --lib --all-features` via RCH passed without the previous `VERGEN_GIT_* set to default` warnings: 2157 passed, 0 failed, 7 ignored.
 
 ### assert_cmd: 2.2.1 -> 2.2.2
 
 - **Breaking:** None found. Patch release in the same 2.x testing helper line.
 - **Migration:** Manifest version only.
+- **Tests:** `cargo test --lib --all-features` via RCH passed: 2157 passed, 0 failed, 7 ignored.
+
+### signal-hook: 0.3.x -> 0.4.4
+
+- **Breaking:** None found for this project usage. The direct dependency now targets the current 0.4 line; `crossterm` still retains its own compatible 0.3 transitive dependency.
+- **Migration:** Manifest version only; no code changes required.
+- **Tests:** `cargo test --lib --all-features` via RCH passed: 2157 passed, 0 failed, 7 ignored.
+
+### tru (`toon_rust`): 0.2.2 -> 0.2.3
+
+- **Breaking:** None found for current TOON formatting usage.
+- **Migration:** Manifest and lockfile update.
 - **Tests:** `cargo test --lib --all-features` via RCH passed: 2157 passed, 0 failed, 7 ignored.
 
 ## Blockers / Needs Attention
@@ -43,4 +55,5 @@
 
 ## Validation
 
-- Pending.
+- Incremental all-features library tests via RCH pass after each dependency update.
+- Full release-preparation validation pending.

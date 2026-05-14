@@ -5513,9 +5513,9 @@ dependencies = [
 
 [[package]]
 name = "tru"
-version = "0.2.2"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2cc0fc04e9d3efcecd4c94322bd2a28c35a3d02012252c7de91c611b097dfeea"
+checksum = "5e3a3ec4e4ded9246bfbf007bcea74355c322eb66f987cf338eeaeadffde0817"
 dependencies = [
  "anyhow",
  "chrono",
