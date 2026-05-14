@@ -1,6 +1,6 @@
 {
   "tool": "br",
-  "generated_at": "2026-04-25T00:17:56.060850569Z",
+  "generated_at": "<GENERATED_AT>",
   "schemas": {
     "IssueDetails": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -151,7 +151,14 @@
           ]
         },
         "source_repo": {
-          "description": "Source repository for multi-repo support.",
+          "description": "Source repository for multi-repo support — basename of the\ncanonicalized parent of `.beads/`. Stable across clones of the\nsame repo on different machines (different absolute paths\nproduce the same basename). See [`canonical_source_repo`] in\n`cli::commands::create`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_repo_path": {
+          "description": "Absolute canonical path of the source repository. Distinct from\n`source_repo`: this field uniquely identifies the workspace on\nthe machine that produced the issue, which is what multi-repo\nfleet automation needs to route beads back to the right\ndirectory (see beads_rust#289). Two clones of the same repo\nunder `~/Developer/foo` vs `~/Developer/scratch/foo` collide on\n`source_repo` but disagree here. Optional — older databases and\nhand-edited JSONL records without this field are valid.",
           "type": [
             "string",
             "null"

@@ -15,6 +15,30 @@ This changelog is organized by capability rather than diff order. Each version s
 
 ---
 
+## v0.2.8 -- 2026-05-14 (Prepared; release blocked)
+
+This version prepares the dependency-refresh release and validates the packaged crate, but the final public release is blocked until the local `fastmcp_rust` `0.3.1` crate family is published to crates.io.
+
+### Dependency Updates
+
+- Updated the fsqlite stack used by storage and sync paths to the latest published local versions: `fsqlite*` `0.1.3` and `fsqlite-vfs` `0.1.4`.
+- Confirmed the direct dependency set is otherwise current with `cargo outdated --root-deps-only`.
+- Left `fastmcp-rust` on the latest crates.io-published version because the newer local `0.3.1` release cannot be consumed by a crates.io-publishable `beads_rust` package until it is published upstream.
+
+### Reliability
+
+- Kept explicit `--lock-timeout` reads on the conservative storage-open path, so users asking for lock-aware behavior do not accidentally route through the read-only fast-open bypass.
+- Reduced noisy expected fsqlite diagnostics during transient WAL tail-read fallback while preserving warnings for unexpected blocked-cache failures.
+- Tightened concurrency and doctor chokepoint tests around the updated storage behavior.
+
+### Validation
+
+- Passed `cargo check --all-targets --all-features`.
+- Passed `cargo clippy --all-targets --all-features -- -D warnings`.
+- Passed `cargo fmt --check` and `git diff --check`.
+- Passed `cargo test --all-features --no-fail-fast`, including doctests.
+- Passed `cargo publish --dry-run --locked --allow-dirty` for `beads_rust v0.2.8`.
+
 ## [v0.1.33](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.1.33) -- 2026-03-23 (Release)
 
 This release supersedes the partial `v0.1.32` fallback build by fixing release automation so `dsr` can produce installer-compatible assets deterministically.

@@ -4,7 +4,7 @@
 
 ## Summary
 
-- **Updated:** 4 | **Skipped:** 0 | **Failed:** 0 | **Blocked:** 2
+- **Updated:** 5 dependency families | **Skipped:** 0 | **Failed:** 0 | **Blocked:** 1 release prerequisite
 
 ## Discovery
 
@@ -12,6 +12,7 @@
 - Lock file: `Cargo.lock`
 - Outdated direct dependencies from `cargo outdated --root-deps-only`: `assert_cmd`, `clap_complete`, `signal-hook`, `tru`.
 - Sibling `/data/projects` dependencies checked: `frankensqlite` (`fsqlite*`), `toon_rust` (`tru`), `rich_rust`, and `fastmcp_rust`.
+- Final `cargo outdated --root-deps-only` reports all direct dependencies up to date.
 
 ## Updates
 
@@ -45,15 +46,33 @@
 - **Migration:** Manifest and lockfile update.
 - **Tests:** `cargo test --lib --all-features` via RCH passed: 2157 passed, 0 failed, 7 ignored.
 
+### fsqlite stack: 0.1.2/0.1.3 -> latest published local stack
+
+- **Updated:** `fsqlite`, `fsqlite-types`, `fsqlite-error`, `fsqlite-core`, `fsqlite-func`, `fsqlite-vdbe`, `fsqlite-pager`, `fsqlite-parser`, `fsqlite-planner`, `fsqlite-wal`, `fsqlite-btree`, `fsqlite-ast`, `fsqlite-mvcc`, and `fsqlite-observability` to `0.1.3`; `fsqlite-vfs` to `0.1.4`.
+- **Breaking:** The newer WAL/pager behavior exposed noisy transient tail-read diagnostics and lock-timeout semantics in read-only fast-open tests.
+- **Migration:** Respect explicit `--lock-timeout` by using the conservative storage open path, downgrade expected transient WAL tail-read fallback logs, and keep default debug logs focused on `beads_rust` rather than fsqlite internals.
+- **Tests:** Full all-features release-preparation suite passed.
+
 ## Blockers / Needs Attention
 
-### Local `/data/projects` dependency versions ahead of crates.io
+### `fastmcp_rust` local version ahead of crates.io
 
-- `frankensqlite` local manifests are at `fsqlite* = 0.1.3` and `fsqlite-vfs = 0.1.4`, but crates.io currently reports `fsqlite* = 0.1.2` and `fsqlite-vfs = 0.1.3`.
-- `fastmcp_rust` local workspace is `0.3.1`, while crates.io currently reports `fastmcp-rust = 0.3.0`.
-- `beads_rust` cannot publish to crates.io with those local-only versions until the upstream crates are published or the release intentionally stays on the latest published registry versions.
+- `frankensqlite` is now aligned with the latest published local stack used by `beads_rust`.
+- `fastmcp_rust` local workspace is `0.3.1`, while crates.io currently has `fastmcp-rust = 0.3.0`.
+- `cargo publish --dry-run -p fastmcp-core` succeeded from `/data/projects/fastmcp_rust`, but the real `cargo publish -p fastmcp-core` attempt failed with `403 Forbidden: authentication failed`.
+- `beads_rust` cannot both use the latest local `fastmcp_rust` and publish to crates.io until the FastMCP `0.3.1` crate family is published with valid credentials.
 
 ## Validation
 
-- Incremental all-features library tests via RCH pass after each dependency update.
-- Full release-preparation validation pending.
+- `cargo outdated --root-deps-only` reports all direct dependencies up to date.
+- `cargo check --all-targets --all-features` passed.
+- `cargo clippy --all-targets --all-features -- -D warnings` passed.
+- `cargo fmt --check` passed.
+- `git diff --check` passed.
+- `cargo test --all-features --no-fail-fast` passed, including doctests.
+- `cargo publish --dry-run --locked --allow-dirty` passed for `beads_rust v0.2.8`.
+
+## Release Status
+
+- Prepared `beads_rust v0.2.8`.
+- Final `dsr`, crates.io publish, and Homebrew publication were not run because the requested "latest local `/dp` libraries" requirement is blocked on publishing `fastmcp_rust 0.3.1` to crates.io.

@@ -4957,11 +4957,19 @@ impl SqliteStorage {
         stage: &'static str,
         error: &dyn std::fmt::Display,
     ) -> Result<HashMap<String, Vec<String>>> {
-        tracing::warn!(
-            stage,
-            %error,
-            "Blocked cache unavailable; computing blocker graph directly"
-        );
+        if is_transient_wal_tail_read_error(error) {
+            tracing::trace!(
+                stage,
+                %error,
+                "Blocked cache unavailable during transient WAL tail read; computing blocker graph directly"
+            );
+        } else {
+            tracing::warn!(
+                stage,
+                %error,
+                "Blocked cache unavailable; computing blocker graph directly"
+            );
+        }
         Self::compute_blocked_issues_map_impl(&self.conn)
     }
 
@@ -9799,6 +9807,12 @@ fn database_header_user_version(path: &Path) -> Option<u32> {
     Some(u32::from_be_bytes([
         header[60], header[61], header[62], header[63],
     ]))
+}
+
+fn is_transient_wal_tail_read_error(error: &dyn std::fmt::Display) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("wal file is corrupt")
+        && (message.contains("short read") || message.contains("short header read"))
 }
 
 /// Filter options for listing issues.
@@ -17344,7 +17358,7 @@ mod tests {
         let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
         conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
             .unwrap();
-        drop(conn);
+        conn.close().unwrap();
 
         assert_eq!(
             database_header_user_version(&db_path),

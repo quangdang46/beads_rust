@@ -2699,7 +2699,7 @@ fn open_sqlite_storage_for_startup(
                 options.allow_external_jsonl,
             ),
             Err(err) => {
-                tracing::debug!(
+                tracing::trace!(
                     error = %err,
                     "read-only fast open failed; falling back to normal storage open"
                 );

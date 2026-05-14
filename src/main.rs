@@ -1132,6 +1132,7 @@ fn handle_error(err: &BeadsError, json_mode: bool, color_mode: bool) -> ! {
 
 fn build_cli_overrides(cli: &Cli) -> config::CliOverrides {
     let read_only_fast_open = !cli.no_db
+        && cli.lock_timeout.is_none()
         && !read_only_fast_open_disabled_for_cli()
         && supports_read_only_fast_open(&cli.command)
         && ((cli.no_auto_import && cli.no_auto_flush)
@@ -1327,6 +1328,9 @@ mod tests {
     fn read_only_fast_open_supports_explicit_suppression_and_safe_list_probe() {
         let list = Cli::parse_from(["br", "list"]);
         assert!(build_cli_overrides(&list).read_only_fast_open);
+
+        let list_with_lock_timeout = Cli::parse_from(["br", "--lock-timeout", "50", "list"]);
+        assert!(!build_cli_overrides(&list_with_lock_timeout).read_only_fast_open);
 
         let stats = Cli::parse_from(["br", "stats"]);
         assert!(!build_cli_overrides(&stats).read_only_fast_open);

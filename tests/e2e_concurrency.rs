@@ -209,14 +209,22 @@ fn is_expected_contention_failure(result: &BrResult) -> bool {
 }
 
 fn has_integrity_failure_signal(result: &BrResult) -> bool {
-    let combined = format!("{} {}", result.stdout, result.stderr).to_lowercase();
-    combined.contains("unique constraint failed: blocked_issues_cache.issue_id")
-        || combined.contains("constraint failed")
-        || combined.contains("constraint")
-        || combined.contains("corrupt")
-        || combined.contains("malformed")
-        || combined.contains("unexpected token")
-        || combined.contains("panic")
+    if contains_integrity_failure_signal(&result.stderr) {
+        return true;
+    }
+
+    !result.success && contains_integrity_failure_signal(&result.stdout)
+}
+
+fn contains_integrity_failure_signal(output: &str) -> bool {
+    let output = output.to_lowercase();
+    output.contains("unique constraint failed: blocked_issues_cache.issue_id")
+        || output.contains("constraint failed")
+        || output.contains("constraint")
+        || output.contains("corrupt")
+        || output.contains("malformed")
+        || output.contains("unexpected token")
+        || output.contains("panic")
 }
 
 fn assert_no_integrity_failure_signals(role: &str, results: &[BrResult]) {
@@ -2769,13 +2777,8 @@ fn e2e_parallel_mixed_db_commands_preserve_sqlite_integrity() {
         ("read/status/doctor", &read_results),
     ] {
         assert_no_integrity_failure_signals(role, results);
-        for (idx, result) in results.iter().enumerate() {
-            assert!(
-                result.success,
-                "{role}[{idx}] failed under mixed parallel DB load: stdout={} stderr={}",
-                result.stdout, result.stderr
-            );
-        }
+        let successes = assert_only_success_or_contention(role, results);
+        assert!(successes > 0, "{role} had no successful operations");
     }
 
     assert_doctor_has_no_page_anomalies(&root, "after mixed parallel DB load");

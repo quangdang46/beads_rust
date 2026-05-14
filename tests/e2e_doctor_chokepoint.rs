@@ -395,9 +395,15 @@ fn chokepoint_round_trip_gitignore() {
         "undo had failures: {undo_envelope}"
     );
 
-    // Step 7: every backed-up file now hashes to its recorded
-    // before_hash. This is the byte-identical recovery contract.
+    // Step 7: every backed-up file action now hashes to its recorded
+    // before_hash. DbExec actions restore logical table snapshots rather
+    // than byte-restoring the SQLite file; those are covered by the
+    // dedicated DbExec round-trip assertions in this harness.
+    let mut checked_file_restores = 0usize;
     for action in &actions {
+        if action["op"].as_str() == Some("db_exec") {
+            continue;
+        }
         let rel = Path::new(action["path"].as_str().expect("path"));
         let bh = action["before_hash"]
             .as_str()
@@ -418,7 +424,12 @@ fn chokepoint_round_trip_gitignore() {
             "post-undo hash mismatch for {}: live={live_hex} before_hash={bh}",
             live.display()
         );
+        checked_file_restores += 1;
     }
+    assert!(
+        checked_file_restores > 0,
+        "expected at least one byte-restored file action; actions={actions:#?}"
+    );
 
     // Step 8: files the chokepoint did NOT touch are byte-identical to
     // their post-repair state (i.e. undo did not regress unrelated

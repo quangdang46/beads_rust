@@ -1,6 +1,6 @@
 [package]
 name = "beads_rust"
-version = "0.2.7"
+version = "0.2.8"
 edition = "2024"
 rust-version = "1.88"
 autobenches = false
@@ -42,21 +42,21 @@ clap_complete = { version = "4.6.5", features = ["unstable-dynamic"] }
 
 # Database (pure-Rust SQLite with concurrent writer support)
 # NOTE: transitive fsqlite workspace deps listed explicitly so rch syncs them
-fsqlite = "0.1.2"
-fsqlite-types = "0.1.2"
-fsqlite-error = "0.1.2"
-fsqlite-core = "0.1.2"
-fsqlite-func = "0.1.2"
-fsqlite-vdbe = "0.1.2"
-fsqlite-vfs = "0.1.3"
-fsqlite-pager = "0.1.2"
-fsqlite-parser = "0.1.2"
-fsqlite-planner = "0.1.2"
-fsqlite-wal = "0.1.2"
-fsqlite-btree = "0.1.2"
-fsqlite-ast = "0.1.2"
-fsqlite-mvcc = "0.1.2"
-fsqlite-observability = "0.1.2"
+fsqlite = "0.1.3"
+fsqlite-types = "0.1.3"
+fsqlite-error = "0.1.3"
+fsqlite-core = "0.1.3"
+fsqlite-func = "0.1.3"
+fsqlite-vdbe = "0.1.3"
+fsqlite-vfs = "0.1.4"
+fsqlite-pager = "0.1.3"
+fsqlite-parser = "0.1.3"
+fsqlite-planner = "0.1.3"
+fsqlite-wal = "0.1.3"
+fsqlite-btree = "0.1.3"
+fsqlite-ast = "0.1.3"
+fsqlite-mvcc = "0.1.3"
+fsqlite-observability = "0.1.3"
 
 # Serialization
 serde = { version = "1.0.228", features = ["derive"] }
@@ -162,8 +162,8 @@ self_update = [
 
 # NOTE: no `[patch.crates-io]` here.
 #
-# All dependencies — fsqlite 0.1.2+, its fsqlite-* transitive crates, and
-# fastmcp-rust 0.2.1+ — are published on crates.io, so this crate
+# All dependencies — fsqlite 0.1.3+, its fsqlite-* transitive crates, and
+# fastmcp-rust 0.3.0+ — are published on crates.io, so this crate
 # resolves everything from the registry out of the box.  That makes
 # `cargo install --git https://github.com/Dicklesworthstone/beads_rust.git`
 # work without requiring sibling `frankensqlite` or `fastmcp_rust`
