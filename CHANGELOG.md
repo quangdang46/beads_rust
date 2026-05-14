@@ -39,6 +39,9 @@ failure handling.
 - Package-manager manifest templates now track the DSR-published
   `br-<version>-<platform>` archive names and current `v0.2.10` checksums, so
   future manifest automation does not keep looking for stale `br-v...` assets.
+- The installer and release workflow now keep the tag name (`vX.Y.Z`) separate
+  from package asset names (`br-X.Y.Z-...`), preventing future binary installs
+  and manifest updates from disagreeing about release artifact URLs.
 
 ### Validation
 
@@ -48,6 +51,8 @@ failure handling.
   Windows doctor portability fix.
 - Post-release fresh-eyes validation also checked the Homebrew/Scoop/AUR
   manifest templates against the published DSR assets.
+- Follow-up validation traced the same asset naming rule through `install.sh`,
+  `br upgrade`, and the release workflow fragment harness.
 
 ## v0.2.9 -- 2026-05-14 (Crates.io, superseded)
 

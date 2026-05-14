@@ -392,6 +392,10 @@ fn test_update_package_manifests_workflow_uses_current_checksums() {
         "workflow must download the DSR-published checksum sidecars"
     );
     assert!(
+        workflow.contains(r#"VERSION="${VERSION#v}""#),
+        "workflow_dispatch inputs must normalize an optional leading v before building asset names"
+    );
+    assert!(
         !workflow.contains("br-v${VERSION}"),
         "workflow must not look for stale br-v checksum sidecars"
     );

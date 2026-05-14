@@ -309,7 +309,7 @@ fn resolve_auth_token() -> Option<String> {
 
 /// Map the Rust target triple to the asset name fragment used in GitHub releases.
 ///
-/// Release assets follow the pattern `br-v{VERSION}-{platform}_{arch}.tar.gz`
+/// Release assets follow the pattern `br-{VERSION}-{platform}_{arch}.tar.gz`
 /// (e.g. `darwin_amd64`, `linux_arm64`), which differs from the Rust target
 /// triple that `self_update` uses by default (e.g. `x86_64-apple-darwin`).
 fn asset_target_name() -> &'static str {
@@ -846,33 +846,33 @@ mod tests {
     #[test]
     fn release_binary_asset_ignores_checksum_and_signature_assets() {
         let release = release_with_assets(&[
-            "br-v1.2.3-linux_amd64.tar.gz.sha256",
-            "br-v1.2.3-linux_amd64.tar.gz.minisig",
-            "br-v1.2.3-linux_amd64.tar.gz",
+            "br-1.2.3-linux_amd64.tar.gz.sha256",
+            "br-1.2.3-linux_amd64.tar.gz.minisig",
+            "br-1.2.3-linux_amd64.tar.gz",
         ]);
 
         let asset = release_binary_asset_for(&release, "linux_amd64", None).unwrap();
-        assert_eq!(asset.name, "br-v1.2.3-linux_amd64.tar.gz");
+        assert_eq!(asset.name, "br-1.2.3-linux_amd64.tar.gz");
     }
 
     #[test]
     fn checksum_asset_matches_archive_name_exactly() {
         let release = release_with_assets(&[
-            "br-v1.2.3-linux_arm64.tar.gz.sha256",
-            "br-v1.2.3-linux_amd64.tar.gz.sha256",
-            "br-v1.2.3-linux_amd64.tar.gz",
+            "br-1.2.3-linux_arm64.tar.gz.sha256",
+            "br-1.2.3-linux_amd64.tar.gz.sha256",
+            "br-1.2.3-linux_amd64.tar.gz",
         ]);
 
-        let asset = checksum_asset_for(&release, "br-v1.2.3-linux_amd64.tar.gz").unwrap();
-        assert_eq!(asset.name, "br-v1.2.3-linux_amd64.tar.gz.sha256");
+        let asset = checksum_asset_for(&release, "br-1.2.3-linux_amd64.tar.gz").unwrap();
+        assert_eq!(asset.name, "br-1.2.3-linux_amd64.tar.gz.sha256");
     }
 
     #[test]
     fn parse_sha256_checksum_accepts_standard_sha256sum_line() {
         let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let checksum = parse_sha256_checksum(
-            &format!("{hash}  br-v1.2.3-linux_amd64.tar.gz\n"),
-            "br-v1.2.3-linux_amd64.tar.gz",
+            &format!("{hash}  br-1.2.3-linux_amd64.tar.gz\n"),
+            "br-1.2.3-linux_amd64.tar.gz",
         )
         .unwrap();
         assert_eq!(checksum, hash);
@@ -882,8 +882,8 @@ mod tests {
     fn parse_sha256_checksum_rejects_wrong_archive_name() {
         let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let err = parse_sha256_checksum(
-            &format!("{hash}  br-v1.2.3-linux_arm64.tar.gz\n"),
-            "br-v1.2.3-linux_amd64.tar.gz",
+            &format!("{hash}  br-1.2.3-linux_arm64.tar.gz\n"),
+            "br-1.2.3-linux_amd64.tar.gz",
         )
         .unwrap_err();
         assert!(err.to_string().contains("linux_amd64"));

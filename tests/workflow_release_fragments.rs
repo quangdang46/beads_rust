@@ -59,6 +59,22 @@ fn release_workflow_exposes_expected_fragment_steps() -> Result<(), String> {
 }
 
 #[test]
+fn release_workflow_uses_tagless_asset_file_names() -> Result<(), String> {
+    let workflow = read_to_string(Path::new(RELEASE_WORKFLOW))?;
+
+    require_contains(&workflow, r#"ASSET_VERSION="${GITHUB_REF_NAME#v}""#)?;
+    require_contains(
+        &workflow,
+        "br-${{ steps.asset_version.outputs.asset_version }}-${{ matrix.name }}",
+    )?;
+    require_contains(&workflow, "artifacts/br-${ASSET_VERSION}-${platform}.*")?;
+    require_not_contains(&workflow, "br-${{ github.ref_name }}-${{ matrix.name }}")?;
+    require_not_contains(&workflow, "artifacts/br-${{ github.ref_name }}-*")?;
+
+    Ok(())
+}
+
+#[test]
 fn reliability_override_fragment_requires_reason_and_records_summary() -> Result<(), String> {
     let script = release_step_script("Validate reliability override")?;
     let fixture = WorkflowFixture::new()?;
@@ -129,8 +145,8 @@ fn combined_checksums_fragment_is_null_safe_and_replaces_existing_file() -> Resu
     let script = release_step_script("Generate combined checksums")?;
     let fixture = WorkflowFixture::new()?;
     fixture.create_artifacts_dir()?;
-    fixture.write_artifact("br-v9.9.9-linux_amd64.tar.gz.sha256", b"linux\n")?;
-    fixture.write_artifact("br-v9.9.9-darwin amd64.tar.gz.sha256", b"darwin\n")?;
+    fixture.write_artifact("br-9.9.9-linux_amd64.tar.gz.sha256", b"linux\n")?;
+    fixture.write_artifact("br-9.9.9-darwin amd64.tar.gz.sha256", b"darwin\n")?;
     fixture.write_artifact("--leading-name.sha256", b"leading\n")?;
     fixture.write_artifact("checksums.sha256", b"stale\n")?;
 
@@ -163,10 +179,10 @@ fn verify_checksums_fragment_fails_on_corrupt_checksum() -> Result<(), String> {
     let script = release_step_script("Verify all checksums")?;
     let fixture = WorkflowFixture::new()?;
     fixture.create_artifacts_dir()?;
-    fixture.write_artifact("br-v9.9.9-linux_amd64.tar.gz", b"actual bytes")?;
+    fixture.write_artifact("br-9.9.9-linux_amd64.tar.gz", b"actual bytes")?;
     fixture.write_artifact(
-        "br-v9.9.9-linux_amd64.tar.gz.sha256",
-        b"0000000000000000000000000000000000000000000000000000000000000000  br-v9.9.9-linux_amd64.tar.gz\n",
+        "br-9.9.9-linux_amd64.tar.gz.sha256",
+        b"0000000000000000000000000000000000000000000000000000000000000000  br-9.9.9-linux_amd64.tar.gz\n",
     )?;
 
     let result = run_bash_step(&script, fixture.root(), &[])?;
@@ -328,7 +344,7 @@ impl WorkflowFixture {
     }
 
     fn write_release_artifact(&self, platform: &str, bytes: &[u8]) -> Result<(), String> {
-        let mut name = String::from("br-v9.9.9-");
+        let mut name = String::from("br-9.9.9-");
         name.push_str(platform);
         name.push_str(".tar.gz");
         self.write_artifact(&name, bytes)
