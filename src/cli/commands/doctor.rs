@@ -8605,10 +8605,14 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_fix_base_jsonl_symlink_quarantines_via_chokepoint() {
-        // Pass-5 cycle 5: the fixer must MOVE the symlinked anchor into
-        // the run-dir quarantine via Op::Rename. The target the symlink
-        // pointed at must be UNDISTURBED.
+    fn test_fix_base_jsonl_symlink_refuses_out_of_scope_target() {
+        // Pass-5 cycle 5: the fixer (via the chokepoint's canonicalized
+        // write_scope check) MUST refuse to follow a symlink whose
+        // target resolves outside `.beads/` or `.doctor/`. This is the
+        // safety behavior that protects operators against an attacker
+        // shape where the merge anchor points at an arbitrary file.
+        // The detector flags the symlink; the fixer correctly declines
+        // to quarantine it (operator must remove the symlink manually).
         use std::os::unix::fs::symlink;
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
@@ -8617,7 +8621,6 @@ mod tests {
         fs::write(&outside, b"{\"id\":\"bd-outside\"}\n").unwrap();
         let symlink_path = beads_dir.join("beads.base.jsonl");
         symlink(&outside, &symlink_path).unwrap();
-        // The live JSONL must also exist for the detect path to run.
         fs::write(beads_dir.join("issues.jsonl"), b"{}\n").unwrap();
 
         let mut report = DoctorReport {
@@ -8627,12 +8630,73 @@ mod tests {
             checks: Vec::new(),
         };
         check_base_jsonl(&beads_dir, &mut report.checks);
-        assert!(report.checks.iter().any(|c| c.name == "base_jsonl"
-            && matches!(c.status, CheckStatus::Warn)));
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.name == "base_jsonl" && matches!(c.status, CheckStatus::Warn))
+        );
 
         let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
             .expect("session must build");
-        let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Json, false, true);
+        let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Text, false, true);
+        // Out-of-scope symlink target → fixer returns false (chokepoint
+        // refuses per safety) AND the symlink remains at its original
+        // path (no partial mutation).
+        let result =
+            fix_base_jsonl_symlink_if_warned(&beads_dir, &report, &ctx, Some(&mut session));
+        assert!(
+            !result,
+            "fixer must refuse when symlink target is outside write_scopes"
+        );
+        assert!(
+            fs::symlink_metadata(&symlink_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "symlink must remain in place when refused"
+        );
+        assert_eq!(
+            fs::read(&outside).unwrap(),
+            b"{\"id\":\"bd-outside\"}\n",
+            "symlink target's bytes must not be modified"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_fix_base_jsonl_symlink_quarantines_in_scope_target() {
+        // Pass-5 cycle 5: when the symlink points at a file INSIDE the
+        // workspace (e.g., a sibling JSONL), the chokepoint allows the
+        // rename and the fixer quarantines the symlink.
+        use std::os::unix::fs::symlink;
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        // In-scope target lives under .beads/
+        let inside_target = beads_dir.join("sibling.jsonl");
+        fs::write(&inside_target, b"{\"id\":\"bd-sibling\"}\n").unwrap();
+        let symlink_path = beads_dir.join("beads.base.jsonl");
+        symlink(&inside_target, &symlink_path).unwrap();
+        fs::write(beads_dir.join("issues.jsonl"), b"{}\n").unwrap();
+
+        let mut report = DoctorReport {
+            ok: false,
+            workspace_health: Some("degraded".to_string()),
+            reliability_audit: None,
+            checks: Vec::new(),
+        };
+        check_base_jsonl(&beads_dir, &mut report.checks);
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.name == "base_jsonl" && matches!(c.status, CheckStatus::Warn))
+        );
+
+        let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
+            .expect("session must build");
+        let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Text, false, true);
         assert!(fix_base_jsonl_symlink_if_warned(
             &beads_dir,
             &report,
@@ -8640,28 +8704,23 @@ mod tests {
             Some(&mut session),
         ));
 
-        // Symlink quarantined.
+        // Source symlink gone, quarantine populated.
         assert!(
-            fs::symlink_metadata(&symlink_path).is_err()
-                || !fs::symlink_metadata(&symlink_path)
-                    .unwrap()
-                    .file_type()
-                    .is_symlink()
+            !symlink_path.exists() && fs::symlink_metadata(&symlink_path).is_err(),
+            "source symlink should be moved out of .beads/"
         );
-        // Quarantine populated.
         let q = session.run.root.join("quarantine/.beads/beads.base.jsonl");
         assert!(
-            fs::symlink_metadata(&q).is_ok(),
-            "quarantine should hold the moved symlink (or its target bytes), got: {q:?}"
+            q.exists(),
+            "quarantine should hold the moved symlink content at {q:?}"
         );
-        // The target the symlink pointed at must be untouched.
+        // Sibling target is untouched.
         assert_eq!(
-            fs::read(&outside).unwrap(),
-            b"{\"id\":\"bd-outside\"}\n",
+            fs::read(&inside_target).unwrap(),
+            b"{\"id\":\"bd-sibling\"}\n",
             "symlink target's bytes must not be modified"
         );
 
-        // actions.jsonl records one rename op.
         let actions = fs::read_to_string(&session.run.actions_file).unwrap();
         let rename_count = actions
             .lines()

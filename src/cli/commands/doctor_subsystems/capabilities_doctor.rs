@@ -576,6 +576,7 @@ mod tests {
                 "doctor.startup_cache_quarantine",
                 "doctor.recovery_artifacts_aged_quarantine",
                 "doctor.export_hash_cache_repair",
+                "doctor.base_jsonl_symlink_quarantine",
                 "doctor.repair_recoverable_db_state",
                 "doctor.repair_partial_indexes",
                 "doctor.repair_via_vacuum",
