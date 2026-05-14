@@ -644,6 +644,7 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
         "permissions.config_yaml_secrets",
         "fm-permissions-config-yaml-mode-leaks-secrets",
     ),
+    ("br_path_dupes", "fm-external_artifacts-multiple-br-in-path"),
     ("startup_cache.health", "fm-configs-startup-cache-poisoned"),
     ("sync_jsonl_path", FM_JSONL_ROW_COUNT_MISMATCH),
     (
@@ -2897,6 +2898,74 @@ fn check_base_jsonl_missing_post_flush(
             );
         }
     }
+}
+
+/// Pass-5 cycle 12: detector for
+/// `fm-external_artifacts-multiple-br-in-path`.
+///
+/// Walks `$PATH` and reports a warning when more than one executable
+/// named `br` is found. Operators with multiple installs (cargo
+/// install, system package manager, vendored fork) can be confused
+/// about which version is actually invoked. Detect-only — resolving
+/// the ambiguity is operator-controlled (PATH ordering, removing
+/// stale installs, choosing a canonical location).
+///
+/// The pure helper `br_binaries_in_path_str` makes the detector
+/// testable without env mutation.
+fn br_binaries_in_path_str(path_var: &str) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for dir in std::env::split_paths(path_var) {
+        let candidate = dir.join("br");
+        let canonical = candidate.canonicalize().ok();
+        // Dedupe by canonical path so a/PATH/br and b/PATH/br both
+        // pointing to the same file via symlinks count once.
+        let key = canonical.clone().unwrap_or_else(|| candidate.clone());
+        if seen.contains(&key) {
+            continue;
+        }
+        if candidate.is_file() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = fs::metadata(&candidate)
+                    && (meta.permissions().mode() & 0o111) != 0
+                {
+                    found.push(candidate.clone());
+                    seen.insert(key);
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                found.push(candidate.clone());
+                seen.insert(key);
+            }
+        }
+    }
+    found
+}
+
+fn check_multiple_br_in_path(checks: &mut Vec<CheckResult>) {
+    let path_var = std::env::var("PATH").unwrap_or_default();
+    let binaries = br_binaries_in_path_str(&path_var);
+    if binaries.len() <= 1 {
+        push_check(checks, "br_path_dupes", CheckStatus::Ok, None, None);
+        return;
+    }
+    let display: Vec<String> = binaries.iter().map(|p| p.display().to_string()).collect();
+    push_check(
+        checks,
+        "br_path_dupes",
+        CheckStatus::Warn,
+        Some(format!(
+            "Found {} `br` executables on $PATH — operator may be confused which one runs",
+            binaries.len()
+        )),
+        Some(serde_json::json!({
+            "br_paths": display,
+            "remediation": "Reorder PATH so the canonical install resolves first, or remove stale copies",
+        })),
+    );
 }
 
 /// Pass-5 cycle 11: detector for
@@ -7286,6 +7355,9 @@ fn collect_doctor_report_with_mode_and_db_override(
     check_doctor_runs_dir_size(repo_root, &mut checks);
     // Pass-5 cycle 11: world-readable config.yaml containing secrets.
     check_config_yaml_secret_mode(beads_dir, &mut checks);
+    // Pass-5 cycle 12: multiple `br` binaries on $PATH (env-based,
+    // not workspace-scoped).
+    check_multiple_br_in_path(&mut checks);
     check_root_gitignore(beads_dir, &mut checks);
     check_routes_jsonl(beads_dir, &mut checks);
     check_rust_log_noisy(&mut checks);
@@ -9565,6 +9637,73 @@ mod tests {
         check_config_yaml_secret_mode(&beads_dir, &mut checks);
         let check = find_check(&checks, "permissions.config_yaml_secrets").expect("check present");
         assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_br_binaries_in_path_str_finds_multiple() {
+        // Pass-5 cycle 12: pure helper finds duplicate br executables
+        // across a synthesized PATH string.
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let dir_a = temp.path().join("a");
+        let dir_b = temp.path().join("b");
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::create_dir_all(&dir_b).unwrap();
+        let br_a = dir_a.join("br");
+        let br_b = dir_b.join("br");
+        fs::write(&br_a, b"#!/bin/sh\n").unwrap();
+        fs::write(&br_b, b"#!/bin/sh\n").unwrap();
+        let mut perms = fs::metadata(&br_a).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&br_a, perms.clone()).unwrap();
+        fs::set_permissions(&br_b, perms).unwrap();
+
+        let path_var = format!("{}:{}", dir_a.display(), dir_b.display());
+        let found = br_binaries_in_path_str(&path_var);
+        assert_eq!(found.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_br_binaries_in_path_str_skips_non_executable() {
+        // Non-executable file shouldn't count as a `br` binary.
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().join("d");
+        fs::create_dir_all(&dir).unwrap();
+        let br = dir.join("br");
+        fs::write(&br, b"not a binary").unwrap();
+        let mut perms = fs::metadata(&br).unwrap().permissions();
+        perms.set_mode(0o644);
+        fs::set_permissions(&br, perms).unwrap();
+
+        let path_var = dir.display().to_string();
+        let found = br_binaries_in_path_str(&path_var);
+        assert!(found.is_empty(), "non-executable should be skipped");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_br_binaries_in_path_str_dedupes_canonical_path() {
+        // Two PATH entries pointing at the same canonical br via a
+        // symlinked directory should count as one binary.
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::symlink;
+        let temp = TempDir::new().unwrap();
+        let real_dir = temp.path().join("real");
+        fs::create_dir_all(&real_dir).unwrap();
+        let br = real_dir.join("br");
+        fs::write(&br, b"#!/bin/sh\n").unwrap();
+        let mut perms = fs::metadata(&br).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&br, perms).unwrap();
+        let link_dir = temp.path().join("link");
+        symlink(&real_dir, &link_dir).unwrap();
+
+        let path_var = format!("{}:{}", real_dir.display(), link_dir.display());
+        let found = br_binaries_in_path_str(&path_var);
+        assert_eq!(found.len(), 1, "canonical dedup expected: {found:?}");
     }
 
     #[test]
