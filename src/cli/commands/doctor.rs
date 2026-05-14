@@ -640,6 +640,10 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
         "doctor.runs_dir",
         "fm-observability-doctor-runs-dir-grows-unbounded",
     ),
+    (
+        "permissions.config_yaml_secrets",
+        "fm-permissions-config-yaml-mode-leaks-secrets",
+    ),
     ("startup_cache.health", "fm-configs-startup-cache-poisoned"),
     ("sync_jsonl_path", FM_JSONL_ROW_COUNT_MISMATCH),
     (
@@ -2893,6 +2897,122 @@ fn check_base_jsonl_missing_post_flush(
             );
         }
     }
+}
+
+/// Pass-5 cycle 11: detector for
+/// `fm-permissions-config-yaml-mode-leaks-secrets`.
+///
+/// Warns when `.beads/config.yaml` is world-readable (mode has the
+/// other-readable bit `0o004` set) AND its contents contain
+/// secret-shaped keywords (`token`, `secret`, `password`, `api_key`).
+/// Detect-only — the doctor cannot chmod operator files without
+/// explicit consent (operators may have compliance-locked workflows
+/// that require specific mode bits).
+///
+/// On non-Unix targets the mode check is a no-op (always Ok).
+fn check_config_yaml_secret_mode(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
+    const SECRET_KEYWORDS: &[&str] = &["token", "secret", "password", "api_key", "private_key"];
+    let config = beads_dir.join("config.yaml");
+    let Ok(meta) = fs::symlink_metadata(&config) else {
+        push_check(
+            checks,
+            "permissions.config_yaml_secrets",
+            CheckStatus::Ok,
+            None,
+            None,
+        );
+        return;
+    };
+    // Skip symlinks; the existing config.yaml check covers symlink-shape
+    // concerns and we shouldn't follow into out-of-scope targets.
+    if meta.file_type().is_symlink() {
+        push_check(
+            checks,
+            "permissions.config_yaml_secrets",
+            CheckStatus::Ok,
+            None,
+            None,
+        );
+        return;
+    }
+    #[cfg(unix)]
+    let world_readable = {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode();
+        (mode & 0o004) != 0
+    };
+    #[cfg(not(unix))]
+    let world_readable = false;
+    if !world_readable {
+        push_check(
+            checks,
+            "permissions.config_yaml_secrets",
+            CheckStatus::Ok,
+            None,
+            None,
+        );
+        return;
+    }
+    let Ok(contents) = fs::read_to_string(&config) else {
+        // Unreadable → covered by the regular config.yaml check.
+        push_check(
+            checks,
+            "permissions.config_yaml_secrets",
+            CheckStatus::Ok,
+            None,
+            None,
+        );
+        return;
+    };
+    let lower = contents.to_ascii_lowercase();
+    // Match common secret-shaped tokens. Substring match keeps the
+    // detector cheap and false-positive-prone — operators who genuinely
+    // want a comment about "passwords" can ignore the warning. We
+    // surface the matched keyword in details so the operator can
+    // verify quickly.
+    let matched: Vec<&str> = SECRET_KEYWORDS
+        .iter()
+        .copied()
+        .filter(|kw| lower.contains(kw))
+        .collect();
+    if matched.is_empty() {
+        push_check(
+            checks,
+            "permissions.config_yaml_secrets",
+            CheckStatus::Ok,
+            None,
+            None,
+        );
+        return;
+    }
+    let mode_bits = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            meta.permissions().mode() & 0o777
+        }
+        #[cfg(not(unix))]
+        {
+            0u32
+        }
+    };
+    push_check(
+        checks,
+        "permissions.config_yaml_secrets",
+        CheckStatus::Warn,
+        Some(format!(
+            "{} is world-readable (mode {:o}) and appears to contain secret-shaped values; consider `chmod 0600 {}`",
+            config.display(),
+            mode_bits,
+            config.display()
+        )),
+        Some(serde_json::json!({
+            "path": config.display().to_string(),
+            "mode_octal": format!("{mode_bits:o}"),
+            "matched_keywords": matched,
+            "remediation": format!("chmod 0600 {}", config.display()),
+        })),
+    );
 }
 
 /// Pass-5 cycle 10: detector for
@@ -7164,6 +7284,8 @@ fn collect_doctor_report_with_mode_and_db_override(
     // Pass-5 cycle 10: doctor's own runs dir size (operator-prunable).
     let repo_root = beads_dir.parent().unwrap_or(beads_dir);
     check_doctor_runs_dir_size(repo_root, &mut checks);
+    // Pass-5 cycle 11: world-readable config.yaml containing secrets.
+    check_config_yaml_secret_mode(beads_dir, &mut checks);
     check_root_gitignore(beads_dir, &mut checks);
     check_routes_jsonl(beads_dir, &mut checks);
     check_rust_log_noisy(&mut checks);
@@ -9374,6 +9496,75 @@ mod tests {
         check_doctor_runs_dir_size(temp.path(), &mut checks);
         let check = find_check(&checks, "doctor.runs_dir").expect("check present");
         assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_config_yaml_secret_mode_warns_on_world_readable_with_secrets() {
+        // Pass-5 cycle 11: world-readable config.yaml containing a
+        // secret-shaped keyword → warn.
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let config = beads_dir.join("config.yaml");
+        fs::write(&config, b"github_token: ghp_abc123\n").unwrap();
+        let mut perms = fs::metadata(&config).unwrap().permissions();
+        perms.set_mode(0o644); // world-readable
+        fs::set_permissions(&config, perms).unwrap();
+
+        let mut checks = Vec::new();
+        check_config_yaml_secret_mode(&beads_dir, &mut checks);
+        let check = find_check(&checks, "permissions.config_yaml_secrets").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
+        let matched = check
+            .details
+            .as_ref()
+            .and_then(|d| d.get("matched_keywords"))
+            .and_then(|v| v.as_array())
+            .map(Vec::len)
+            .unwrap_or(0);
+        assert!(matched >= 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_config_yaml_secret_mode_ok_when_mode_0600() {
+        // mode 0600 → not world-readable → Ok regardless of contents.
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let config = beads_dir.join("config.yaml");
+        fs::write(&config, b"github_token: ghp_xyz\npassword: hunter2\n").unwrap();
+        let mut perms = fs::metadata(&config).unwrap().permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(&config, perms).unwrap();
+
+        let mut checks = Vec::new();
+        check_config_yaml_secret_mode(&beads_dir, &mut checks);
+        let check = find_check(&checks, "permissions.config_yaml_secrets").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_config_yaml_secret_mode_ok_when_no_secrets() {
+        // World-readable but no secret-keywords → Ok.
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let config = beads_dir.join("config.yaml");
+        fs::write(&config, b"theme: dark\neditor: vim\n").unwrap();
+        let mut perms = fs::metadata(&config).unwrap().permissions();
+        perms.set_mode(0o644);
+        fs::set_permissions(&config, perms).unwrap();
+
+        let mut checks = Vec::new();
+        check_config_yaml_secret_mode(&beads_dir, &mut checks);
+        let check = find_check(&checks, "permissions.config_yaml_secrets").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
     }
 
     #[test]
