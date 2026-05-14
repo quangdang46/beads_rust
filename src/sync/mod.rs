@@ -3435,6 +3435,7 @@ fn try_incremental_auto_flush(
     beads_dir: &Path,
     jsonl_path: &Path,
     allow_external_jsonl: bool,
+    history_config: HistoryConfig,
 ) -> Result<Option<AutoFlushResult>> {
     if !jsonl_path.exists() {
         return Ok(None);
@@ -3450,6 +3451,7 @@ fn try_incremental_auto_flush(
         force: false,
         beads_dir: Some(beads_dir.to_path_buf()),
         allow_external_jsonl,
+        history: history_config,
         ..Default::default()
     };
 
@@ -3526,6 +3528,7 @@ pub fn auto_flush(
     beads_dir: &Path,
     jsonl_path: &Path,
     allow_external_jsonl: bool,
+    history_config: HistoryConfig,
 ) -> Result<AutoFlushResult> {
     // Check for dirty issues or forced flush first
     let jsonl_exists = jsonl_path.exists();
@@ -3565,7 +3568,13 @@ pub fn auto_flush(
     );
 
     if !needs_flush {
-        match try_incremental_auto_flush(storage, beads_dir, jsonl_path, allow_external_jsonl) {
+        match try_incremental_auto_flush(
+            storage,
+            beads_dir,
+            jsonl_path,
+            allow_external_jsonl,
+            history_config.clone(),
+        ) {
             Ok(Some(result)) => {
                 tracing::info!(
                     flushed = result.flushed,
@@ -3593,6 +3602,7 @@ pub fn auto_flush(
         force: needs_flush,
         beads_dir: Some(beads_dir.to_path_buf()),
         allow_external_jsonl,
+        history: history_config,
         ..Default::default()
     };
 
@@ -6430,7 +6440,7 @@ mod tests {
         let issue = make_test_issue("bd-scan-error", "Dirty issue");
         storage.create_issue(&issue, "tester").unwrap();
 
-        let err = auto_flush(&mut storage, &beads_dir, &jsonl_path, false).unwrap_err();
+        let err = auto_flush(&mut storage, &beads_dir, &jsonl_path, false, HistoryConfig::default()).unwrap_err();
         assert!(
             err.to_string().contains("directory")
                 || err.to_string().contains("Is a directory")
@@ -6457,7 +6467,7 @@ mod tests {
         let issue = make_test_issue("bd-auto-flush-path", "Dirty issue");
         storage.create_issue(&issue, "tester").unwrap();
 
-        let err = auto_flush(&mut storage, &beads_dir, &outside_jsonl_path, false).unwrap_err();
+        let err = auto_flush(&mut storage, &beads_dir, &outside_jsonl_path, false, HistoryConfig::default()).unwrap_err();
         assert!(
             err.to_string().contains("outside the beads directory"),
             "unexpected error: {err}"
@@ -7767,7 +7777,7 @@ mod tests {
         let issue = make_test_issue("bd-noop", "No-op dirty marker");
         storage.create_issue(&issue, "test").unwrap();
 
-        let first = auto_flush(&mut storage, &beads_dir, &output_path, false).unwrap();
+        let first = auto_flush(&mut storage, &beads_dir, &output_path, false, HistoryConfig::default()).unwrap();
         assert!(first.flushed);
         let before = fs::read_to_string(&output_path).unwrap();
 
@@ -7775,7 +7785,7 @@ mod tests {
             .replace_dirty_issue_marker("bd-noop", "manual-dirty-marker")
             .unwrap();
 
-        let second = auto_flush(&mut storage, &beads_dir, &output_path, false).unwrap();
+        let second = auto_flush(&mut storage, &beads_dir, &output_path, false, HistoryConfig::default()).unwrap();
         assert!(
             !second.flushed,
             "byte-identical dirty markers should not rewrite JSONL"

@@ -133,6 +133,7 @@ struct SyncDispatchOptions {
     retention_days: Option<u64>,
     use_json: bool,
     show_progress: bool,
+    history_config: HistoryConfig,
 }
 
 /// Execute the sync command.
@@ -457,6 +458,7 @@ fn dispatch_sync_subcommand(
             options.use_json,
             options.show_progress,
             options.retention_days,
+            options.history_config.clone(),
             ctx,
         ),
         SyncOperation::Merge => execute_merge(
@@ -466,6 +468,7 @@ fn dispatch_sync_subcommand(
             options.use_json,
             options.show_progress,
             options.retention_days,
+            options.history_config.clone(),
             cli,
             ctx,
         ),
@@ -499,6 +502,7 @@ fn sync_dispatch_options(
         retention_days: open_result.paths.metadata.deletions_retention_days,
         use_json,
         show_progress: should_show_progress(use_json, quiet),
+        history_config: open_result.resolved_history_config(),
     }
 }
 
@@ -1140,6 +1144,7 @@ fn execute_flush(
     use_json: bool,
     show_progress: bool,
     retention_days: Option<u64>,
+    history_config: HistoryConfig,
     ctx: &OutputContext,
 ) -> Result<()> {
     info!("Starting JSONL export");
@@ -1255,7 +1260,7 @@ fn execute_flush(
         beads_dir: Some(path_policy.beads_dir.clone()),
         allow_external_jsonl: path_policy.allow_external_jsonl,
         show_progress,
-        history: HistoryConfig::default(),
+        history: history_config,
         max_parallel_workers: args.export_parallelism.unwrap_or(0),
     };
 
@@ -2416,6 +2421,7 @@ fn execute_merge(
     use_json: bool,
     show_progress: bool,
     retention_days: Option<u64>,
+    history_config: HistoryConfig,
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
@@ -2562,7 +2568,7 @@ fn execute_merge(
         beads_dir: Some(path_policy.beads_dir.clone()),
         allow_external_jsonl: path_policy.allow_external_jsonl,
         show_progress,
-        history: HistoryConfig::default(),
+        history: history_config,
         max_parallel_workers: args.export_parallelism.unwrap_or(0),
     };
 

@@ -2574,13 +2574,30 @@ impl OpenStorageResult {
             return Ok(());
         }
 
+        let history_config = self.resolved_history_config();
         auto_flush(
             &mut self.storage,
             &self.paths.beads_dir,
             &self.paths.jsonl_path,
             self.allow_external_jsonl,
+            history_config,
         )?;
         Ok(())
+    }
+
+    /// Resolve a [`HistoryConfig`] honoring the merged config layer.
+    ///
+    /// Operators who set `sync.history_enabled: false` (or the inverted
+    /// `no-history: true`) get a config with `enabled = false`, which causes
+    /// [`crate::sync::history::backup_before_export`] to short-circuit instead
+    /// of creating the `.br_history/` directory. See br#293.
+    #[must_use]
+    pub fn resolved_history_config(&self) -> crate::sync::history::HistoryConfig {
+        let mut cfg = crate::sync::history::HistoryConfig::default();
+        if let Some(enabled) = history_enabled_from_layer(&self.bootstrap_layer) {
+            cfg.enabled = enabled;
+        }
+        cfg
     }
 }
 
@@ -2874,6 +2891,39 @@ pub fn no_auto_flush_from_layer(layer: &ConfigLayer) -> Option<bool> {
     // Legacy key: no-auto-flush / no_auto_flush / no.auto.flush
     get_startup_value(layer, &["no-auto-flush", "no_auto_flush", "no.auto.flush"])
         .and_then(|value| parse_bool(value))
+}
+
+/// Check merged config for `sync.history_enabled` (positive) or legacy `no-history` (inverted).
+///
+/// Priority order (highest first):
+/// 1. `sync.history_enabled` / `sync.history-enabled` / `sync.history.enabled` — canonical positive key
+/// 2. `no-history` / `no_history` / `no.history` — inverted convenience key
+///
+/// The canonical `sync.history_enabled: false` means "disable `.br_history/` backups".
+/// `no-history: true` means the same thing. Returns `None` when no key is set so the
+/// caller can keep the default-enabled behavior unchanged.
+///
+/// This is the storage-policy switch requested in
+/// <https://github.com/Dicklesworthstone/beads_rust/issues/293> — operators who
+/// want `issues.jsonl` to be the single durable state file can flip this and
+/// stop the `.br_history/` directory from being created.
+#[must_use]
+pub fn history_enabled_from_layer(layer: &ConfigLayer) -> Option<bool> {
+    if let Some(v) = get_startup_value(
+        layer,
+        &[
+            "sync.history_enabled",
+            "sync.history-enabled",
+            "sync.history.enabled",
+        ],
+    )
+    .and_then(|value| parse_bool(value))
+    {
+        return Some(v);
+    }
+    get_startup_value(layer, &["no-history", "no_history", "no.history"])
+        .and_then(|value| parse_bool(value))
+        .map(|v| !v)
 }
 
 /// Check merged config for `sync.auto_import` (inverted) or legacy `no-auto-import`.
@@ -4196,6 +4246,7 @@ pub fn is_startup_key(key: &str) -> bool {
             | "no-daemon"
             | "no-auto-flush"
             | "no-auto-import"
+            | "no-history"
             | "json"
             | "db"
             | "actor"
@@ -5415,6 +5466,49 @@ labels:
             Some(false),
             "sync.auto_flush=true should win over legacy no-auto-flush=true"
         );
+    }
+
+    #[test]
+    fn history_enabled_from_layer_default_returns_none() {
+        let layer = ConfigLayer::default();
+        assert_eq!(history_enabled_from_layer(&layer), None);
+    }
+
+    #[test]
+    fn history_enabled_from_layer_canonical_disable() {
+        let mut layer = ConfigLayer::default();
+        insert_key_value(&mut layer, "sync.history_enabled", "false".to_string());
+        assert_eq!(history_enabled_from_layer(&layer), Some(false));
+    }
+
+    #[test]
+    fn history_enabled_from_layer_canonical_enable() {
+        let mut layer = ConfigLayer::default();
+        insert_key_value(&mut layer, "sync.history_enabled", "true".to_string());
+        assert_eq!(history_enabled_from_layer(&layer), Some(true));
+    }
+
+    #[test]
+    fn history_enabled_from_layer_legacy_no_history_disables() {
+        let mut layer = ConfigLayer::default();
+        insert_key_value(&mut layer, "no-history", "true".to_string());
+        assert_eq!(history_enabled_from_layer(&layer), Some(false));
+    }
+
+    #[test]
+    fn history_enabled_from_layer_canonical_beats_legacy() {
+        // sync.history_enabled=true should win even if no-history=true is present
+        let mut layer = ConfigLayer::default();
+        insert_key_value(&mut layer, "sync.history_enabled", "true".to_string());
+        insert_key_value(&mut layer, "no-history", "true".to_string());
+        assert_eq!(history_enabled_from_layer(&layer), Some(true));
+    }
+
+    #[test]
+    fn history_enabled_from_layer_hyphen_underscore_equivalence() {
+        let mut layer = ConfigLayer::default();
+        insert_key_value(&mut layer, "sync.history-enabled", "false".to_string());
+        assert_eq!(history_enabled_from_layer(&layer), Some(false));
     }
 
     #[test]
