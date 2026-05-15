@@ -664,6 +664,7 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
         "fm-state_files-jsonl-missing-trailing-newline",
     ),
     ("jsonl_crlf", "fm-state_files-jsonl-crlf-line-endings"),
+    ("jsonl_bom", "fm-state_files-jsonl-utf8-bom-prefix"),
     ("startup_cache.health", "fm-configs-startup-cache-poisoned"),
     ("sync_jsonl_path", FM_JSONL_ROW_COUNT_MISMATCH),
     (
@@ -1465,6 +1466,7 @@ struct EarlyRepairSummary {
     base_jsonl_stale: bool,
     orphan_tmp: bool,
     jsonl_eof_newline: bool,
+    jsonl_bom: bool,
 }
 
 impl EarlyRepairSummary {
@@ -1478,6 +1480,7 @@ impl EarlyRepairSummary {
             || self.base_jsonl_stale
             || self.orphan_tmp
             || self.jsonl_eof_newline
+            || self.jsonl_bom
     }
 
     fn action_labels(self) -> Vec<String> {
@@ -1508,6 +1511,9 @@ impl EarlyRepairSummary {
         }
         if self.jsonl_eof_newline {
             actions.push("jsonl_trailing_newline_appended".to_string());
+        }
+        if self.jsonl_bom {
+            actions.push("jsonl_bom_stripped".to_string());
         }
         actions
     }
@@ -1540,6 +1546,9 @@ impl EarlyRepairSummary {
         }
         if self.jsonl_eof_newline {
             messages.push("Appended missing trailing newline to issues.jsonl.".to_string());
+        }
+        if self.jsonl_bom {
+            messages.push("Stripped UTF-8 BOM from issues.jsonl.".to_string());
         }
         messages
     }
@@ -2948,6 +2957,119 @@ fn check_base_jsonl_missing_post_flush(
 /// teams). The doctor scans the first 64KB only to keep the check
 /// cheap on large workspaces.
 const CRLF_SCAN_PREFIX_BYTES: usize = 64 * 1024;
+
+/// Pass-5 cycle 21: detector for
+/// `fm-state_files-jsonl-utf8-bom-prefix`.
+///
+/// Warns when `.beads/issues.jsonl` starts with the UTF-8 BOM
+/// (`0xEF 0xBB 0xBF`). Some Windows editors (older Visual Studio,
+/// classic Notepad) prepend it; most JSONL parsers don't strip it,
+/// so the first record fails to parse with a phantom prefix.
+/// Auto-fixable: rewrite the file without the leading 3 bytes via
+/// `Op::WriteFile` through the chokepoint.
+const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+
+fn check_jsonl_utf8_bom(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
+    use std::io::Read;
+    let path = beads_dir.join("issues.jsonl");
+    let Ok(meta) = fs::symlink_metadata(&path) else {
+        push_check(checks, "jsonl_bom", CheckStatus::Ok, None, None);
+        return;
+    };
+    if meta.file_type().is_symlink() || !meta.is_file() || meta.len() < 3 {
+        push_check(checks, "jsonl_bom", CheckStatus::Ok, None, None);
+        return;
+    }
+    let Ok(mut f) = fs::File::open(&path) else {
+        push_check(checks, "jsonl_bom", CheckStatus::Ok, None, None);
+        return;
+    };
+    let mut head = [0u8; 3];
+    if f.read_exact(&mut head).is_err() {
+        push_check(checks, "jsonl_bom", CheckStatus::Ok, None, None);
+        return;
+    }
+    if head == UTF8_BOM {
+        push_check(
+            checks,
+            "jsonl_bom",
+            CheckStatus::Warn,
+            Some(format!(
+                "{} starts with a UTF-8 BOM (0xEF 0xBB 0xBF); JSONL parsers will fail on the first record",
+                path.display()
+            )),
+            Some(serde_json::json!({
+                "path": path.display().to_string(),
+                "remediation": "`br doctor --repair` strips the BOM via Op::WriteFile",
+            })),
+        );
+    } else {
+        push_check(checks, "jsonl_bom", CheckStatus::Ok, None, None);
+    }
+}
+
+/// Pass-5 cycle 21 — fixer for
+/// `fm-state_files-jsonl-utf8-bom-prefix`.
+///
+/// Rewrites `.beads/issues.jsonl` without the leading 3 bytes via
+/// [`chokepoint::mutate(Op::WriteFile)`]. The chokepoint captures
+/// pre-rewrite bytes in a verbatim backup so `doctor undo`
+/// byte-restores the original BOM-prefixed state.
+fn fix_jsonl_utf8_bom_if_warned(
+    beads_dir: &Path,
+    report: &DoctorReport,
+    ctx: &OutputContext,
+    session: Option<&mut DoctorRepairSession>,
+) -> bool {
+    let has_warning = report
+        .checks
+        .iter()
+        .any(|c| c.name == "jsonl_bom" && c.status == CheckStatus::Warn);
+    if !has_warning {
+        return false;
+    }
+    let Some(session) = session else {
+        if !ctx.is_json() {
+            ctx.warning("Skipping BOM strip: no doctor repair session (run-dir creation failed)");
+        }
+        return false;
+    };
+    let path = beads_dir.join("issues.jsonl");
+    // TOCTOU defense: re-read at fix time.
+    let Ok(bytes) = fs::read(&path) else {
+        return false;
+    };
+    if !bytes.starts_with(UTF8_BOM) {
+        return false;
+    }
+    let stripped = bytes[UTF8_BOM.len()..].to_vec();
+    session.set_fixer("doctor.jsonl_bom_strip");
+    match chokepoint::mutate(
+        &session.ctx,
+        &path,
+        Op::WriteFile {
+            content: stripped,
+            mode: None,
+        },
+    ) {
+        Ok(result) if result.ok => {
+            if !ctx.is_json() {
+                ctx.info(&format!("Stripped UTF-8 BOM from {}", path.display()));
+            }
+            true
+        }
+        Ok(_) => false,
+        Err(err) => {
+            if !ctx.is_json() {
+                ctx.warning(&format!(
+                    "Failed to strip BOM from {}: {err}",
+                    path.display()
+                ));
+            }
+            false
+        }
+    }
+}
 
 fn check_jsonl_crlf_endings(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
     use std::io::Read;
@@ -8081,6 +8203,8 @@ fn collect_doctor_report_with_mode_and_db_override(
     check_br_history_size(beads_dir, &mut checks);
     // Pass-5 cycle 20: CRLF line endings on issues.jsonl.
     check_jsonl_crlf_endings(beads_dir, &mut checks);
+    // Pass-5 cycle 21: UTF-8 BOM at start of issues.jsonl.
+    check_jsonl_utf8_bom(beads_dir, &mut checks);
     check_root_gitignore(beads_dir, &mut checks);
     check_routes_jsonl(beads_dir, &mut checks);
     check_rust_log_noisy(&mut checks);
@@ -8662,6 +8786,20 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         };
     let _ = jsonl_eof_newline_repaired;
 
+    // Pass-5 cycle 21: strip UTF-8 BOM from issues.jsonl via Op::WriteFile.
+    let jsonl_bom_repaired =
+        if args.repair && fixer_filter.allows("fm-state_files-jsonl-utf8-bom-prefix") {
+            let repaired =
+                fix_jsonl_utf8_bom_if_warned(&beads_dir, &initial.report, ctx, session.as_mut());
+            if repaired {
+                initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+            }
+            repaired
+        } else {
+            false
+        };
+    let _ = jsonl_bom_repaired;
+
     if args.repair && (fixer_filter.has_only() || fixer_filter.has_skip()) {
         tracing::info!(
             target: "br::doctor::filter",
@@ -8680,6 +8818,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         base_jsonl_stale: base_jsonl_stale_repaired,
         orphan_tmp: orphan_tmp_repaired,
         jsonl_eof_newline: jsonl_eof_newline_repaired,
+        jsonl_bom: jsonl_bom_repaired,
     };
 
     if !args.repair {
@@ -10855,6 +10994,67 @@ mod tests {
     }
 
     #[test]
+    fn test_check_jsonl_utf8_bom_warns_when_present() {
+        // Pass-5 cycle 21: BOM in JSONL → warn.
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let mut bom_bytes = UTF8_BOM.to_vec();
+        bom_bytes.extend_from_slice(b"{\"id\":\"bd-bom\"}\n");
+        fs::write(beads_dir.join("issues.jsonl"), &bom_bytes).unwrap();
+
+        let mut checks = Vec::new();
+        check_jsonl_utf8_bom(&beads_dir, &mut checks);
+        let check = find_check(&checks, "jsonl_bom").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
+    }
+
+    #[test]
+    fn test_check_jsonl_utf8_bom_ok_when_clean() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::write(beads_dir.join("issues.jsonl"), b"{\"id\":\"bd-clean\"}\n").unwrap();
+        let mut checks = Vec::new();
+        check_jsonl_utf8_bom(&beads_dir, &mut checks);
+        let check = find_check(&checks, "jsonl_bom").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn test_fix_jsonl_utf8_bom_strips_via_chokepoint() {
+        // The fixer must rewrite the file without the leading BOM,
+        // preserving the rest of the bytes verbatim.
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let payload = b"{\"id\":\"bd-bom\"}\n{\"id\":\"bd-other\"}\n";
+        let mut bom_bytes = UTF8_BOM.to_vec();
+        bom_bytes.extend_from_slice(payload);
+        fs::write(beads_dir.join("issues.jsonl"), &bom_bytes).unwrap();
+
+        let mut report = DoctorReport {
+            ok: false,
+            workspace_health: Some("degraded".to_string()),
+            reliability_audit: None,
+            checks: Vec::new(),
+        };
+        check_jsonl_utf8_bom(&beads_dir, &mut report.checks);
+
+        let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
+            .expect("session must build");
+        let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Text, false, true);
+        assert!(fix_jsonl_utf8_bom_if_warned(
+            &beads_dir,
+            &report,
+            &ctx,
+            Some(&mut session),
+        ));
+        let after = fs::read(beads_dir.join("issues.jsonl")).unwrap();
+        assert_eq!(after, payload, "BOM stripped, payload preserved");
+    }
+
+    #[test]
     fn test_check_jsonl_oversized_missing_is_ok() {
         // No JSONL at all → ok (other checks cover missing-file case).
         let mut checks = Vec::new();
@@ -11461,6 +11661,7 @@ mod tests {
             base_jsonl_stale: false,
             orphan_tmp: false,
             jsonl_eof_newline: false,
+            jsonl_bom: false,
         };
 
         assert!(summary.applied());
@@ -11511,6 +11712,7 @@ mod tests {
             base_jsonl_stale: false,
             orphan_tmp: false,
             jsonl_eof_newline: false,
+            jsonl_bom: false,
         };
 
         assert!(summary.applied());
@@ -11543,6 +11745,7 @@ mod tests {
             base_jsonl_stale: true,
             orphan_tmp: false,
             jsonl_eof_newline: false,
+            jsonl_bom: false,
         };
 
         assert!(summary.applied());
@@ -11575,6 +11778,7 @@ mod tests {
             base_jsonl_stale: false,
             orphan_tmp: true,
             jsonl_eof_newline: false,
+            jsonl_bom: false,
         };
 
         assert!(summary.applied());

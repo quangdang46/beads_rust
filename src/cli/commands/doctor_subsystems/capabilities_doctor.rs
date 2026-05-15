@@ -280,6 +280,7 @@ fn build_detector_registry() -> Vec<DetectorEntry> {
         ("br_history.size", "state_files", "warn", true),
         ("jsonl_eof_newline", "state_files", "warn", true),
         ("jsonl_crlf", "state_files", "warn", true),
+        ("jsonl_bom", "state_files", "warn", true),
         ("startup_cache.health", "configs", "warn", true),
         ("sync_jsonl_path", "state_files", "warn", true),
         ("sync_conflict_markers", "state_files", "error", true),
@@ -400,6 +401,13 @@ fn early_chokepoint_fixer_rows() -> &'static [FixerRow] {
             true,
             true,
             &["jsonl_eof_newline"],
+        ),
+        (
+            "doctor.jsonl_bom_strip",
+            "state_files",
+            true,
+            true,
+            &["jsonl_bom"],
         ),
     ]
 }
@@ -628,6 +636,7 @@ mod tests {
                 "doctor.base_jsonl_regen",
                 "doctor.orphan_tmp_quarantine",
                 "doctor.jsonl_trailing_newline_append",
+                "doctor.jsonl_bom_strip",
                 "doctor.repair_recoverable_db_state",
                 "doctor.repair_partial_indexes",
                 "doctor.repair_via_vacuum",
