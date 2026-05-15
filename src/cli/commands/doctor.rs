@@ -666,6 +666,7 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
     ("jsonl_crlf", "fm-state_files-jsonl-crlf-line-endings"),
     ("jsonl_bom", "fm-state_files-jsonl-utf8-bom-prefix"),
     ("db_bloat", "fm-caches_indexes-db-bloat-vs-jsonl"),
+    ("wal_size", "fm-state_files-wal-oversized"),
     ("startup_cache.health", "fm-configs-startup-cache-poisoned"),
     ("sync_jsonl_path", FM_JSONL_ROW_COUNT_MISMATCH),
     (
@@ -2958,6 +2959,52 @@ fn check_base_jsonl_missing_post_flush(
 /// teams). The doctor scans the first 64KB only to keep the check
 /// cheap on large workspaces.
 const CRLF_SCAN_PREFIX_BYTES: usize = 64 * 1024;
+
+/// Pass-5 cycle 23: detector for
+/// `fm-state_files-wal-oversized`.
+///
+/// Warns when `.beads/beads.db-wal` exceeds `WAL_OVERSIZED_BYTES`
+/// (32MB). A healthy WAL is reset by SQLite's auto-checkpoint at
+/// ~4MB; a much larger WAL means checkpoint hasn't run (long-running
+/// read snapshot blocking, or a peer process holding the WAL open).
+/// Detect-only — operators can run `PRAGMA wal_checkpoint(TRUNCATE)`
+/// manually, or `br doctor --repair-indexes` (which checkpoints as
+/// a side effect).
+const WAL_OVERSIZED_BYTES: u64 = 32 * 1024 * 1024;
+
+fn check_wal_oversized(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
+    let path = beads_dir.join("beads.db-wal");
+    let Ok(meta) = fs::symlink_metadata(&path) else {
+        push_check(checks, "wal_size", CheckStatus::Ok, None, None);
+        return;
+    };
+    if !meta.is_file() || meta.file_type().is_symlink() {
+        push_check(checks, "wal_size", CheckStatus::Ok, None, None);
+        return;
+    }
+    let bytes = meta.len();
+    if bytes > WAL_OVERSIZED_BYTES {
+        push_check(
+            checks,
+            "wal_size",
+            CheckStatus::Warn,
+            Some(format!(
+                "{} is {}MB (>{}MB threshold); SQLite auto-checkpoint may be blocked by a long-running read snapshot",
+                path.display(),
+                bytes / (1024 * 1024),
+                WAL_OVERSIZED_BYTES / (1024 * 1024)
+            )),
+            Some(serde_json::json!({
+                "path": path.display().to_string(),
+                "size_bytes": bytes,
+                "threshold_bytes": WAL_OVERSIZED_BYTES,
+                "remediation": "`sqlite3 .beads/beads.db 'PRAGMA wal_checkpoint(TRUNCATE)'` or `br doctor --repair-indexes`",
+            })),
+        );
+    } else {
+        push_check(checks, "wal_size", CheckStatus::Ok, None, None);
+    }
+}
 
 /// Pass-5 cycle 22: detector for
 /// `fm-caches_indexes-db-bloat-vs-jsonl`.
@@ -8266,6 +8313,8 @@ fn collect_doctor_report_with_mode_and_db_override(
     check_jsonl_utf8_bom(beads_dir, &mut checks);
     // Pass-5 cycle 22: db-to-jsonl size ratio (VACUUM candidate).
     check_db_bloat_vs_jsonl(beads_dir, &mut checks);
+    // Pass-5 cycle 23: WAL sidecar oversized (checkpoint candidate).
+    check_wal_oversized(beads_dir, &mut checks);
     check_root_gitignore(beads_dir, &mut checks);
     check_routes_jsonl(beads_dir, &mut checks);
     check_rust_log_noisy(&mut checks);
@@ -11177,6 +11226,57 @@ mod tests {
         let mut checks = Vec::new();
         check_db_bloat_vs_jsonl(&beads_dir, &mut checks);
         let check = find_check(&checks, "db_bloat").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn test_check_wal_oversized_warns_on_oversized() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let wal = fs::File::create(beads_dir.join("beads.db-wal")).unwrap();
+        wal.set_len(WAL_OVERSIZED_BYTES + 1).unwrap();
+        drop(wal);
+
+        let mut checks = Vec::new();
+        check_wal_oversized(&beads_dir, &mut checks);
+        let check = find_check(&checks, "wal_size").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
+        let details = check.details.as_ref().expect("details");
+        assert_eq!(
+            details
+                .get("threshold_bytes")
+                .and_then(serde_json::Value::as_u64),
+            Some(WAL_OVERSIZED_BYTES)
+        );
+    }
+
+    #[test]
+    fn test_check_wal_oversized_ok_on_normal_size() {
+        // 4MB WAL is healthy — SQLite auto-checkpoint runs at ~4MB.
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let wal = fs::File::create(beads_dir.join("beads.db-wal")).unwrap();
+        wal.set_len(4 * 1024 * 1024).unwrap();
+        drop(wal);
+
+        let mut checks = Vec::new();
+        check_wal_oversized(&beads_dir, &mut checks);
+        let check = find_check(&checks, "wal_size").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn test_check_wal_oversized_missing_is_ok() {
+        // No WAL file at all → ok (workspace not in WAL mode or freshly checkpointed).
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let mut checks = Vec::new();
+        check_wal_oversized(&beads_dir, &mut checks);
+        let check = find_check(&checks, "wal_size").expect("check present");
         assert!(matches!(check.status, CheckStatus::Ok));
     }
 
