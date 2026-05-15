@@ -383,6 +383,13 @@ fn early_chokepoint_fixer_rows() -> &'static [FixerRow] {
             true,
             &["base_jsonl"],
         ),
+        (
+            "doctor.orphan_tmp_quarantine",
+            "state_files",
+            true,
+            true,
+            &["tmp_files_orphan"],
+        ),
     ]
 }
 
@@ -608,6 +615,7 @@ mod tests {
                 "doctor.export_hash_cache_repair",
                 "doctor.base_jsonl_symlink_quarantine",
                 "doctor.base_jsonl_regen",
+                "doctor.orphan_tmp_quarantine",
                 "doctor.repair_recoverable_db_state",
                 "doctor.repair_partial_indexes",
                 "doctor.repair_via_vacuum",

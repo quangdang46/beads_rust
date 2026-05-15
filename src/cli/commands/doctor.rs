@@ -1453,6 +1453,7 @@ struct EarlyRepairSummary {
     export_hash: bool,
     base_jsonl_symlink: bool,
     base_jsonl_stale: bool,
+    orphan_tmp: bool,
 }
 
 impl EarlyRepairSummary {
@@ -1464,6 +1465,7 @@ impl EarlyRepairSummary {
             || self.export_hash
             || self.base_jsonl_symlink
             || self.base_jsonl_stale
+            || self.orphan_tmp
     }
 
     fn action_labels(self) -> Vec<String> {
@@ -1488,6 +1490,9 @@ impl EarlyRepairSummary {
         }
         if self.base_jsonl_stale {
             actions.push("base_jsonl_anchor_regenerated".to_string());
+        }
+        if self.orphan_tmp {
+            actions.push("orphan_tmp_quarantined".to_string());
         }
         actions
     }
@@ -1514,6 +1519,9 @@ impl EarlyRepairSummary {
         }
         if self.base_jsonl_stale {
             messages.push("Regenerated stale merge anchor from current JSONL.".to_string());
+        }
+        if self.orphan_tmp {
+            messages.push("Quarantined orphan tmp files.".to_string());
         }
         messages
     }
@@ -2915,15 +2923,52 @@ fn check_base_jsonl_missing_post_flush(
 /// Walks `.beads/` for `*.tmp` and `*.tmp.<digits>` files left behind
 /// by interrupted atomic-rename writes. Anything older than 1 hour is
 /// almost certainly orphaned (in-flight tmps live milliseconds). Detect-
-/// only — auto-cleanup risks deleting a tmp from an actively-writing
-/// peer process on a slow filesystem (e.g., NFS-backed workspaces).
+/// and-repair via quarantine: `br doctor --repair` re-runs this exact
+/// predicate at fix time and renames matching regular files into the
+/// per-run quarantine so no bytes are deleted.
 const ORPHAN_TMP_AGE_THRESHOLD_SECS: u64 = 60 * 60;
+
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
+fn is_orphan_tmp_name(name: &str) -> bool {
+    name.ends_with(".tmp")
+        || (name.contains(".tmp.")
+            && name
+                .rsplit('.')
+                .next()
+                .is_some_and(|s| s.chars().all(|c| c.is_ascii_digit())))
+}
+
+fn orphan_tmp_entry(
+    entry: &fs::DirEntry,
+    now: std::time::SystemTime,
+    threshold: std::time::Duration,
+) -> Option<(String, PathBuf)> {
+    let name_os = entry.file_name();
+    let name = name_os.to_str()?;
+    if !is_orphan_tmp_name(name) {
+        return None;
+    }
+    let file_type = entry.file_type().ok()?;
+    if !file_type.is_file() {
+        return None;
+    }
+    let meta = entry.metadata().ok()?;
+    let mtime = meta.modified().ok()?;
+    if now
+        .duration_since(mtime)
+        .map(|age| age > threshold)
+        .unwrap_or(false)
+    {
+        Some((name.to_string(), entry.path()))
+    } else {
+        None
+    }
+}
 
 // case_sensitive_file_extension_comparisons fires on `name.ends_with(".tmp")`
 // because clippy prefers Path::extension(). We deliberately match exact-case
 // `.tmp` (BR's atomic-write writers produce lowercase) and the secondary
 // `*.tmp.<digits>` shape doesn't have `.tmp` as the Path extension.
-#[allow(clippy::case_sensitive_file_extension_comparisons)]
 fn check_orphan_tmp_files(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
     use std::time::{Duration, SystemTime};
     let Ok(entries) = fs::read_dir(beads_dir) else {
@@ -2934,41 +2979,8 @@ fn check_orphan_tmp_files(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
     let threshold = Duration::from_secs(ORPHAN_TMP_AGE_THRESHOLD_SECS);
     let mut orphans: Vec<String> = Vec::new();
     for entry in entries.flatten() {
-        let name_os = entry.file_name();
-        let Some(name) = name_os.to_str() else {
-            continue;
-        };
-        // Match common atomic-write tmp shapes:
-        //   issues.jsonl.<pid>.tmp
-        //   foo.tmp
-        //   foo.tmp.<digits>
-        let is_tmp_shape = name.ends_with(".tmp")
-            || (name.contains(".tmp.")
-                && name
-                    .rsplit('.')
-                    .next()
-                    .is_some_and(|s| s.chars().all(|c| c.is_ascii_digit())));
-        if !is_tmp_shape {
-            continue;
-        }
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if !file_type.is_file() {
-            continue;
-        }
-        let Ok(meta) = entry.metadata() else {
-            continue;
-        };
-        let Ok(mtime) = meta.modified() else {
-            continue;
-        };
-        if now
-            .duration_since(mtime)
-            .map(|age| age > threshold)
-            .unwrap_or(false)
-        {
-            orphans.push(name.to_string());
+        if let Some((name, _path)) = orphan_tmp_entry(&entry, now, threshold) {
+            orphans.push(name);
         }
     }
     orphans.sort();
@@ -2988,7 +3000,7 @@ fn check_orphan_tmp_files(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
             Some(serde_json::json!({
                 "files": orphans,
                 "age_threshold_secs": ORPHAN_TMP_AGE_THRESHOLD_SECS,
-                "remediation": "Verify no peer process is writing, then manually remove the tmp files",
+                "remediation": "Verify no peer process is writing, then run br doctor --repair to quarantine the tmp files",
             })),
         );
     }
@@ -6376,6 +6388,101 @@ fn fix_base_jsonl_stale_if_warned(
     }
 }
 
+/// Pass-5 cycle 16: quarantine fixer for
+/// `fm-state_files-orphan-tmp-files`.
+///
+/// When `tmp_files_orphan` Warn is present under `--repair`, walks the
+/// orphan list (re-detected at fix time for TOCTOU defense) and
+/// renames each past-threshold tmp file into
+/// `<run-dir>/quarantine/.beads/<filename>` via
+/// [`chokepoint::mutate(Op::Rename)`]. Per AGENTS.md RULE 1: rename,
+/// never delete. `doctor undo` byte-restores the original tmp files.
+///
+/// The detector itself stays as the source of truth for what counts
+/// as "orphan" — this fixer re-runs the same time-threshold check at
+/// fix time so a peer-process write that just landed isn't
+/// inadvertently quarantined.
+///
+/// Lifts the FM from Tier B (cycle 15) to Tier A.
+fn fix_orphan_tmp_files_if_warned(
+    beads_dir: &Path,
+    report: &DoctorReport,
+    ctx: &OutputContext,
+    session: Option<&mut DoctorRepairSession>,
+) -> bool {
+    use std::time::{Duration, SystemTime};
+    let has_warning = report
+        .checks
+        .iter()
+        .any(|c| c.name == "tmp_files_orphan" && c.status == CheckStatus::Warn);
+    if !has_warning {
+        return false;
+    }
+    let Some(session) = session else {
+        if !ctx.is_json() {
+            ctx.warning(
+                "Skipping orphan-tmp quarantine: no doctor repair session (run-dir creation failed)",
+            );
+        }
+        return false;
+    };
+
+    // Re-run the detector at fix time. Anything that's no-longer-orphan
+    // (e.g., a peer process just wrote it) must not be touched.
+    let Ok(entries) = fs::read_dir(beads_dir) else {
+        return false;
+    };
+    let now = SystemTime::now();
+    let threshold = Duration::from_secs(ORPHAN_TMP_AGE_THRESHOLD_SECS);
+    let mut orphans: Vec<PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        if let Some((_name, path)) = orphan_tmp_entry(&entry, now, threshold) {
+            orphans.push(path);
+        }
+    }
+    orphans.sort();
+    if orphans.is_empty() {
+        return false;
+    }
+
+    session.set_fixer("doctor.orphan_tmp_quarantine");
+    let mut quarantined = 0_usize;
+    for source in &orphans {
+        let Some(name) = source.file_name() else {
+            continue;
+        };
+        let dest = session
+            .run
+            .root
+            .join("quarantine")
+            .join(".beads")
+            .join(name);
+        match chokepoint::mutate(&session.ctx, source, Op::Rename { to: dest.clone() }) {
+            Ok(result) if result.ok => quarantined += 1,
+            Ok(_) => {
+                if !ctx.is_json() {
+                    ctx.warning(&format!(
+                        "Orphan-tmp quarantine no-op for {}",
+                        source.display()
+                    ));
+                }
+            }
+            Err(err) => {
+                if !ctx.is_json() {
+                    ctx.warning(&format!("Failed to quarantine {}: {err}", source.display()));
+                }
+            }
+        }
+    }
+    if quarantined > 0 && !ctx.is_json() {
+        ctx.info(&format!(
+            "Quarantined {quarantined} orphan tmp file(s) under {}",
+            session.run.root.join("quarantine/.beads").display()
+        ));
+    }
+    quarantined > 0
+}
+
 fn read_root_gitignore_content(gitignore_path: &Path) -> Result<Option<String>> {
     let metadata = match fs::symlink_metadata(gitignore_path) {
         Ok(metadata) => metadata,
@@ -8182,6 +8289,20 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             false
         };
 
+    // Pass-5 cycle 16: quarantine orphan *.tmp files under .beads/
+    // via Op::Rename (same pattern as cycle 1's merge-artifact-stuck).
+    let orphan_tmp_repaired =
+        if args.repair && fixer_filter.allows("fm-state_files-orphan-tmp-files") {
+            let repaired =
+                fix_orphan_tmp_files_if_warned(&beads_dir, &initial.report, ctx, session.as_mut());
+            if repaired {
+                initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+            }
+            repaired
+        } else {
+            false
+        };
+
     if args.repair && (fixer_filter.has_only() || fixer_filter.has_skip()) {
         tracing::info!(
             target: "br::doctor::filter",
@@ -8198,6 +8319,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         export_hash: export_hash_repaired,
         base_jsonl_symlink: base_jsonl_symlink_repaired,
         base_jsonl_stale: base_jsonl_stale_repaired,
+        orphan_tmp: orphan_tmp_repaired,
     };
 
     if !args.repair {
@@ -8686,6 +8808,14 @@ mod tests {
 
     fn find_check<'a>(checks: &'a [CheckResult], name: &str) -> Option<&'a CheckResult> {
         checks.iter().find(|check| check.name == name)
+    }
+
+    fn backdate_file_two_hours(path: &Path) {
+        let two_hours_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 60 * 60);
+        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(two_hours_ago))
+            .unwrap();
     }
 
     fn sample_issue(id: &str, title: &str) -> Issue {
@@ -10271,6 +10401,125 @@ mod tests {
     }
 
     #[test]
+    fn test_fix_orphan_tmp_files_quarantines_old_regular_files_only() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let old_tmp = beads_dir.join("issues.jsonl.99999.tmp");
+        let fresh_tmp = beads_dir.join("issues.jsonl.12345.tmp");
+        fs::write(&old_tmp, b"old partial write").unwrap();
+        fs::write(&fresh_tmp, b"fresh partial write").unwrap();
+        backdate_file_two_hours(&old_tmp);
+
+        let report = DoctorReport {
+            ok: false,
+            workspace_health: None,
+            reliability_audit: None,
+            checks: vec![CheckResult {
+                name: "tmp_files_orphan".to_string(),
+                status: CheckStatus::Warn,
+                message: None,
+                details: None,
+            }],
+        };
+        let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
+            .expect("session must build");
+
+        assert!(fix_orphan_tmp_files_if_warned(
+            &beads_dir,
+            &report,
+            &quiet_ctx(),
+            Some(&mut session),
+        ));
+        assert!(!old_tmp.exists(), "old tmp must be moved into quarantine");
+        assert!(fresh_tmp.is_file(), "fresh tmp must be preserved in place");
+        assert!(
+            session
+                .run
+                .root
+                .join("quarantine/.beads/issues.jsonl.99999.tmp")
+                .is_file()
+        );
+
+        let actions_before = fs::read_to_string(&session.run.actions_file).unwrap();
+        assert_eq!(actions_before.matches("\"op\":\"rename\"").count(), 1);
+        assert!(!fix_orphan_tmp_files_if_warned(
+            &beads_dir,
+            &report,
+            &quiet_ctx(),
+            Some(&mut session),
+        ));
+        let actions_after = fs::read_to_string(&session.run.actions_file).unwrap();
+        assert_eq!(actions_after, actions_before, "second pass must be a no-op");
+    }
+
+    #[test]
+    fn test_fix_orphan_tmp_files_ignores_symlinked_tmp_names() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let real_orphan = beads_dir.join("real.tmp");
+        fs::write(&real_orphan, b"old regular tmp").unwrap();
+        backdate_file_two_hours(&real_orphan);
+
+        let symlink_target = beads_dir.join("target-data");
+        let symlink_path = beads_dir.join("linked.tmp");
+        fs::write(&symlink_target, b"old target behind symlink").unwrap();
+        backdate_file_two_hours(&symlink_target);
+        symlink(&symlink_target, &symlink_path).unwrap();
+
+        let report = DoctorReport {
+            ok: false,
+            workspace_health: None,
+            reliability_audit: None,
+            checks: vec![CheckResult {
+                name: "tmp_files_orphan".to_string(),
+                status: CheckStatus::Warn,
+                message: None,
+                details: None,
+            }],
+        };
+        let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
+            .expect("session must build");
+
+        assert!(fix_orphan_tmp_files_if_warned(
+            &beads_dir,
+            &report,
+            &quiet_ctx(),
+            Some(&mut session),
+        ));
+
+        assert!(
+            !real_orphan.exists(),
+            "regular orphan should be quarantined"
+        );
+        assert!(
+            fs::symlink_metadata(&symlink_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "symlink-shaped tmp names are not detector-owned and must stay in place"
+        );
+        assert!(
+            symlink_target.is_file(),
+            "the symlink target must not be modified"
+        );
+        assert!(
+            !session
+                .run
+                .root
+                .join("quarantine/.beads/linked.tmp")
+                .exists(),
+            "repair must not quarantine symlink-shaped tmp names"
+        );
+
+        let actions = fs::read_to_string(&session.run.actions_file).unwrap();
+        assert_eq!(actions.matches("\"op\":\"rename\"").count(), 1);
+    }
+
+    #[test]
     fn test_fixer_filter_empty_allows_everything() {
         // Pass-5 cycle 1: default (no --only/--skip) accepts every FM.
         let filter = FixerFilter::default();
@@ -10655,6 +10904,7 @@ mod tests {
             export_hash: true,
             base_jsonl_symlink: false,
             base_jsonl_stale: false,
+            orphan_tmp: false,
         };
 
         assert!(summary.applied());
@@ -10703,6 +10953,7 @@ mod tests {
             export_hash: false,
             base_jsonl_symlink: true,
             base_jsonl_stale: false,
+            orphan_tmp: false,
         };
 
         assert!(summary.applied());
@@ -10733,6 +10984,7 @@ mod tests {
             export_hash: false,
             base_jsonl_symlink: false,
             base_jsonl_stale: true,
+            orphan_tmp: false,
         };
 
         assert!(summary.applied());
@@ -10750,6 +11002,37 @@ mod tests {
         assert_eq!(
             audit.applied_actions,
             vec!["base_jsonl_anchor_regenerated".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_early_repair_summary_reports_orphan_tmp_quarantine() {
+        let summary = EarlyRepairSummary {
+            gitignore: false,
+            merge_artifacts: false,
+            startup_cache: false,
+            recovery_aged: false,
+            export_hash: false,
+            base_jsonl_symlink: false,
+            base_jsonl_stale: false,
+            orphan_tmp: true,
+        };
+
+        assert!(summary.applied());
+        assert_eq!(
+            summary.action_labels(),
+            vec!["orphan_tmp_quarantined".to_string()]
+        );
+        assert_eq!(
+            repair_outcome_message_from_parts(summary.messages(), None, None),
+            "Quarantined orphan tmp files."
+        );
+        let audit = summary.audit_record();
+        assert_eq!(audit.phase, "doctor.early_repair");
+        assert_eq!(audit.outcome, "orphan_tmp_quarantined");
+        assert_eq!(
+            audit.applied_actions,
+            vec!["orphan_tmp_quarantined".to_string()]
         );
     }
 
