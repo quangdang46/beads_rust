@@ -654,6 +654,7 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
         "fm-permissions-jsonl-world-writable",
     ),
     ("tmp_files_orphan", "fm-state_files-orphan-tmp-files"),
+    ("jsonl_size", "fm-state_files-jsonl-oversized"),
     ("startup_cache.health", "fm-configs-startup-cache-poisoned"),
     ("sync_jsonl_path", FM_JSONL_ROW_COUNT_MISMATCH),
     (
@@ -2917,17 +2918,66 @@ fn check_base_jsonl_missing_post_flush(
     }
 }
 
+/// Pass-5 cycle 17: detector for
+/// `fm-state_files-jsonl-oversized`.
+///
+/// Warns when `.beads/issues.jsonl` exceeds
+/// `JSONL_OVERSIZED_THRESHOLD_BYTES` (100MB). At that scale the sync
+/// engine's full-file read on every flush becomes slow and the
+/// in-memory parse can pressure low-RAM hosts. Detect-only —
+/// compaction (closing stale issues, archiving old comments) is
+/// operator-decided.
+const JSONL_OVERSIZED_THRESHOLD_BYTES: u64 = 100 * 1024 * 1024;
+
+fn check_jsonl_oversized(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
+    let path = beads_dir.join("issues.jsonl");
+    let Ok(meta) = fs::symlink_metadata(&path) else {
+        push_check(checks, "jsonl_size", CheckStatus::Ok, None, None);
+        return;
+    };
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        push_check(checks, "jsonl_size", CheckStatus::Ok, None, None);
+        return;
+    }
+    let bytes = meta.len();
+    if bytes > JSONL_OVERSIZED_THRESHOLD_BYTES {
+        push_check(
+            checks,
+            "jsonl_size",
+            CheckStatus::Warn,
+            Some(format!(
+                "{} is {} MB (>{} MB threshold); flushes will be slow and may pressure low-RAM hosts",
+                path.display(),
+                bytes / (1024 * 1024),
+                JSONL_OVERSIZED_THRESHOLD_BYTES / (1024 * 1024)
+            )),
+            Some(serde_json::json!({
+                "path": path.display().to_string(),
+                "size_bytes": bytes,
+                "threshold_bytes": JSONL_OVERSIZED_THRESHOLD_BYTES,
+                "remediation": "Close stale issues, archive old comments, or split the workspace",
+            })),
+        );
+    } else {
+        push_check(checks, "jsonl_size", CheckStatus::Ok, None, None);
+    }
+}
+
 /// Pass-5 cycle 15: detector for
 /// `fm-state_files-orphan-tmp-files`.
 ///
 /// Walks `.beads/` for `*.tmp` and `*.tmp.<digits>` files left behind
 /// by interrupted atomic-rename writes. Anything older than 1 hour is
-/// almost certainly orphaned (in-flight tmps live milliseconds). Detect-
-/// and-repair via quarantine: `br doctor --repair` re-runs this exact
+/// almost certainly orphaned (in-flight tmps live milliseconds). Detect
+/// and repair via quarantine: `br doctor --repair` re-runs this exact
 /// predicate at fix time and renames matching regular files into the
 /// per-run quarantine so no bytes are deleted.
 const ORPHAN_TMP_AGE_THRESHOLD_SECS: u64 = 60 * 60;
 
+// case_sensitive_file_extension_comparisons fires on `name.ends_with(".tmp")`
+// because clippy prefers Path::extension(). We deliberately match exact-case
+// `.tmp` (BR's atomic-write writers produce lowercase) and the secondary
+// `*.tmp.<digits>` shape doesn't have `.tmp` as the Path extension.
 #[allow(clippy::case_sensitive_file_extension_comparisons)]
 fn is_orphan_tmp_name(name: &str) -> bool {
     name.ends_with(".tmp")
@@ -2965,10 +3015,6 @@ fn orphan_tmp_entry(
     }
 }
 
-// case_sensitive_file_extension_comparisons fires on `name.ends_with(".tmp")`
-// because clippy prefers Path::extension(). We deliberately match exact-case
-// `.tmp` (BR's atomic-write writers produce lowercase) and the secondary
-// `*.tmp.<digits>` shape doesn't have `.tmp` as the Path extension.
 fn check_orphan_tmp_files(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
     use std::time::{Duration, SystemTime};
     let Ok(entries) = fs::read_dir(beads_dir) else {
@@ -7746,6 +7792,8 @@ fn collect_doctor_report_with_mode_and_db_override(
     check_jsonl_world_writable(beads_dir, &mut checks);
     // Pass-5 cycle 15: orphan *.tmp files from interrupted atomic writes.
     check_orphan_tmp_files(beads_dir, &mut checks);
+    // Pass-5 cycle 17: oversized JSONL (slow flushes, RAM pressure).
+    check_jsonl_oversized(beads_dir, &mut checks);
     check_root_gitignore(beads_dir, &mut checks);
     check_routes_jsonl(beads_dir, &mut checks);
     check_rust_log_noisy(&mut checks);
@@ -10332,6 +10380,57 @@ mod tests {
         let mut checks = Vec::new();
         check_orphan_tmp_files(&beads_dir, &mut checks);
         let check = find_check(&checks, "tmp_files_orphan").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn test_check_jsonl_oversized_warns_above_threshold() {
+        // Pass-5 cycle 17: file size > threshold → warn.
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let jsonl = beads_dir.join("issues.jsonl");
+        // Write a sparse file beyond the threshold using set_len(). The
+        // OS treats this as zero-filled without actually consuming
+        // 100MB on disk (filesystem-dependent; works on tmpfs/ext4/xfs).
+        let f = fs::File::create(&jsonl).unwrap();
+        f.set_len(JSONL_OVERSIZED_THRESHOLD_BYTES + 1).unwrap();
+        drop(f);
+
+        let mut checks = Vec::new();
+        check_jsonl_oversized(&beads_dir, &mut checks);
+        let check = find_check(&checks, "jsonl_size").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
+        let size_bytes = check
+            .details
+            .as_ref()
+            .and_then(|d| d.get("size_bytes"))
+            .and_then(serde_json::Value::as_u64);
+        assert_eq!(size_bytes, Some(JSONL_OVERSIZED_THRESHOLD_BYTES + 1));
+    }
+
+    #[test]
+    fn test_check_jsonl_oversized_ok_below_threshold() {
+        // Small JSONL → ok.
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::write(beads_dir.join("issues.jsonl"), b"{\"id\":\"bd-tiny\"}\n").unwrap();
+        let mut checks = Vec::new();
+        check_jsonl_oversized(&beads_dir, &mut checks);
+        let check = find_check(&checks, "jsonl_size").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn test_check_jsonl_oversized_missing_is_ok() {
+        // No JSONL at all → ok (other checks cover missing-file case).
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let mut checks = Vec::new();
+        check_jsonl_oversized(&beads_dir, &mut checks);
+        let check = find_check(&checks, "jsonl_size").expect("check present");
         assert!(matches!(check.status, CheckStatus::Ok));
     }
 
