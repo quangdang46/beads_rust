@@ -663,6 +663,7 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
         "jsonl_eof_newline",
         "fm-state_files-jsonl-missing-trailing-newline",
     ),
+    ("jsonl_crlf", "fm-state_files-jsonl-crlf-line-endings"),
     ("startup_cache.health", "fm-configs-startup-cache-poisoned"),
     ("sync_jsonl_path", FM_JSONL_ROW_COUNT_MISMATCH),
     (
@@ -2931,6 +2932,63 @@ fn check_base_jsonl_missing_post_flush(
                 None,
             );
         }
+    }
+}
+
+/// Pass-5 cycle 20: detector for
+/// `fm-state_files-jsonl-crlf-line-endings`.
+///
+/// Warns when `.beads/issues.jsonl` contains CRLF (`\r\n`) line
+/// endings. Operators sometimes import workspaces from Windows
+/// terminals or git autocrlf-configured repos that rewrite line
+/// endings; CRLF breaks `git diff --no-index` legibility and
+/// confuses streaming JSONL parsers that split on `\n`.
+///
+/// Detect-only — operators may have intentional CRLF (Windows-only
+/// teams). The doctor scans the first 64KB only to keep the check
+/// cheap on large workspaces.
+const CRLF_SCAN_PREFIX_BYTES: usize = 64 * 1024;
+
+fn check_jsonl_crlf_endings(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
+    use std::io::Read;
+    let path = beads_dir.join("issues.jsonl");
+    let Ok(meta) = fs::symlink_metadata(&path) else {
+        push_check(checks, "jsonl_crlf", CheckStatus::Ok, None, None);
+        return;
+    };
+    if meta.file_type().is_symlink() || !meta.is_file() || meta.len() == 0 {
+        push_check(checks, "jsonl_crlf", CheckStatus::Ok, None, None);
+        return;
+    }
+    let Ok(mut f) = fs::File::open(&path) else {
+        push_check(checks, "jsonl_crlf", CheckStatus::Ok, None, None);
+        return;
+    };
+    let len_clamped = usize::try_from(meta.len()).unwrap_or(CRLF_SCAN_PREFIX_BYTES);
+    let mut buf = vec![0u8; CRLF_SCAN_PREFIX_BYTES.min(len_clamped)];
+    let Ok(n) = f.read(&mut buf) else {
+        push_check(checks, "jsonl_crlf", CheckStatus::Ok, None, None);
+        return;
+    };
+    let has_crlf = buf[..n].windows(2).any(|w| w == b"\r\n");
+    if has_crlf {
+        push_check(
+            checks,
+            "jsonl_crlf",
+            CheckStatus::Warn,
+            Some(format!(
+                "{} contains CRLF line endings (scanned first {} bytes); git diff and streaming JSONL parsers may misbehave",
+                path.display(),
+                n
+            )),
+            Some(serde_json::json!({
+                "path": path.display().to_string(),
+                "scanned_bytes": n,
+                "remediation": "Convert via `dos2unix .beads/issues.jsonl` or `sed -i 's/\\r$//' .beads/issues.jsonl`",
+            })),
+        );
+    } else {
+        push_check(checks, "jsonl_crlf", CheckStatus::Ok, None, None);
     }
 }
 
@@ -8021,6 +8079,8 @@ fn collect_doctor_report_with_mode_and_db_override(
     check_orphan_tmp_files(beads_dir, &mut checks);
     // Pass-5 cycle 18: .br_history/ snapshot accumulation (inode pressure).
     check_br_history_size(beads_dir, &mut checks);
+    // Pass-5 cycle 20: CRLF line endings on issues.jsonl.
+    check_jsonl_crlf_endings(beads_dir, &mut checks);
     check_root_gitignore(beads_dir, &mut checks);
     check_routes_jsonl(beads_dir, &mut checks);
     check_rust_log_noisy(&mut checks);
@@ -10748,6 +10808,49 @@ mod tests {
         let mut checks = Vec::new();
         check_br_history_size(&beads_dir, &mut checks);
         let check = find_check(&checks, "br_history.size").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn test_check_jsonl_crlf_endings_warns_on_crlf() {
+        // Pass-5 cycle 20: CRLF in JSONL → warn.
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::write(
+            beads_dir.join("issues.jsonl"),
+            b"{\"id\":\"bd-windows\"}\r\n",
+        )
+        .unwrap();
+
+        let mut checks = Vec::new();
+        check_jsonl_crlf_endings(&beads_dir, &mut checks);
+        let check = find_check(&checks, "jsonl_crlf").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
+    }
+
+    #[test]
+    fn test_check_jsonl_crlf_endings_lf_only_is_ok() {
+        // Plain LF → ok.
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::write(beads_dir.join("issues.jsonl"), b"{\"id\":\"bd-unix\"}\n").unwrap();
+
+        let mut checks = Vec::new();
+        check_jsonl_crlf_endings(&beads_dir, &mut checks);
+        let check = find_check(&checks, "jsonl_crlf").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn test_check_jsonl_crlf_endings_missing_is_ok() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let mut checks = Vec::new();
+        check_jsonl_crlf_endings(&beads_dir, &mut checks);
+        let check = find_check(&checks, "jsonl_crlf").expect("check present");
         assert!(matches!(check.status, CheckStatus::Ok));
     }
 
