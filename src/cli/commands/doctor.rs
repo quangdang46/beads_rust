@@ -1477,6 +1477,7 @@ struct EarlyRepairSummary {
     jsonl_world_writable: bool,
     config_yaml_secret_mode: bool,
     inner_gitignore: bool,
+    dirty_bitmap_orphans: bool,
 }
 
 impl EarlyRepairSummary {
@@ -1495,6 +1496,7 @@ impl EarlyRepairSummary {
             || self.jsonl_world_writable
             || self.config_yaml_secret_mode
             || self.inner_gitignore
+            || self.dirty_bitmap_orphans
     }
 
     fn action_labels(self) -> Vec<String> {
@@ -1540,6 +1542,9 @@ impl EarlyRepairSummary {
         }
         if self.inner_gitignore {
             actions.push("inner_gitignore_appended".to_string());
+        }
+        if self.dirty_bitmap_orphans {
+            actions.push("dirty_bitmap_orphans_pruned".to_string());
         }
         actions
     }
@@ -1594,6 +1599,9 @@ impl EarlyRepairSummary {
         }
         if self.inner_gitignore {
             messages.push("Appended canonical patterns to `.beads/.gitignore`.".to_string());
+        }
+        if self.dirty_bitmap_orphans {
+            messages.push("Pruned orphan rows from dirty_issues table.".to_string());
         }
         messages
     }
@@ -3739,12 +3747,12 @@ fn check_orphan_tmp_files(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
 /// Pass-5 cycle 14: detector for
 /// `fm-permissions-jsonl-world-writable`.
 ///
-/// Warns when `.beads/issues.jsonl` has the world-write bit (`0o002`)
-/// set. A world-writable JSONL data file is a real security concern —
-/// any local user could inject malicious issues that subsequent
-/// `br sync --flush-only` reads back into the DB. Detect-only —
-/// operator may have intentional permissive perms (shared workspace,
-/// CI scratch space). On non-Unix targets this is a no-op.
+/// Warns when the selected JSONL export has the world-write bit
+/// (`0o002`) set. A world-writable JSONL data file is a real security
+/// concern — any local user could inject malicious issues that
+/// subsequent `br sync --flush-only` reads back into the DB.
+/// Auto-fixable via `br doctor --repair` for selected JSONL paths
+/// inside the workspace. On non-Unix targets this is a no-op.
 fn check_jsonl_world_writable(jsonl_path: Option<&Path>, checks: &mut Vec<CheckResult>) {
     let Some(path) = jsonl_path else {
         push_check(
@@ -3864,9 +3872,23 @@ fn fix_jsonl_world_writable_if_warned(
             // TOCTOU: caller may have already chmod'd between detect and fix.
             return false;
         }
+        if !path_is_inside_workspace(path, &session.ctx.repo_root) {
+            if !ctx.is_json() {
+                ctx.warning(&format!(
+                    "Skipping world-writable chmod for external JSONL outside workspace: {}",
+                    path.display()
+                ));
+            }
+            return false;
+        }
         // Keep every other bit; only the world-write bit changes.
         let new_mode = current & !0o002;
         session.set_fixer("doctor.jsonl_world_writable_chmod");
+        session
+            .ctx
+            .capabilities
+            .write_scopes
+            .push(path.to_path_buf());
         match chokepoint::mutate(&session.ctx, path, Op::Chmod { mode: new_mode }) {
             Ok(result) if result.ok => {
                 if !ctx.is_json() {
@@ -3907,9 +3929,9 @@ fn fix_jsonl_world_writable_if_warned(
 /// `gitignore.beads_inner` check, which only validates that the ROOT
 /// `.gitignore` doesn't shadow this file.
 ///
-/// Detect-only — operators may have intentionally pruned their
-/// inner `.gitignore` for compliance workflows; auto-rewriting would
-/// stomp their decisions.
+/// Auto-fixable for the missing/incomplete regular-file cases by
+/// appending the canonical patterns. Symlinked ignore files remain
+/// operator-managed because replacing them would stomp intent.
 fn check_inner_gitignore_present(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
     const EXPECTED_PATTERNS: &[&str] = &[".write.lock", "*.tmp"];
     let path = beads_dir.join(".gitignore");
@@ -4181,9 +4203,8 @@ fn check_multiple_br_in_path(checks: &mut Vec<CheckResult>) {
 /// Warns when `.beads/config.yaml` is world-readable (mode has the
 /// other-readable bit `0o004` set) AND its contents contain
 /// secret-shaped keywords (`token`, `secret`, `password`, `api_key`).
-/// Detect-only — the doctor cannot chmod operator files without
-/// explicit consent (operators may have compliance-locked workflows
-/// that require specific mode bits).
+/// Auto-fixable via `br doctor --repair` by stripping other-read and
+/// other-write bits while preserving owner/group permissions.
 ///
 /// On non-Unix targets the mode check is a no-op (always Ok).
 fn check_config_yaml_secret_mode(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
@@ -4504,10 +4525,8 @@ fn check_doctor_runs_creatable(repo_root: &Path, checks: &mut Vec<CheckResult>) 
 /// shouldn't normally exist, but if FK enforcement was off when
 /// issues were deleted (or a partial-rebuild path bypassed the FK
 /// pragma), orphan rows can linger and cause incremental export
-/// to attempt rewriting non-existent records. Detect-only: the
-/// repair path is already covered by the existing
-/// `repair_database_from_jsonl` rebuild, which truncates
-/// `dirty_issues` and rebuilds from authoritative state.
+/// to attempt rewriting non-existent records. Auto-fixable via a
+/// targeted chokepointed prune that snapshots matching rows first.
 fn check_dirty_bitmap_divergence(conn: &Connection, checks: &mut Vec<CheckResult>) {
     let Ok(rows) = conn.query(
         "SELECT COUNT(*) FROM dirty_issues d LEFT JOIN issues i ON d.issue_id = i.id WHERE i.id IS NULL",
@@ -4552,9 +4571,70 @@ fn check_dirty_bitmap_divergence(conn: &Connection, checks: &mut Vec<CheckResult
         Some(serde_json::json!({
             "orphan_count": orphan_count,
             "sample_issue_ids": sample,
-            "remediation": "br doctor --repair triggers a JSONL rebuild that truncates dirty_issues",
+            "remediation": "br doctor --repair surgically prunes orphan dirty_issues rows via chokepointed DELETE (full JSONL rebuild remains the heavy hammer alternative)",
         })),
     );
+}
+
+/// Pass-5 cycle 29 — fixer for `fm-caches_indexes-dirty-bitmap-divergence`.
+///
+/// Surgically deletes orphan rows from `dirty_issues` (rows whose
+/// `issue_id` no longer exists in `issues`) via
+/// [`chokepoint::mutate(Op::DbExec)`]. This is a targeted alternative
+/// to the existing `repair_database_from_jsonl` heavy hammer — the
+/// chokepoint snapshots every row of `dirty_issues` matching the
+/// orphan predicate before the DELETE fires, so `doctor undo` can
+/// restore the orphan rows from snapshot.
+///
+/// Returns `true` if the DELETE succeeded.
+const DIRTY_BITMAP_ORPHAN_PREDICATE: &str =
+    "NOT EXISTS (SELECT 1 FROM issues WHERE issues.id = dirty_issues.issue_id)";
+
+fn fix_dirty_bitmap_orphans_if_warned(
+    db_path: &Path,
+    report: &DoctorReport,
+    ctx: &OutputContext,
+    session: Option<&mut DoctorRepairSession>,
+) -> bool {
+    let has_warning = report
+        .checks
+        .iter()
+        .any(|c| c.name == "dirty_bitmap" && c.status == CheckStatus::Warn);
+    if !has_warning {
+        return false;
+    }
+    let Some(session) = session else {
+        if !ctx.is_json() {
+            ctx.warning(
+                "Skipping dirty-bitmap orphan prune: no doctor repair session (run-dir creation failed)",
+            );
+        }
+        return false;
+    };
+    session.set_fixer("doctor.dirty_bitmap_orphan_prune");
+    let op = Op::DbExec {
+        sql: format!("DELETE FROM dirty_issues WHERE {DIRTY_BITMAP_ORPHAN_PREDICATE}"),
+        args: Vec::new(),
+        affected_tables: vec!["dirty_issues".to_string()],
+        // The DELETE's WHERE clause; the chokepoint snapshots every row
+        // that matches this predicate so `doctor undo` can restore them.
+        affected_predicate: Some(DIRTY_BITMAP_ORPHAN_PREDICATE.to_string()),
+    };
+    match chokepoint::mutate(&session.ctx, db_path, op) {
+        Ok(result) if result.ok => {
+            if !ctx.is_json() {
+                ctx.info("Pruned orphan rows from dirty_issues");
+            }
+            true
+        }
+        Ok(_) => false,
+        Err(err) => {
+            if !ctx.is_json() {
+                ctx.warning(&format!("Failed to prune orphan dirty_issues rows: {err}"));
+            }
+            false
+        }
+    }
 }
 
 fn push_recoverable_anomalies_check(checks: &mut Vec<CheckResult>, findings: &[String]) {
@@ -9494,6 +9574,24 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         };
     let _ = inner_gitignore_repaired;
 
+    // Pass-5 cycle 29: surgically prune orphan dirty_issues rows via Op::DbExec.
+    let dirty_bitmap_orphans_repaired =
+        if args.repair && fixer_filter.allows("fm-caches_indexes-dirty-bitmap-divergence") {
+            let repaired = fix_dirty_bitmap_orphans_if_warned(
+                &paths.db_path,
+                &initial.report,
+                ctx,
+                session.as_mut(),
+            );
+            if repaired {
+                initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+            }
+            repaired
+        } else {
+            false
+        };
+    let _ = dirty_bitmap_orphans_repaired;
+
     if args.repair && (fixer_filter.has_only() || fixer_filter.has_skip()) {
         tracing::info!(
             target: "br::doctor::filter",
@@ -9517,6 +9615,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         jsonl_world_writable: jsonl_world_writable_repaired,
         config_yaml_secret_mode: config_yaml_secret_mode_repaired,
         inner_gitignore: inner_gitignore_repaired,
+        dirty_bitmap_orphans: dirty_bitmap_orphans_repaired,
     };
 
     if !args.repair {
@@ -11133,6 +11232,153 @@ mod tests {
     }
 
     #[test]
+    fn test_fix_dirty_bitmap_orphans_prunes_via_chokepoint() {
+        // Insert an orphan dirty_issues row (FK off), then assert the
+        // fixer prunes it through the chokepoint and the post-fix
+        // detector reports clean.
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        let _storage = SqliteStorage::open(&db_path).unwrap();
+        {
+            let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            let _ = conn.execute("PRAGMA foreign_keys = OFF");
+            conn.execute_with_params(
+                "INSERT INTO dirty_issues(issue_id, marked_at) VALUES (?1, ?2)",
+                &[
+                    SqliteValue::Text("bd-orphan-fix".into()),
+                    SqliteValue::Text("2026-05-15T00:00:00Z".into()),
+                ],
+            )
+            .unwrap();
+        }
+
+        let mut report = DoctorReport {
+            ok: false,
+            workspace_health: Some("degraded".to_string()),
+            reliability_audit: None,
+            checks: Vec::new(),
+        };
+        {
+            let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            check_dirty_bitmap_divergence(&conn, &mut report.checks);
+        }
+        let warned = report
+            .checks
+            .iter()
+            .any(|c| c.name == "dirty_bitmap" && matches!(c.status, CheckStatus::Warn));
+        assert!(warned, "precondition: detector must warn");
+
+        let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
+            .expect("session must build");
+        let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Text, false, true);
+        assert!(fix_dirty_bitmap_orphans_if_warned(
+            &db_path,
+            &report,
+            &ctx,
+            Some(&mut session),
+        ));
+
+        // Re-run the detector against the same DB; it must now be clean.
+        let mut after = Vec::new();
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        check_dirty_bitmap_divergence(&conn, &mut after);
+        let check = find_check(&after, "dirty_bitmap").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+    }
+
+    #[test]
+    fn test_fix_dirty_bitmap_orphans_prunes_null_issue_id() {
+        // SQLite permits NULL in a TEXT PRIMARY KEY on legacy tables.
+        // The detector counts that as an orphan via LEFT JOIN; the
+        // fixer must use NOT EXISTS rather than NOT IN so the same row
+        // is actually pruned.
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        let _storage = SqliteStorage::open(&db_path).unwrap();
+        {
+            let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            let _ = conn.execute("PRAGMA foreign_keys = OFF");
+            conn.execute_with_params(
+                "INSERT INTO dirty_issues(issue_id, marked_at) VALUES (?1, ?2)",
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Text("2026-05-15T00:00:00Z".into()),
+                ],
+            )
+            .unwrap();
+        }
+
+        let mut report = DoctorReport {
+            ok: false,
+            workspace_health: Some("degraded".to_string()),
+            reliability_audit: None,
+            checks: Vec::new(),
+        };
+        {
+            let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            check_dirty_bitmap_divergence(&conn, &mut report.checks);
+        }
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.name == "dirty_bitmap" && matches!(c.status, CheckStatus::Warn)),
+            "precondition: NULL dirty_issues issue_id must warn"
+        );
+
+        let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
+            .expect("session must build");
+        assert!(fix_dirty_bitmap_orphans_if_warned(
+            &db_path,
+            &report,
+            &quiet_ctx(),
+            Some(&mut session),
+        ));
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let count = conn
+            .query_row("SELECT COUNT(*) FROM dirty_issues")
+            .unwrap()
+            .get(0)
+            .and_then(SqliteValue::as_integer)
+            .unwrap_or(-1);
+        assert_eq!(count, 0, "NULL issue_id orphan should be pruned");
+    }
+
+    #[test]
+    fn test_fix_dirty_bitmap_orphans_noop_when_clean() {
+        // No orphan rows → no warning → fixer is a no-op.
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        let _storage = SqliteStorage::open(&db_path).unwrap();
+
+        let mut report = DoctorReport {
+            ok: true,
+            workspace_health: Some("healthy".to_string()),
+            reliability_audit: None,
+            checks: Vec::new(),
+        };
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        check_dirty_bitmap_divergence(&conn, &mut report.checks);
+
+        let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
+            .expect("session must build");
+        let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Text, false, true);
+        assert!(!fix_dirty_bitmap_orphans_if_warned(
+            &db_path,
+            &report,
+            &ctx,
+            Some(&mut session),
+        ));
+    }
+
+    #[test]
     fn test_check_doctor_runs_dir_below_threshold_ok() {
         // Few run dirs → Ok.
         let temp = TempDir::new().unwrap();
@@ -12181,6 +12427,37 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn test_fix_jsonl_world_writable_allows_selected_in_workspace_jsonl() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let jsonl_dir = temp.path().join("external");
+        fs::create_dir_all(&jsonl_dir).unwrap();
+        let jsonl = jsonl_dir.join("issues.jsonl");
+        fs::write(&jsonl, b"{\"id\":\"bd-external\"}\n").unwrap();
+        fs::set_permissions(&jsonl, fs::Permissions::from_mode(0o666)).unwrap();
+
+        let mut report = DoctorReport {
+            ok: false,
+            workspace_health: Some("degraded".to_string()),
+            reliability_audit: None,
+            checks: Vec::new(),
+        };
+        check_jsonl_world_writable(Some(&jsonl), &mut report.checks);
+
+        let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
+            .expect("session must build");
+        assert!(fix_jsonl_world_writable_if_warned(
+            Some(&jsonl),
+            &report,
+            &quiet_ctx(),
+            Some(&mut session),
+        ));
+        let after = fs::metadata(&jsonl).unwrap().permissions().mode() & 0o777;
+        assert_eq!(after, 0o664, "only the world-write bit is stripped");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn test_fix_jsonl_world_writable_noop_when_clean() {
         use std::os::unix::fs::PermissionsExt;
         let temp = TempDir::new().unwrap();
@@ -13027,6 +13304,7 @@ mod tests {
             jsonl_world_writable: false,
             config_yaml_secret_mode: false,
             inner_gitignore: false,
+            dirty_bitmap_orphans: false,
         };
 
         assert!(summary.applied());
@@ -13082,6 +13360,7 @@ mod tests {
             jsonl_world_writable: false,
             config_yaml_secret_mode: false,
             inner_gitignore: false,
+            dirty_bitmap_orphans: false,
         };
 
         assert!(summary.applied());
@@ -13119,6 +13398,7 @@ mod tests {
             jsonl_world_writable: false,
             config_yaml_secret_mode: false,
             inner_gitignore: false,
+            dirty_bitmap_orphans: false,
         };
 
         assert!(summary.applied());
@@ -13156,6 +13436,7 @@ mod tests {
             jsonl_world_writable: false,
             config_yaml_secret_mode: false,
             inner_gitignore: false,
+            dirty_bitmap_orphans: false,
         };
 
         assert!(summary.applied());
