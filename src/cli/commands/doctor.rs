@@ -641,6 +641,10 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
         "fm-observability-doctor-runs-dir-grows-unbounded",
     ),
     (
+        "doctor.runs_creatable",
+        "fm-permissions-doctor-runs-not-creatable",
+    ),
+    (
         "permissions.config_yaml_secrets",
         "fm-permissions-config-yaml-mode-leaks-secrets",
     ),
@@ -4428,6 +4432,69 @@ fn check_doctor_runs_dir_size(repo_root: &Path, checks: &mut Vec<CheckResult>) {
     } else {
         push_check(checks, "doctor.runs_dir", CheckStatus::Ok, None, None);
     }
+}
+
+/// Pass-5 cycle 28 — detector for
+/// `fm-permissions-doctor-runs-not-creatable`.
+///
+/// Warns when `.doctor/` exists at the repo root but the current
+/// process lacks owner-write permission on it. The doctor's
+/// `--repair` flow creates a fresh `.doctor/runs/<run-id>/` directory
+/// for every run; if `.doctor/` is read-only the chokepoint cannot
+/// open the per-run audit log and operators see a confusing
+/// `Permission denied` from deep inside the mutate path. Surfacing
+/// this up-front during read-only doctor saves a wasted `--repair`
+/// attempt.
+///
+/// Detect-only — operators may have intentionally locked
+/// `.doctor/` (compliance, group-shared workflows); auto-chmoding
+/// would stomp their decision. The remediation is operator-driven:
+/// `chmod u+w .doctor` or move the dir out of the way.
+///
+/// Unix-only — non-Unix lacks the POSIX mode bits this check relies
+/// on, so it always emits Ok there.
+fn check_doctor_runs_creatable(repo_root: &Path, checks: &mut Vec<CheckResult>) {
+    let doctor_dir = repo_root.join(".doctor");
+    let Ok(meta) = fs::symlink_metadata(&doctor_dir) else {
+        // Missing is fine — the dir will be created on first --repair.
+        push_check(checks, "doctor.runs_creatable", CheckStatus::Ok, None, None);
+        return;
+    };
+    if !meta.is_dir() {
+        // `.doctor` exists but isn't a directory; a different FM owns this.
+        push_check(checks, "doctor.runs_creatable", CheckStatus::Ok, None, None);
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode();
+        // Owner-write bit on the directory. POSIX semantics: writing
+        // INTO a directory (creating a new entry) requires `w` on the
+        // dir, not on the parent. We check the owner bit because the
+        // doctor only ever runs as the workspace owner — group/other
+        // writability is a separate concern (and we already flag
+        // world-writable JSONL).
+        if (mode & 0o200) == 0 {
+            push_check(
+                checks,
+                "doctor.runs_creatable",
+                CheckStatus::Warn,
+                Some(format!(
+                    "{} is not writable by owner (mode {:o}); next `br doctor --repair` will fail to create a per-run audit dir",
+                    doctor_dir.display(),
+                    mode & 0o777
+                )),
+                Some(serde_json::json!({
+                    "path": doctor_dir.display().to_string(),
+                    "mode_octal": format!("{:o}", mode & 0o777),
+                    "remediation": format!("`chmod u+w {}` or move it aside before re-running `--repair`", doctor_dir.display()),
+                })),
+            );
+            return;
+        }
+    }
+    push_check(checks, "doctor.runs_creatable", CheckStatus::Ok, None, None);
 }
 
 /// Pass-5 cycle 8: detector for `fm-caches_indexes-dirty-bitmap-divergence`.
@@ -8736,6 +8803,9 @@ fn collect_doctor_report_with_mode_and_db_override(
     // Pass-5 cycle 10: doctor's own runs dir size (operator-prunable).
     let repo_root = beads_dir.parent().unwrap_or(beads_dir);
     check_doctor_runs_dir_size(repo_root, &mut checks);
+    // Pass-5 cycle 28: writability of `.doctor/` so the next --repair
+    // won't crash deep inside the chokepoint.
+    check_doctor_runs_creatable(repo_root, &mut checks);
     // Pass-5 cycle 11: world-readable config.yaml containing secrets.
     check_config_yaml_secret_mode(beads_dir, &mut checks);
     // Pass-5 cycle 12: multiple `br` binaries on $PATH (env-based,
@@ -11106,6 +11176,50 @@ mod tests {
         check_doctor_runs_dir_size(temp.path(), &mut checks);
         let check = find_check(&checks, "doctor.runs_dir").expect("check present");
         assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn test_check_doctor_runs_creatable_ok_when_missing() {
+        // No .doctor/ at all → Ok (will be created on first --repair).
+        let temp = TempDir::new().unwrap();
+        let mut checks = Vec::new();
+        check_doctor_runs_creatable(temp.path(), &mut checks);
+        let check = find_check(&checks, "doctor.runs_creatable").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn test_check_doctor_runs_creatable_ok_when_writable() {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir_all(temp.path().join(".doctor")).unwrap();
+        let mut checks = Vec::new();
+        check_doctor_runs_creatable(temp.path(), &mut checks);
+        let check = find_check(&checks, "doctor.runs_creatable").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_doctor_runs_creatable_warns_when_not_writable() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let doctor = temp.path().join(".doctor");
+        fs::create_dir_all(&doctor).unwrap();
+        // Strip owner-write so the next --repair can't create a run-dir.
+        fs::set_permissions(&doctor, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let mut checks = Vec::new();
+        check_doctor_runs_creatable(temp.path(), &mut checks);
+        let check = find_check(&checks, "doctor.runs_creatable").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
+        let details = check.details.as_ref().expect("details");
+        assert_eq!(
+            details.get("mode_octal").and_then(|v| v.as_str()),
+            Some("555")
+        );
+
+        // Restore so TempDir's drop can clean up.
+        fs::set_permissions(&doctor, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[cfg(unix)]

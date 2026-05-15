@@ -261,6 +261,7 @@ fn build_detector_registry() -> Vec<DetectorEntry> {
         ),
         ("dirty_bitmap", "caches_indexes", "warn", false),
         ("doctor.runs_dir", "observability", "warn", true),
+        ("doctor.runs_creatable", "permissions", "warn", true),
         (
             "permissions.config_yaml_secrets",
             "permissions",
