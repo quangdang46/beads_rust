@@ -1469,6 +1469,7 @@ struct EarlyRepairSummary {
     orphan_tmp: bool,
     jsonl_eof_newline: bool,
     jsonl_bom: bool,
+    jsonl_crlf: bool,
 }
 
 impl EarlyRepairSummary {
@@ -1483,6 +1484,7 @@ impl EarlyRepairSummary {
             || self.orphan_tmp
             || self.jsonl_eof_newline
             || self.jsonl_bom
+            || self.jsonl_crlf
     }
 
     fn action_labels(self) -> Vec<String> {
@@ -1517,6 +1519,9 @@ impl EarlyRepairSummary {
         if self.jsonl_bom {
             actions.push("jsonl_bom_stripped".to_string());
         }
+        if self.jsonl_crlf {
+            actions.push("jsonl_crlf_converted".to_string());
+        }
         actions
     }
 
@@ -1547,10 +1552,17 @@ impl EarlyRepairSummary {
             messages.push("Quarantined orphan tmp files.".to_string());
         }
         if self.jsonl_eof_newline {
-            messages.push("Appended missing trailing newline to issues.jsonl.".to_string());
+            messages.push(
+                "Appended missing trailing newline to the selected JSONL export.".to_string(),
+            );
         }
         if self.jsonl_bom {
-            messages.push("Stripped UTF-8 BOM from issues.jsonl.".to_string());
+            messages.push("Stripped UTF-8 BOM from the selected JSONL export.".to_string());
+        }
+        if self.jsonl_crlf {
+            messages.push(
+                "Converted CRLF line endings to LF in the selected JSONL export.".to_string(),
+            );
         }
         messages
     }
@@ -2949,21 +2961,21 @@ fn check_base_jsonl_missing_post_flush(
 /// Pass-5 cycle 20: detector for
 /// `fm-state_files-jsonl-crlf-line-endings`.
 ///
-/// Warns when `.beads/issues.jsonl` contains CRLF (`\r\n`) line
+/// Warns when the selected JSONL export contains CRLF (`\r\n`) line
 /// endings. Operators sometimes import workspaces from Windows
 /// terminals or git autocrlf-configured repos that rewrite line
 /// endings; CRLF breaks `git diff --no-index` legibility and
 /// confuses streaming JSONL parsers that split on `\n`.
 ///
-/// Detect-only — operators may have intentional CRLF (Windows-only
-/// teams). The doctor scans the first 64KB only to keep the check
-/// cheap on large workspaces.
+/// Auto-fixable when the selected JSONL export is inside the workspace.
+/// The doctor scans the first 64KB only to keep the check cheap on large
+/// workspaces.
 const CRLF_SCAN_PREFIX_BYTES: usize = 64 * 1024;
 
 /// Pass-5 cycle 23: detector for
 /// `fm-state_files-wal-oversized`.
 ///
-/// Warns when `.beads/beads.db-wal` exceeds `WAL_OVERSIZED_BYTES`
+/// Warns when the selected SQLite database WAL exceeds `WAL_OVERSIZED_BYTES`
 /// (32MB). A healthy WAL is reset by SQLite's auto-checkpoint at
 /// ~4MB; a much larger WAL means checkpoint hasn't run (long-running
 /// read snapshot blocking, or a peer process holding the WAL open).
@@ -2972,8 +2984,14 @@ const CRLF_SCAN_PREFIX_BYTES: usize = 64 * 1024;
 /// a side effect).
 const WAL_OVERSIZED_BYTES: u64 = 32 * 1024 * 1024;
 
-fn check_wal_oversized(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
-    let path = beads_dir.join("beads.db-wal");
+fn sqlite_wal_sidecar_path(db_path: &Path) -> PathBuf {
+    let mut sidecar = db_path.as_os_str().to_os_string();
+    sidecar.push("-wal");
+    PathBuf::from(sidecar)
+}
+
+fn check_wal_oversized(db_path: &Path, checks: &mut Vec<CheckResult>) {
+    let path = sqlite_wal_sidecar_path(db_path);
     let Ok(meta) = fs::symlink_metadata(&path) else {
         push_check(checks, "wal_size", CheckStatus::Ok, None, None);
         return;
@@ -2998,7 +3016,7 @@ fn check_wal_oversized(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
                 "path": path.display().to_string(),
                 "size_bytes": bytes,
                 "threshold_bytes": WAL_OVERSIZED_BYTES,
-                "remediation": "`sqlite3 .beads/beads.db 'PRAGMA wal_checkpoint(TRUNCATE)'` or `br doctor --repair-indexes`",
+                "remediation": "Run `PRAGMA wal_checkpoint(TRUNCATE)` against the selected SQLite database or `br doctor --repair-indexes`",
             })),
         );
     } else {
@@ -3009,19 +3027,25 @@ fn check_wal_oversized(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
 /// Pass-5 cycle 22: detector for
 /// `fm-caches_indexes-db-bloat-vs-jsonl`.
 ///
-/// Warns when `.beads/beads.db` exceeds `DB_BLOAT_RATIO_THRESHOLD`
-/// times the size of `.beads/issues.jsonl`. SQLite retains freelist
+/// Warns when the selected SQLite database exceeds `DB_BLOAT_RATIO_THRESHOLD`
+/// times the size of the selected JSONL export. SQLite retains freelist
 /// pages after DELETE operations; a high ratio is a strong signal
 /// that VACUUM would reclaim significant disk space.
 const DB_BLOAT_RATIO_THRESHOLD: u64 = 10;
 const DB_BLOAT_MIN_JSONL_BYTES: u64 = 1024 * 1024;
 
-fn check_db_bloat_vs_jsonl(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
-    let db_path = beads_dir.join("beads.db");
-    let jsonl_path = beads_dir.join("issues.jsonl");
+fn check_db_bloat_vs_jsonl(
+    db_path: &Path,
+    jsonl_path: Option<&Path>,
+    checks: &mut Vec<CheckResult>,
+) {
+    let Some(jsonl_path) = jsonl_path else {
+        push_check(checks, "db_bloat", CheckStatus::Ok, None, None);
+        return;
+    };
     let (Ok(db_meta), Ok(jsonl_meta)) = (
-        fs::symlink_metadata(&db_path),
-        fs::symlink_metadata(&jsonl_path),
+        fs::symlink_metadata(db_path),
+        fs::symlink_metadata(jsonl_path),
     ) else {
         push_check(checks, "db_bloat", CheckStatus::Ok, None, None);
         return;
@@ -3056,7 +3080,7 @@ fn check_db_bloat_vs_jsonl(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
                 "jsonl_bytes": jsonl_bytes,
                 "ratio": db_bytes / jsonl_bytes,
                 "threshold": DB_BLOAT_RATIO_THRESHOLD,
-                "remediation": "`sqlite3 .beads/beads.db VACUUM` or run `br doctor --repair` if integrity warnings are present",
+                "remediation": "Run `VACUUM` against the selected SQLite database or run `br doctor --repair` if integrity warnings are present",
             })),
         );
     } else {
@@ -3067,7 +3091,7 @@ fn check_db_bloat_vs_jsonl(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
 /// Pass-5 cycle 21: detector for
 /// `fm-state_files-jsonl-utf8-bom-prefix`.
 ///
-/// Warns when `.beads/issues.jsonl` starts with the UTF-8 BOM
+/// Warns when the selected JSONL export starts with the UTF-8 BOM
 /// (`0xEF 0xBB 0xBF`). Some Windows editors (older Visual Studio,
 /// classic Notepad) prepend it; most JSONL parsers don't strip it,
 /// so the first record fails to parse with a phantom prefix.
@@ -3075,10 +3099,22 @@ fn check_db_bloat_vs_jsonl(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
 /// `Op::WriteFile` through the chokepoint.
 const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
 
-fn check_jsonl_utf8_bom(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
+fn path_is_inside_workspace(path: &Path, repo_root: &Path) -> bool {
+    // Repair fixers widen write_scopes for selected JSONL paths, so the
+    // workspace check must resolve `..` components and symlinks first.
+    let (Ok(path), Ok(repo_root)) = (fs::canonicalize(path), fs::canonicalize(repo_root)) else {
+        return false;
+    };
+    path.starts_with(repo_root)
+}
+
+fn check_jsonl_utf8_bom(jsonl_path: Option<&Path>, checks: &mut Vec<CheckResult>) {
     use std::io::Read;
-    let path = beads_dir.join("issues.jsonl");
-    let Ok(meta) = fs::symlink_metadata(&path) else {
+    let Some(path) = jsonl_path else {
+        push_check(checks, "jsonl_bom", CheckStatus::Ok, None, None);
+        return;
+    };
+    let Ok(meta) = fs::symlink_metadata(path) else {
         push_check(checks, "jsonl_bom", CheckStatus::Ok, None, None);
         return;
     };
@@ -3086,7 +3122,7 @@ fn check_jsonl_utf8_bom(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
         push_check(checks, "jsonl_bom", CheckStatus::Ok, None, None);
         return;
     }
-    let Ok(mut f) = fs::File::open(&path) else {
+    let Ok(mut f) = fs::File::open(path) else {
         push_check(checks, "jsonl_bom", CheckStatus::Ok, None, None);
         return;
     };
@@ -3106,7 +3142,7 @@ fn check_jsonl_utf8_bom(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
             )),
             Some(serde_json::json!({
                 "path": path.display().to_string(),
-                "remediation": "`br doctor --repair` strips the BOM via Op::WriteFile",
+                "remediation": "`br doctor --repair` strips the BOM when the selected JSONL is inside the workspace; otherwise strip it manually",
             })),
         );
     } else {
@@ -3117,12 +3153,12 @@ fn check_jsonl_utf8_bom(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
 /// Pass-5 cycle 21 — fixer for
 /// `fm-state_files-jsonl-utf8-bom-prefix`.
 ///
-/// Rewrites `.beads/issues.jsonl` without the leading 3 bytes via
+/// Rewrites the selected JSONL export without the leading 3 bytes via
 /// [`chokepoint::mutate(Op::WriteFile)`]. The chokepoint captures
 /// pre-rewrite bytes in a verbatim backup so `doctor undo`
 /// byte-restores the original BOM-prefixed state.
 fn fix_jsonl_utf8_bom_if_warned(
-    beads_dir: &Path,
+    jsonl_path: Option<&Path>,
     report: &DoctorReport,
     ctx: &OutputContext,
     session: Option<&mut DoctorRepairSession>,
@@ -3140,19 +3176,35 @@ fn fix_jsonl_utf8_bom_if_warned(
         }
         return false;
     };
-    let path = beads_dir.join("issues.jsonl");
+    let Some(path) = jsonl_path else {
+        return false;
+    };
     // TOCTOU defense: re-read at fix time.
-    let Ok(bytes) = fs::read(&path) else {
+    let Ok(bytes) = fs::read(path) else {
         return false;
     };
     if !bytes.starts_with(UTF8_BOM) {
         return false;
     }
+    if !path_is_inside_workspace(path, &session.ctx.repo_root) {
+        if !ctx.is_json() {
+            ctx.warning(&format!(
+                "Skipping BOM strip for external JSONL outside workspace: {}",
+                path.display()
+            ));
+        }
+        return false;
+    }
     let stripped = bytes[UTF8_BOM.len()..].to_vec();
     session.set_fixer("doctor.jsonl_bom_strip");
+    session
+        .ctx
+        .capabilities
+        .write_scopes
+        .push(path.to_path_buf());
     match chokepoint::mutate(
         &session.ctx,
-        &path,
+        path,
         Op::WriteFile {
             content: stripped,
             mode: None,
@@ -3177,10 +3229,105 @@ fn fix_jsonl_utf8_bom_if_warned(
     }
 }
 
-fn check_jsonl_crlf_endings(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
+/// Pass-5 cycle 24 — fixer for
+/// `fm-state_files-jsonl-crlf-line-endings`.
+///
+/// Converts CRLF (`\r\n`) sequences to LF (`\n`) in the selected JSONL
+/// export via [`chokepoint::mutate(Op::WriteFile)`].
+/// Standalone `\r` bytes are preserved — only the specific CRLF
+/// pattern the detector flags is normalised. The chokepoint captures
+/// pre-rewrite bytes in a verbatim backup so `doctor undo`
+/// byte-restores the original CRLF state.
+fn fix_jsonl_crlf_endings_if_warned(
+    jsonl_path: Option<&Path>,
+    report: &DoctorReport,
+    ctx: &OutputContext,
+    session: Option<&mut DoctorRepairSession>,
+) -> bool {
+    let has_warning = report
+        .checks
+        .iter()
+        .any(|c| c.name == "jsonl_crlf" && c.status == CheckStatus::Warn);
+    if !has_warning {
+        return false;
+    }
+    let Some(session) = session else {
+        if !ctx.is_json() {
+            ctx.warning(
+                "Skipping CRLF→LF conversion: no doctor repair session (run-dir creation failed)",
+            );
+        }
+        return false;
+    };
+    let Some(path) = jsonl_path else {
+        return false;
+    };
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    if !bytes.windows(2).any(|w| w == b"\r\n") {
+        return false;
+    }
+    if !path_is_inside_workspace(path, &session.ctx.repo_root) {
+        if !ctx.is_json() {
+            ctx.warning(&format!(
+                "Skipping CRLF→LF conversion for external JSONL outside workspace: {}",
+                path.display()
+            ));
+        }
+        return false;
+    }
+    let mut converted = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 1 < bytes.len() && bytes[i] == b'\r' && bytes[i + 1] == b'\n' {
+            converted.push(b'\n');
+            i += 2;
+        } else {
+            converted.push(bytes[i]);
+            i += 1;
+        }
+    }
+    session.set_fixer("doctor.jsonl_crlf_to_lf");
+    session
+        .ctx
+        .capabilities
+        .write_scopes
+        .push(path.to_path_buf());
+    match chokepoint::mutate(
+        &session.ctx,
+        path,
+        Op::WriteFile {
+            content: converted,
+            mode: None,
+        },
+    ) {
+        Ok(result) if result.ok => {
+            if !ctx.is_json() {
+                ctx.info(&format!("Converted CRLF→LF in {}", path.display()));
+            }
+            true
+        }
+        Ok(_) => false,
+        Err(err) => {
+            if !ctx.is_json() {
+                ctx.warning(&format!(
+                    "Failed to convert CRLF→LF in {}: {err}",
+                    path.display()
+                ));
+            }
+            false
+        }
+    }
+}
+
+fn check_jsonl_crlf_endings(jsonl_path: Option<&Path>, checks: &mut Vec<CheckResult>) {
     use std::io::Read;
-    let path = beads_dir.join("issues.jsonl");
-    let Ok(meta) = fs::symlink_metadata(&path) else {
+    let Some(path) = jsonl_path else {
+        push_check(checks, "jsonl_crlf", CheckStatus::Ok, None, None);
+        return;
+    };
+    let Ok(meta) = fs::symlink_metadata(path) else {
         push_check(checks, "jsonl_crlf", CheckStatus::Ok, None, None);
         return;
     };
@@ -3188,7 +3335,7 @@ fn check_jsonl_crlf_endings(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
         push_check(checks, "jsonl_crlf", CheckStatus::Ok, None, None);
         return;
     }
-    let Ok(mut f) = fs::File::open(&path) else {
+    let Ok(mut f) = fs::File::open(path) else {
         push_check(checks, "jsonl_crlf", CheckStatus::Ok, None, None);
         return;
     };
@@ -3212,7 +3359,7 @@ fn check_jsonl_crlf_endings(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
             Some(serde_json::json!({
                 "path": path.display().to_string(),
                 "scanned_bytes": n,
-                "remediation": "Convert via `dos2unix .beads/issues.jsonl` or `sed -i 's/\\r$//' .beads/issues.jsonl`",
+                "remediation": "Convert line endings to LF for the selected JSONL export",
             })),
         );
     } else {
@@ -3323,7 +3470,7 @@ fn fix_jsonl_trailing_newline_if_warned(
     if last[0] == b'\n' {
         return false;
     }
-    if path.strip_prefix(&session.ctx.repo_root).is_err() {
+    if !path_is_inside_workspace(path, &session.ctx.repo_root) {
         if !ctx.is_json() {
             ctx.warning(&format!(
                 "Skipping jsonl-trailing-newline fix for external JSONL outside workspace: {}",
@@ -8307,14 +8454,6 @@ fn collect_doctor_report_with_mode_and_db_override(
     check_orphan_tmp_files(beads_dir, &mut checks);
     // Pass-5 cycle 18: .br_history/ snapshot accumulation (inode pressure).
     check_br_history_size(beads_dir, &mut checks);
-    // Pass-5 cycle 20: CRLF line endings on issues.jsonl.
-    check_jsonl_crlf_endings(beads_dir, &mut checks);
-    // Pass-5 cycle 21: UTF-8 BOM at start of issues.jsonl.
-    check_jsonl_utf8_bom(beads_dir, &mut checks);
-    // Pass-5 cycle 22: db-to-jsonl size ratio (VACUUM candidate).
-    check_db_bloat_vs_jsonl(beads_dir, &mut checks);
-    // Pass-5 cycle 23: WAL sidecar oversized (checkpoint candidate).
-    check_wal_oversized(beads_dir, &mut checks);
     check_root_gitignore(beads_dir, &mut checks);
     check_routes_jsonl(beads_dir, &mut checks);
     check_rust_log_noisy(&mut checks);
@@ -8327,6 +8466,10 @@ fn collect_doctor_report_with_mode_and_db_override(
     check_startup_cache(beads_dir, db_override, &mut checks);
 
     let (jsonl_path, jsonl_count) = inspect_doctor_jsonl(beads_dir, paths, &mut checks);
+    // Pass-5 cycle 22: db-to-selected-jsonl size ratio (VACUUM candidate).
+    check_db_bloat_vs_jsonl(&paths.db_path, jsonl_path.as_deref(), &mut checks);
+    // Pass-5 cycle 23: selected DB WAL sidecar oversized (checkpoint candidate).
+    check_wal_oversized(&paths.db_path, &mut checks);
     inspect_doctor_database(
         beads_dir,
         &paths.db_path,
@@ -8363,6 +8506,10 @@ fn inspect_doctor_jsonl(
     let jsonl_path = select_doctor_jsonl_path(beads_dir, paths);
     // Pass-5 cycle 14: selected JSONL world-writable security check.
     check_jsonl_world_writable(jsonl_path.as_deref(), checks);
+    // Pass-5 cycle 20: selected JSONL CRLF line endings.
+    check_jsonl_crlf_endings(jsonl_path.as_deref(), checks);
+    // Pass-5 cycle 21: UTF-8 BOM at start of selected JSONL.
+    check_jsonl_utf8_bom(jsonl_path.as_deref(), checks);
     // Pass-5 cycle 19: selected JSONL trailing newline convention.
     check_jsonl_trailing_newline(jsonl_path.as_deref(), checks);
     // Pass-5 cycle 17: oversized JSONL (slow flushes, RAM pressure).
@@ -8896,11 +9043,15 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         };
     let _ = jsonl_eof_newline_repaired;
 
-    // Pass-5 cycle 21: strip UTF-8 BOM from issues.jsonl via Op::WriteFile.
+    // Pass-5 cycle 21: strip UTF-8 BOM from the selected JSONL via Op::WriteFile.
     let jsonl_bom_repaired =
         if args.repair && fixer_filter.allows("fm-state_files-jsonl-utf8-bom-prefix") {
-            let repaired =
-                fix_jsonl_utf8_bom_if_warned(&beads_dir, &initial.report, ctx, session.as_mut());
+            let repaired = fix_jsonl_utf8_bom_if_warned(
+                initial.jsonl_path.as_deref(),
+                &initial.report,
+                ctx,
+                session.as_mut(),
+            );
             if repaired {
                 initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
             }
@@ -8909,6 +9060,24 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             false
         };
     let _ = jsonl_bom_repaired;
+
+    // Pass-5 cycle 24: convert CRLF→LF in the selected JSONL via Op::WriteFile.
+    let jsonl_crlf_repaired =
+        if args.repair && fixer_filter.allows("fm-state_files-jsonl-crlf-line-endings") {
+            let repaired = fix_jsonl_crlf_endings_if_warned(
+                initial.jsonl_path.as_deref(),
+                &initial.report,
+                ctx,
+                session.as_mut(),
+            );
+            if repaired {
+                initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+            }
+            repaired
+        } else {
+            false
+        };
+    let _ = jsonl_crlf_repaired;
 
     if args.repair && (fixer_filter.has_only() || fixer_filter.has_skip()) {
         tracing::info!(
@@ -8929,6 +9098,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         orphan_tmp: orphan_tmp_repaired,
         jsonl_eof_newline: jsonl_eof_newline_repaired,
         jsonl_bom: jsonl_bom_repaired,
+        jsonl_crlf: jsonl_crlf_repaired,
     };
 
     if !args.repair {
@@ -11073,7 +11243,7 @@ mod tests {
         .unwrap();
 
         let mut checks = Vec::new();
-        check_jsonl_crlf_endings(&beads_dir, &mut checks);
+        check_jsonl_crlf_endings(Some(&beads_dir.join("issues.jsonl")), &mut checks);
         let check = find_check(&checks, "jsonl_crlf").expect("check present");
         assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
     }
@@ -11087,7 +11257,7 @@ mod tests {
         fs::write(beads_dir.join("issues.jsonl"), b"{\"id\":\"bd-unix\"}\n").unwrap();
 
         let mut checks = Vec::new();
-        check_jsonl_crlf_endings(&beads_dir, &mut checks);
+        check_jsonl_crlf_endings(Some(&beads_dir.join("issues.jsonl")), &mut checks);
         let check = find_check(&checks, "jsonl_crlf").expect("check present");
         assert!(matches!(check.status, CheckStatus::Ok));
     }
@@ -11098,7 +11268,7 @@ mod tests {
         let beads_dir = temp.path().join(".beads");
         fs::create_dir_all(&beads_dir).unwrap();
         let mut checks = Vec::new();
-        check_jsonl_crlf_endings(&beads_dir, &mut checks);
+        check_jsonl_crlf_endings(None, &mut checks);
         let check = find_check(&checks, "jsonl_crlf").expect("check present");
         assert!(matches!(check.status, CheckStatus::Ok));
     }
@@ -11114,7 +11284,7 @@ mod tests {
         fs::write(beads_dir.join("issues.jsonl"), &bom_bytes).unwrap();
 
         let mut checks = Vec::new();
-        check_jsonl_utf8_bom(&beads_dir, &mut checks);
+        check_jsonl_utf8_bom(Some(&beads_dir.join("issues.jsonl")), &mut checks);
         let check = find_check(&checks, "jsonl_bom").expect("check present");
         assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
     }
@@ -11126,7 +11296,7 @@ mod tests {
         fs::create_dir_all(&beads_dir).unwrap();
         fs::write(beads_dir.join("issues.jsonl"), b"{\"id\":\"bd-clean\"}\n").unwrap();
         let mut checks = Vec::new();
-        check_jsonl_utf8_bom(&beads_dir, &mut checks);
+        check_jsonl_utf8_bom(Some(&beads_dir.join("issues.jsonl")), &mut checks);
         let check = find_check(&checks, "jsonl_bom").expect("check present");
         assert!(matches!(check.status, CheckStatus::Ok));
     }
@@ -11136,12 +11306,13 @@ mod tests {
         // The fixer must rewrite the file without the leading BOM,
         // preserving the rest of the bytes verbatim.
         let temp = TempDir::new().unwrap();
-        let beads_dir = temp.path().join(".beads");
-        fs::create_dir_all(&beads_dir).unwrap();
+        let jsonl_dir = temp.path().join("external");
+        fs::create_dir_all(&jsonl_dir).unwrap();
+        let jsonl_path = jsonl_dir.join("issues.jsonl");
         let payload = b"{\"id\":\"bd-bom\"}\n{\"id\":\"bd-other\"}\n";
         let mut bom_bytes = UTF8_BOM.to_vec();
         bom_bytes.extend_from_slice(payload);
-        fs::write(beads_dir.join("issues.jsonl"), &bom_bytes).unwrap();
+        fs::write(&jsonl_path, &bom_bytes).unwrap();
 
         let mut report = DoctorReport {
             ok: false,
@@ -11149,19 +11320,66 @@ mod tests {
             reliability_audit: None,
             checks: Vec::new(),
         };
-        check_jsonl_utf8_bom(&beads_dir, &mut report.checks);
+        check_jsonl_utf8_bom(Some(&jsonl_path), &mut report.checks);
 
         let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
             .expect("session must build");
         let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Text, false, true);
         assert!(fix_jsonl_utf8_bom_if_warned(
-            &beads_dir,
+            Some(&jsonl_path),
             &report,
             &ctx,
             Some(&mut session),
         ));
-        let after = fs::read(beads_dir.join("issues.jsonl")).unwrap();
+        let after = fs::read(&jsonl_path).unwrap();
         assert_eq!(after, payload, "BOM stripped, payload preserved");
+        assert!(
+            session
+                .run
+                .root
+                .join("backups/external/issues.jsonl")
+                .is_file(),
+            "selected in-workspace JSONL should be backed up relative to repo root"
+        );
+    }
+
+    #[test]
+    fn test_fix_jsonl_utf8_bom_skips_traversal_outside_workspace() {
+        let parent = TempDir::new().unwrap();
+        let repo = parent.path().join("repo");
+        let outside = parent.path().join("outside");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let outside_jsonl = outside.join("issues.jsonl");
+        let mut original = UTF8_BOM.to_vec();
+        original.extend_from_slice(b"{\"id\":\"bd-outside\"}\n");
+        fs::write(&outside_jsonl, &original).unwrap();
+        let traversal_path = repo.join("../outside/issues.jsonl");
+        let mut report = DoctorReport {
+            ok: false,
+            workspace_health: Some("degraded".to_string()),
+            reliability_audit: None,
+            checks: Vec::new(),
+        };
+        check_jsonl_utf8_bom(Some(&traversal_path), &mut report.checks);
+        let mut session = DoctorRepairSession::new(&repo, /* dry_run = */ false).expect("session");
+
+        assert!(!fix_jsonl_utf8_bom_if_warned(
+            Some(&traversal_path),
+            &report,
+            &quiet_ctx(),
+            Some(&mut session),
+        ));
+        assert_eq!(
+            fs::read(&outside_jsonl).unwrap(),
+            original,
+            "traversal-selected outside JSONL must not be rewritten"
+        );
+        assert_eq!(
+            fs::read_to_string(&session.run.actions_file).unwrap(),
+            "",
+            "skipped traversal repairs must not write an undo action"
+        );
     }
 
     #[test]
@@ -11171,17 +11389,19 @@ mod tests {
         let beads_dir = temp.path().join(".beads");
         fs::create_dir_all(&beads_dir).unwrap();
         // JSONL: just above the 1MB minimum threshold.
-        let jsonl_f = fs::File::create(beads_dir.join("issues.jsonl")).unwrap();
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        let jsonl_f = fs::File::create(&jsonl_path).unwrap();
         jsonl_f.set_len(DB_BLOAT_MIN_JSONL_BYTES + 1024).unwrap();
         drop(jsonl_f);
         // DB: 20x the JSONL size (well above the 10x threshold).
-        let db_f = fs::File::create(beads_dir.join("beads.db")).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        let db_f = fs::File::create(&db_path).unwrap();
         db_f.set_len((DB_BLOAT_MIN_JSONL_BYTES + 1024) * 20)
             .unwrap();
         drop(db_f);
 
         let mut checks = Vec::new();
-        check_db_bloat_vs_jsonl(&beads_dir, &mut checks);
+        check_db_bloat_vs_jsonl(&db_path, Some(&jsonl_path), &mut checks);
         let check = find_check(&checks, "db_bloat").expect("check present");
         assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
         let ratio = check
@@ -11198,15 +11418,17 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
         fs::create_dir_all(&beads_dir).unwrap();
-        let jsonl_f = fs::File::create(beads_dir.join("issues.jsonl")).unwrap();
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        let jsonl_f = fs::File::create(&jsonl_path).unwrap();
         jsonl_f.set_len(DB_BLOAT_MIN_JSONL_BYTES + 1024).unwrap();
         drop(jsonl_f);
-        let db_f = fs::File::create(beads_dir.join("beads.db")).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        let db_f = fs::File::create(&db_path).unwrap();
         db_f.set_len((DB_BLOAT_MIN_JSONL_BYTES + 1024) * 2).unwrap();
         drop(db_f);
 
         let mut checks = Vec::new();
-        check_db_bloat_vs_jsonl(&beads_dir, &mut checks);
+        check_db_bloat_vs_jsonl(&db_path, Some(&jsonl_path), &mut checks);
         let check = find_check(&checks, "db_bloat").expect("check present");
         assert!(matches!(check.status, CheckStatus::Ok));
     }
@@ -11218,15 +11440,174 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
         fs::create_dir_all(&beads_dir).unwrap();
-        fs::write(beads_dir.join("issues.jsonl"), b"tiny").unwrap();
-        let db_f = fs::File::create(beads_dir.join("beads.db")).unwrap();
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::write(&jsonl_path, b"tiny").unwrap();
+        let db_path = beads_dir.join("beads.db");
+        let db_f = fs::File::create(&db_path).unwrap();
         db_f.set_len(100 * 1024 * 1024).unwrap();
         drop(db_f);
 
         let mut checks = Vec::new();
-        check_db_bloat_vs_jsonl(&beads_dir, &mut checks);
+        check_db_bloat_vs_jsonl(&db_path, Some(&jsonl_path), &mut checks);
         let check = find_check(&checks, "db_bloat").expect("check present");
         assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn test_check_db_bloat_uses_selected_db_and_jsonl_paths() {
+        let temp = TempDir::new().unwrap();
+        let db_dir = temp.path().join("db");
+        let jsonl_dir = temp.path().join("external");
+        fs::create_dir_all(&db_dir).unwrap();
+        fs::create_dir_all(&jsonl_dir).unwrap();
+
+        let db_path = db_dir.join("custom.sqlite");
+        let jsonl_path = jsonl_dir.join("issues.jsonl");
+        let jsonl_f = fs::File::create(&jsonl_path).unwrap();
+        jsonl_f.set_len(DB_BLOAT_MIN_JSONL_BYTES + 1024).unwrap();
+        drop(jsonl_f);
+        let db_f = fs::File::create(&db_path).unwrap();
+        db_f.set_len((DB_BLOAT_MIN_JSONL_BYTES + 1024) * 20)
+            .unwrap();
+        drop(db_f);
+
+        let mut checks = Vec::new();
+        check_db_bloat_vs_jsonl(&db_path, Some(&jsonl_path), &mut checks);
+        let check = find_check(&checks, "db_bloat").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
+        assert_eq!(
+            check
+                .details
+                .as_ref()
+                .and_then(|details| details.get("db_path"))
+                .and_then(serde_json::Value::as_str),
+            Some(db_path.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            check
+                .details
+                .as_ref()
+                .and_then(|details| details.get("jsonl_path"))
+                .and_then(serde_json::Value::as_str),
+            Some(jsonl_path.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn test_fix_jsonl_crlf_converts_via_chokepoint() {
+        // The fixer must rewrite the file converting CRLF→LF and
+        // preserve every other byte verbatim.
+        let temp = TempDir::new().unwrap();
+        let jsonl_dir = temp.path().join("external");
+        fs::create_dir_all(&jsonl_dir).unwrap();
+        let jsonl_path = jsonl_dir.join("issues.jsonl");
+        let mixed = b"{\"id\":\"bd-1\"}\r\n{\"id\":\"bd-2\"}\r\nfinal-no-eol";
+        fs::write(&jsonl_path, mixed).unwrap();
+
+        let mut report = DoctorReport {
+            ok: false,
+            workspace_health: Some("degraded".to_string()),
+            reliability_audit: None,
+            checks: Vec::new(),
+        };
+        check_jsonl_crlf_endings(Some(&jsonl_path), &mut report.checks);
+
+        let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
+            .expect("session must build");
+        let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Text, false, true);
+        assert!(fix_jsonl_crlf_endings_if_warned(
+            Some(&jsonl_path),
+            &report,
+            &ctx,
+            Some(&mut session),
+        ));
+        let after = fs::read(&jsonl_path).unwrap();
+        assert_eq!(
+            after, b"{\"id\":\"bd-1\"}\n{\"id\":\"bd-2\"}\nfinal-no-eol",
+            "CRLF converted to LF; payload otherwise preserved"
+        );
+        assert!(
+            session
+                .run
+                .root
+                .join("backups/external/issues.jsonl")
+                .is_file(),
+            "selected in-workspace JSONL should be backed up relative to repo root"
+        );
+    }
+
+    #[test]
+    fn test_fix_jsonl_crlf_noop_when_clean() {
+        // No CRLF in the warned check → fixer must not mutate.
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let clean = b"{\"id\":\"bd-clean\"}\n";
+        fs::write(beads_dir.join("issues.jsonl"), clean).unwrap();
+
+        let mut report = DoctorReport {
+            ok: true,
+            workspace_health: Some("healthy".to_string()),
+            reliability_audit: None,
+            checks: Vec::new(),
+        };
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        check_jsonl_crlf_endings(Some(&jsonl_path), &mut report.checks);
+
+        let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
+            .expect("session must build");
+        let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Text, false, true);
+        // No "warn" → returns false without touching the file.
+        assert!(!fix_jsonl_crlf_endings_if_warned(
+            Some(&jsonl_path),
+            &report,
+            &ctx,
+            Some(&mut session),
+        ));
+        let after = fs::read(beads_dir.join("issues.jsonl")).unwrap();
+        assert_eq!(after, clean, "file untouched when no warning");
+    }
+
+    #[test]
+    fn test_fix_jsonl_crlf_skips_traversal_outside_workspace() {
+        let parent = TempDir::new().unwrap();
+        let repo = parent.path().join("repo");
+        let outside = parent.path().join("outside");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let outside_jsonl = outside.join("issues.jsonl");
+        let original = b"{\"id\":\"bd-outside\"}\r\n";
+        fs::write(&outside_jsonl, original).unwrap();
+        let traversal_path = repo.join("../outside/issues.jsonl");
+        let report = DoctorReport {
+            ok: false,
+            workspace_health: None,
+            reliability_audit: None,
+            checks: vec![CheckResult {
+                name: "jsonl_crlf".to_string(),
+                status: CheckStatus::Warn,
+                message: None,
+                details: None,
+            }],
+        };
+        let mut session = DoctorRepairSession::new(&repo, /* dry_run = */ false).expect("session");
+
+        assert!(!fix_jsonl_crlf_endings_if_warned(
+            Some(&traversal_path),
+            &report,
+            &quiet_ctx(),
+            Some(&mut session),
+        ));
+        assert_eq!(
+            fs::read(&outside_jsonl).unwrap(),
+            original,
+            "traversal-selected outside JSONL must not be rewritten"
+        );
+        assert_eq!(
+            fs::read_to_string(&session.run.actions_file).unwrap(),
+            "",
+            "skipped traversal repairs must not write an undo action"
+        );
     }
 
     #[test]
@@ -11239,7 +11620,7 @@ mod tests {
         drop(wal);
 
         let mut checks = Vec::new();
-        check_wal_oversized(&beads_dir, &mut checks);
+        check_wal_oversized(&beads_dir.join("beads.db"), &mut checks);
         let check = find_check(&checks, "wal_size").expect("check present");
         assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
         let details = check.details.as_ref().expect("details");
@@ -11262,7 +11643,7 @@ mod tests {
         drop(wal);
 
         let mut checks = Vec::new();
-        check_wal_oversized(&beads_dir, &mut checks);
+        check_wal_oversized(&beads_dir.join("beads.db"), &mut checks);
         let check = find_check(&checks, "wal_size").expect("check present");
         assert!(matches!(check.status, CheckStatus::Ok));
     }
@@ -11275,9 +11656,45 @@ mod tests {
         fs::create_dir_all(&beads_dir).unwrap();
 
         let mut checks = Vec::new();
-        check_wal_oversized(&beads_dir, &mut checks);
+        check_wal_oversized(&beads_dir.join("beads.db"), &mut checks);
         let check = find_check(&checks, "wal_size").expect("check present");
         assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn test_sqlite_wal_sidecar_path_preserves_non_utf8_bytes() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let db_path = PathBuf::from(OsString::from_vec(b"/tmp/br-\xFF.sqlite".to_vec()));
+        let wal_path = sqlite_wal_sidecar_path(&db_path);
+
+        assert_eq!(wal_path.as_os_str().as_bytes(), b"/tmp/br-\xFF.sqlite-wal");
+    }
+
+    #[test]
+    fn test_check_wal_oversized_uses_selected_db_sidecar_path() {
+        let temp = TempDir::new().unwrap();
+        let db_dir = temp.path().join("db");
+        fs::create_dir_all(&db_dir).unwrap();
+        let db_path = db_dir.join("custom.sqlite");
+        let wal_path = sqlite_wal_sidecar_path(&db_path);
+        let wal = fs::File::create(&wal_path).unwrap();
+        wal.set_len(WAL_OVERSIZED_BYTES + 1).unwrap();
+        drop(wal);
+
+        let mut checks = Vec::new();
+        check_wal_oversized(&db_path, &mut checks);
+        let check = find_check(&checks, "wal_size").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
+        assert_eq!(
+            check
+                .details
+                .as_ref()
+                .and_then(|details| details.get("path"))
+                .and_then(serde_json::Value::as_str),
+            Some(wal_path.to_string_lossy().as_ref())
+        );
     }
 
     #[test]
@@ -11888,6 +12305,7 @@ mod tests {
             orphan_tmp: false,
             jsonl_eof_newline: false,
             jsonl_bom: false,
+            jsonl_crlf: false,
         };
 
         assert!(summary.applied());
@@ -11939,6 +12357,7 @@ mod tests {
             orphan_tmp: false,
             jsonl_eof_newline: false,
             jsonl_bom: false,
+            jsonl_crlf: false,
         };
 
         assert!(summary.applied());
@@ -11972,6 +12391,7 @@ mod tests {
             orphan_tmp: false,
             jsonl_eof_newline: false,
             jsonl_bom: false,
+            jsonl_crlf: false,
         };
 
         assert!(summary.applied());
@@ -12005,6 +12425,7 @@ mod tests {
             orphan_tmp: true,
             jsonl_eof_newline: false,
             jsonl_bom: false,
+            jsonl_crlf: false,
         };
 
         assert!(summary.applied());
@@ -12531,6 +12952,50 @@ mod tests {
     }
 
     #[test]
+    fn test_collect_doctor_report_checks_selected_external_jsonl_bom_and_crlf() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let external_dir = temp.path().join("external");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&external_dir).unwrap();
+
+        let db_path = beads_dir.join("beads.db");
+        let external_jsonl = external_dir.join("issues.jsonl");
+        fs::write(beads_dir.join("issues.jsonl"), "{\"id\":\"bd-local\"}\n").unwrap();
+        let mut external_bytes = UTF8_BOM.to_vec();
+        external_bytes.extend_from_slice(b"{\"id\":\"bd-external\"}\r\n");
+        fs::write(&external_jsonl, external_bytes).unwrap();
+        let _storage = SqliteStorage::open(&db_path).unwrap();
+
+        let paths = config::ConfigPaths {
+            beads_dir: beads_dir.clone(),
+            db_path,
+            jsonl_path: external_jsonl.clone(),
+            metadata: config::Metadata {
+                database: "beads.db".to_string(),
+                jsonl_export: external_jsonl.to_string_lossy().into_owned(),
+                backend: None,
+                deletions_retention_days: None,
+            },
+        };
+
+        let report = collect_doctor_report(&beads_dir, &paths).expect("doctor report");
+        for check_name in ["jsonl_bom", "jsonl_crlf"] {
+            let check = find_check(&report.report.checks, check_name).expect("selected path check");
+            assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
+            assert_eq!(
+                check
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.get("path"))
+                    .and_then(serde_json::Value::as_str),
+                Some(external_jsonl.to_string_lossy().as_ref()),
+                "{check_name} must report the selected external JSONL"
+            );
+        }
+    }
+
+    #[test]
     fn test_fix_jsonl_trailing_newline_appends_selected_in_workspace_path() {
         let temp = TempDir::new().unwrap();
         let external_dir = temp.path().join("external");
@@ -12601,6 +13066,47 @@ mod tests {
             fs::read_to_string(&session.run.actions_file).unwrap(),
             "",
             "skipped external repairs must not write an undo action"
+        );
+    }
+
+    #[test]
+    fn test_fix_jsonl_trailing_newline_skips_traversal_outside_workspace() {
+        let parent = TempDir::new().unwrap();
+        let repo = parent.path().join("repo");
+        let outside = parent.path().join("outside");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let outside_jsonl = outside.join("issues.jsonl");
+        fs::write(&outside_jsonl, "{\"id\":\"bd-outside\"}").unwrap();
+        let traversal_path = repo.join("../outside/issues.jsonl");
+        let report = DoctorReport {
+            ok: false,
+            workspace_health: None,
+            reliability_audit: None,
+            checks: vec![CheckResult {
+                name: "jsonl_eof_newline".to_string(),
+                status: CheckStatus::Warn,
+                message: None,
+                details: None,
+            }],
+        };
+        let mut session = DoctorRepairSession::new(&repo, /* dry_run = */ false).expect("session");
+
+        assert!(!fix_jsonl_trailing_newline_if_warned(
+            Some(&traversal_path),
+            &report,
+            &quiet_ctx(),
+            Some(&mut session),
+        ));
+        assert_eq!(
+            fs::read_to_string(&outside_jsonl).unwrap(),
+            "{\"id\":\"bd-outside\"}",
+            "traversal-selected outside JSONL must not be rewritten"
+        );
+        assert_eq!(
+            fs::read_to_string(&session.run.actions_file).unwrap(),
+            "",
+            "skipped traversal repairs must not write an undo action"
         );
     }
 

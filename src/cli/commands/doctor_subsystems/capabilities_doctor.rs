@@ -411,6 +411,13 @@ fn early_chokepoint_fixer_rows() -> &'static [FixerRow] {
             true,
             &["jsonl_bom"],
         ),
+        (
+            "doctor.jsonl_crlf_to_lf",
+            "state_files",
+            true,
+            true,
+            &["jsonl_crlf"],
+        ),
     ]
 }
 
@@ -639,6 +646,7 @@ mod tests {
                 "doctor.orphan_tmp_quarantine",
                 "doctor.jsonl_trailing_newline_append",
                 "doctor.jsonl_bom_strip",
+                "doctor.jsonl_crlf_to_lf",
                 "doctor.repair_recoverable_db_state",
                 "doctor.repair_partial_indexes",
                 "doctor.repair_via_vacuum",
