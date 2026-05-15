@@ -659,6 +659,10 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
         "br_history.size",
         "fm-state_files-br-history-grows-unbounded",
     ),
+    (
+        "jsonl_eof_newline",
+        "fm-state_files-jsonl-missing-trailing-newline",
+    ),
     ("startup_cache.health", "fm-configs-startup-cache-poisoned"),
     ("sync_jsonl_path", FM_JSONL_ROW_COUNT_MISMATCH),
     (
@@ -1459,6 +1463,7 @@ struct EarlyRepairSummary {
     base_jsonl_symlink: bool,
     base_jsonl_stale: bool,
     orphan_tmp: bool,
+    jsonl_eof_newline: bool,
 }
 
 impl EarlyRepairSummary {
@@ -1471,6 +1476,7 @@ impl EarlyRepairSummary {
             || self.base_jsonl_symlink
             || self.base_jsonl_stale
             || self.orphan_tmp
+            || self.jsonl_eof_newline
     }
 
     fn action_labels(self) -> Vec<String> {
@@ -1498,6 +1504,9 @@ impl EarlyRepairSummary {
         }
         if self.orphan_tmp {
             actions.push("orphan_tmp_quarantined".to_string());
+        }
+        if self.jsonl_eof_newline {
+            actions.push("jsonl_trailing_newline_appended".to_string());
         }
         actions
     }
@@ -1527,6 +1536,9 @@ impl EarlyRepairSummary {
         }
         if self.orphan_tmp {
             messages.push("Quarantined orphan tmp files.".to_string());
+        }
+        if self.jsonl_eof_newline {
+            messages.push("Appended missing trailing newline to issues.jsonl.".to_string());
         }
         messages
     }
@@ -2918,6 +2930,150 @@ fn check_base_jsonl_missing_post_flush(
                 None,
                 None,
             );
+        }
+    }
+}
+
+/// Pass-5 cycle 19: detector for
+/// `fm-state_files-jsonl-missing-trailing-newline`.
+///
+/// Warns when the selected JSONL export exists, is non-empty, and its
+/// last byte is not `\n`. POSIX text files should end with a newline;
+/// missing one causes `grep`, `jq -s`, `sed`, `wc -l`, and most
+/// line-oriented tools to silently skip or miscount the last record.
+/// Auto-fixable via `fix_jsonl_trailing_newline_if_warned` below.
+fn check_jsonl_trailing_newline(jsonl_path: Option<&Path>, checks: &mut Vec<CheckResult>) {
+    use std::io::{Read, Seek, SeekFrom};
+    let Some(path) = jsonl_path else {
+        push_check(checks, "jsonl_eof_newline", CheckStatus::Ok, None, None);
+        return;
+    };
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        push_check(checks, "jsonl_eof_newline", CheckStatus::Ok, None, None);
+        return;
+    };
+    if meta.file_type().is_symlink() || !meta.is_file() || meta.len() == 0 {
+        push_check(checks, "jsonl_eof_newline", CheckStatus::Ok, None, None);
+        return;
+    }
+    let Ok(mut f) = fs::File::open(path) else {
+        push_check(checks, "jsonl_eof_newline", CheckStatus::Ok, None, None);
+        return;
+    };
+    if f.seek(SeekFrom::End(-1)).is_err() {
+        push_check(checks, "jsonl_eof_newline", CheckStatus::Ok, None, None);
+        return;
+    }
+    let mut last = [0u8; 1];
+    if f.read_exact(&mut last).is_err() {
+        push_check(checks, "jsonl_eof_newline", CheckStatus::Ok, None, None);
+        return;
+    }
+    if last[0] == b'\n' {
+        push_check(checks, "jsonl_eof_newline", CheckStatus::Ok, None, None);
+    } else {
+        push_check(
+            checks,
+            "jsonl_eof_newline",
+            CheckStatus::Warn,
+            Some(format!(
+                "{} does not end with a newline; line-oriented tools may skip the last record",
+                path.display()
+            )),
+            Some(serde_json::json!({
+                "path": path.display().to_string(),
+                "last_byte": last[0],
+                "remediation": "`br doctor --repair` will append a single newline when the selected JSONL is inside the workspace; otherwise append one manually",
+            })),
+        );
+    }
+}
+
+/// Pass-5 cycle 19 — fixer for
+/// `fm-state_files-jsonl-missing-trailing-newline`.
+///
+/// Appends a single `\n` to the selected JSONL export via
+/// [`chokepoint::mutate(Op::AppendFile)`] when the detector flagged
+/// the missing newline. The chokepoint captures the pre-append bytes
+/// in a verbatim backup so `doctor undo` can byte-restore the
+/// original (no-newline) state.
+fn fix_jsonl_trailing_newline_if_warned(
+    jsonl_path: Option<&Path>,
+    report: &DoctorReport,
+    ctx: &OutputContext,
+    session: Option<&mut DoctorRepairSession>,
+) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let has_warning = report
+        .checks
+        .iter()
+        .any(|c| c.name == "jsonl_eof_newline" && c.status == CheckStatus::Warn);
+    if !has_warning {
+        return false;
+    }
+    let Some(session) = session else {
+        if !ctx.is_json() {
+            ctx.warning(
+                "Skipping jsonl-trailing-newline fix: no doctor repair session (run-dir creation failed)",
+            );
+        }
+        return false;
+    };
+    let Some(path) = jsonl_path else {
+        return false;
+    };
+    // TOCTOU defense: re-check last byte at fix time.
+    let Ok(mut f) = fs::File::open(path) else {
+        return false;
+    };
+    if f.seek(SeekFrom::End(-1)).is_err() {
+        return false;
+    }
+    let mut last = [0u8; 1];
+    if f.read_exact(&mut last).is_err() {
+        return false;
+    }
+    drop(f);
+    if last[0] == b'\n' {
+        return false;
+    }
+    if path.strip_prefix(&session.ctx.repo_root).is_err() {
+        if !ctx.is_json() {
+            ctx.warning(&format!(
+                "Skipping jsonl-trailing-newline fix for external JSONL outside workspace: {}",
+                path.display()
+            ));
+        }
+        return false;
+    }
+    session.set_fixer("doctor.jsonl_trailing_newline_append");
+    session
+        .ctx
+        .capabilities
+        .write_scopes
+        .push(path.to_path_buf());
+    match chokepoint::mutate(
+        &session.ctx,
+        path,
+        Op::AppendFile {
+            content: b"\n".to_vec(),
+        },
+    ) {
+        Ok(result) if result.ok => {
+            if !ctx.is_json() {
+                ctx.info(&format!("Appended trailing newline to {}", path.display()));
+            }
+            true
+        }
+        Ok(_) => false,
+        Err(err) => {
+            if !ctx.is_json() {
+                ctx.warning(&format!(
+                    "Failed to append trailing newline to {}: {err}",
+                    path.display()
+                ));
+            }
+            false
         }
     }
 }
@@ -7913,6 +8069,8 @@ fn inspect_doctor_jsonl(
     let jsonl_path = select_doctor_jsonl_path(beads_dir, paths);
     // Pass-5 cycle 14: selected JSONL world-writable security check.
     check_jsonl_world_writable(jsonl_path.as_deref(), checks);
+    // Pass-5 cycle 19: selected JSONL trailing newline convention.
+    check_jsonl_trailing_newline(jsonl_path.as_deref(), checks);
     // Pass-5 cycle 17: oversized JSONL (slow flushes, RAM pressure).
     check_jsonl_oversized(jsonl_path.as_deref(), checks);
     let jsonl_count = if let Some(path) = jsonl_path.as_ref() {
@@ -8426,6 +8584,24 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             false
         };
 
+    // Pass-5 cycle 19: append trailing newline to the selected JSONL via Op::AppendFile.
+    let jsonl_eof_newline_repaired =
+        if args.repair && fixer_filter.allows("fm-state_files-jsonl-missing-trailing-newline") {
+            let repaired = fix_jsonl_trailing_newline_if_warned(
+                initial.jsonl_path.as_deref(),
+                &initial.report,
+                ctx,
+                session.as_mut(),
+            );
+            if repaired {
+                initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+            }
+            repaired
+        } else {
+            false
+        };
+    let _ = jsonl_eof_newline_repaired;
+
     if args.repair && (fixer_filter.has_only() || fixer_filter.has_skip()) {
         tracing::info!(
             target: "br::doctor::filter",
@@ -8443,6 +8619,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         base_jsonl_symlink: base_jsonl_symlink_repaired,
         base_jsonl_stale: base_jsonl_stale_repaired,
         orphan_tmp: orphan_tmp_repaired,
+        jsonl_eof_newline: jsonl_eof_newline_repaired,
     };
 
     if !args.repair {
@@ -11180,6 +11357,7 @@ mod tests {
             base_jsonl_symlink: false,
             base_jsonl_stale: false,
             orphan_tmp: false,
+            jsonl_eof_newline: false,
         };
 
         assert!(summary.applied());
@@ -11229,6 +11407,7 @@ mod tests {
             base_jsonl_symlink: true,
             base_jsonl_stale: false,
             orphan_tmp: false,
+            jsonl_eof_newline: false,
         };
 
         assert!(summary.applied());
@@ -11260,6 +11439,7 @@ mod tests {
             base_jsonl_symlink: false,
             base_jsonl_stale: true,
             orphan_tmp: false,
+            jsonl_eof_newline: false,
         };
 
         assert!(summary.applied());
@@ -11291,6 +11471,7 @@ mod tests {
             base_jsonl_symlink: false,
             base_jsonl_stale: false,
             orphan_tmp: true,
+            jsonl_eof_newline: false,
         };
 
         assert!(summary.applied());

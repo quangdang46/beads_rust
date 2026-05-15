@@ -278,6 +278,7 @@ fn build_detector_registry() -> Vec<DetectorEntry> {
         ("tmp_files_orphan", "state_files", "warn", true),
         ("jsonl_size", "state_files", "warn", true),
         ("br_history.size", "state_files", "warn", true),
+        ("jsonl_eof_newline", "state_files", "warn", true),
         ("startup_cache.health", "configs", "warn", true),
         ("sync_jsonl_path", "state_files", "warn", true),
         ("sync_conflict_markers", "state_files", "error", true),
@@ -391,6 +392,13 @@ fn early_chokepoint_fixer_rows() -> &'static [FixerRow] {
             true,
             true,
             &["tmp_files_orphan"],
+        ),
+        (
+            "doctor.jsonl_trailing_newline_append",
+            "state_files",
+            true,
+            true,
+            &["jsonl_eof_newline"],
         ),
     ]
 }
@@ -618,6 +626,7 @@ mod tests {
                 "doctor.base_jsonl_symlink_quarantine",
                 "doctor.base_jsonl_regen",
                 "doctor.orphan_tmp_quarantine",
+                "doctor.jsonl_trailing_newline_append",
                 "doctor.repair_recoverable_db_state",
                 "doctor.repair_partial_indexes",
                 "doctor.repair_via_vacuum",
