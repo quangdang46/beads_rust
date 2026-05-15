@@ -281,6 +281,7 @@ fn build_detector_registry() -> Vec<DetectorEntry> {
         ("jsonl_eof_newline", "state_files", "warn", true),
         ("jsonl_crlf", "state_files", "warn", true),
         ("jsonl_bom", "state_files", "warn", true),
+        ("db_bloat", "caches_indexes", "warn", true),
         ("startup_cache.health", "configs", "warn", true),
         ("sync_jsonl_path", "state_files", "warn", true),
         ("sync_conflict_markers", "state_files", "error", true),

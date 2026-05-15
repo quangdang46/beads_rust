@@ -665,6 +665,7 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
     ),
     ("jsonl_crlf", "fm-state_files-jsonl-crlf-line-endings"),
     ("jsonl_bom", "fm-state_files-jsonl-utf8-bom-prefix"),
+    ("db_bloat", "fm-caches_indexes-db-bloat-vs-jsonl"),
     ("startup_cache.health", "fm-configs-startup-cache-poisoned"),
     ("sync_jsonl_path", FM_JSONL_ROW_COUNT_MISMATCH),
     (
@@ -2957,6 +2958,64 @@ fn check_base_jsonl_missing_post_flush(
 /// teams). The doctor scans the first 64KB only to keep the check
 /// cheap on large workspaces.
 const CRLF_SCAN_PREFIX_BYTES: usize = 64 * 1024;
+
+/// Pass-5 cycle 22: detector for
+/// `fm-caches_indexes-db-bloat-vs-jsonl`.
+///
+/// Warns when `.beads/beads.db` exceeds `DB_BLOAT_RATIO_THRESHOLD`
+/// times the size of `.beads/issues.jsonl`. SQLite retains freelist
+/// pages after DELETE operations; a high ratio is a strong signal
+/// that VACUUM would reclaim significant disk space.
+const DB_BLOAT_RATIO_THRESHOLD: u64 = 10;
+const DB_BLOAT_MIN_JSONL_BYTES: u64 = 1024 * 1024;
+
+fn check_db_bloat_vs_jsonl(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
+    let db_path = beads_dir.join("beads.db");
+    let jsonl_path = beads_dir.join("issues.jsonl");
+    let (Ok(db_meta), Ok(jsonl_meta)) = (
+        fs::symlink_metadata(&db_path),
+        fs::symlink_metadata(&jsonl_path),
+    ) else {
+        push_check(checks, "db_bloat", CheckStatus::Ok, None, None);
+        return;
+    };
+    if !db_meta.is_file() || !jsonl_meta.is_file() {
+        push_check(checks, "db_bloat", CheckStatus::Ok, None, None);
+        return;
+    }
+    let db_bytes = db_meta.len();
+    let jsonl_bytes = jsonl_meta.len();
+    if jsonl_bytes < DB_BLOAT_MIN_JSONL_BYTES {
+        push_check(checks, "db_bloat", CheckStatus::Ok, None, None);
+        return;
+    }
+    if db_bytes > jsonl_bytes.saturating_mul(DB_BLOAT_RATIO_THRESHOLD) {
+        push_check(
+            checks,
+            "db_bloat",
+            CheckStatus::Warn,
+            Some(format!(
+                "{} is {}x the size of {} ({}MB vs {}MB); VACUUM would likely reclaim significant space",
+                db_path.display(),
+                db_bytes / jsonl_bytes,
+                jsonl_path.display(),
+                db_bytes / (1024 * 1024),
+                jsonl_bytes / (1024 * 1024)
+            )),
+            Some(serde_json::json!({
+                "db_path": db_path.display().to_string(),
+                "jsonl_path": jsonl_path.display().to_string(),
+                "db_bytes": db_bytes,
+                "jsonl_bytes": jsonl_bytes,
+                "ratio": db_bytes / jsonl_bytes,
+                "threshold": DB_BLOAT_RATIO_THRESHOLD,
+                "remediation": "`sqlite3 .beads/beads.db VACUUM` or run `br doctor --repair` if integrity warnings are present",
+            })),
+        );
+    } else {
+        push_check(checks, "db_bloat", CheckStatus::Ok, None, None);
+    }
+}
 
 /// Pass-5 cycle 21: detector for
 /// `fm-state_files-jsonl-utf8-bom-prefix`.
@@ -8205,6 +8264,8 @@ fn collect_doctor_report_with_mode_and_db_override(
     check_jsonl_crlf_endings(beads_dir, &mut checks);
     // Pass-5 cycle 21: UTF-8 BOM at start of issues.jsonl.
     check_jsonl_utf8_bom(beads_dir, &mut checks);
+    // Pass-5 cycle 22: db-to-jsonl size ratio (VACUUM candidate).
+    check_db_bloat_vs_jsonl(beads_dir, &mut checks);
     check_root_gitignore(beads_dir, &mut checks);
     check_routes_jsonl(beads_dir, &mut checks);
     check_rust_log_noisy(&mut checks);
@@ -11052,6 +11113,71 @@ mod tests {
         ));
         let after = fs::read(beads_dir.join("issues.jsonl")).unwrap();
         assert_eq!(after, payload, "BOM stripped, payload preserved");
+    }
+
+    #[test]
+    fn test_check_db_bloat_warns_on_high_ratio() {
+        // Pass-5 cycle 22: db >> jsonl by ratio → warn.
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        // JSONL: just above the 1MB minimum threshold.
+        let jsonl_f = fs::File::create(beads_dir.join("issues.jsonl")).unwrap();
+        jsonl_f.set_len(DB_BLOAT_MIN_JSONL_BYTES + 1024).unwrap();
+        drop(jsonl_f);
+        // DB: 20x the JSONL size (well above the 10x threshold).
+        let db_f = fs::File::create(beads_dir.join("beads.db")).unwrap();
+        db_f.set_len((DB_BLOAT_MIN_JSONL_BYTES + 1024) * 20)
+            .unwrap();
+        drop(db_f);
+
+        let mut checks = Vec::new();
+        check_db_bloat_vs_jsonl(&beads_dir, &mut checks);
+        let check = find_check(&checks, "db_bloat").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
+        let ratio = check
+            .details
+            .as_ref()
+            .and_then(|d| d.get("ratio"))
+            .and_then(serde_json::Value::as_u64);
+        assert_eq!(ratio, Some(20));
+    }
+
+    #[test]
+    fn test_check_db_bloat_ok_under_threshold() {
+        // DB only 2x the JSONL → ok.
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let jsonl_f = fs::File::create(beads_dir.join("issues.jsonl")).unwrap();
+        jsonl_f.set_len(DB_BLOAT_MIN_JSONL_BYTES + 1024).unwrap();
+        drop(jsonl_f);
+        let db_f = fs::File::create(beads_dir.join("beads.db")).unwrap();
+        db_f.set_len((DB_BLOAT_MIN_JSONL_BYTES + 1024) * 2).unwrap();
+        drop(db_f);
+
+        let mut checks = Vec::new();
+        check_db_bloat_vs_jsonl(&beads_dir, &mut checks);
+        let check = find_check(&checks, "db_bloat").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn test_check_db_bloat_skip_small_workspaces() {
+        // JSONL < 1 MB minimum → check skipped (ok). DB much larger
+        // doesn't matter; the ratio is meaningless for tiny workspaces.
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::write(beads_dir.join("issues.jsonl"), b"tiny").unwrap();
+        let db_f = fs::File::create(beads_dir.join("beads.db")).unwrap();
+        db_f.set_len(100 * 1024 * 1024).unwrap();
+        drop(db_f);
+
+        let mut checks = Vec::new();
+        check_db_bloat_vs_jsonl(&beads_dir, &mut checks);
+        let check = find_check(&checks, "db_bloat").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok));
     }
 
     #[test]
