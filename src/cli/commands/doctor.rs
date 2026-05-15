@@ -3125,9 +3125,18 @@ fn check_orphan_tmp_files(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
 /// `br sync --flush-only` reads back into the DB. Detect-only —
 /// operator may have intentional permissive perms (shared workspace,
 /// CI scratch space). On non-Unix targets this is a no-op.
-fn check_jsonl_world_writable(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
-    let path = beads_dir.join("issues.jsonl");
-    let Ok(meta) = fs::symlink_metadata(&path) else {
+fn check_jsonl_world_writable(jsonl_path: Option<&Path>, checks: &mut Vec<CheckResult>) {
+    let Some(path) = jsonl_path else {
+        push_check(
+            checks,
+            "permissions.jsonl_world_writable",
+            CheckStatus::Ok,
+            None,
+            None,
+        );
+        return;
+    };
+    let Ok(meta) = fs::symlink_metadata(path) else {
         push_check(
             checks,
             "permissions.jsonl_world_writable",
@@ -7852,8 +7861,6 @@ fn collect_doctor_report_with_mode_and_db_override(
     check_multiple_br_in_path(&mut checks);
     // Pass-5 cycle 13: .beads/.gitignore present + expected patterns.
     check_inner_gitignore_present(beads_dir, &mut checks);
-    // Pass-5 cycle 14: .beads/issues.jsonl world-writable security check.
-    check_jsonl_world_writable(beads_dir, &mut checks);
     // Pass-5 cycle 15: orphan *.tmp files from interrupted atomic writes.
     check_orphan_tmp_files(beads_dir, &mut checks);
     // Pass-5 cycle 18: .br_history/ snapshot accumulation (inode pressure).
@@ -7904,6 +7911,8 @@ fn inspect_doctor_jsonl(
     checks: &mut Vec<CheckResult>,
 ) -> (Option<PathBuf>, JsonlCountState) {
     let jsonl_path = select_doctor_jsonl_path(beads_dir, paths);
+    // Pass-5 cycle 14: selected JSONL world-writable security check.
+    check_jsonl_world_writable(jsonl_path.as_deref(), checks);
     // Pass-5 cycle 17: oversized JSONL (slow flushes, RAM pressure).
     check_jsonl_oversized(jsonl_path.as_deref(), checks);
     let jsonl_count = if let Some(path) = jsonl_path.as_ref() {
@@ -10341,7 +10350,7 @@ mod tests {
         fs::set_permissions(&jsonl, perms).unwrap();
 
         let mut checks = Vec::new();
-        check_jsonl_world_writable(&beads_dir, &mut checks);
+        check_jsonl_world_writable(Some(&jsonl), &mut checks);
         let check = find_check(&checks, "permissions.jsonl_world_writable").expect("check present");
         assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
     }
@@ -10361,7 +10370,7 @@ mod tests {
         fs::set_permissions(&jsonl, perms).unwrap();
 
         let mut checks = Vec::new();
-        check_jsonl_world_writable(&beads_dir, &mut checks);
+        check_jsonl_world_writable(Some(&jsonl), &mut checks);
         let check = find_check(&checks, "permissions.jsonl_world_writable").expect("check present");
         assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
     }
@@ -10373,7 +10382,7 @@ mod tests {
         let beads_dir = temp.path().join(".beads");
         fs::create_dir_all(&beads_dir).unwrap();
         let mut checks = Vec::new();
-        check_jsonl_world_writable(&beads_dir, &mut checks);
+        check_jsonl_world_writable(None, &mut checks);
         let check = find_check(&checks, "permissions.jsonl_world_writable").expect("check present");
         assert!(matches!(check.status, CheckStatus::Ok));
     }
@@ -11709,6 +11718,57 @@ mod tests {
                 .and_then(|details| details.get("external"))
                 .and_then(serde_json::Value::as_bool),
             Some(true)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_collect_doctor_report_checks_selected_external_jsonl_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let external_dir = temp.path().join("external");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&external_dir).unwrap();
+
+        let db_path = beads_dir.join("beads.db");
+        let external_jsonl = external_dir.join("issues.jsonl");
+        fs::write(beads_dir.join("issues.jsonl"), "{\"id\":\"bd-local\"}\n").unwrap();
+        fs::write(&external_jsonl, "{\"id\":\"bd-external\"}\n").unwrap();
+        let mut perms = fs::metadata(&external_jsonl).unwrap().permissions();
+        perms.set_mode(0o666);
+        fs::set_permissions(&external_jsonl, perms).unwrap();
+        let _storage = SqliteStorage::open(&db_path).unwrap();
+
+        let paths = config::ConfigPaths {
+            beads_dir: beads_dir.clone(),
+            db_path,
+            jsonl_path: external_jsonl.clone(),
+            metadata: config::Metadata {
+                database: "beads.db".to_string(),
+                jsonl_export: external_jsonl.to_string_lossy().into_owned(),
+                backend: None,
+                deletions_retention_days: None,
+            },
+        };
+
+        let report = collect_doctor_report(&beads_dir, &paths).expect("doctor report");
+        let permission_check =
+            find_check(&report.report.checks, "permissions.jsonl_world_writable")
+                .expect("permission check");
+
+        assert!(
+            matches!(permission_check.status, CheckStatus::Warn),
+            "{permission_check:?}"
+        );
+        assert_eq!(
+            permission_check
+                .details
+                .as_ref()
+                .and_then(|details| details.get("path"))
+                .and_then(serde_json::Value::as_str),
+            Some(external_jsonl.to_string_lossy().as_ref())
         );
     }
 
