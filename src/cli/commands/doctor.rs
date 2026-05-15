@@ -655,6 +655,10 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
     ),
     ("tmp_files_orphan", "fm-state_files-orphan-tmp-files"),
     ("jsonl_size", "fm-state_files-jsonl-oversized"),
+    (
+        "br_history.size",
+        "fm-state_files-br-history-grows-unbounded",
+    ),
     ("startup_cache.health", "fm-configs-startup-cache-poisoned"),
     ("sync_jsonl_path", FM_JSONL_ROW_COUNT_MISMATCH),
     (
@@ -2918,6 +2922,47 @@ fn check_base_jsonl_missing_post_flush(
     }
 }
 
+/// Pass-5 cycle 18: detector for
+/// `fm-state_files-br-history-grows-unbounded`.
+///
+/// Warns when `.beads/.br_history/` accumulates more than
+/// `BR_HISTORY_SNAPSHOT_THRESHOLD` snapshot files. The history dir
+/// stores point-in-time JSONL snapshots that operators rarely
+/// inspect, but they consume inodes and slow directory listing.
+///
+/// Detect-only — pruning history risks data loss; operator decides
+/// whether/how to compact.
+const BR_HISTORY_SNAPSHOT_THRESHOLD: usize = 100;
+
+fn check_br_history_size(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
+    let history = beads_dir.join(".br_history");
+    let Ok(entries) = fs::read_dir(&history) else {
+        push_check(checks, "br_history.size", CheckStatus::Ok, None, None);
+        return;
+    };
+    let snapshot_count = entries.flatten().filter(|e| e.path().is_file()).count();
+    if snapshot_count > BR_HISTORY_SNAPSHOT_THRESHOLD {
+        push_check(
+            checks,
+            "br_history.size",
+            CheckStatus::Warn,
+            Some(format!(
+                "{} snapshot file(s) accumulated in {}; consider pruning",
+                snapshot_count,
+                history.display()
+            )),
+            Some(serde_json::json!({
+                "history_dir": history.display().to_string(),
+                "snapshot_count": snapshot_count,
+                "threshold": BR_HISTORY_SNAPSHOT_THRESHOLD,
+                "remediation": "Review and archive old snapshots; `br history` commands manage selectively",
+            })),
+        );
+    } else {
+        push_check(checks, "br_history.size", CheckStatus::Ok, None, None);
+    }
+}
+
 /// Pass-5 cycle 17: detector for
 /// `fm-state_files-jsonl-oversized`.
 ///
@@ -2929,9 +2974,12 @@ fn check_base_jsonl_missing_post_flush(
 /// operator-decided.
 const JSONL_OVERSIZED_THRESHOLD_BYTES: u64 = 100 * 1024 * 1024;
 
-fn check_jsonl_oversized(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
-    let path = beads_dir.join("issues.jsonl");
-    let Ok(meta) = fs::symlink_metadata(&path) else {
+fn check_jsonl_oversized(jsonl_path: Option<&Path>, checks: &mut Vec<CheckResult>) {
+    let Some(path) = jsonl_path else {
+        push_check(checks, "jsonl_size", CheckStatus::Ok, None, None);
+        return;
+    };
+    let Ok(meta) = fs::symlink_metadata(path) else {
         push_check(checks, "jsonl_size", CheckStatus::Ok, None, None);
         return;
     };
@@ -7792,8 +7840,8 @@ fn collect_doctor_report_with_mode_and_db_override(
     check_jsonl_world_writable(beads_dir, &mut checks);
     // Pass-5 cycle 15: orphan *.tmp files from interrupted atomic writes.
     check_orphan_tmp_files(beads_dir, &mut checks);
-    // Pass-5 cycle 17: oversized JSONL (slow flushes, RAM pressure).
-    check_jsonl_oversized(beads_dir, &mut checks);
+    // Pass-5 cycle 18: .br_history/ snapshot accumulation (inode pressure).
+    check_br_history_size(beads_dir, &mut checks);
     check_root_gitignore(beads_dir, &mut checks);
     check_routes_jsonl(beads_dir, &mut checks);
     check_rust_log_noisy(&mut checks);
@@ -7840,6 +7888,8 @@ fn inspect_doctor_jsonl(
     checks: &mut Vec<CheckResult>,
 ) -> (Option<PathBuf>, JsonlCountState) {
     let jsonl_path = select_doctor_jsonl_path(beads_dir, paths);
+    // Pass-5 cycle 17: oversized JSONL (slow flushes, RAM pressure).
+    check_jsonl_oversized(jsonl_path.as_deref(), checks);
     let jsonl_count = if let Some(path) = jsonl_path.as_ref() {
         check_sync_jsonl_path(path, beads_dir, checks);
         check_sync_conflict_markers(path, checks);
@@ -10398,7 +10448,7 @@ mod tests {
         drop(f);
 
         let mut checks = Vec::new();
-        check_jsonl_oversized(&beads_dir, &mut checks);
+        check_jsonl_oversized(Some(&jsonl), &mut checks);
         let check = find_check(&checks, "jsonl_size").expect("check present");
         assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
         let size_bytes = check
@@ -10415,23 +10465,96 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
         fs::create_dir_all(&beads_dir).unwrap();
-        fs::write(beads_dir.join("issues.jsonl"), b"{\"id\":\"bd-tiny\"}\n").unwrap();
+        let jsonl = beads_dir.join("issues.jsonl");
+        fs::write(&jsonl, b"{\"id\":\"bd-tiny\"}\n").unwrap();
         let mut checks = Vec::new();
-        check_jsonl_oversized(&beads_dir, &mut checks);
+        check_jsonl_oversized(Some(&jsonl), &mut checks);
         let check = find_check(&checks, "jsonl_size").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn test_check_br_history_above_threshold_warns() {
+        // Pass-5 cycle 18: > threshold snapshot files → warn with count.
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let history = beads_dir.join(".br_history");
+        fs::create_dir_all(&history).unwrap();
+        for i in 0..(BR_HISTORY_SNAPSHOT_THRESHOLD + 5) {
+            fs::write(history.join(format!("issues.{i:05}.jsonl")), b"{}\n").unwrap();
+        }
+        let mut checks = Vec::new();
+        check_br_history_size(&beads_dir, &mut checks);
+        let check = find_check(&checks, "br_history.size").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
+        let count = check
+            .details
+            .as_ref()
+            .and_then(|d| d.get("snapshot_count"))
+            .and_then(serde_json::Value::as_u64);
+        assert_eq!(count, Some((BR_HISTORY_SNAPSHOT_THRESHOLD + 5) as u64));
+    }
+
+    #[test]
+    fn test_check_br_history_below_threshold_ok() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let history = beads_dir.join(".br_history");
+        fs::create_dir_all(&history).unwrap();
+        for i in 0..5 {
+            fs::write(history.join(format!("issues.{i}.jsonl")), b"{}\n").unwrap();
+        }
+        let mut checks = Vec::new();
+        check_br_history_size(&beads_dir, &mut checks);
+        let check = find_check(&checks, "br_history.size").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn test_check_br_history_missing_is_ok() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let mut checks = Vec::new();
+        check_br_history_size(&beads_dir, &mut checks);
+        let check = find_check(&checks, "br_history.size").expect("check present");
         assert!(matches!(check.status, CheckStatus::Ok));
     }
 
     #[test]
     fn test_check_jsonl_oversized_missing_is_ok() {
         // No JSONL at all → ok (other checks cover missing-file case).
-        let temp = TempDir::new().unwrap();
-        let beads_dir = temp.path().join(".beads");
-        fs::create_dir_all(&beads_dir).unwrap();
         let mut checks = Vec::new();
-        check_jsonl_oversized(&beads_dir, &mut checks);
+        check_jsonl_oversized(None, &mut checks);
         let check = find_check(&checks, "jsonl_size").expect("check present");
         assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn test_check_jsonl_oversized_uses_selected_external_path() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let external_dir = temp.path().join("external");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&external_dir).unwrap();
+        fs::write(beads_dir.join("issues.jsonl"), b"{\"id\":\"bd-small\"}\n").unwrap();
+        let external_jsonl = external_dir.join("issues.jsonl");
+        let f = fs::File::create(&external_jsonl).unwrap();
+        f.set_len(JSONL_OVERSIZED_THRESHOLD_BYTES + 1).unwrap();
+        drop(f);
+
+        let mut checks = Vec::new();
+        check_jsonl_oversized(Some(&external_jsonl), &mut checks);
+        let check = find_check(&checks, "jsonl_size").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
+        assert_eq!(
+            check
+                .details
+                .as_ref()
+                .and_then(|d| d.get("path"))
+                .and_then(serde_json::Value::as_str),
+            Some(external_jsonl.to_string_lossy().as_ref())
+        );
     }
 
     #[cfg(unix)]
