@@ -262,6 +262,7 @@ const DETECTOR_ROWS: &[DetectorRow] = &[
     ("dirty_bitmap", "caches_indexes", "warn", false),
     ("doctor.runs_dir", "observability", "warn", true),
     ("doctor.runs_creatable", "permissions", "warn", true),
+    ("permissions.recovery_dir", "permissions", "warn", true),
     (
         "permissions.config_yaml_secrets",
         "permissions",

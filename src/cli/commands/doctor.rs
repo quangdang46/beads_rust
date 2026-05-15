@@ -645,6 +645,10 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
         "fm-permissions-doctor-runs-not-creatable",
     ),
     (
+        "permissions.recovery_dir",
+        "fm-permissions-recovery-dir-not-writable",
+    ),
+    (
         "permissions.config_yaml_secrets",
         "fm-permissions-config-yaml-mode-leaks-secrets",
     ),
@@ -4516,6 +4520,78 @@ fn check_doctor_runs_creatable(repo_root: &Path, checks: &mut Vec<CheckResult>) 
         }
     }
     push_check(checks, "doctor.runs_creatable", CheckStatus::Ok, None, None);
+}
+
+/// Pass-5 cycle 30 — detector for
+/// `fm-permissions-recovery-dir-not-writable`.
+///
+/// Warns when the configured DB family's recovery dir exists but
+/// lacks the owner-write bit. The recovery dir is where `--repair`
+/// paths move quarantined DB families to before performing destructive
+/// rebuilds; if it's read-only the backup move fails and the
+/// recoverable-anomaly fixer can't run safely.
+///
+/// Detect-only — operators may have intentionally locked the recovery
+/// dir for compliance (immutable backup folder); auto-chmoding would
+/// stomp that decision. Remediation: `chmod u+w .beads/.br_recovery`
+/// or unset the lock-down before re-running `--repair`.
+///
+/// Unix-only — non-Unix lacks the POSIX mode bits this check relies
+/// on, so it always emits Ok there.
+fn check_recovery_dir_writable(db_path: &Path, beads_dir: &Path, checks: &mut Vec<CheckResult>) {
+    let recovery_dir = config::recovery_dir_for_db_path(db_path, beads_dir);
+    let Ok(meta) = fs::symlink_metadata(&recovery_dir) else {
+        // Missing is fine — the dir is created on demand by the recovery path.
+        push_check(
+            checks,
+            "permissions.recovery_dir",
+            CheckStatus::Ok,
+            None,
+            None,
+        );
+        return;
+    };
+    if !meta.is_dir() {
+        // `.br_recovery` exists but isn't a directory; a different FM owns this.
+        push_check(
+            checks,
+            "permissions.recovery_dir",
+            CheckStatus::Ok,
+            None,
+            None,
+        );
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode();
+        if (mode & 0o200) == 0 {
+            push_check(
+                checks,
+                "permissions.recovery_dir",
+                CheckStatus::Warn,
+                Some(format!(
+                    "{} is not writable by owner (mode {:o}); next `br doctor --repair` will fail to quarantine the DB family before rebuild",
+                    recovery_dir.display(),
+                    mode & 0o777
+                )),
+                Some(serde_json::json!({
+                    "path": recovery_dir.display().to_string(),
+                    "mode_octal": format!("{:o}", mode & 0o777),
+                    "remediation": format!("`chmod u+w {}` or move it aside before re-running `--repair`", recovery_dir.display()),
+                })),
+            );
+            return;
+        }
+    }
+    push_check(
+        checks,
+        "permissions.recovery_dir",
+        CheckStatus::Ok,
+        None,
+        None,
+    );
 }
 
 /// Pass-5 cycle 8: detector for `fm-caches_indexes-dirty-bitmap-divergence`.
@@ -8886,6 +8962,9 @@ fn collect_doctor_report_with_mode_and_db_override(
     // Pass-5 cycle 28: writability of `.doctor/` so the next --repair
     // won't crash deep inside the chokepoint.
     check_doctor_runs_creatable(repo_root, &mut checks);
+    // Pass-5 cycle 30: writability of `.beads/.br_recovery/` so the
+    // next --repair won't crash mid-backup.
+    check_recovery_dir_writable(&paths.db_path, beads_dir, &mut checks);
     // Pass-5 cycle 11: world-readable config.yaml containing secrets.
     check_config_yaml_secret_mode(beads_dir, &mut checks);
     // Pass-5 cycle 12: multiple `br` binaries on $PATH (env-based,
@@ -11442,6 +11521,87 @@ mod tests {
         check_doctor_runs_creatable(temp.path(), &mut checks);
         let check = find_check(&checks, "doctor.runs_creatable").expect("check present");
         assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn test_check_recovery_dir_writable_ok_when_missing() {
+        // No .br_recovery at all → Ok (created on demand).
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        let mut checks = Vec::new();
+        check_recovery_dir_writable(&db_path, &beads_dir, &mut checks);
+        let check = find_check(&checks, "permissions.recovery_dir").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn test_check_recovery_dir_writable_ok_when_writable() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(beads_dir.join(".br_recovery")).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        let mut checks = Vec::new();
+        check_recovery_dir_writable(&db_path, &beads_dir, &mut checks);
+        let check = find_check(&checks, "permissions.recovery_dir").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_recovery_dir_writable_warns_when_not_writable() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let recovery = beads_dir.join(".br_recovery");
+        fs::create_dir_all(&recovery).unwrap();
+        fs::set_permissions(&recovery, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let db_path = beads_dir.join("beads.db");
+        let mut checks = Vec::new();
+        check_recovery_dir_writable(&db_path, &beads_dir, &mut checks);
+        let check = find_check(&checks, "permissions.recovery_dir").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
+        let details = check.details.as_ref().expect("details");
+        assert_eq!(
+            details.get("mode_octal").and_then(|v| v.as_str()),
+            Some("555")
+        );
+
+        // Restore so TempDir's drop can clean up.
+        fs::set_permissions(&recovery, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_recovery_dir_writable_uses_configured_db_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(beads_dir.join(".br_recovery")).unwrap();
+        let db_dir = temp.path().join("configured-db");
+        let recovery = db_dir.join(".br_recovery");
+        fs::create_dir_all(&recovery).unwrap();
+        fs::set_permissions(&recovery, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let db_path = db_dir.join("beads.db");
+        let mut checks = Vec::new();
+        check_recovery_dir_writable(&db_path, &beads_dir, &mut checks);
+        let check = find_check(&checks, "permissions.recovery_dir").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
+        let expected_path = recovery.to_string_lossy().into_owned();
+        assert_eq!(
+            check
+                .details
+                .as_ref()
+                .and_then(|details| details.get("path"))
+                .and_then(|path| path.as_str()),
+            Some(expected_path.as_str())
+        );
+
+        // Restore so TempDir's drop can clean up.
+        fs::set_permissions(&recovery, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[cfg(unix)]
