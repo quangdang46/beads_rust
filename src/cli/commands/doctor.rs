@@ -3072,9 +3072,32 @@ fn check_jsonl_world_writable(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
 fn check_inner_gitignore_present(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
     const EXPECTED_PATTERNS: &[&str] = &[".write.lock", "*.tmp"];
     let path = beads_dir.join(".gitignore");
-    let Ok(contents) = fs::read_to_string(&path) else {
-        if path.exists() {
-            // Unreadable but present (perms issue?) — leave to the
+    let meta = match fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            push_check(
+                checks,
+                "gitignore.beads_inner_present",
+                CheckStatus::Warn,
+                Some(format!(
+                    "{} is missing; transient .beads/ state can leak into git history",
+                    path.display()
+                )),
+                Some(serde_json::json!({
+                    "path": path.display().to_string(),
+                    "kind": "missing",
+                    "expected_patterns": EXPECTED_PATTERNS,
+                    "remediation": format!(
+                        "Create {} with at least: {}",
+                        path.display(),
+                        EXPECTED_PATTERNS.join(", ")
+                    ),
+                })),
+            );
+            return;
+        }
+        Err(_) => {
+            // Uninspectable but present (perms issue?) — leave to the
             // permissions check.
             push_check(
                 checks,
@@ -3085,24 +3108,38 @@ fn check_inner_gitignore_present(beads_dir: &Path, checks: &mut Vec<CheckResult>
             );
             return;
         }
+    };
+    if meta.file_type().is_symlink() {
         push_check(
             checks,
             "gitignore.beads_inner_present",
             CheckStatus::Warn,
             Some(format!(
-                "{} is missing; transient .beads/ state can leak into git history",
+                "{} is a symlink; git ignore files in the working tree must be regular files to reliably protect .beads/ state",
                 path.display()
             )),
             Some(serde_json::json!({
                 "path": path.display().to_string(),
-                "kind": "missing",
+                "kind": "symlink",
                 "expected_patterns": EXPECTED_PATTERNS,
                 "remediation": format!(
-                    "Create {} with at least: {}",
+                    "Replace {} with a regular file containing at least: {}",
                     path.display(),
                     EXPECTED_PATTERNS.join(", ")
                 ),
             })),
+        );
+        return;
+    }
+    let Ok(contents) = fs::read_to_string(&path) else {
+        // Unreadable but present (perms issue?) — leave to the
+        // permissions check.
+        push_check(
+            checks,
+            "gitignore.beads_inner_present",
+            CheckStatus::Ok,
+            None,
+            None,
         );
         return;
     };
@@ -10014,6 +10051,35 @@ mod tests {
             .map(Vec::len)
             .unwrap_or(0);
         assert_eq!(missing, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_inner_gitignore_present_symlink_warns_even_with_valid_target() {
+        // Git ignore rules in the working tree must be regular files.
+        // Reading through a symlink here would make doctor report a
+        // false healthy state while git ignores the symlinked ignore file.
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let target = temp.path().join("shared-ignore");
+        fs::write(&target, b".write.lock\n*.tmp\n").unwrap();
+        symlink(&target, beads_dir.join(".gitignore")).unwrap();
+
+        let mut checks = Vec::new();
+        check_inner_gitignore_present(&beads_dir, &mut checks);
+        let check = find_check(&checks, "gitignore.beads_inner_present").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
+        assert_eq!(
+            check
+                .details
+                .as_ref()
+                .and_then(|d| d.get("kind"))
+                .and_then(|v| v.as_str()),
+            Some("symlink")
+        );
     }
 
     #[cfg(unix)]
