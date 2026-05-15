@@ -11954,6 +11954,124 @@ mod tests {
     }
 
     #[test]
+    fn test_collect_doctor_report_checks_selected_external_jsonl_trailing_newline() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let external_dir = temp.path().join("external");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&external_dir).unwrap();
+
+        let db_path = beads_dir.join("beads.db");
+        let external_jsonl = external_dir.join("issues.jsonl");
+        fs::write(beads_dir.join("issues.jsonl"), "{\"id\":\"bd-local\"}\n").unwrap();
+        fs::write(&external_jsonl, "{\"id\":\"bd-external\"}").unwrap();
+        let _storage = SqliteStorage::open(&db_path).unwrap();
+
+        let paths = config::ConfigPaths {
+            beads_dir: beads_dir.clone(),
+            db_path,
+            jsonl_path: external_jsonl.clone(),
+            metadata: config::Metadata {
+                database: "beads.db".to_string(),
+                jsonl_export: external_jsonl.to_string_lossy().into_owned(),
+                backend: None,
+                deletions_retention_days: None,
+            },
+        };
+
+        let report = collect_doctor_report(&beads_dir, &paths).expect("doctor report");
+        let newline_check =
+            find_check(&report.report.checks, "jsonl_eof_newline").expect("newline check");
+
+        assert!(
+            matches!(newline_check.status, CheckStatus::Warn),
+            "{newline_check:?}"
+        );
+        assert_eq!(
+            newline_check
+                .details
+                .as_ref()
+                .and_then(|details| details.get("path"))
+                .and_then(serde_json::Value::as_str),
+            Some(external_jsonl.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn test_fix_jsonl_trailing_newline_appends_selected_in_workspace_path() {
+        let temp = TempDir::new().unwrap();
+        let external_dir = temp.path().join("external");
+        fs::create_dir_all(&external_dir).unwrap();
+        let external_jsonl = external_dir.join("issues.jsonl");
+        fs::write(&external_jsonl, "{\"id\":\"bd-external\"}").unwrap();
+        let report = DoctorReport {
+            ok: false,
+            workspace_health: None,
+            reliability_audit: None,
+            checks: vec![CheckResult {
+                name: "jsonl_eof_newline".to_string(),
+                status: CheckStatus::Warn,
+                message: None,
+                details: None,
+            }],
+        };
+        let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
+            .expect("session must build");
+
+        assert!(fix_jsonl_trailing_newline_if_warned(
+            Some(&external_jsonl),
+            &report,
+            &quiet_ctx(),
+            Some(&mut session),
+        ));
+        assert_eq!(
+            fs::read_to_string(&external_jsonl).unwrap(),
+            "{\"id\":\"bd-external\"}\n"
+        );
+        assert_eq!(
+            fs::read_to_string(session.run.root.join("backups/external/issues.jsonl")).unwrap(),
+            "{\"id\":\"bd-external\"}"
+        );
+    }
+
+    #[test]
+    fn test_fix_jsonl_trailing_newline_skips_path_outside_workspace() {
+        let repo = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let external_jsonl = outside.path().join("issues.jsonl");
+        fs::write(&external_jsonl, "{\"id\":\"bd-outside\"}").unwrap();
+        let report = DoctorReport {
+            ok: false,
+            workspace_health: None,
+            reliability_audit: None,
+            checks: vec![CheckResult {
+                name: "jsonl_eof_newline".to_string(),
+                status: CheckStatus::Warn,
+                message: None,
+                details: None,
+            }],
+        };
+        let mut session =
+            DoctorRepairSession::new(repo.path(), /* dry_run = */ false).expect("session");
+
+        assert!(!fix_jsonl_trailing_newline_if_warned(
+            Some(&external_jsonl),
+            &report,
+            &quiet_ctx(),
+            Some(&mut session),
+        ));
+        assert_eq!(
+            fs::read_to_string(&external_jsonl).unwrap(),
+            "{\"id\":\"bd-outside\"}"
+        );
+        assert_eq!(
+            fs::read_to_string(&session.run.actions_file).unwrap(),
+            "",
+            "skipped external repairs must not write an undo action"
+        );
+    }
+
+    #[test]
     fn test_integrity_check_messages_collects_all_rows() {
         let messages = integrity_check_messages(&[
             vec![SqliteValue::Text("row 1 missing from index idx_a".into())],
