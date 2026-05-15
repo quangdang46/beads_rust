@@ -1472,6 +1472,7 @@ struct EarlyRepairSummary {
     jsonl_crlf: bool,
     jsonl_world_writable: bool,
     config_yaml_secret_mode: bool,
+    inner_gitignore: bool,
 }
 
 impl EarlyRepairSummary {
@@ -1489,6 +1490,7 @@ impl EarlyRepairSummary {
             || self.jsonl_crlf
             || self.jsonl_world_writable
             || self.config_yaml_secret_mode
+            || self.inner_gitignore
     }
 
     fn action_labels(self) -> Vec<String> {
@@ -1531,6 +1533,9 @@ impl EarlyRepairSummary {
         }
         if self.config_yaml_secret_mode {
             actions.push("config_yaml_secret_mode_chmod".to_string());
+        }
+        if self.inner_gitignore {
+            actions.push("inner_gitignore_appended".to_string());
         }
         actions
     }
@@ -1582,6 +1587,9 @@ impl EarlyRepairSummary {
                 "Stripped world-read/write bits from `.beads/config.yaml` (contains secrets)."
                     .to_string(),
             );
+        }
+        if self.inner_gitignore {
+            messages.push("Appended canonical patterns to `.beads/.gitignore`.".to_string());
         }
         messages
     }
@@ -4001,6 +4009,97 @@ fn check_inner_gitignore_present(beads_dir: &Path, checks: &mut Vec<CheckResult>
                 "missing_patterns": missing,
             })),
         );
+    }
+}
+
+/// Pass-5 cycle 27 — fixer for the missing/incomplete subset of
+/// `fm-configs-gitignore-leaking-beads` (inner-gitignore family).
+///
+/// When the detector warns with `kind="missing"` or `kind="incomplete"`,
+/// auto-append the canonical patterns to `.beads/.gitignore` via
+/// [`chokepoint::mutate(Op::AppendFile)`]. The chokepoint handles the
+/// missing-file case by treating absent contents as empty bytes; the
+/// resulting file gets the canonical patterns one per line.
+///
+/// Symlinks are REFUSED — replacing a symlink with a regular file
+/// could break operator intent (compliance workflows, vendored shared
+/// configs). The detector's `kind="symlink"` warning remains the
+/// operator's responsibility.
+///
+/// The chokepoint backs up the pre-fix file bytes (or records "did
+/// not exist" for missing) so `doctor undo` restores the file —
+/// either to its previous incomplete state or by removing it
+/// entirely. TOCTOU-safe: missing patterns are re-derived at fix time.
+fn fix_inner_gitignore_if_warned(
+    beads_dir: &Path,
+    report: &DoctorReport,
+    ctx: &OutputContext,
+    session: Option<&mut DoctorRepairSession>,
+) -> bool {
+    const EXPECTED_PATTERNS: &[&str] = &[".write.lock", "*.tmp"];
+    let has_warning = report
+        .checks
+        .iter()
+        .any(|c| c.name == "gitignore.beads_inner_present" && c.status == CheckStatus::Warn);
+    if !has_warning {
+        return false;
+    }
+    let Some(session) = session else {
+        if !ctx.is_json() {
+            ctx.warning(
+                "Skipping inner-gitignore repair: no doctor repair session (run-dir creation failed)",
+            );
+        }
+        return false;
+    };
+    let path = beads_dir.join(".gitignore");
+    let existing = match fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            // Refuse to convert a symlink into a regular file.
+            return false;
+        }
+        Ok(_) => fs::read_to_string(&path).unwrap_or_default(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(_) => return false,
+    };
+    let missing: Vec<&str> = EXPECTED_PATTERNS
+        .iter()
+        .copied()
+        .filter(|needle| !existing.lines().map(str::trim).any(|line| line == *needle))
+        .collect();
+    if missing.is_empty() {
+        return false;
+    }
+    let mut content: Vec<u8> = Vec::new();
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        content.push(b'\n');
+    }
+    for pattern in &missing {
+        content.extend_from_slice(pattern.as_bytes());
+        content.push(b'\n');
+    }
+    session.set_fixer("doctor.inner_gitignore_append");
+    match chokepoint::mutate(&session.ctx, &path, Op::AppendFile { content }) {
+        Ok(result) if result.ok => {
+            if !ctx.is_json() {
+                ctx.info(&format!(
+                    "Appended missing pattern(s) to {}: {}",
+                    path.display(),
+                    missing.join(", ")
+                ));
+            }
+            true
+        }
+        Ok(_) => false,
+        Err(err) => {
+            if !ctx.is_json() {
+                ctx.warning(&format!(
+                    "Failed to append patterns to {}: {err}",
+                    path.display()
+                ));
+            }
+            false
+        }
     }
 }
 
@@ -9310,6 +9409,21 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         };
     let _ = config_yaml_secret_mode_repaired;
 
+    // Pass-5 cycle 27: append missing canonical patterns to .beads/.gitignore
+    // via Op::AppendFile.
+    let inner_gitignore_repaired =
+        if args.repair && fixer_filter.allows("fm-configs-gitignore-leaking-beads") {
+            let repaired =
+                fix_inner_gitignore_if_warned(&beads_dir, &initial.report, ctx, session.as_mut());
+            if repaired {
+                initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+            }
+            repaired
+        } else {
+            false
+        };
+    let _ = inner_gitignore_repaired;
+
     if args.repair && (fixer_filter.has_only() || fixer_filter.has_skip()) {
         tracing::info!(
             target: "br::doctor::filter",
@@ -9332,6 +9446,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         jsonl_crlf: jsonl_crlf_repaired,
         jsonl_world_writable: jsonl_world_writable_repaired,
         config_yaml_secret_mode: config_yaml_secret_mode_repaired,
+        inner_gitignore: inner_gitignore_repaired,
     };
 
     if !args.repair {
@@ -11726,6 +11841,117 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_fix_inner_gitignore_creates_when_missing() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        // No .gitignore at all → fixer creates it with both canonical patterns.
+
+        let mut report = DoctorReport {
+            ok: false,
+            workspace_health: Some("degraded".to_string()),
+            reliability_audit: None,
+            checks: Vec::new(),
+        };
+        check_inner_gitignore_present(&beads_dir, &mut report.checks);
+
+        let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
+            .expect("session must build");
+        let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Text, false, true);
+        assert!(fix_inner_gitignore_if_warned(
+            &beads_dir,
+            &report,
+            &ctx,
+            Some(&mut session),
+        ));
+        let after = fs::read_to_string(beads_dir.join(".gitignore")).unwrap();
+        assert!(
+            after.lines().any(|l| l.trim() == ".write.lock"),
+            "{after:?}"
+        );
+        assert!(after.lines().any(|l| l.trim() == "*.tmp"), "{after:?}");
+    }
+
+    #[test]
+    fn test_fix_inner_gitignore_appends_when_incomplete() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        // .gitignore has one canonical pattern + a custom one; missing *.tmp.
+        fs::write(
+            beads_dir.join(".gitignore"),
+            "# operator custom\n.write.lock\nlocal-cache/\n",
+        )
+        .unwrap();
+
+        let mut report = DoctorReport {
+            ok: false,
+            workspace_health: Some("degraded".to_string()),
+            reliability_audit: None,
+            checks: Vec::new(),
+        };
+        check_inner_gitignore_present(&beads_dir, &mut report.checks);
+
+        let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
+            .expect("session must build");
+        let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Text, false, true);
+        assert!(fix_inner_gitignore_if_warned(
+            &beads_dir,
+            &report,
+            &ctx,
+            Some(&mut session),
+        ));
+        let after = fs::read_to_string(beads_dir.join(".gitignore")).unwrap();
+        // Existing operator lines preserved verbatim.
+        assert!(after.contains("# operator custom"), "{after:?}");
+        assert!(after.contains("local-cache/"), "{after:?}");
+        // Both canonical patterns now present.
+        assert!(
+            after.lines().any(|l| l.trim() == ".write.lock"),
+            "{after:?}"
+        );
+        assert!(after.lines().any(|l| l.trim() == "*.tmp"), "{after:?}");
+    }
+
+    #[test]
+    fn test_fix_inner_gitignore_refuses_symlink() {
+        #[cfg(unix)]
+        {
+            let temp = TempDir::new().unwrap();
+            let beads_dir = temp.path().join(".beads");
+            fs::create_dir_all(&beads_dir).unwrap();
+            // Make .beads/.gitignore a symlink to an external file.
+            let external = temp.path().join("external.gitignore");
+            fs::write(&external, ".write.lock\n").unwrap();
+            std::os::unix::fs::symlink(&external, beads_dir.join(".gitignore")).unwrap();
+
+            let mut report = DoctorReport {
+                ok: false,
+                workspace_health: Some("degraded".to_string()),
+                reliability_audit: None,
+                checks: Vec::new(),
+            };
+            check_inner_gitignore_present(&beads_dir, &mut report.checks);
+
+            let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
+                .expect("session must build");
+            let ctx =
+                OutputContext::from_output_format(crate::cli::OutputFormat::Text, false, true);
+            // Detector warned for symlink, but fixer must refuse — operator
+            // intent (compliance, vendored share) cannot be stomped.
+            assert!(!fix_inner_gitignore_if_warned(
+                &beads_dir,
+                &report,
+                &ctx,
+                Some(&mut session),
+            ));
+            // Symlink still in place pointing at the same target.
+            let after_meta = fs::symlink_metadata(beads_dir.join(".gitignore")).unwrap();
+            assert!(after_meta.file_type().is_symlink());
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_fix_config_yaml_secret_mode_chmods_via_chokepoint() {
@@ -12686,6 +12912,7 @@ mod tests {
             jsonl_crlf: false,
             jsonl_world_writable: false,
             config_yaml_secret_mode: false,
+            inner_gitignore: false,
         };
 
         assert!(summary.applied());
@@ -12740,6 +12967,7 @@ mod tests {
             jsonl_crlf: false,
             jsonl_world_writable: false,
             config_yaml_secret_mode: false,
+            inner_gitignore: false,
         };
 
         assert!(summary.applied());
@@ -12776,6 +13004,7 @@ mod tests {
             jsonl_crlf: false,
             jsonl_world_writable: false,
             config_yaml_secret_mode: false,
+            inner_gitignore: false,
         };
 
         assert!(summary.applied());
@@ -12812,6 +13041,7 @@ mod tests {
             jsonl_crlf: false,
             jsonl_world_writable: false,
             config_yaml_secret_mode: false,
+            inner_gitignore: false,
         };
 
         assert!(summary.applied());

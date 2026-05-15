@@ -432,6 +432,13 @@ fn early_chokepoint_fixer_rows() -> &'static [FixerRow] {
             true,
             &["permissions.config_yaml_secrets"],
         ),
+        (
+            "doctor.inner_gitignore_append",
+            "configs",
+            true,
+            true,
+            &["gitignore.beads_inner_present"],
+        ),
     ]
 }
 
@@ -663,6 +670,7 @@ mod tests {
                 "doctor.jsonl_crlf_to_lf",
                 "doctor.jsonl_world_writable_chmod",
                 "doctor.config_yaml_secret_chmod",
+                "doctor.inner_gitignore_append",
                 "doctor.repair_recoverable_db_state",
                 "doctor.repair_partial_indexes",
                 "doctor.repair_via_vacuum",
