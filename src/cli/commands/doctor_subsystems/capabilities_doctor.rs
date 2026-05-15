@@ -418,6 +418,13 @@ fn early_chokepoint_fixer_rows() -> &'static [FixerRow] {
             true,
             &["jsonl_crlf"],
         ),
+        (
+            "doctor.jsonl_world_writable_chmod",
+            "permissions",
+            true,
+            true,
+            &["permissions.jsonl_world_writable"],
+        ),
     ]
 }
 
@@ -647,6 +654,7 @@ mod tests {
                 "doctor.jsonl_trailing_newline_append",
                 "doctor.jsonl_bom_strip",
                 "doctor.jsonl_crlf_to_lf",
+                "doctor.jsonl_world_writable_chmod",
                 "doctor.repair_recoverable_db_state",
                 "doctor.repair_partial_indexes",
                 "doctor.repair_via_vacuum",

@@ -1470,6 +1470,7 @@ struct EarlyRepairSummary {
     jsonl_eof_newline: bool,
     jsonl_bom: bool,
     jsonl_crlf: bool,
+    jsonl_world_writable: bool,
 }
 
 impl EarlyRepairSummary {
@@ -1485,6 +1486,7 @@ impl EarlyRepairSummary {
             || self.jsonl_eof_newline
             || self.jsonl_bom
             || self.jsonl_crlf
+            || self.jsonl_world_writable
     }
 
     fn action_labels(self) -> Vec<String> {
@@ -1521,6 +1523,9 @@ impl EarlyRepairSummary {
         }
         if self.jsonl_crlf {
             actions.push("jsonl_crlf_converted".to_string());
+        }
+        if self.jsonl_world_writable {
+            actions.push("jsonl_world_write_stripped".to_string());
         }
         actions
     }
@@ -1563,6 +1568,9 @@ impl EarlyRepairSummary {
             messages.push(
                 "Converted CRLF line endings to LF in the selected JSONL export.".to_string(),
             );
+        }
+        if self.jsonl_world_writable {
+            messages.push("Stripped world-write bit from the selected JSONL export.".to_string());
         }
         messages
     }
@@ -3775,6 +3783,96 @@ fn check_jsonl_world_writable(jsonl_path: Option<&Path>, checks: &mut Vec<CheckR
         None,
         None,
     );
+}
+
+/// Pass-5 cycle 25 — fixer for
+/// `fm-permissions-jsonl-world-writable`.
+///
+/// Strips the world-write bit (`0o002`) from the selected JSONL
+/// export's mode via [`chokepoint::mutate(Op::Chmod)`]. This is the
+/// first production exercise of `Op::Chmod`. The chokepoint backs up
+/// the file bytes verbatim (preserving the ORIGINAL mode via
+/// `copy_source_permissions`) so `doctor undo` byte-restores both the
+/// content and the original mode.
+///
+/// Unix-only; non-Unix targets always see the detector emit `Ok` so
+/// the fixer is unreachable there. Returns `true` if the chmod
+/// succeeded.
+fn fix_jsonl_world_writable_if_warned(
+    jsonl_path: Option<&Path>,
+    report: &DoctorReport,
+    ctx: &OutputContext,
+    session: Option<&mut DoctorRepairSession>,
+) -> bool {
+    let has_warning = report
+        .checks
+        .iter()
+        .any(|c| c.name == "permissions.jsonl_world_writable" && c.status == CheckStatus::Warn);
+    if !has_warning {
+        return false;
+    }
+    let Some(path) = jsonl_path else {
+        if !ctx.is_json() {
+            ctx.warning(
+                "Skipping world-writable chmod: no JSONL path resolved (workspace not initialised)",
+            );
+        }
+        return false;
+    };
+    let Some(session) = session else {
+        if !ctx.is_json() {
+            ctx.warning(
+                "Skipping world-writable chmod: no doctor repair session (run-dir creation failed)",
+            );
+        }
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(meta) = fs::symlink_metadata(path) else {
+            return false;
+        };
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            return false;
+        }
+        let current = meta.permissions().mode();
+        if (current & 0o002) == 0 {
+            // TOCTOU: caller may have already chmod'd between detect and fix.
+            return false;
+        }
+        // Keep every other bit; only the world-write bit changes.
+        let new_mode = current & !0o002;
+        session.set_fixer("doctor.jsonl_world_writable_chmod");
+        match chokepoint::mutate(&session.ctx, path, Op::Chmod { mode: new_mode }) {
+            Ok(result) if result.ok => {
+                if !ctx.is_json() {
+                    ctx.info(&format!(
+                        "Stripped world-write bit from {} (mode {:o}→{:o})",
+                        path.display(),
+                        current & 0o777,
+                        new_mode & 0o777
+                    ));
+                }
+                true
+            }
+            Ok(_) => false,
+            Err(err) => {
+                if !ctx.is_json() {
+                    ctx.warning(&format!(
+                        "Failed to chmod world-write bit off {}: {err}",
+                        path.display()
+                    ));
+                }
+                false
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, session);
+        false
+    }
 }
 
 /// Pass-5 cycle 13: detector for the inner-gitignore-present subset of
@@ -9079,6 +9177,24 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         };
     let _ = jsonl_crlf_repaired;
 
+    // Pass-5 cycle 25: strip world-write bit from issues.jsonl via Op::Chmod.
+    let jsonl_world_writable_repaired =
+        if args.repair && fixer_filter.allows("fm-permissions-jsonl-world-writable") {
+            let repaired = fix_jsonl_world_writable_if_warned(
+                initial.jsonl_path.as_deref(),
+                &initial.report,
+                ctx,
+                session.as_mut(),
+            );
+            if repaired {
+                initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+            }
+            repaired
+        } else {
+            false
+        };
+    let _ = jsonl_world_writable_repaired;
+
     if args.repair && (fixer_filter.has_only() || fixer_filter.has_skip()) {
         tracing::info!(
             target: "br::doctor::filter",
@@ -9099,6 +9215,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         jsonl_eof_newline: jsonl_eof_newline_repaired,
         jsonl_bom: jsonl_bom_repaired,
         jsonl_crlf: jsonl_crlf_repaired,
+        jsonl_world_writable: jsonl_world_writable_repaired,
     };
 
     if !args.repair {
@@ -11493,6 +11610,79 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_fix_jsonl_world_writable_chmods_via_chokepoint() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let jsonl = beads_dir.join("issues.jsonl");
+        fs::write(&jsonl, b"{\"id\":\"bd-1\"}\n").unwrap();
+        // Set world-writable mode.
+        fs::set_permissions(&jsonl, fs::Permissions::from_mode(0o666)).unwrap();
+        let before = fs::metadata(&jsonl).unwrap().permissions().mode() & 0o777;
+        assert_ne!(before & 0o002, 0, "precondition: world-write bit set");
+
+        let mut report = DoctorReport {
+            ok: false,
+            workspace_health: Some("degraded".to_string()),
+            reliability_audit: None,
+            checks: Vec::new(),
+        };
+        check_jsonl_world_writable(Some(&jsonl), &mut report.checks);
+
+        let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
+            .expect("session must build");
+        let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Text, false, true);
+        assert!(fix_jsonl_world_writable_if_warned(
+            Some(&jsonl),
+            &report,
+            &ctx,
+            Some(&mut session),
+        ));
+        let after = fs::metadata(&jsonl).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            after & 0o002,
+            0,
+            "world-write bit must be cleared (mode {after:o})"
+        );
+        // Owner/group bits preserved: only the world-write bit changed.
+        assert_eq!(after, before & !0o002, "only world-write bit removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_fix_jsonl_world_writable_noop_when_clean() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let jsonl = beads_dir.join("issues.jsonl");
+        fs::write(&jsonl, b"{\"id\":\"bd-clean\"}\n").unwrap();
+        fs::set_permissions(&jsonl, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let mut report = DoctorReport {
+            ok: true,
+            workspace_health: Some("healthy".to_string()),
+            reliability_audit: None,
+            checks: Vec::new(),
+        };
+        check_jsonl_world_writable(Some(&jsonl), &mut report.checks);
+
+        let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
+            .expect("session must build");
+        let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Text, false, true);
+        assert!(!fix_jsonl_world_writable_if_warned(
+            Some(&jsonl),
+            &report,
+            &ctx,
+            Some(&mut session),
+        ));
+        let after = fs::metadata(&jsonl).unwrap().permissions().mode() & 0o777;
+        assert_eq!(after, 0o644, "mode untouched when no warning");
+    }
+
     #[test]
     fn test_fix_jsonl_crlf_converts_via_chokepoint() {
         // The fixer must rewrite the file converting CRLF→LF and
@@ -12306,6 +12496,7 @@ mod tests {
             jsonl_eof_newline: false,
             jsonl_bom: false,
             jsonl_crlf: false,
+            jsonl_world_writable: false,
         };
 
         assert!(summary.applied());
@@ -12358,6 +12549,7 @@ mod tests {
             jsonl_eof_newline: false,
             jsonl_bom: false,
             jsonl_crlf: false,
+            jsonl_world_writable: false,
         };
 
         assert!(summary.applied());
@@ -12392,6 +12584,7 @@ mod tests {
             jsonl_eof_newline: false,
             jsonl_bom: false,
             jsonl_crlf: false,
+            jsonl_world_writable: false,
         };
 
         assert!(summary.applied());
@@ -12426,6 +12619,7 @@ mod tests {
             jsonl_eof_newline: false,
             jsonl_bom: false,
             jsonl_crlf: false,
+            jsonl_world_writable: false,
         };
 
         assert!(summary.applied());
