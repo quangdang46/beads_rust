@@ -425,6 +425,13 @@ fn early_chokepoint_fixer_rows() -> &'static [FixerRow] {
             true,
             &["permissions.jsonl_world_writable"],
         ),
+        (
+            "doctor.config_yaml_secret_chmod",
+            "permissions",
+            true,
+            true,
+            &["permissions.config_yaml_secrets"],
+        ),
     ]
 }
 
@@ -655,6 +662,7 @@ mod tests {
                 "doctor.jsonl_bom_strip",
                 "doctor.jsonl_crlf_to_lf",
                 "doctor.jsonl_world_writable_chmod",
+                "doctor.config_yaml_secret_chmod",
                 "doctor.repair_recoverable_db_state",
                 "doctor.repair_partial_indexes",
                 "doctor.repair_via_vacuum",

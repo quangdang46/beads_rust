@@ -1471,6 +1471,7 @@ struct EarlyRepairSummary {
     jsonl_bom: bool,
     jsonl_crlf: bool,
     jsonl_world_writable: bool,
+    config_yaml_secret_mode: bool,
 }
 
 impl EarlyRepairSummary {
@@ -1487,6 +1488,7 @@ impl EarlyRepairSummary {
             || self.jsonl_bom
             || self.jsonl_crlf
             || self.jsonl_world_writable
+            || self.config_yaml_secret_mode
     }
 
     fn action_labels(self) -> Vec<String> {
@@ -1526,6 +1528,9 @@ impl EarlyRepairSummary {
         }
         if self.jsonl_world_writable {
             actions.push("jsonl_world_write_stripped".to_string());
+        }
+        if self.config_yaml_secret_mode {
+            actions.push("config_yaml_secret_mode_chmod".to_string());
         }
         actions
     }
@@ -1571,6 +1576,12 @@ impl EarlyRepairSummary {
         }
         if self.jsonl_world_writable {
             messages.push("Stripped world-write bit from the selected JSONL export.".to_string());
+        }
+        if self.config_yaml_secret_mode {
+            messages.push(
+                "Stripped world-read/write bits from `.beads/config.yaml` (contains secrets)."
+                    .to_string(),
+            );
         }
         messages
     }
@@ -4175,6 +4186,91 @@ fn check_config_yaml_secret_mode(beads_dir: &Path, checks: &mut Vec<CheckResult>
             "remediation": format!("chmod 0600 {}", config.display()),
         })),
     );
+}
+
+/// Pass-5 cycle 26 — fixer for
+/// `fm-permissions-config-yaml-mode-leaks-secrets`.
+///
+/// When the detector warns that `.beads/config.yaml` is world-readable
+/// AND contains secret-shaped keywords, strip the world-read AND
+/// world-write bits (`0o006` mask) via [`chokepoint::mutate(Op::Chmod)`].
+/// We strip both because a file flagged as containing secrets should
+/// not be world-readable OR world-writable; the mask is conservative
+/// (group bits preserved) so operators using group-shared configs
+/// keep working. The chokepoint backs up the file bytes verbatim with
+/// the ORIGINAL mode preserved, so `doctor undo` byte-restores both
+/// content and mode through the existing WriteFile-with-mode path.
+///
+/// Unix-only; non-Unix targets always emit Ok from the detector so the
+/// fixer is unreachable there.
+fn fix_config_yaml_secret_mode_if_warned(
+    beads_dir: &Path,
+    report: &DoctorReport,
+    ctx: &OutputContext,
+    session: Option<&mut DoctorRepairSession>,
+) -> bool {
+    let has_warning = report
+        .checks
+        .iter()
+        .any(|c| c.name == "permissions.config_yaml_secrets" && c.status == CheckStatus::Warn);
+    if !has_warning {
+        return false;
+    }
+    let Some(session) = session else {
+        if !ctx.is_json() {
+            ctx.warning(
+                "Skipping config.yaml secrets chmod: no doctor repair session (run-dir creation failed)",
+            );
+        }
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = beads_dir.join("config.yaml");
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            return false;
+        };
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            return false;
+        }
+        let current = meta.permissions().mode();
+        // Already secured — TOCTOU defense.
+        if (current & 0o006) == 0 {
+            return false;
+        }
+        // Strip world-read AND world-write; preserve every other bit.
+        let new_mode = current & !0o006;
+        session.set_fixer("doctor.config_yaml_secret_chmod");
+        match chokepoint::mutate(&session.ctx, &path, Op::Chmod { mode: new_mode }) {
+            Ok(result) if result.ok => {
+                if !ctx.is_json() {
+                    ctx.info(&format!(
+                        "Stripped world-read/write bits from {} (mode {:o}→{:o})",
+                        path.display(),
+                        current & 0o777,
+                        new_mode & 0o777
+                    ));
+                }
+                true
+            }
+            Ok(_) => false,
+            Err(err) => {
+                if !ctx.is_json() {
+                    ctx.warning(&format!(
+                        "Failed to chmod config.yaml secret mode {}: {err}",
+                        path.display()
+                    ));
+                }
+                false
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (beads_dir, session);
+        false
+    }
 }
 
 /// Pass-5 cycle 10: detector for
@@ -9195,6 +9291,25 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         };
     let _ = jsonl_world_writable_repaired;
 
+    // Pass-5 cycle 26: strip world-read/write bits from .beads/config.yaml
+    // when it contains secrets, via Op::Chmod.
+    let config_yaml_secret_mode_repaired =
+        if args.repair && fixer_filter.allows("fm-permissions-config-yaml-mode-leaks-secrets") {
+            let repaired = fix_config_yaml_secret_mode_if_warned(
+                &beads_dir,
+                &initial.report,
+                ctx,
+                session.as_mut(),
+            );
+            if repaired {
+                initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+            }
+            repaired
+        } else {
+            false
+        };
+    let _ = config_yaml_secret_mode_repaired;
+
     if args.repair && (fixer_filter.has_only() || fixer_filter.has_skip()) {
         tracing::info!(
             target: "br::doctor::filter",
@@ -9216,6 +9331,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         jsonl_bom: jsonl_bom_repaired,
         jsonl_crlf: jsonl_crlf_repaired,
         jsonl_world_writable: jsonl_world_writable_repaired,
+        config_yaml_secret_mode: config_yaml_secret_mode_repaired,
     };
 
     if !args.repair {
@@ -11612,6 +11728,78 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn test_fix_config_yaml_secret_mode_chmods_via_chokepoint() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let config = beads_dir.join("config.yaml");
+        fs::write(&config, b"github_token: abc123\nfoo: bar\n").unwrap();
+        // World-readable + world-writable; contains secret-shaped keyword.
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o666)).unwrap();
+        let before = fs::metadata(&config).unwrap().permissions().mode() & 0o777;
+
+        let mut report = DoctorReport {
+            ok: false,
+            workspace_health: Some("degraded".to_string()),
+            reliability_audit: None,
+            checks: Vec::new(),
+        };
+        check_config_yaml_secret_mode(&beads_dir, &mut report.checks);
+
+        let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
+            .expect("session must build");
+        let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Text, false, true);
+        assert!(fix_config_yaml_secret_mode_if_warned(
+            &beads_dir,
+            &report,
+            &ctx,
+            Some(&mut session),
+        ));
+        let after = fs::metadata(&config).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            after & 0o006,
+            0,
+            "world-read/write bits must be cleared (mode {after:o})"
+        );
+        assert_eq!(after, before & !0o006, "only world bits removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_fix_config_yaml_secret_mode_noop_when_no_warning() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let config = beads_dir.join("config.yaml");
+        fs::write(&config, b"foo: bar\n").unwrap();
+        // World-readable but NO secrets → no warn → no fix.
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let mut report = DoctorReport {
+            ok: true,
+            workspace_health: Some("healthy".to_string()),
+            reliability_audit: None,
+            checks: Vec::new(),
+        };
+        check_config_yaml_secret_mode(&beads_dir, &mut report.checks);
+
+        let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
+            .expect("session must build");
+        let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Text, false, true);
+        assert!(!fix_config_yaml_secret_mode_if_warned(
+            &beads_dir,
+            &report,
+            &ctx,
+            Some(&mut session),
+        ));
+        let after = fs::metadata(&config).unwrap().permissions().mode() & 0o777;
+        assert_eq!(after, 0o644, "mode untouched when no warning");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn test_fix_jsonl_world_writable_chmods_via_chokepoint() {
         use std::os::unix::fs::PermissionsExt;
         let temp = TempDir::new().unwrap();
@@ -12497,6 +12685,7 @@ mod tests {
             jsonl_bom: false,
             jsonl_crlf: false,
             jsonl_world_writable: false,
+            config_yaml_secret_mode: false,
         };
 
         assert!(summary.applied());
@@ -12550,6 +12739,7 @@ mod tests {
             jsonl_bom: false,
             jsonl_crlf: false,
             jsonl_world_writable: false,
+            config_yaml_secret_mode: false,
         };
 
         assert!(summary.applied());
@@ -12585,6 +12775,7 @@ mod tests {
             jsonl_bom: false,
             jsonl_crlf: false,
             jsonl_world_writable: false,
+            config_yaml_secret_mode: false,
         };
 
         assert!(summary.applied());
@@ -12620,6 +12811,7 @@ mod tests {
             jsonl_bom: false,
             jsonl_crlf: false,
             jsonl_world_writable: false,
+            config_yaml_secret_mode: false,
         };
 
         assert!(summary.applied());
