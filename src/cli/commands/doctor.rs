@@ -2936,11 +2936,27 @@ const BR_HISTORY_SNAPSHOT_THRESHOLD: usize = 100;
 
 fn check_br_history_size(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
     let history = beads_dir.join(".br_history");
-    let Ok(entries) = fs::read_dir(&history) else {
-        push_check(checks, "br_history.size", CheckStatus::Ok, None, None);
-        return;
+    let backups = match crate::sync::history::list_backups(&history, None) {
+        Ok(backups) => backups,
+        Err(err) => {
+            push_check(
+                checks,
+                "br_history.size",
+                CheckStatus::Warn,
+                Some(format!(
+                    "Could not inspect history directory {}: {err}",
+                    history.display()
+                )),
+                Some(serde_json::json!({
+                    "history_dir": history.display().to_string(),
+                    "error": err.to_string(),
+                    "remediation": "Inspect .beads/.br_history/ permissions and symlink shape",
+                })),
+            );
+            return;
+        }
     };
-    let snapshot_count = entries.flatten().filter(|e| e.path().is_file()).count();
+    let snapshot_count = backups.len();
     if snapshot_count > BR_HISTORY_SNAPSHOT_THRESHOLD {
         push_check(
             checks,
@@ -10481,7 +10497,11 @@ mod tests {
         let history = beads_dir.join(".br_history");
         fs::create_dir_all(&history).unwrap();
         for i in 0..(BR_HISTORY_SNAPSHOT_THRESHOLD + 5) {
-            fs::write(history.join(format!("issues.{i:05}.jsonl")), b"{}\n").unwrap();
+            fs::write(
+                history.join(format!("issues.20250101_000000.{i}.jsonl")),
+                b"{}\n",
+            )
+            .unwrap();
         }
         let mut checks = Vec::new();
         check_br_history_size(&beads_dir, &mut checks);
@@ -10502,12 +10522,36 @@ mod tests {
         let history = beads_dir.join(".br_history");
         fs::create_dir_all(&history).unwrap();
         for i in 0..5 {
-            fs::write(history.join(format!("issues.{i}.jsonl")), b"{}\n").unwrap();
+            fs::write(
+                history.join(format!("issues.20250101_000000.{i}.jsonl")),
+                b"{}\n",
+            )
+            .unwrap();
         }
         let mut checks = Vec::new();
         check_br_history_size(&beads_dir, &mut checks);
         let check = find_check(&checks, "br_history.size").expect("check present");
         assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn test_check_br_history_metadata_sidecars_do_not_count_as_snapshots() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let history = beads_dir.join(".br_history");
+        fs::create_dir_all(&history).unwrap();
+        for i in 0..BR_HISTORY_SNAPSHOT_THRESHOLD {
+            let backup = history.join(format!("issues.20250101_000000.{i}.jsonl"));
+            fs::write(&backup, b"{}\n").unwrap();
+            fs::write(backup.with_extension("jsonl.meta.json"), b"{not-json").unwrap();
+        }
+        let mut checks = Vec::new();
+        check_br_history_size(&beads_dir, &mut checks);
+        let check = find_check(&checks, "br_history.size").expect("check present");
+        assert!(
+            matches!(check.status, CheckStatus::Ok),
+            "metadata sidecars must not push threshold backups over the limit: {check:?}"
+        );
     }
 
     #[test]
