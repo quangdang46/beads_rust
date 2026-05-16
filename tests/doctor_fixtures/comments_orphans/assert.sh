@@ -33,7 +33,7 @@ orphan_body() {
 import sqlite3
 conn = sqlite3.connect(".beads/beads.db")
 cur = conn.cursor()
-cur.execute("SELECT body FROM comments WHERE issue_id = 'bd-ghost-fixture'")
+cur.execute("SELECT text FROM comments WHERE issue_id = 'bd-ghost-fixture'")
 row = cur.fetchone()
 print(row[0] if row else "")
 conn.close()

@@ -40,7 +40,7 @@ conn = sqlite3.connect(".beads/beads.db")
 cur = conn.cursor()
 cur.execute("PRAGMA foreign_keys = OFF")
 cur.execute(
-    "INSERT INTO comments(issue_id, body, created_at, author) "
+    "INSERT INTO comments(issue_id, text, created_at, author) "
     "VALUES (?, ?, ?, ?)",
     ("bd-ghost-fixture", "orphan body", "2026-05-16T00:00:00Z", "ghost"),
 )
