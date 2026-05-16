@@ -4967,7 +4967,7 @@ fn fix_dirty_bitmap_orphans_if_warned(
     }
 }
 
-/// Pass-5 cycle 34 — detector for `fm-caches_indexes-comments-orphans`.
+/// Pass-5 cycle 34: detector for `fm-caches_indexes-comments-orphans`.
 ///
 /// The `comments` table declares `FOREIGN KEY (issue_id) REFERENCES
 /// issues(id) ON DELETE CASCADE` so orphan rows shouldn't normally
@@ -5015,7 +5015,7 @@ fn check_comments_orphans(conn: &Connection, checks: &mut Vec<CheckResult>) {
         "comments.orphans",
         CheckStatus::Warn,
         Some(format!(
-            "{orphan_count} orphan row(s) in comments — issue_id has no matching issues row (FK guard probably bypassed during a delete)"
+            "{orphan_count} orphan row(s) in comments - issue_id has no matching issues row (FK guard probably bypassed during a delete)"
         )),
         Some(serde_json::json!({
             "orphan_count": orphan_count,
@@ -5025,7 +5025,7 @@ fn check_comments_orphans(conn: &Connection, checks: &mut Vec<CheckResult>) {
     );
 }
 
-/// Pass-5 cycle 34 — fixer for `fm-caches_indexes-comments-orphans`.
+/// Pass-5 cycle 34: fixer for `fm-caches_indexes-comments-orphans`.
 ///
 /// Surgically deletes orphan rows from `comments` (rows whose
 /// `issue_id` no longer exists in `issues`) via
@@ -5033,6 +5033,9 @@ fn check_comments_orphans(conn: &Connection, checks: &mut Vec<CheckResult>) {
 /// fixer from cycle 29 exactly: the chokepoint snapshots every row
 /// matching the orphan predicate before the DELETE fires, so
 /// `doctor undo` can restore the orphan rows from snapshot.
+const COMMENTS_ORPHAN_PREDICATE: &str =
+    "NOT EXISTS (SELECT 1 FROM issues WHERE issues.id = comments.issue_id)";
+
 fn fix_comments_orphans_if_warned(
     db_path: &Path,
     report: &DoctorReport,
@@ -5056,10 +5059,10 @@ fn fix_comments_orphans_if_warned(
     };
     session.set_fixer("doctor.comments_orphan_prune");
     let op = Op::DbExec {
-        sql: "DELETE FROM comments WHERE issue_id NOT IN (SELECT id FROM issues)".to_string(),
+        sql: format!("DELETE FROM comments WHERE {COMMENTS_ORPHAN_PREDICATE}"),
         args: Vec::new(),
         affected_tables: vec!["comments".to_string()],
-        affected_predicate: Some("issue_id NOT IN (SELECT id FROM issues)".to_string()),
+        affected_predicate: Some(COMMENTS_ORPHAN_PREDICATE.to_string()),
     };
     match chokepoint::mutate(&session.ctx, db_path, op) {
         Ok(result) if result.ok => {
@@ -10058,21 +10061,18 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     let _ = dirty_bitmap_orphans_repaired;
 
     // Pass-5 cycle 34: surgically prune orphan comments rows via Op::DbExec.
-    let comments_orphans_repaired =
-        if args.repair && fixer_filter.allows("fm-caches_indexes-comments-orphans") {
-            let repaired = fix_comments_orphans_if_warned(
-                &paths.db_path,
-                &initial.report,
-                ctx,
-                session.as_mut(),
-            );
-            if repaired {
-                initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
-            }
-            repaired
-        } else {
-            false
-        };
+    let comments_orphans_repaired = if args.repair
+        && fixer_filter.allows("fm-caches_indexes-comments-orphans")
+    {
+        let repaired =
+            fix_comments_orphans_if_warned(&paths.db_path, &initial.report, ctx, session.as_mut());
+        if repaired {
+            initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+        }
+        repaired
+    } else {
+        false
+    };
     let _ = comments_orphans_repaired;
 
     if args.repair && (fixer_filter.has_only() || fixer_filter.has_skip()) {
@@ -11731,7 +11731,7 @@ mod tests {
         let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
         let _ = conn.execute("PRAGMA foreign_keys = OFF");
         conn.execute_with_params(
-            "INSERT INTO comments(issue_id, body, created_at, author) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO comments(issue_id, text, created_at, author) VALUES (?1, ?2, ?3, ?4)",
             &[
                 SqliteValue::Text("bd-orphan-c".into()),
                 SqliteValue::Text("orphan body".into()),
@@ -11776,7 +11776,7 @@ mod tests {
             let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
             let _ = conn.execute("PRAGMA foreign_keys = OFF");
             conn.execute_with_params(
-                "INSERT INTO comments(issue_id, body, created_at, author) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO comments(issue_id, text, created_at, author) VALUES (?1, ?2, ?3, ?4)",
                 &[
                     SqliteValue::Text("bd-orphan-fix".into()),
                     SqliteValue::Text("orphan body".into()),
@@ -11797,10 +11797,12 @@ mod tests {
             let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
             check_comments_orphans(&conn, &mut report.checks);
         }
-        assert!(report
-            .checks
-            .iter()
-            .any(|c| c.name == "comments.orphans" && matches!(c.status, CheckStatus::Warn)));
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.name == "comments.orphans" && matches!(c.status, CheckStatus::Warn))
+        );
 
         let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
             .expect("session must build");
