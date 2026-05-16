@@ -264,6 +264,7 @@ const DETECTOR_ROWS: &[DetectorRow] = &[
     ("doctor.runs_creatable", "permissions", "warn", true),
     ("permissions.recovery_dir", "permissions", "warn", true),
     ("permissions.write_lock", "permissions", "warn", true),
+    ("permissions.root_gitignore", "permissions", "warn", true),
     (
         "permissions.config_yaml_secrets",
         "permissions",

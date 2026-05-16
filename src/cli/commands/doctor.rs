@@ -653,6 +653,10 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
         "fm-state_files-orphaned-write-lock",
     ),
     (
+        "permissions.root_gitignore",
+        "fm-permissions-gitignore-not-writable-blocks-repair",
+    ),
+    (
         "permissions.config_yaml_secrets",
         "fm-permissions-config-yaml-mode-leaks-secrets",
     ),
@@ -4665,6 +4669,77 @@ fn check_write_lock_writable(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
     push_check(
         checks,
         "permissions.write_lock",
+        CheckStatus::Ok,
+        None,
+        None,
+    );
+}
+
+/// Pass-5 cycle 32 — detector for
+/// `fm-permissions-gitignore-not-writable-blocks-repair`.
+///
+/// Warns when the repo-root `.gitignore` exists but the current
+/// process lacks owner-write permission on it. The existing
+/// `doctor.gitignore_repair` fixer rewrites this file in place when
+/// the `.beads/` shadow rule is missing; a read-only file makes that
+/// write fail mid-fix and leaves the workspace in the same bad
+/// state the operator started in.
+///
+/// Detect-only — operators may have intentionally locked the
+/// repo-root `.gitignore` (compliance-controlled file, vendored
+/// shared config). Remediation: `chmod u+w .gitignore` or hand-edit
+/// the file before re-running `--repair`.
+///
+/// Unix-only — non-Unix lacks POSIX mode bits this check relies on.
+fn check_root_gitignore_writable(repo_root: &Path, checks: &mut Vec<CheckResult>) {
+    let gitignore = repo_root.join(".gitignore");
+    let Ok(meta) = fs::symlink_metadata(&gitignore) else {
+        // Missing is fine — the gitignore_repair fixer creates one.
+        push_check(
+            checks,
+            "permissions.root_gitignore",
+            CheckStatus::Ok,
+            None,
+            None,
+        );
+        return;
+    };
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        push_check(
+            checks,
+            "permissions.root_gitignore",
+            CheckStatus::Ok,
+            None,
+            None,
+        );
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode();
+        if (mode & 0o200) == 0 {
+            push_check(
+                checks,
+                "permissions.root_gitignore",
+                CheckStatus::Warn,
+                Some(format!(
+                    "{} is not writable by owner (mode {:o}); `doctor --repair` cannot fix a missing `.beads/` rule until owner-write is restored",
+                    gitignore.display(),
+                    mode & 0o777
+                )),
+                Some(serde_json::json!({
+                    "path": gitignore.display().to_string(),
+                    "mode_octal": format!("{:o}", mode & 0o777),
+                    "remediation": format!("`chmod u+w {}` or hand-edit before re-running `--repair`", gitignore.display()),
+                })),
+            );
+            return;
+        }
+    }
+    push_check(
+        checks,
+        "permissions.root_gitignore",
         CheckStatus::Ok,
         None,
         None,
@@ -9045,6 +9120,9 @@ fn collect_doctor_report_with_mode_and_db_override(
     // Pass-5 cycle 31: writability of `.beads/.write.lock` so we don't
     // mask EACCES failures as cryptic "could not open lock" errors.
     check_write_lock_writable(beads_dir, &mut checks);
+    // Pass-5 cycle 32: writability of the repo-root `.gitignore` —
+    // surfaces a real blocker to the existing gitignore_repair fixer.
+    check_root_gitignore_writable(repo_root, &mut checks);
     // Pass-5 cycle 11: world-readable config.yaml containing secrets.
     check_config_yaml_secret_mode(beads_dir, &mut checks);
     // Pass-5 cycle 12: multiple `br` binaries on $PATH (env-based,
@@ -9789,25 +9867,20 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 .report
                 .checks
                 .retain(|c| !is_quick_suppressed_doctor_check(&c.name));
-            // Recompute `ok` from the filtered set so the exit code
-            // reflects only the cheap checks the caller asked for.
-            initial.report.ok = !has_non_ok(&initial.report.checks);
         }
+        // Per `DoctorExitCode` (and the surface documentation in
+        // `doctor_subsystems/surface.rs`), `br doctor` without `--repair`
+        // should exit `FindingsPresent` (1) whenever any check is not OK
+        // — both WARN and Error. Quick mode already recomputed `ok` this
+        // way after filtering; the full-mode path used to leave `ok`
+        // pinned to `!has_error(&checks)` (set by report construction)
+        // which left WARN findings shaped as `ok: true` in JSON while
+        // we wanted them to fail. Recompute unconditionally so the JSON
+        // `ok` field and the exit code agree on the same predicate
+        // (`!has_non_ok`). See #292.
+        initial.report.ok = !has_non_ok(&initial.report.checks);
         print_report(&initial.report, ctx)?;
-        // `report.ok` is the "no Error" signal (per the
-        // `DoctorInspectionMode::Full => !has_error(&checks)` rule used
-        // at report construction), which is the right shape for the
-        // `ok: bool` JSON field but the wrong shape for the doctor exit
-        // code: per the `DoctorExitCode` contract (and the surface
-        // documentation in `doctor_subsystems/surface.rs`), `br doctor`
-        // without `--repair` should exit `FindingsPresent` (1) whenever
-        // any check is not OK — both WARN and Error. Today WARN-only
-        // findings exit 0 because we keyed exit off `report.ok` instead
-        // of `has_non_ok`. Use the structured exit code so callers can
-        // distinguish "recoverable, --repair would fix" from
-        // "manual intervention" (see #292).
-        let has_findings = has_non_ok(&initial.report.checks);
-        if has_findings {
+        if !initial.report.ok {
             std::process::exit(DoctorExitCode::FindingsPresent.as_i32());
         }
         return Ok(());
@@ -11614,6 +11687,48 @@ mod tests {
         check_doctor_runs_creatable(temp.path(), &mut checks);
         let check = find_check(&checks, "doctor.runs_creatable").expect("check present");
         assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn test_check_root_gitignore_writable_ok_when_missing() {
+        let temp = TempDir::new().unwrap();
+        let mut checks = Vec::new();
+        check_root_gitignore_writable(temp.path(), &mut checks);
+        let check = find_check(&checks, "permissions.root_gitignore").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn test_check_root_gitignore_writable_ok_when_writable() {
+        let temp = TempDir::new().unwrap();
+        fs::write(temp.path().join(".gitignore"), b"target/\n").unwrap();
+        let mut checks = Vec::new();
+        check_root_gitignore_writable(temp.path(), &mut checks);
+        let check = find_check(&checks, "permissions.root_gitignore").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_root_gitignore_writable_warns_when_not_writable() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let gi = temp.path().join(".gitignore");
+        fs::write(&gi, b"target/\n").unwrap();
+        fs::set_permissions(&gi, fs::Permissions::from_mode(0o444)).unwrap();
+
+        let mut checks = Vec::new();
+        check_root_gitignore_writable(temp.path(), &mut checks);
+        let check = find_check(&checks, "permissions.root_gitignore").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
+        let details = check.details.as_ref().expect("details");
+        assert_eq!(
+            details.get("mode_octal").and_then(|v| v.as_str()),
+            Some("444")
+        );
+
+        // Restore so TempDir's drop can clean up.
+        fs::set_permissions(&gi, fs::Permissions::from_mode(0o644)).unwrap();
     }
 
     #[test]
