@@ -265,6 +265,7 @@ const DETECTOR_ROWS: &[DetectorRow] = &[
     ("permissions.recovery_dir", "permissions", "warn", true),
     ("permissions.write_lock", "permissions", "warn", true),
     ("permissions.root_gitignore", "permissions", "warn", true),
+    ("jsonl.duplicate_ids", "state_files", "warn", false),
     (
         "permissions.config_yaml_secrets",
         "permissions",

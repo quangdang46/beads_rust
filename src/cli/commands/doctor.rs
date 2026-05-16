@@ -656,6 +656,7 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
         "permissions.root_gitignore",
         "fm-permissions-gitignore-not-writable-blocks-repair",
     ),
+    ("jsonl.duplicate_ids", "fm-state_files-jsonl-duplicate-ids"),
     (
         "permissions.config_yaml_secrets",
         "fm-permissions-config-yaml-mode-leaks-secrets",
@@ -3667,6 +3668,99 @@ fn check_jsonl_oversized(jsonl_path: Option<&Path>, checks: &mut Vec<CheckResult
     }
 }
 
+/// Pass-5 cycle 33: detector for
+/// `fm-state_files-jsonl-duplicate-ids`.
+///
+/// Streams the selected JSONL export line by line, extracts the
+/// top-level `id` value from each record, and warns when any id
+/// appears more than once. Two records with the same id is a clear
+/// corruption signal - usually the result of an unresolved merge
+/// conflict that left both sides' records or a partial JSONL rebuild
+/// that double-appended an issue.
+///
+/// Detect-only - auto-fix is too risky: deciding which copy is
+/// canonical depends on operator intent (timestamp? content hash?
+/// dependency graph?). If SQLite is authoritative, operators can
+/// regenerate JSONL with `br sync --flush-only`; if JSONL is
+/// authoritative, they must manually remove stale records before any
+/// import/rebuild.
+///
+/// Records up to 5 duplicate IDs so the operator can locate
+/// them quickly. Malformed lines are left to the existing JSONL parse
+/// detector; this check only uses records that parse and expose a
+/// string `id`.
+fn check_jsonl_duplicate_ids(jsonl_path: Option<&Path>, checks: &mut Vec<CheckResult>) {
+    use std::collections::BTreeMap;
+    use std::io::{BufRead, BufReader};
+
+    let Some(path) = jsonl_path else {
+        push_check(checks, "jsonl.duplicate_ids", CheckStatus::Ok, None, None);
+        return;
+    };
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        push_check(checks, "jsonl.duplicate_ids", CheckStatus::Ok, None, None);
+        return;
+    };
+    if meta.file_type().is_symlink() || !meta.is_file() || meta.len() == 0 {
+        push_check(checks, "jsonl.duplicate_ids", CheckStatus::Ok, None, None);
+        return;
+    }
+    let Ok(file) = fs::File::open(path) else {
+        push_check(checks, "jsonl.duplicate_ids", CheckStatus::Ok, None, None);
+        return;
+    };
+    let mut id_counts = BTreeMap::<String, u64>::new();
+    for line in BufReader::new(file)
+        .lines()
+        .map_while(std::result::Result::ok)
+    {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if let Some(id) = record.get("id").and_then(serde_json::Value::as_str)
+            && !id.is_empty()
+        {
+            *id_counts.entry(id.to_string()).or_default() += 1;
+        }
+    }
+    let duplicate_counts: Vec<(&String, u64)> = id_counts
+        .iter()
+        .filter_map(|(id, count)| (*count > 1).then_some((id, *count)))
+        .collect();
+    if duplicate_counts.is_empty() {
+        push_check(checks, "jsonl.duplicate_ids", CheckStatus::Ok, None, None);
+        return;
+    }
+    let total_dup_records: u64 = duplicate_counts.iter().map(|(_, count)| *count).sum();
+    let sample_ids: Vec<&str> = duplicate_counts
+        .iter()
+        .take(5)
+        .map(|(id, _)| id.as_str())
+        .collect();
+    push_check(
+        checks,
+        "jsonl.duplicate_ids",
+        CheckStatus::Warn,
+        Some(format!(
+            "{} contains {} duplicate id(s) across {} record(s); usually an unresolved merge artifact",
+            path.display(),
+            duplicate_counts.len(),
+            total_dup_records
+        )),
+        Some(serde_json::json!({
+            "path": path.display().to_string(),
+            "distinct_duplicate_ids": duplicate_counts.len(),
+            "total_duplicate_records": total_dup_records,
+            "sample_duplicate_ids": sample_ids,
+            "remediation": "If SQLite is authoritative, run `br sync --flush-only` to regenerate JSONL; if JSONL is authoritative, edit out stale duplicate records before import/rebuild",
+        })),
+    );
+}
+
 /// Pass-5 cycle 15: detector for
 /// `fm-state_files-orphan-tmp-files`.
 ///
@@ -4680,10 +4774,9 @@ fn check_write_lock_writable(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
 ///
 /// Warns when the repo-root `.gitignore` exists but the current
 /// process lacks owner-write permission on it. The existing
-/// `doctor.gitignore_repair` fixer rewrites this file in place when
-/// the `.beads/` shadow rule is missing; a read-only file makes that
-/// write fail mid-fix and leaves the workspace in the same bad
-/// state the operator started in.
+/// `doctor.gitignore_repair` fixer rewrites this file when the
+/// `.beads/` shadow rule is missing; this detector lets that fixer
+/// refuse the write before it bypasses an intentionally locked file.
 ///
 /// Detect-only — operators may have intentionally locked the
 /// repo-root `.gitignore` (compliance-controlled file, vendored
@@ -4724,7 +4817,7 @@ fn check_root_gitignore_writable(repo_root: &Path, checks: &mut Vec<CheckResult>
                 "permissions.root_gitignore",
                 CheckStatus::Warn,
                 Some(format!(
-                    "{} is not writable by owner (mode {:o}); `doctor --repair` cannot fix a missing `.beads/` rule until owner-write is restored",
+                    "{} is not writable by owner (mode {:o}); `doctor --repair` will skip `.gitignore` repair until owner-write is restored",
                     gitignore.display(),
                     mode & 0o777
                 )),
@@ -7113,6 +7206,16 @@ fn fix_root_gitignore_if_warned(
     if !has_warning {
         return false;
     }
+    let root_gitignore_locked = report
+        .checks
+        .iter()
+        .any(|c| c.name == "permissions.root_gitignore" && matches!(c.status, CheckStatus::Warn));
+    if root_gitignore_locked {
+        if !ctx.is_json() {
+            ctx.warning("Skipping .gitignore repair: root .gitignore is not owner-writable");
+        }
+        return false;
+    }
     let Some(project_root) = beads_dir.parent() else {
         return false;
     };
@@ -9194,6 +9297,9 @@ fn inspect_doctor_jsonl(
     check_jsonl_trailing_newline(jsonl_path.as_deref(), checks);
     // Pass-5 cycle 17: oversized JSONL (slow flushes, RAM pressure).
     check_jsonl_oversized(jsonl_path.as_deref(), checks);
+    // Pass-5 cycle 33: scan for duplicate `id` values in the JSONL
+    // (merge-artifact corruption signal).
+    check_jsonl_duplicate_ids(jsonl_path.as_deref(), checks);
     let jsonl_count = if let Some(path) = jsonl_path.as_ref() {
         check_sync_jsonl_path(path, beads_dir, checks);
         check_sync_conflict_markers(path, checks);
@@ -12235,6 +12341,75 @@ mod tests {
         let mut checks = Vec::new();
         check_orphan_tmp_files(&beads_dir, &mut checks);
         let check = find_check(&checks, "tmp_files_orphan").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn test_check_jsonl_duplicate_ids_warns_on_dup() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let jsonl = beads_dir.join("issues.jsonl");
+        // 3 records: two share id=bd-aaa, one unique. The second
+        // duplicate intentionally uses valid JSON whitespace that a
+        // literal `"id":"` substring scan would miss.
+        fs::write(
+            &jsonl,
+            "{\"id\":\"bd-aaa\",\"title\":\"first\"}\n\
+             {\"id\":\"bd-bbb\",\"title\":\"unique\"}\n\
+             {\"id\": \"bd-aaa\", \"title\":\"merge-conflict-side\"}\n",
+        )
+        .unwrap();
+
+        let mut checks = Vec::new();
+        check_jsonl_duplicate_ids(Some(&jsonl), &mut checks);
+        let check = find_check(&checks, "jsonl.duplicate_ids").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
+        let details = check.details.as_ref().expect("details");
+        assert_eq!(
+            details
+                .get("distinct_duplicate_ids")
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            details
+                .get("total_duplicate_records")
+                .and_then(serde_json::Value::as_u64),
+            Some(2)
+        );
+        let sample = details
+            .get("sample_duplicate_ids")
+            .and_then(|v| v.as_array())
+            .expect("sample array");
+        assert_eq!(sample.len(), 1);
+        assert_eq!(sample[0].as_str(), Some("bd-aaa"));
+    }
+
+    #[test]
+    fn test_check_jsonl_duplicate_ids_ok_when_unique() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let jsonl = beads_dir.join("issues.jsonl");
+        fs::write(
+            &jsonl,
+            "{\"id\":\"bd-aaa\"}\n{\"id\":\"bd-bbb\"}\n{\"id\":\"bd-ccc\"}\n",
+        )
+        .unwrap();
+
+        let mut checks = Vec::new();
+        check_jsonl_duplicate_ids(Some(&jsonl), &mut checks);
+        let check = find_check(&checks, "jsonl.duplicate_ids").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn test_check_jsonl_duplicate_ids_missing_is_ok() {
+        // No JSONL path -> ok. Missing-or-empty cases handled by other checks.
+        let mut checks = Vec::new();
+        check_jsonl_duplicate_ids(None, &mut checks);
+        let check = find_check(&checks, "jsonl.duplicate_ids").expect("check present");
         assert!(matches!(check.status, CheckStatus::Ok));
     }
 
@@ -15921,6 +16096,39 @@ mod tests {
             value["after_hash"].as_str().unwrap().starts_with("sha256:"),
             "after_hash present"
         );
+    }
+
+    #[test]
+    fn wp3_repair_skips_locked_root_gitignore() {
+        let tmp = TempDir::new().unwrap();
+        let (beads_dir, gitignore, mut report) = make_doctor_fixture(tmp.path());
+        report.checks.push(CheckResult {
+            name: "permissions.root_gitignore".to_string(),
+            status: CheckStatus::Warn,
+            message: Some("root .gitignore is not owner-writable".to_string()),
+            details: None,
+        });
+
+        let mut session = DoctorRepairSession::new(tmp.path(), /* dry_run = */ false)
+            .expect("session must build");
+        fs::set_permissions(&gitignore, fs::Permissions::from_mode(0o444)).unwrap();
+        let before = fs::read(&gitignore).unwrap();
+        let actions_path = session.run.actions_file.clone();
+
+        let result =
+            fix_root_gitignore_if_warned(&beads_dir, &report, &quiet_ctx(), Some(&mut session));
+        assert!(!result, "locked root .gitignore repair must be skipped");
+        assert_eq!(
+            fs::read(&gitignore).unwrap(),
+            before,
+            "locked root .gitignore must not be rewritten"
+        );
+        assert!(
+            fs::read(&actions_path).unwrap_or_default().is_empty(),
+            "skipped repair must not append an action"
+        );
+
+        fs::set_permissions(&gitignore, fs::Permissions::from_mode(0o644)).unwrap();
     }
 
     #[test]
