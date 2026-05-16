@@ -649,6 +649,10 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
         "fm-permissions-recovery-dir-not-writable",
     ),
     (
+        "permissions.write_lock",
+        "fm-state_files-orphaned-write-lock",
+    ),
+    (
         "permissions.config_yaml_secrets",
         "fm-permissions-config-yaml-mode-leaks-secrets",
     ),
@@ -4533,8 +4537,9 @@ fn check_doctor_runs_creatable(repo_root: &Path, checks: &mut Vec<CheckResult>) 
 ///
 /// Detect-only — operators may have intentionally locked the recovery
 /// dir for compliance (immutable backup folder); auto-chmoding would
-/// stomp that decision. Remediation: `chmod u+w .beads/.br_recovery`
-/// or unset the lock-down before re-running `--repair`.
+/// stomp that decision. Remediation: restore owner-write permission
+/// on the reported path or unset the lock-down before re-running
+/// `--repair`.
 ///
 /// Unix-only — non-Unix lacks the POSIX mode bits this check relies
 /// on, so it always emits Ok there.
@@ -4588,6 +4593,78 @@ fn check_recovery_dir_writable(db_path: &Path, beads_dir: &Path, checks: &mut Ve
     push_check(
         checks,
         "permissions.recovery_dir",
+        CheckStatus::Ok,
+        None,
+        None,
+    );
+}
+
+/// Pass-5 cycle 31 — detector for the lock-permissions subset of
+/// `fm-state_files-orphaned-write-lock`.
+///
+/// Warns when `.beads/.write.lock` exists but the current process
+/// lacks owner-write permission on it. Every mutating `br`
+/// invocation (`create`, `update`, `close`, `sync`, `dep add`, …)
+/// must open this file `O_RDWR` and acquire an advisory lock; a
+/// missing owner-write bit makes the open fail outright with a
+/// cryptic `EACCES` from deep inside the storage layer.
+///
+/// Detect-only — auto-chmoding might collide with operator intent
+/// (e.g. immutable lock files used by some hardened CI runners).
+/// Remediation: `chmod u+w .beads/.write.lock` or remove and let
+/// the next `br` invocation recreate it cleanly.
+///
+/// Unix-only — non-Unix uses different lock semantics so the check
+/// is silenced there.
+fn check_write_lock_writable(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
+    let lock_path = beads_dir.join(".write.lock");
+    let Ok(meta) = fs::symlink_metadata(&lock_path) else {
+        // Missing is fine — created on first mutating call.
+        push_check(
+            checks,
+            "permissions.write_lock",
+            CheckStatus::Ok,
+            None,
+            None,
+        );
+        return;
+    };
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        push_check(
+            checks,
+            "permissions.write_lock",
+            CheckStatus::Ok,
+            None,
+            None,
+        );
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode();
+        if (mode & 0o200) == 0 {
+            push_check(
+                checks,
+                "permissions.write_lock",
+                CheckStatus::Warn,
+                Some(format!(
+                    "{} is not writable by owner (mode {:o}); every mutating `br` invocation will fail to acquire the workspace lock",
+                    lock_path.display(),
+                    mode & 0o777
+                )),
+                Some(serde_json::json!({
+                    "path": lock_path.display().to_string(),
+                    "mode_octal": format!("{:o}", mode & 0o777),
+                    "remediation": format!("`chmod u+w {}` or remove the file (the next br call recreates it)", lock_path.display()),
+                })),
+            );
+            return;
+        }
+    }
+    push_check(
+        checks,
+        "permissions.write_lock",
         CheckStatus::Ok,
         None,
         None,
@@ -8962,9 +9039,12 @@ fn collect_doctor_report_with_mode_and_db_override(
     // Pass-5 cycle 28: writability of `.doctor/` so the next --repair
     // won't crash deep inside the chokepoint.
     check_doctor_runs_creatable(repo_root, &mut checks);
-    // Pass-5 cycle 30: writability of `.beads/.br_recovery/` so the
+    // Pass-5 cycle 30: writability of the active DB recovery dir so the
     // next --repair won't crash mid-backup.
     check_recovery_dir_writable(&paths.db_path, beads_dir, &mut checks);
+    // Pass-5 cycle 31: writability of `.beads/.write.lock` so we don't
+    // mask EACCES failures as cryptic "could not open lock" errors.
+    check_write_lock_writable(beads_dir, &mut checks);
     // Pass-5 cycle 11: world-readable config.yaml containing secrets.
     check_config_yaml_secret_mode(beads_dir, &mut checks);
     // Pass-5 cycle 12: multiple `br` binaries on $PATH (env-based,
@@ -9714,8 +9794,21 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             initial.report.ok = !has_non_ok(&initial.report.checks);
         }
         print_report(&initial.report, ctx)?;
-        if !initial.report.ok {
-            std::process::exit(1);
+        // `report.ok` is the "no Error" signal (per the
+        // `DoctorInspectionMode::Full => !has_error(&checks)` rule used
+        // at report construction), which is the right shape for the
+        // `ok: bool` JSON field but the wrong shape for the doctor exit
+        // code: per the `DoctorExitCode` contract (and the surface
+        // documentation in `doctor_subsystems/surface.rs`), `br doctor`
+        // without `--repair` should exit `FindingsPresent` (1) whenever
+        // any check is not OK — both WARN and Error. Today WARN-only
+        // findings exit 0 because we keyed exit off `report.ok` instead
+        // of `has_non_ok`. Use the structured exit code so callers can
+        // distinguish "recoverable, --repair would fix" from
+        // "manual intervention" (see #292).
+        let has_findings = has_non_ok(&initial.report.checks);
+        if has_findings {
+            std::process::exit(DoctorExitCode::FindingsPresent.as_i32());
         }
         return Ok(());
     }
@@ -11521,6 +11614,54 @@ mod tests {
         check_doctor_runs_creatable(temp.path(), &mut checks);
         let check = find_check(&checks, "doctor.runs_creatable").expect("check present");
         assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn test_check_write_lock_writable_ok_when_missing() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let mut checks = Vec::new();
+        check_write_lock_writable(&beads_dir, &mut checks);
+        let check = find_check(&checks, "permissions.write_lock").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn test_check_write_lock_writable_ok_when_writable() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::write(beads_dir.join(".write.lock"), b"").unwrap();
+        let mut checks = Vec::new();
+        check_write_lock_writable(&beads_dir, &mut checks);
+        let check = find_check(&checks, "permissions.write_lock").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_write_lock_writable_warns_when_not_writable() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let lock = beads_dir.join(".write.lock");
+        fs::write(&lock, b"").unwrap();
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o444)).unwrap();
+
+        let mut checks = Vec::new();
+        check_write_lock_writable(&beads_dir, &mut checks);
+        let check = find_check(&checks, "permissions.write_lock").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
+        let details = check.details.as_ref().expect("details");
+        assert_eq!(
+            details.get("mode_octal").and_then(|v| v.as_str()),
+            Some("444")
+        );
+
+        // Restore so TempDir's drop can clean up.
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o644)).unwrap();
     }
 
     #[test]
