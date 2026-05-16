@@ -72,6 +72,12 @@ pub struct ClosePolicy {
     pub forbid_self_close_after_in_progress: ToggleGate,
     /// Tier 1 attribution capture (default: off).
     pub attribution: Attribution,
+    /// Typed structured references gate (capability #3 of #274). When
+    /// `enabled`, the close `--reason` must contain at least one
+    /// `kind:value` reference matching one of `required_kinds` (e.g.
+    /// `commit:`, `pr:`, `reviewer:`, `investigation:`). Unknown kinds
+    /// are accepted but don't satisfy the gate.
+    pub require_typed_references: RequireTypedReferences,
 }
 
 impl ClosePolicy {
@@ -82,8 +88,33 @@ impl ClosePolicy {
         self.require_close_reason.enabled
             || self.require_acceptance_criteria_satisfied.enabled
             || self.forbid_self_close_after_in_progress.enabled
+            || self.require_typed_references.enabled
             || self.attribution.tier != AttributionTier::Off
     }
+}
+
+/// Typed-references gate (capability #3 of issue #274).
+///
+/// When `enabled`, the close reason must contain at least one
+/// `kind:value` token matching one of `required_kinds`. Recognized
+/// kinds include `commit`, `pr`, `reviewer`, `investigation`,
+/// `agent-mail`, `dashboard`, and any custom kind the project lists.
+///
+/// The matcher is lenient: the kind/value pair can appear anywhere
+/// in the reason text (start, end, embedded in prose) as long as
+/// it's a contiguous `kind:value` token with no whitespace in the
+/// value. We deliberately don't require URL-like values — the point
+/// is queryability, not URL validation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RequireTypedReferences {
+    pub enabled: bool,
+    /// Reference kinds the close reason must contain (logical OR — any one
+    /// satisfies the gate). When empty, the gate accepts any recognized
+    /// reference kind; setting `[]` is therefore equivalent to "at least
+    /// one typed reference of any kind".
+    #[serde(default)]
+    pub required_kinds: Vec<String>,
 }
 
 /// Bare on/off toggle.
@@ -243,7 +274,111 @@ pub fn evaluate(policy: &ClosePolicy, evidence: &CloseEvidence<'_>) -> Vec<Polic
         evaluate_self_close(evidence, &mut violations);
     }
 
+    if policy.require_typed_references.enabled {
+        evaluate_typed_references(&policy.require_typed_references, evidence, &mut violations);
+    }
+
     violations
+}
+
+/// Match `kind:value` tokens inside a close-reason string. We require
+/// the value to be non-empty and not start with whitespace — this
+/// rules out accidental matches like `note: foo` in prose. The kind
+/// itself must be lowercase ASCII letters / hyphens / digits, which
+/// matches the canonical `commit:` / `pr:` / `agent-mail:` shapes
+/// the issue calls out.
+fn extract_typed_references(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Find start of a candidate kind: alpha character preceded
+        // either by start-of-string, whitespace, or a punctuation
+        // boundary character (so we don't pick up `xyz` in `foo-xyz:`).
+        let preceding_ok =
+            i == 0 || matches!(bytes[i - 1], b' ' | b'\n' | b'\t' | b'(' | b'[' | b',');
+        if !preceding_ok {
+            i += 1;
+            continue;
+        }
+        let kind_start = i;
+        while i < bytes.len()
+            && (bytes[i].is_ascii_lowercase() || bytes[i] == b'-' || bytes[i].is_ascii_digit())
+        {
+            i += 1;
+        }
+        if i == kind_start || i >= bytes.len() || bytes[i] != b':' {
+            i += 1;
+            continue;
+        }
+        let kind = &text[kind_start..i];
+        i += 1; // skip the ':'
+        let value_start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b',' {
+            i += 1;
+        }
+        let value = &text[value_start..i];
+        if !value.is_empty() && kind.len() >= 2 {
+            out.push((kind.to_string(), value.to_string()));
+        }
+    }
+    out
+}
+
+fn evaluate_typed_references(
+    rule: &RequireTypedReferences,
+    evidence: &CloseEvidence<'_>,
+    out: &mut Vec<PolicyViolation>,
+) {
+    let reason_text = evidence.close_reason.unwrap_or("");
+    let refs = extract_typed_references(reason_text);
+
+    if refs.is_empty() {
+        out.push(PolicyViolation {
+            gate: "typed_references_required".to_string(),
+            message: format!(
+                "close_reason has no typed references; policy requires at least one of: {}",
+                if rule.required_kinds.is_empty() {
+                    "any kind:value".to_string()
+                } else {
+                    rule.required_kinds.join(", ")
+                }
+            ),
+            detail: Some(serde_json::json!({
+                "required_kinds": rule.required_kinds,
+                "issue_id": evidence.issue_id,
+            })),
+        });
+        return;
+    }
+
+    if !rule.required_kinds.is_empty() {
+        let found_kinds: std::collections::HashSet<&str> =
+            refs.iter().map(|(k, _)| k.as_str()).collect();
+        let satisfied = rule
+            .required_kinds
+            .iter()
+            .any(|k| found_kinds.contains(k.as_str()));
+        if !satisfied {
+            out.push(PolicyViolation {
+                gate: "typed_references_required_kind_missing".to_string(),
+                message: format!(
+                    "close_reason has typed refs ({}) but none satisfy the required kinds: {}",
+                    found_kinds
+                        .iter()
+                        .copied()
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    rule.required_kinds.join(", ")
+                ),
+                detail: Some(serde_json::json!({
+                    "required_kinds": rule.required_kinds,
+                    "found_kinds": found_kinds.into_iter().collect::<Vec<_>>(),
+                    "issue_id": evidence.issue_id,
+                })),
+            });
+        }
+    }
 }
 
 fn evaluate_close_reason(
@@ -944,5 +1079,81 @@ allow_bypass: false
         assert!(parse_unchecked_box("- [X] checked").is_none());
         assert!(parse_unchecked_box("plain text").is_none());
         assert!(parse_unchecked_box("- not a box").is_none());
+    }
+
+    // =========================================================================
+    // Typed-references gate (capability #3 of issue #274)
+    // =========================================================================
+
+    #[test]
+    fn extract_typed_references_finds_kind_value_pairs() {
+        let refs = extract_typed_references("Fixed in commit:abc123 per reviewer:bob");
+        assert_eq!(
+            refs,
+            vec![
+                ("commit".to_string(), "abc123".to_string()),
+                ("reviewer".to_string(), "bob".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_typed_references_handles_hyphenated_kinds() {
+        let refs = extract_typed_references("see agent-mail:thread-xyz for context");
+        assert_eq!(
+            refs,
+            vec![("agent-mail".to_string(), "thread-xyz".to_string())]
+        );
+    }
+
+    #[test]
+    fn extract_typed_references_skips_prose_with_colons() {
+        // `note:` followed by whitespace is prose, not a typed reference.
+        let refs = extract_typed_references("note: this is a regular sentence");
+        assert!(refs.is_empty(), "got {refs:?}");
+    }
+
+    #[test]
+    fn typed_references_gate_rejects_when_none_present() {
+        let policy = ClosePolicy {
+            require_typed_references: RequireTypedReferences {
+                enabled: true,
+                required_kinds: vec![],
+            },
+            ..Default::default()
+        };
+        let evidence = evidence_with_reason("just plain prose with no refs at all", "bd-1");
+        let violations = evaluate(&policy, &evidence);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].gate, "typed_references_required");
+    }
+
+    #[test]
+    fn typed_references_gate_accepts_when_kind_matches() {
+        let policy = ClosePolicy {
+            require_typed_references: RequireTypedReferences {
+                enabled: true,
+                required_kinds: vec!["commit".to_string()],
+            },
+            ..Default::default()
+        };
+        let evidence = evidence_with_reason("Fixed in commit:abc12345", "bd-1");
+        assert!(evaluate(&policy, &evidence).is_empty());
+    }
+
+    #[test]
+    fn typed_references_gate_rejects_wrong_kind() {
+        let policy = ClosePolicy {
+            require_typed_references: RequireTypedReferences {
+                enabled: true,
+                required_kinds: vec!["commit".to_string()],
+            },
+            ..Default::default()
+        };
+        let evidence =
+            evidence_with_reason("see investigation:linear-XYZ-42 for details", "bd-1");
+        let violations = evaluate(&policy, &evidence);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].gate, "typed_references_required_kind_missing");
     }
 }
