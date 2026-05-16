@@ -477,6 +477,13 @@ const EARLY_CHOKEPOINT_FIXER_ROWS: &[FixerRow] = &[
         true,
         &["dependencies.orphans"],
     ),
+    (
+        "doctor.wal_checkpoint_truncate",
+        "state_files",
+        true,
+        true,
+        &["wal_size"],
+    ),
 ];
 
 const fn early_chokepoint_fixer_rows() -> &'static [FixerRow] {
@@ -716,6 +723,7 @@ mod tests {
                 "doctor.comments_orphan_prune",
                 "doctor.labels_orphan_prune",
                 "doctor.dependencies_orphan_prune",
+                "doctor.wal_checkpoint_truncate",
                 "doctor.repair_recoverable_db_state",
                 "doctor.repair_partial_indexes",
                 "doctor.repair_via_vacuum",

@@ -1500,6 +1500,7 @@ struct EarlyRepairSummary {
     comments_orphans: bool,
     labels_orphans: bool,
     dependencies_orphans: bool,
+    wal_checkpoint: bool,
 }
 
 impl EarlyRepairSummary {
@@ -1522,6 +1523,7 @@ impl EarlyRepairSummary {
             || self.comments_orphans
             || self.labels_orphans
             || self.dependencies_orphans
+            || self.wal_checkpoint
     }
 
     fn action_labels(self) -> Vec<String> {
@@ -1579,6 +1581,9 @@ impl EarlyRepairSummary {
         }
         if self.dependencies_orphans {
             actions.push("dependencies_orphans_pruned".to_string());
+        }
+        if self.wal_checkpoint {
+            actions.push("wal_checkpoint_truncated".to_string());
         }
         actions
     }
@@ -1645,6 +1650,9 @@ impl EarlyRepairSummary {
         }
         if self.dependencies_orphans {
             messages.push("Pruned orphan rows from dependencies table.".to_string());
+        }
+        if self.wal_checkpoint {
+            messages.push("Truncated the SQLite WAL via PRAGMA wal_checkpoint.".to_string());
         }
         messages
     }
@@ -3103,6 +3111,75 @@ fn check_wal_oversized(db_path: &Path, checks: &mut Vec<CheckResult>) {
         );
     } else {
         push_check(checks, "wal_size", CheckStatus::Ok, None, None);
+    }
+}
+
+/// Pass-5 cycle 37 — fixer for
+/// `fm-state_files-wal-oversized`.
+///
+/// Runs `PRAGMA wal_checkpoint(TRUNCATE)` against the selected SQLite
+/// database via [`chokepoint::mutate(Op::DbExec)`]. The pragma forces
+/// WAL pages to be written to the main DB file and then truncates the
+/// WAL sidecar to zero bytes. This is a data-equivalent operation —
+/// the database's logical state is unchanged; only how it's stored
+/// (consolidated main file vs WAL buffer + main file) shifts.
+///
+/// Because the operation is data-equivalent, the chokepoint snapshots
+/// nothing (`affected_tables: []`) but still emits an `actions.jsonl`
+/// audit line so the operator can see the checkpoint happened. The
+/// chokepoint's verbatim-backup of the WAL file (captured at step 2
+/// of the 8-step contract) preserves the pre-truncate bytes for
+/// forensic recovery if needed, even though SQLite considers them
+/// redundant.
+///
+/// TRUNCATE was chosen over PASSIVE/RESTART because the FM is "WAL
+/// grew unboundedly" — a no-op opportunistic checkpoint wouldn't
+/// resolve it.
+fn fix_wal_oversized_if_warned(
+    db_path: &Path,
+    report: &DoctorReport,
+    ctx: &OutputContext,
+    session: Option<&mut DoctorRepairSession>,
+) -> bool {
+    let has_warning = report
+        .checks
+        .iter()
+        .any(|c| c.name == "wal_size" && c.status == CheckStatus::Warn);
+    if !has_warning {
+        return false;
+    }
+    let Some(session) = session else {
+        if !ctx.is_json() {
+            ctx.warning(
+                "Skipping wal_checkpoint: no doctor repair session (run-dir creation failed)",
+            );
+        }
+        return false;
+    };
+    session.set_fixer("doctor.wal_checkpoint_truncate");
+    let op = Op::DbExec {
+        sql: "PRAGMA wal_checkpoint(TRUNCATE)".to_string(),
+        args: Vec::new(),
+        // Data-equivalent: no row mutation, no snapshot. The pragma
+        // moves bytes between files but the logical state (SELECT *
+        // FROM <table>) is unchanged before and after.
+        affected_tables: Vec::new(),
+        affected_predicate: None,
+    };
+    match chokepoint::mutate(&session.ctx, db_path, op) {
+        Ok(result) if result.ok => {
+            if !ctx.is_json() {
+                ctx.info("Checkpointed and truncated SQLite WAL");
+            }
+            true
+        }
+        Ok(_) => false,
+        Err(err) => {
+            if !ctx.is_json() {
+                ctx.warning(&format!("Failed to checkpoint WAL: {err}"));
+            }
+            false
+        }
     }
 }
 
@@ -5222,16 +5299,21 @@ fn fix_labels_orphans_if_warned(
 /// The `dependencies` table declares `FOREIGN KEY (issue_id) REFERENCES
 /// issues(id) ON DELETE CASCADE` so orphan rows on the issue_id side
 /// shouldn't normally exist. The depends_on_id column intentionally
-/// has NO FK so it can reference external issues (cross-repo deps);
-/// we never warn on that side.
+/// has NO FK so it can reference external issues (cross-repo deps),
+/// but non-`external:` targets are still local issue references and
+/// must exist.
 ///
 /// Auto-fixable via [`fix_dependencies_orphans_if_warned`] below:
 /// mirrors cycle 29/34/35's surgical-DELETE pattern through the
 /// chokepoint.
+const DEPENDENCIES_ORPHAN_PREDICATE: &str = "NOT EXISTS (SELECT 1 FROM issues WHERE issues.id = dependencies.issue_id) \
+     OR (dependencies.depends_on_id NOT LIKE 'external:%' \
+         AND NOT EXISTS (SELECT 1 FROM issues WHERE issues.id = dependencies.depends_on_id))";
+
 fn check_dependencies_orphans(conn: &Connection, checks: &mut Vec<CheckResult>) {
-    let Ok(rows) = conn.query(
-        "SELECT COUNT(*) FROM dependencies d LEFT JOIN issues i ON d.issue_id = i.id WHERE i.id IS NULL",
-    ) else {
+    let Ok(rows) = conn.query(&format!(
+        "SELECT COUNT(*) FROM dependencies WHERE {DEPENDENCIES_ORPHAN_PREDICATE}"
+    )) else {
         push_check(checks, "dependencies.orphans", CheckStatus::Ok, None, None);
         return;
     };
@@ -5247,15 +5329,24 @@ fn check_dependencies_orphans(conn: &Connection, checks: &mut Vec<CheckResult>) 
         push_check(checks, "dependencies.orphans", CheckStatus::Ok, None, None);
         return;
     }
-    let sample: Vec<String> = match conn.query(
-        "SELECT d.issue_id FROM dependencies d LEFT JOIN issues i ON d.issue_id = i.id WHERE i.id IS NULL LIMIT 5",
-    ) {
+    let sample: Vec<String> = match conn.query(&format!(
+        "SELECT issue_id, depends_on_id FROM dependencies \
+         WHERE {DEPENDENCIES_ORPHAN_PREDICATE} \
+         ORDER BY issue_id, depends_on_id \
+         LIMIT 5"
+    )) {
         Ok(rows) => rows
             .iter()
-            .filter_map(|row| row.values().first().cloned())
-            .filter_map(|v| match v {
-                SqliteValue::Text(s) => Some(s.to_string()),
-                _ => None,
+            .filter_map(|row| {
+                let issue_id = row.values().first().and_then(|v| match v {
+                    SqliteValue::Text(s) => Some(s.as_str()),
+                    _ => None,
+                })?;
+                let depends_on_id = row.values().get(1).and_then(|v| match v {
+                    SqliteValue::Text(s) => Some(s.as_str()),
+                    _ => None,
+                })?;
+                Some(format!("{issue_id} -> {depends_on_id}"))
             })
             .collect(),
         Err(_) => Vec::new(),
@@ -5265,12 +5356,12 @@ fn check_dependencies_orphans(conn: &Connection, checks: &mut Vec<CheckResult>) 
         "dependencies.orphans",
         CheckStatus::Warn,
         Some(format!(
-            "{orphan_count} orphan row(s) in dependencies — issue_id has no matching issues row (FK guard probably bypassed during a delete; depends_on_id side is intentionally unguarded)"
+            "{orphan_count} orphan row(s) in dependencies — issue_id or non-external depends_on_id has no matching issues row"
         )),
         Some(serde_json::json!({
             "orphan_count": orphan_count,
-            "sample_issue_ids": sample,
-            "remediation": "br doctor --repair surgically prunes orphan dependencies rows via chokepointed DELETE (only the issue_id-orphan side; external depends_on_id refs are preserved)",
+            "sample_edges": sample,
+            "remediation": "br doctor --repair surgically prunes orphan dependencies rows via chokepointed DELETE (external depends_on_id refs are preserved)",
         })),
     );
 }
@@ -5278,13 +5369,11 @@ fn check_dependencies_orphans(conn: &Connection, checks: &mut Vec<CheckResult>) 
 /// Pass-5 cycle 36 — fixer for `fm-caches_indexes-dependencies-orphans`.
 ///
 /// Surgically deletes orphan rows from `dependencies` (rows whose
-/// `issue_id` no longer exists in `issues`) via
-/// [`chokepoint::mutate(Op::DbExec)`]. Rows whose `depends_on_id`
-/// points to an external/missing issue are PRESERVED — the schema
-/// intentionally omits an FK on that column for cross-repo references.
-const DEPENDENCIES_ORPHAN_PREDICATE: &str =
-    "NOT EXISTS (SELECT 1 FROM issues WHERE issues.id = dependencies.issue_id)";
-
+/// `issue_id` no longer exists in `issues`, or whose non-external
+/// `depends_on_id` no longer exists) via [`chokepoint::mutate(Op::DbExec)`].
+/// Rows whose `depends_on_id` points to an `external:*` issue are
+/// preserved — the schema intentionally omits an FK on that column
+/// for cross-repo references.
 fn fix_dependencies_orphans_if_warned(
     db_path: &Path,
     report: &DoctorReport,
@@ -10362,6 +10451,20 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         };
     let _ = dependencies_orphans_repaired;
 
+    // Pass-5 cycle 37: PRAGMA wal_checkpoint(TRUNCATE) when the WAL is oversized.
+    let wal_checkpoint_repaired =
+        if args.repair && fixer_filter.allows("fm-state_files-wal-oversized") {
+            let repaired =
+                fix_wal_oversized_if_warned(&paths.db_path, &initial.report, ctx, session.as_mut());
+            if repaired {
+                initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+            }
+            repaired
+        } else {
+            false
+        };
+    let _ = wal_checkpoint_repaired;
+
     if args.repair && (fixer_filter.has_only() || fixer_filter.has_skip()) {
         tracing::info!(
             target: "br::doctor::filter",
@@ -10389,6 +10492,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         comments_orphans: comments_orphans_repaired,
         labels_orphans: labels_orphans_repaired,
         dependencies_orphans: dependencies_orphans_repaired,
+        wal_checkpoint: wal_checkpoint_repaired,
     };
 
     if !args.repair {
@@ -12042,6 +12146,53 @@ mod tests {
     }
 
     #[test]
+    fn test_check_dependencies_orphans_warns_on_missing_local_target() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        storage
+            .create_issue(
+                &sample_issue("bd-owner-d", "Dependency owner with missing target"),
+                "tester",
+            )
+            .unwrap();
+        drop(storage);
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        conn.execute_with_params(
+            "INSERT INTO dependencies(issue_id, depends_on_id, type) VALUES (?1, ?2, ?3)",
+            &[
+                SqliteValue::Text("bd-owner-d".into()),
+                SqliteValue::Text("bd-missing-local-target".into()),
+                SqliteValue::Text("blocks".into()),
+            ],
+        )
+        .unwrap();
+
+        let mut checks = Vec::new();
+        check_dependencies_orphans(&conn, &mut checks);
+        let check = find_check(&checks, "dependencies.orphans").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
+        let count = check
+            .details
+            .as_ref()
+            .and_then(|d| d.get("orphan_count"))
+            .and_then(serde_json::Value::as_i64);
+        assert_eq!(count, Some(1));
+        let sample_edges = check
+            .details
+            .as_ref()
+            .and_then(|d| d.get("sample_edges"))
+            .and_then(serde_json::Value::as_array)
+            .expect("sample_edges array");
+        assert!(
+            sample_edges
+                .iter()
+                .any(|edge| edge.as_str() == Some("bd-owner-d -> bd-missing-local-target")),
+            "missing local target should be sampled: {sample_edges:?}"
+        );
+    }
+
+    #[test]
     fn test_check_dependencies_orphans_clean_workspace_ok() {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("beads.db");
@@ -12079,6 +12230,18 @@ mod tests {
         storage
             .create_issue(&sample_issue("bd-keep-d", "Keep external target"), "tester")
             .unwrap();
+        storage
+            .create_issue(
+                &sample_issue("bd-owner-d", "Prune missing local target"),
+                "tester",
+            )
+            .unwrap();
+        storage
+            .create_issue(&sample_issue("bd-valid-d", "Keep valid owner"), "tester")
+            .unwrap();
+        storage
+            .create_issue(&sample_issue("bd-target-d", "Keep valid target"), "tester")
+            .unwrap();
         drop(storage);
         {
             let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
@@ -12095,8 +12258,26 @@ mod tests {
             conn.execute_with_params(
                 "INSERT INTO dependencies(issue_id, depends_on_id, type) VALUES (?1, ?2, ?3)",
                 &[
+                    SqliteValue::Text("bd-owner-d".into()),
+                    SqliteValue::Text("bd-missing-local-target".into()),
+                    SqliteValue::Text("blocks".into()),
+                ],
+            )
+            .unwrap();
+            conn.execute_with_params(
+                "INSERT INTO dependencies(issue_id, depends_on_id, type) VALUES (?1, ?2, ?3)",
+                &[
                     SqliteValue::Text("bd-keep-d".into()),
                     SqliteValue::Text("external:upstream-1".into()),
+                    SqliteValue::Text("blocks".into()),
+                ],
+            )
+            .unwrap();
+            conn.execute_with_params(
+                "INSERT INTO dependencies(issue_id, depends_on_id, type) VALUES (?1, ?2, ?3)",
+                &[
+                    SqliteValue::Text("bd-valid-d".into()),
+                    SqliteValue::Text("bd-target-d".into()),
                     SqliteValue::Text("blocks".into()),
                 ],
             )
@@ -12152,6 +12333,42 @@ mod tests {
             retained_count,
             Some(1),
             "repair must preserve missing/external depends_on_id rows"
+        );
+        let valid_retained = conn
+            .query(
+                "SELECT COUNT(*) FROM dependencies \
+                 WHERE issue_id = 'bd-valid-d' AND depends_on_id = 'bd-target-d'",
+            )
+            .unwrap();
+        let valid_retained_count = valid_retained
+            .first()
+            .and_then(|row| row.values().first().cloned())
+            .and_then(|v| match v {
+                SqliteValue::Integer(n) => Some(n),
+                _ => None,
+            });
+        assert_eq!(
+            valid_retained_count,
+            Some(1),
+            "repair must preserve valid local dependency rows"
+        );
+        let local_dangling_retained = conn
+            .query(
+                "SELECT COUNT(*) FROM dependencies \
+                 WHERE issue_id = 'bd-owner-d' AND depends_on_id = 'bd-missing-local-target'",
+            )
+            .unwrap();
+        let local_dangling_retained_count = local_dangling_retained
+            .first()
+            .and_then(|row| row.values().first().cloned())
+            .and_then(|v| match v {
+                SqliteValue::Integer(n) => Some(n),
+                _ => None,
+            });
+        assert_eq!(
+            local_dangling_retained_count,
+            Some(0),
+            "repair must prune non-external missing depends_on_id rows"
         );
     }
 
@@ -13962,6 +14179,87 @@ mod tests {
     }
 
     #[test]
+    fn test_fix_wal_oversized_truncates_via_chokepoint() {
+        // Open the storage to materialise a real beads.db, write enough
+        // WAL pages to exceed the threshold by issuing a transaction,
+        // assert the detector warns, then call the fixer and re-verify
+        // the WAL was truncated to a healthy size.
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        let _storage = SqliteStorage::open(&db_path).unwrap();
+
+        // Fabricate an oversized WAL by sparse-writing past the
+        // threshold. The chokepoint cmp_strict step reads bytes, so a
+        // sparse file is fine — we only need the file's size on disk
+        // to exceed the threshold the detector measures.
+        let wal_path = beads_dir.join("beads.db-wal");
+        let f = fs::File::create(&wal_path).unwrap();
+        f.set_len(WAL_OVERSIZED_BYTES + 1).unwrap();
+        drop(f);
+
+        let mut report = DoctorReport {
+            ok: false,
+            workspace_health: Some("degraded".to_string()),
+            reliability_audit: None,
+            checks: Vec::new(),
+        };
+        check_wal_oversized(&db_path, &mut report.checks);
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.name == "wal_size" && matches!(c.status, CheckStatus::Warn))
+        );
+
+        let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
+            .expect("session must build");
+        let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Text, false, true);
+        assert!(fix_wal_oversized_if_warned(
+            &db_path,
+            &report,
+            &ctx,
+            Some(&mut session),
+        ));
+
+        let mut after = Vec::new();
+        check_wal_oversized(&db_path, &mut after);
+        let check = find_check(&after, "wal_size").expect("check present");
+        assert!(
+            matches!(check.status, CheckStatus::Ok),
+            "WAL must be at-or-below threshold after PRAGMA wal_checkpoint(TRUNCATE): {check:?}"
+        );
+    }
+
+    #[test]
+    fn test_fix_wal_oversized_noop_when_no_warning() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        let _storage = SqliteStorage::open(&db_path).unwrap();
+
+        let mut report = DoctorReport {
+            ok: true,
+            workspace_health: Some("healthy".to_string()),
+            reliability_audit: None,
+            checks: Vec::new(),
+        };
+        check_wal_oversized(&db_path, &mut report.checks);
+
+        let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
+            .expect("session must build");
+        let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Text, false, true);
+        assert!(!fix_wal_oversized_if_warned(
+            &db_path,
+            &report,
+            &ctx,
+            Some(&mut session),
+        ));
+    }
+
+    #[test]
     fn test_check_wal_oversized_warns_on_oversized() {
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
@@ -14664,6 +14962,7 @@ mod tests {
             comments_orphans: false,
             labels_orphans: false,
             dependencies_orphans: false,
+            wal_checkpoint: false,
         };
 
         assert!(summary.applied());
@@ -14723,6 +15022,7 @@ mod tests {
             comments_orphans: false,
             labels_orphans: false,
             dependencies_orphans: false,
+            wal_checkpoint: false,
         };
 
         assert!(summary.applied());
@@ -14764,6 +15064,7 @@ mod tests {
             comments_orphans: false,
             labels_orphans: false,
             dependencies_orphans: false,
+            wal_checkpoint: false,
         };
 
         assert!(summary.applied());
@@ -14805,6 +15106,7 @@ mod tests {
             comments_orphans: false,
             labels_orphans: false,
             dependencies_orphans: false,
+            wal_checkpoint: false,
         };
 
         assert!(summary.applied());
