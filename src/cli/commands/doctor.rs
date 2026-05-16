@@ -660,6 +660,10 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
     ("comments.orphans", "fm-caches_indexes-comments-orphans"),
     ("labels.orphans", "fm-caches_indexes-labels-orphans"),
     (
+        "dependencies.orphans",
+        "fm-caches_indexes-dependencies-orphans",
+    ),
+    (
         "permissions.config_yaml_secrets",
         "fm-permissions-config-yaml-mode-leaks-secrets",
     ),
@@ -1495,6 +1499,7 @@ struct EarlyRepairSummary {
     dirty_bitmap_orphans: bool,
     comments_orphans: bool,
     labels_orphans: bool,
+    dependencies_orphans: bool,
 }
 
 impl EarlyRepairSummary {
@@ -1516,6 +1521,7 @@ impl EarlyRepairSummary {
             || self.dirty_bitmap_orphans
             || self.comments_orphans
             || self.labels_orphans
+            || self.dependencies_orphans
     }
 
     fn action_labels(self) -> Vec<String> {
@@ -1570,6 +1576,9 @@ impl EarlyRepairSummary {
         }
         if self.labels_orphans {
             actions.push("labels_orphans_pruned".to_string());
+        }
+        if self.dependencies_orphans {
+            actions.push("dependencies_orphans_pruned".to_string());
         }
         actions
     }
@@ -1633,6 +1642,9 @@ impl EarlyRepairSummary {
         }
         if self.labels_orphans {
             messages.push("Pruned orphan rows from labels table.".to_string());
+        }
+        if self.dependencies_orphans {
+            messages.push("Pruned orphan rows from dependencies table.".to_string());
         }
         messages
     }
@@ -5157,6 +5169,9 @@ fn check_labels_orphans(conn: &Connection, checks: &mut Vec<CheckResult>) {
 /// comments fixers exactly: chokepoint snapshots every orphan row
 /// before the DELETE fires, so `doctor undo` restores them from
 /// snapshot via `restore_db_exec`.
+const LABELS_ORPHAN_PREDICATE: &str =
+    "NOT EXISTS (SELECT 1 FROM issues WHERE issues.id = labels.issue_id)";
+
 fn fix_labels_orphans_if_warned(
     db_path: &Path,
     report: &DoctorReport,
@@ -5180,10 +5195,10 @@ fn fix_labels_orphans_if_warned(
     };
     session.set_fixer("doctor.labels_orphan_prune");
     let op = Op::DbExec {
-        sql: "DELETE FROM labels WHERE issue_id NOT IN (SELECT id FROM issues)".to_string(),
+        sql: format!("DELETE FROM labels WHERE {LABELS_ORPHAN_PREDICATE}"),
         args: Vec::new(),
         affected_tables: vec!["labels".to_string()],
-        affected_predicate: Some("issue_id NOT IN (SELECT id FROM issues)".to_string()),
+        affected_predicate: Some(LABELS_ORPHAN_PREDICATE.to_string()),
     };
     match chokepoint::mutate(&session.ctx, db_path, op) {
         Ok(result) if result.ok => {
@@ -5196,6 +5211,119 @@ fn fix_labels_orphans_if_warned(
         Err(err) => {
             if !ctx.is_json() {
                 ctx.warning(&format!("Failed to prune orphan labels rows: {err}"));
+            }
+            false
+        }
+    }
+}
+
+/// Pass-5 cycle 36 — detector for `fm-caches_indexes-dependencies-orphans`.
+///
+/// The `dependencies` table declares `FOREIGN KEY (issue_id) REFERENCES
+/// issues(id) ON DELETE CASCADE` so orphan rows on the issue_id side
+/// shouldn't normally exist. The depends_on_id column intentionally
+/// has NO FK so it can reference external issues (cross-repo deps);
+/// we never warn on that side.
+///
+/// Auto-fixable via [`fix_dependencies_orphans_if_warned`] below:
+/// mirrors cycle 29/34/35's surgical-DELETE pattern through the
+/// chokepoint.
+fn check_dependencies_orphans(conn: &Connection, checks: &mut Vec<CheckResult>) {
+    let Ok(rows) = conn.query(
+        "SELECT COUNT(*) FROM dependencies d LEFT JOIN issues i ON d.issue_id = i.id WHERE i.id IS NULL",
+    ) else {
+        push_check(checks, "dependencies.orphans", CheckStatus::Ok, None, None);
+        return;
+    };
+    let orphan_count = rows
+        .first()
+        .and_then(|row| row.values().first().cloned())
+        .and_then(|v| match v {
+            SqliteValue::Integer(n) => Some(n),
+            _ => None,
+        })
+        .unwrap_or(0);
+    if orphan_count == 0 {
+        push_check(checks, "dependencies.orphans", CheckStatus::Ok, None, None);
+        return;
+    }
+    let sample: Vec<String> = match conn.query(
+        "SELECT d.issue_id FROM dependencies d LEFT JOIN issues i ON d.issue_id = i.id WHERE i.id IS NULL LIMIT 5",
+    ) {
+        Ok(rows) => rows
+            .iter()
+            .filter_map(|row| row.values().first().cloned())
+            .filter_map(|v| match v {
+                SqliteValue::Text(s) => Some(s.to_string()),
+                _ => None,
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    push_check(
+        checks,
+        "dependencies.orphans",
+        CheckStatus::Warn,
+        Some(format!(
+            "{orphan_count} orphan row(s) in dependencies — issue_id has no matching issues row (FK guard probably bypassed during a delete; depends_on_id side is intentionally unguarded)"
+        )),
+        Some(serde_json::json!({
+            "orphan_count": orphan_count,
+            "sample_issue_ids": sample,
+            "remediation": "br doctor --repair surgically prunes orphan dependencies rows via chokepointed DELETE (only the issue_id-orphan side; external depends_on_id refs are preserved)",
+        })),
+    );
+}
+
+/// Pass-5 cycle 36 — fixer for `fm-caches_indexes-dependencies-orphans`.
+///
+/// Surgically deletes orphan rows from `dependencies` (rows whose
+/// `issue_id` no longer exists in `issues`) via
+/// [`chokepoint::mutate(Op::DbExec)`]. Rows whose `depends_on_id`
+/// points to an external/missing issue are PRESERVED — the schema
+/// intentionally omits an FK on that column for cross-repo references.
+const DEPENDENCIES_ORPHAN_PREDICATE: &str =
+    "NOT EXISTS (SELECT 1 FROM issues WHERE issues.id = dependencies.issue_id)";
+
+fn fix_dependencies_orphans_if_warned(
+    db_path: &Path,
+    report: &DoctorReport,
+    ctx: &OutputContext,
+    session: Option<&mut DoctorRepairSession>,
+) -> bool {
+    let has_warning = report
+        .checks
+        .iter()
+        .any(|c| c.name == "dependencies.orphans" && c.status == CheckStatus::Warn);
+    if !has_warning {
+        return false;
+    }
+    let Some(session) = session else {
+        if !ctx.is_json() {
+            ctx.warning(
+                "Skipping dependencies-orphan prune: no doctor repair session (run-dir creation failed)",
+            );
+        }
+        return false;
+    };
+    session.set_fixer("doctor.dependencies_orphan_prune");
+    let op = Op::DbExec {
+        sql: format!("DELETE FROM dependencies WHERE {DEPENDENCIES_ORPHAN_PREDICATE}"),
+        args: Vec::new(),
+        affected_tables: vec!["dependencies".to_string()],
+        affected_predicate: Some(DEPENDENCIES_ORPHAN_PREDICATE.to_string()),
+    };
+    match chokepoint::mutate(&session.ctx, db_path, op) {
+        Ok(result) if result.ok => {
+            if !ctx.is_json() {
+                ctx.info("Pruned orphan rows from dependencies");
+            }
+            true
+        }
+        Ok(_) => false,
+        Err(err) => {
+            if !ctx.is_json() {
+                ctx.warning(&format!("Failed to prune orphan dependencies rows: {err}"));
             }
             false
         }
@@ -9671,6 +9799,9 @@ fn inspect_existing_doctor_database(
         check_comments_orphans(&conn, checks);
         // Pass-5 cycle 35: orphan rows in labels (FK off during delete).
         check_labels_orphans(&conn, checks);
+        // Pass-5 cycle 36: orphan rows in dependencies (issue_id side only;
+        // depends_on_id intentionally unguarded for cross-repo refs).
+        check_dependencies_orphans(&conn, checks);
         // beads_rust-m3mi: audit-suspect close_reasons (warn level)
         check_suspect_close_reasons(&conn, checks);
         if mode == DoctorInspectionMode::Full {
@@ -10213,6 +10344,24 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     };
     let _ = labels_orphans_repaired;
 
+    // Pass-5 cycle 36: surgically prune orphan dependencies rows via Op::DbExec.
+    let dependencies_orphans_repaired =
+        if args.repair && fixer_filter.allows("fm-caches_indexes-dependencies-orphans") {
+            let repaired = fix_dependencies_orphans_if_warned(
+                &paths.db_path,
+                &initial.report,
+                ctx,
+                session.as_mut(),
+            );
+            if repaired {
+                initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+            }
+            repaired
+        } else {
+            false
+        };
+    let _ = dependencies_orphans_repaired;
+
     if args.repair && (fixer_filter.has_only() || fixer_filter.has_skip()) {
         tracing::info!(
             target: "br::doctor::filter",
@@ -10239,6 +10388,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         dirty_bitmap_orphans: dirty_bitmap_orphans_repaired,
         comments_orphans: comments_orphans_repaired,
         labels_orphans: labels_orphans_repaired,
+        dependencies_orphans: dependencies_orphans_repaired,
     };
 
     if !args.repair {
@@ -11860,6 +12010,149 @@ mod tests {
             .map(Vec::len)
             .unwrap_or(0);
         assert_eq!(sample, 1);
+    }
+
+    #[test]
+    fn test_check_dependencies_orphans_warns_on_orphan_row() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let _storage = SqliteStorage::open(&db_path).unwrap();
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let _ = conn.execute("PRAGMA foreign_keys = OFF");
+        conn.execute_with_params(
+            "INSERT INTO dependencies(issue_id, depends_on_id, type) VALUES (?1, ?2, ?3)",
+            &[
+                SqliteValue::Text("bd-orphan-d".into()),
+                SqliteValue::Text("bd-other".into()),
+                SqliteValue::Text("blocks".into()),
+            ],
+        )
+        .unwrap();
+
+        let mut checks = Vec::new();
+        check_dependencies_orphans(&conn, &mut checks);
+        let check = find_check(&checks, "dependencies.orphans").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
+        let count = check
+            .details
+            .as_ref()
+            .and_then(|d| d.get("orphan_count"))
+            .and_then(serde_json::Value::as_i64);
+        assert_eq!(count, Some(1));
+    }
+
+    #[test]
+    fn test_check_dependencies_orphans_clean_workspace_ok() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        storage
+            .create_issue(
+                &sample_issue("bd-local-d", "Local dependency owner"),
+                "tester",
+            )
+            .unwrap();
+        drop(storage);
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        conn.execute_with_params(
+            "INSERT INTO dependencies(issue_id, depends_on_id, type) VALUES (?1, ?2, ?3)",
+            &[
+                SqliteValue::Text("bd-local-d".into()),
+                SqliteValue::Text("external:upstream-1".into()),
+                SqliteValue::Text("blocks".into()),
+            ],
+        )
+        .unwrap();
+        let mut checks = Vec::new();
+        check_dependencies_orphans(&conn, &mut checks);
+        let check = find_check(&checks, "dependencies.orphans").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn test_fix_dependencies_orphans_prunes_via_chokepoint() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        storage
+            .create_issue(&sample_issue("bd-keep-d", "Keep external target"), "tester")
+            .unwrap();
+        drop(storage);
+        {
+            let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            let _ = conn.execute("PRAGMA foreign_keys = OFF");
+            conn.execute_with_params(
+                "INSERT INTO dependencies(issue_id, depends_on_id, type) VALUES (?1, ?2, ?3)",
+                &[
+                    SqliteValue::Text("bd-orphan-fix-d".into()),
+                    SqliteValue::Text("bd-other".into()),
+                    SqliteValue::Text("blocks".into()),
+                ],
+            )
+            .unwrap();
+            conn.execute_with_params(
+                "INSERT INTO dependencies(issue_id, depends_on_id, type) VALUES (?1, ?2, ?3)",
+                &[
+                    SqliteValue::Text("bd-keep-d".into()),
+                    SqliteValue::Text("external:upstream-1".into()),
+                    SqliteValue::Text("blocks".into()),
+                ],
+            )
+            .unwrap();
+        }
+
+        let mut report = DoctorReport {
+            ok: false,
+            workspace_health: Some("degraded".to_string()),
+            reliability_audit: None,
+            checks: Vec::new(),
+        };
+        {
+            let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            check_dependencies_orphans(&conn, &mut report.checks);
+        }
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.name == "dependencies.orphans" && matches!(c.status, CheckStatus::Warn))
+        );
+
+        let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
+            .expect("session must build");
+        let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Text, false, true);
+        assert!(fix_dependencies_orphans_if_warned(
+            &db_path,
+            &report,
+            &ctx,
+            Some(&mut session),
+        ));
+
+        let mut after = Vec::new();
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        check_dependencies_orphans(&conn, &mut after);
+        let check = find_check(&after, "dependencies.orphans").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+        let retained = conn
+            .query(
+                "SELECT COUNT(*) FROM dependencies \
+                 WHERE issue_id = 'bd-keep-d' AND depends_on_id = 'external:upstream-1'",
+            )
+            .unwrap();
+        let retained_count = retained
+            .first()
+            .and_then(|row| row.values().first().cloned())
+            .and_then(|v| match v {
+                SqliteValue::Integer(n) => Some(n),
+                _ => None,
+            });
+        assert_eq!(
+            retained_count,
+            Some(1),
+            "repair must preserve missing/external depends_on_id rows"
+        );
     }
 
     #[test]
@@ -14370,6 +14663,7 @@ mod tests {
             dirty_bitmap_orphans: false,
             comments_orphans: false,
             labels_orphans: false,
+            dependencies_orphans: false,
         };
 
         assert!(summary.applied());
@@ -14428,6 +14722,7 @@ mod tests {
             dirty_bitmap_orphans: false,
             comments_orphans: false,
             labels_orphans: false,
+            dependencies_orphans: false,
         };
 
         assert!(summary.applied());
@@ -14468,6 +14763,7 @@ mod tests {
             dirty_bitmap_orphans: false,
             comments_orphans: false,
             labels_orphans: false,
+            dependencies_orphans: false,
         };
 
         assert!(summary.applied());
@@ -14508,6 +14804,7 @@ mod tests {
             dirty_bitmap_orphans: false,
             comments_orphans: false,
             labels_orphans: false,
+            dependencies_orphans: false,
         };
 
         assert!(summary.applied());

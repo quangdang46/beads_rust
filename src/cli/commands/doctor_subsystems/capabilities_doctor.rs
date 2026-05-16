@@ -268,6 +268,7 @@ const DETECTOR_ROWS: &[DetectorRow] = &[
     ("jsonl.duplicate_ids", "state_files", "warn", false),
     ("comments.orphans", "caches_indexes", "warn", false),
     ("labels.orphans", "caches_indexes", "warn", false),
+    ("dependencies.orphans", "caches_indexes", "warn", false),
     (
         "permissions.config_yaml_secrets",
         "permissions",
@@ -468,6 +469,13 @@ const EARLY_CHOKEPOINT_FIXER_ROWS: &[FixerRow] = &[
         true,
         true,
         &["labels.orphans"],
+    ),
+    (
+        "doctor.dependencies_orphan_prune",
+        "caches_indexes",
+        true,
+        true,
+        &["dependencies.orphans"],
     ),
 ];
 
@@ -707,6 +715,7 @@ mod tests {
                 "doctor.dirty_bitmap_orphan_prune",
                 "doctor.comments_orphan_prune",
                 "doctor.labels_orphan_prune",
+                "doctor.dependencies_orphan_prune",
                 "doctor.repair_recoverable_db_state",
                 "doctor.repair_partial_indexes",
                 "doctor.repair_via_vacuum",
