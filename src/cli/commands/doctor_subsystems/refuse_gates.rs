@@ -114,8 +114,8 @@ pub fn gate_schema_version_downgrade(db_path: &Path) -> GateOutcome {
 /// In WP1 this gate is conservative: if there is no recovery directory
 /// (the common case for healthy workspaces), the gate allows.
 #[must_use]
-pub fn gate_recovery_fingerprint_integrity(beads_dir: &Path) -> GateOutcome {
-    let recovery_dir = beads_dir.join(".br_recovery");
+pub fn gate_recovery_fingerprint_integrity(beads_dir: &Path, db_path: &Path) -> GateOutcome {
+    let recovery_dir = crate::config::recovery_dir_for_db_path(db_path, beads_dir);
     gate_recovery_fingerprint_integrity_in_dir(&recovery_dir)
 }
 
@@ -322,15 +322,14 @@ pub fn run_all(beads_dir: &Path, db_path: &Path) -> GateOutcome {
     if downgrade.is_refused() {
         return downgrade;
     }
-    let recovery_dir = crate::config::recovery_dir_for_db_path(db_path, beads_dir);
-    gate_recovery_fingerprint_integrity_in_dir(&recovery_dir)
+    gate_recovery_fingerprint_integrity(beads_dir, db_path)
 }
 
 /// Surfaces the recovery directory used by the integrity gate. Useful
 /// for callers that want to advertise what the gate inspected.
 #[must_use]
-pub fn recovery_dir_for(beads_dir: &Path) -> PathBuf {
-    beads_dir.join(".br_recovery")
+pub fn recovery_dir_for(beads_dir: &Path, db_path: &Path) -> PathBuf {
+    crate::config::recovery_dir_for_db_path(db_path, beads_dir)
 }
 
 #[cfg(test)]
@@ -400,9 +399,10 @@ mod tests {
     fn recovery_fingerprint_integrity_allows_when_dir_missing() {
         let tmp = tempfile::tempdir().unwrap();
         let beads_dir = tmp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
         fs::create_dir_all(&beads_dir).unwrap();
         assert!(matches!(
-            gate_recovery_fingerprint_integrity(&beads_dir),
+            gate_recovery_fingerprint_integrity(&beads_dir, &db_path),
             GateOutcome::Allow
         ));
     }
@@ -411,6 +411,7 @@ mod tests {
     fn recovery_fingerprint_integrity_refuses_on_sha_mismatch() {
         let tmp = tempfile::tempdir().unwrap();
         let beads_dir = tmp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
         let recovery = beads_dir.join(".br_recovery");
         fs::create_dir_all(&recovery).unwrap();
 
@@ -428,7 +429,7 @@ mod tests {
         )
         .unwrap();
 
-        let outcome = gate_recovery_fingerprint_integrity(&beads_dir);
+        let outcome = gate_recovery_fingerprint_integrity(&beads_dir, &db_path);
         assert!(
             matches!(outcome, GateOutcome::Refuse { .. }),
             "must refuse on fingerprint mismatch"
@@ -440,6 +441,40 @@ mod tests {
         assert_eq!(evidence["gate"], "recovery_fingerprint_integrity");
         let arr = evidence["mismatched_artifacts"].as_array().expect("array");
         assert_eq!(arr.len(), 1);
+    }
+
+    #[test]
+    fn recovery_fingerprint_integrity_scans_active_db_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        let external_db_dir = tmp.path().join("external-db");
+        let external_db = external_db_dir.join("custom.db");
+        let recovery = external_db_dir.join(".br_recovery");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&recovery).unwrap();
+        write_fake_sqlite_db(&external_db, 0);
+
+        let artifact = recovery.join("custom.db.bak");
+        fs::write(&artifact, b"actual bytes").unwrap();
+        let fingerprint = serde_json::json!({
+            "artifact": "custom.db.bak",
+            "sha256": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        });
+        fs::write(
+            recovery.join("custom.db.bak.fingerprint.json"),
+            serde_json::to_string_pretty(&fingerprint).unwrap(),
+        )
+        .unwrap();
+
+        let outcome = gate_recovery_fingerprint_integrity(&beads_dir, &external_db);
+        assert!(
+            matches!(outcome, GateOutcome::Refuse { .. }),
+            "direct recovery gate must inspect the active db path"
+        );
+        let GateOutcome::Refuse { evidence, .. } = outcome else {
+            return;
+        };
+        assert_eq!(evidence["recovery_dir"], recovery.display().to_string());
     }
 
     #[test]
@@ -478,9 +513,22 @@ mod tests {
     }
 
     #[test]
+    fn recovery_dir_for_returns_active_db_recovery_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        let db_path = tmp.path().join("configured-db").join("custom.db");
+
+        assert_eq!(
+            recovery_dir_for(&beads_dir, &db_path),
+            db_path.parent().unwrap().join(".br_recovery")
+        );
+    }
+
+    #[test]
     fn recovery_fingerprint_integrity_refuses_artifact_path_traversal() {
         let tmp = tempfile::tempdir().unwrap();
         let beads_dir = tmp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
         let recovery = beads_dir.join(".br_recovery");
         fs::create_dir_all(&recovery).unwrap();
 
@@ -497,7 +545,7 @@ mod tests {
         )
         .unwrap();
 
-        let outcome = gate_recovery_fingerprint_integrity(&beads_dir);
+        let outcome = gate_recovery_fingerprint_integrity(&beads_dir, &db_path);
         assert!(
             matches!(outcome, GateOutcome::Refuse { .. }),
             "must refuse artifact path traversal"
