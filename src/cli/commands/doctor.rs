@@ -3106,7 +3106,7 @@ fn check_wal_oversized(db_path: &Path, checks: &mut Vec<CheckResult>) {
                 "path": path.display().to_string(),
                 "size_bytes": bytes,
                 "threshold_bytes": WAL_OVERSIZED_BYTES,
-                "remediation": "Run `PRAGMA wal_checkpoint(TRUNCATE)` against the selected SQLite database or `br doctor --repair-indexes`",
+                "remediation": "Run `br doctor --repair --only fm-state_files-wal-oversized` or manually run `PRAGMA wal_checkpoint(TRUNCATE)` against the selected SQLite database",
             })),
         );
     } else {
@@ -3118,19 +3118,16 @@ fn check_wal_oversized(db_path: &Path, checks: &mut Vec<CheckResult>) {
 /// `fm-state_files-wal-oversized`.
 ///
 /// Runs `PRAGMA wal_checkpoint(TRUNCATE)` against the selected SQLite
-/// database via [`chokepoint::mutate(Op::DbExec)`]. The pragma forces
-/// WAL pages to be written to the main DB file and then truncates the
-/// WAL sidecar to zero bytes. This is a data-equivalent operation —
-/// the database's logical state is unchanged; only how it's stored
-/// (consolidated main file vs WAL buffer + main file) shifts.
+/// database via the legacy chokepoint wrapper. Checkpoint pragmas must
+/// run outside an explicit transaction, so this cannot use `Op::DbExec`
+/// (which wraps SQL in `BEGIN IMMEDIATE`). The legacy wrapper still
+/// snapshots the database plus WAL/SHM sidecars before running the
+/// pragma and records `actions.jsonl` entries for undo/forensics.
 ///
-/// Because the operation is data-equivalent, the chokepoint snapshots
-/// nothing (`affected_tables: []`) but still emits an `actions.jsonl`
-/// audit line so the operator can see the checkpoint happened. The
-/// chokepoint's verbatim-backup of the WAL file (captured at step 2
-/// of the 8-step contract) preserves the pre-truncate bytes for
-/// forensic recovery if needed, even though SQLite considers them
-/// redundant.
+/// The pragma forces WAL pages to be written to the main DB file and
+/// then truncates the WAL sidecar to zero bytes. This is a
+/// data-equivalent operation — the database's logical state is
+/// unchanged; only how it's stored shifts.
 ///
 /// TRUNCATE was chosen over PASSIVE/RESTART because the FM is "WAL
 /// grew unboundedly" — a no-op opportunistic checkpoint wouldn't
@@ -3156,24 +3153,19 @@ fn fix_wal_oversized_if_warned(
         }
         return false;
     };
-    session.set_fixer("doctor.wal_checkpoint_truncate");
-    let op = Op::DbExec {
-        sql: "PRAGMA wal_checkpoint(TRUNCATE)".to_string(),
-        args: Vec::new(),
-        // Data-equivalent: no row mutation, no snapshot. The pragma
-        // moves bytes between files but the logical state (SELECT *
-        // FROM <table>) is unchanged before and after.
-        affected_tables: Vec::new(),
-        affected_predicate: None,
-    };
-    match chokepoint::mutate(&session.ctx, db_path, op) {
-        Ok(result) if result.ok => {
+    let wal_path = sqlite_wal_sidecar_path(db_path);
+    let shm_path = sqlite_shm_sidecar_path(db_path);
+    match session.record_legacy_mutation(
+        "doctor.wal_checkpoint_truncate",
+        &[db_path, &wal_path, &shm_path],
+        || checkpoint_wal_truncate(db_path),
+    ) {
+        Ok(()) => {
             if !ctx.is_json() {
                 ctx.info("Checkpointed and truncated SQLite WAL");
             }
             true
         }
-        Ok(_) => false,
         Err(err) => {
             if !ctx.is_json() {
                 ctx.warning(&format!("Failed to checkpoint WAL: {err}"));
@@ -3181,6 +3173,44 @@ fn fix_wal_oversized_if_warned(
             false
         }
     }
+}
+
+fn sqlite_shm_sidecar_path(db_path: &Path) -> PathBuf {
+    let mut sidecar = db_path.as_os_str().to_os_string();
+    sidecar.push("-shm");
+    PathBuf::from(sidecar)
+}
+
+fn checkpoint_wal_truncate(db_path: &Path) -> Result<()> {
+    let conn = Connection::open(db_path.to_string_lossy().into_owned())?;
+    let checkpoint_complete = match wal_checkpoint_truncate_complete(&conn) {
+        Ok(complete) => complete,
+        Err(err) => {
+            let _ = conn.close();
+            return Err(err.into());
+        }
+    };
+    conn.close()?;
+    if !checkpoint_complete {
+        return Err(BeadsError::internal(
+            "doctor: WAL checkpoint did not complete; a reader may still hold a snapshot",
+        ));
+    }
+
+    let wal_path = sqlite_wal_sidecar_path(db_path);
+    if let Ok(meta) = fs::symlink_metadata(&wal_path)
+        && meta.is_file()
+        && !meta.file_type().is_symlink()
+        && meta.len() > WAL_OVERSIZED_BYTES
+    {
+        return Err(BeadsError::internal(format!(
+            "doctor: WAL checkpoint reported complete but {} is still {} bytes",
+            wal_path.display(),
+            meta.len()
+        )));
+    }
+
+    Ok(())
 }
 
 /// Pass-5 cycle 22: detector for
@@ -5306,9 +5336,9 @@ fn fix_labels_orphans_if_warned(
 /// Auto-fixable via [`fix_dependencies_orphans_if_warned`] below:
 /// mirrors cycle 29/34/35's surgical-DELETE pattern through the
 /// chokepoint.
-const DEPENDENCIES_ORPHAN_PREDICATE: &str = "NOT EXISTS (SELECT 1 FROM issues WHERE issues.id = dependencies.issue_id) \
-     OR (dependencies.depends_on_id NOT LIKE 'external:%' \
-         AND NOT EXISTS (SELECT 1 FROM issues WHERE issues.id = dependencies.depends_on_id))";
+const DEPENDENCIES_ORPHAN_PREDICATE: &str = "issue_id NOT IN (SELECT id FROM issues) \
+     OR (depends_on_id NOT LIKE 'external:%' \
+         AND depends_on_id NOT IN (SELECT id FROM issues))";
 
 fn check_dependencies_orphans(conn: &Connection, checks: &mut Vec<CheckResult>) {
     let Ok(rows) = conn.query(&format!(
@@ -11044,6 +11074,78 @@ mod tests {
         }
     }
 
+    fn create_sample_issue(storage: &mut SqliteStorage, id: &str, title: &str) {
+        storage
+            .create_issue(&sample_issue(id, title), "tester")
+            .unwrap();
+    }
+
+    fn insert_dependency_row(conn: &Connection, issue_id: &str, depends_on_id: &str) {
+        conn.execute_with_params(
+            "INSERT INTO dependencies(issue_id, depends_on_id, type) VALUES (?1, ?2, ?3)",
+            &[
+                SqliteValue::Text(issue_id.into()),
+                SqliteValue::Text(depends_on_id.into()),
+                SqliteValue::Text("blocks".into()),
+            ],
+        )
+        .unwrap();
+    }
+
+    fn dependency_row_count(conn: &Connection, issue_id: &str, depends_on_id: &str) -> i64 {
+        let rows = conn
+            .query("SELECT issue_id, depends_on_id FROM dependencies")
+            .unwrap();
+        rows.iter()
+            .filter(|row| {
+                let values = row.values();
+                matches!(
+                    (values.first(), values.get(1)),
+                    (Some(SqliteValue::Text(owner)), Some(SqliteValue::Text(target)))
+                        if owner.as_str() == issue_id && target.as_str() == depends_on_id
+                )
+            })
+            .count()
+            .try_into()
+            .expect("dependency row count should fit in i64")
+    }
+
+    fn seed_dependency_orphan_repair_fixture(db_path: &Path) {
+        let mut storage = SqliteStorage::open(db_path).unwrap();
+        for (id, title) in [
+            ("bd-keep-d", "Keep external target"),
+            ("bd-owner-d", "Prune missing local target"),
+            ("bd-valid-d", "Keep valid owner"),
+            ("bd-target-d", "Keep valid target"),
+        ] {
+            create_sample_issue(&mut storage, id, title);
+        }
+        drop(storage);
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let _ = conn.execute("PRAGMA foreign_keys = OFF");
+        for (issue_id, depends_on_id) in [
+            ("bd-orphan-fix-d", "bd-other"),
+            ("bd-owner-d", "bd-missing-local-target"),
+            ("bd-keep-d", "external:upstream-1"),
+            ("bd-valid-d", "bd-target-d"),
+        ] {
+            insert_dependency_row(&conn, issue_id, depends_on_id);
+        }
+    }
+
+    fn dependency_orphan_report(db_path: &Path) -> DoctorReport {
+        let mut report = DoctorReport {
+            ok: false,
+            workspace_health: Some("degraded".to_string()),
+            reliability_audit: None,
+            checks: Vec::new(),
+        };
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        check_dependencies_orphans(&conn, &mut report.checks);
+        report
+    }
+
     #[test]
     fn test_repair_orphan_cleanup_preserves_external_dependency_endpoints() {
         let mut storage = SqliteStorage::open_memory().unwrap();
@@ -12226,74 +12328,9 @@ mod tests {
         let beads_dir = temp.path().join(".beads");
         fs::create_dir_all(&beads_dir).unwrap();
         let db_path = beads_dir.join("beads.db");
-        let mut storage = SqliteStorage::open(&db_path).unwrap();
-        storage
-            .create_issue(&sample_issue("bd-keep-d", "Keep external target"), "tester")
-            .unwrap();
-        storage
-            .create_issue(
-                &sample_issue("bd-owner-d", "Prune missing local target"),
-                "tester",
-            )
-            .unwrap();
-        storage
-            .create_issue(&sample_issue("bd-valid-d", "Keep valid owner"), "tester")
-            .unwrap();
-        storage
-            .create_issue(&sample_issue("bd-target-d", "Keep valid target"), "tester")
-            .unwrap();
-        drop(storage);
-        {
-            let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
-            let _ = conn.execute("PRAGMA foreign_keys = OFF");
-            conn.execute_with_params(
-                "INSERT INTO dependencies(issue_id, depends_on_id, type) VALUES (?1, ?2, ?3)",
-                &[
-                    SqliteValue::Text("bd-orphan-fix-d".into()),
-                    SqliteValue::Text("bd-other".into()),
-                    SqliteValue::Text("blocks".into()),
-                ],
-            )
-            .unwrap();
-            conn.execute_with_params(
-                "INSERT INTO dependencies(issue_id, depends_on_id, type) VALUES (?1, ?2, ?3)",
-                &[
-                    SqliteValue::Text("bd-owner-d".into()),
-                    SqliteValue::Text("bd-missing-local-target".into()),
-                    SqliteValue::Text("blocks".into()),
-                ],
-            )
-            .unwrap();
-            conn.execute_with_params(
-                "INSERT INTO dependencies(issue_id, depends_on_id, type) VALUES (?1, ?2, ?3)",
-                &[
-                    SqliteValue::Text("bd-keep-d".into()),
-                    SqliteValue::Text("external:upstream-1".into()),
-                    SqliteValue::Text("blocks".into()),
-                ],
-            )
-            .unwrap();
-            conn.execute_with_params(
-                "INSERT INTO dependencies(issue_id, depends_on_id, type) VALUES (?1, ?2, ?3)",
-                &[
-                    SqliteValue::Text("bd-valid-d".into()),
-                    SqliteValue::Text("bd-target-d".into()),
-                    SqliteValue::Text("blocks".into()),
-                ],
-            )
-            .unwrap();
-        }
+        seed_dependency_orphan_repair_fixture(&db_path);
 
-        let mut report = DoctorReport {
-            ok: false,
-            workspace_health: Some("degraded".to_string()),
-            reliability_audit: None,
-            checks: Vec::new(),
-        };
-        {
-            let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
-            check_dependencies_orphans(&conn, &mut report.checks);
-        }
+        let report = dependency_orphan_report(&db_path);
         assert!(
             report
                 .checks
@@ -12316,58 +12353,19 @@ mod tests {
         check_dependencies_orphans(&conn, &mut after);
         let check = find_check(&after, "dependencies.orphans").expect("check present");
         assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
-        let retained = conn
-            .query(
-                "SELECT COUNT(*) FROM dependencies \
-                 WHERE issue_id = 'bd-keep-d' AND depends_on_id = 'external:upstream-1'",
-            )
-            .unwrap();
-        let retained_count = retained
-            .first()
-            .and_then(|row| row.values().first().cloned())
-            .and_then(|v| match v {
-                SqliteValue::Integer(n) => Some(n),
-                _ => None,
-            });
         assert_eq!(
-            retained_count,
-            Some(1),
+            dependency_row_count(&conn, "bd-keep-d", "external:upstream-1"),
+            1,
             "repair must preserve missing/external depends_on_id rows"
         );
-        let valid_retained = conn
-            .query(
-                "SELECT COUNT(*) FROM dependencies \
-                 WHERE issue_id = 'bd-valid-d' AND depends_on_id = 'bd-target-d'",
-            )
-            .unwrap();
-        let valid_retained_count = valid_retained
-            .first()
-            .and_then(|row| row.values().first().cloned())
-            .and_then(|v| match v {
-                SqliteValue::Integer(n) => Some(n),
-                _ => None,
-            });
         assert_eq!(
-            valid_retained_count,
-            Some(1),
+            dependency_row_count(&conn, "bd-valid-d", "bd-target-d"),
+            1,
             "repair must preserve valid local dependency rows"
         );
-        let local_dangling_retained = conn
-            .query(
-                "SELECT COUNT(*) FROM dependencies \
-                 WHERE issue_id = 'bd-owner-d' AND depends_on_id = 'bd-missing-local-target'",
-            )
-            .unwrap();
-        let local_dangling_retained_count = local_dangling_retained
-            .first()
-            .and_then(|row| row.values().first().cloned())
-            .and_then(|v| match v {
-                SqliteValue::Integer(n) => Some(n),
-                _ => None,
-            });
         assert_eq!(
-            local_dangling_retained_count,
-            Some(0),
+            dependency_row_count(&conn, "bd-owner-d", "bd-missing-local-target"),
+            0,
             "repair must prune non-external missing depends_on_id rows"
         );
     }
@@ -14179,25 +14177,13 @@ mod tests {
     }
 
     #[test]
-    fn test_fix_wal_oversized_truncates_via_chokepoint() {
-        // Open the storage to materialise a real beads.db, write enough
-        // WAL pages to exceed the threshold by issuing a transaction,
-        // assert the detector warns, then call the fixer and re-verify
-        // the WAL was truncated to a healthy size.
+    fn test_fix_wal_oversized_truncates_valid_wal_via_chokepoint() {
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
         fs::create_dir_all(&beads_dir).unwrap();
         let db_path = beads_dir.join("beads.db");
-        let _storage = SqliteStorage::open(&db_path).unwrap();
-
-        // Fabricate an oversized WAL by sparse-writing past the
-        // threshold. The chokepoint cmp_strict step reads bytes, so a
-        // sparse file is fine — we only need the file's size on disk
-        // to exceed the threshold the detector measures.
-        let wal_path = beads_dir.join("beads.db-wal");
-        let f = fs::File::create(&wal_path).unwrap();
-        f.set_len(WAL_OVERSIZED_BYTES + 1).unwrap();
-        drop(f);
+        let wal_writer = create_valid_oversized_wal(&db_path);
+        wal_writer.close().unwrap();
 
         let mut report = DoctorReport {
             ok: false,
@@ -14230,6 +14216,34 @@ mod tests {
             matches!(check.status, CheckStatus::Ok),
             "WAL must be at-or-below threshold after PRAGMA wal_checkpoint(TRUNCATE): {check:?}"
         );
+    }
+
+    fn create_valid_oversized_wal(db_path: &Path) -> Connection {
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        conn.execute("PRAGMA journal_mode = WAL").unwrap();
+        conn.execute("PRAGMA wal_autocheckpoint = 0").unwrap();
+        conn.execute("CREATE TABLE wal_growth (id INTEGER PRIMARY KEY, payload TEXT)")
+            .unwrap();
+
+        let payload = "x".repeat(1024 * 1024);
+        let wal_path = sqlite_wal_sidecar_path(db_path);
+        for _ in 0..(WAL_OVERSIZED_BYTES / (1024 * 1024) + 4) {
+            conn.execute_with_params(
+                "INSERT INTO wal_growth(payload) VALUES (?1)",
+                &[SqliteValue::Text(payload.as_str().into())],
+            )
+            .unwrap();
+            if fs::metadata(&wal_path).map_or(0, |meta| meta.len()) > WAL_OVERSIZED_BYTES {
+                break;
+            }
+        }
+
+        let wal_size = fs::metadata(&wal_path).map_or(0, |meta| meta.len());
+        assert!(
+            wal_size > WAL_OVERSIZED_BYTES,
+            "test setup must create a valid oversized WAL, got {wal_size} bytes"
+        );
+        conn
     }
 
     #[test]
