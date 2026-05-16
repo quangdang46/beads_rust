@@ -657,6 +657,7 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
         "fm-permissions-gitignore-not-writable-blocks-repair",
     ),
     ("jsonl.duplicate_ids", "fm-state_files-jsonl-duplicate-ids"),
+    ("comments.orphans", "fm-caches_indexes-comments-orphans"),
     (
         "permissions.config_yaml_secrets",
         "fm-permissions-config-yaml-mode-leaks-secrets",
@@ -1491,6 +1492,7 @@ struct EarlyRepairSummary {
     config_yaml_secret_mode: bool,
     inner_gitignore: bool,
     dirty_bitmap_orphans: bool,
+    comments_orphans: bool,
 }
 
 impl EarlyRepairSummary {
@@ -1510,6 +1512,7 @@ impl EarlyRepairSummary {
             || self.config_yaml_secret_mode
             || self.inner_gitignore
             || self.dirty_bitmap_orphans
+            || self.comments_orphans
     }
 
     fn action_labels(self) -> Vec<String> {
@@ -1558,6 +1561,9 @@ impl EarlyRepairSummary {
         }
         if self.dirty_bitmap_orphans {
             actions.push("dirty_bitmap_orphans_pruned".to_string());
+        }
+        if self.comments_orphans {
+            actions.push("comments_orphans_pruned".to_string());
         }
         actions
     }
@@ -1615,6 +1621,9 @@ impl EarlyRepairSummary {
         }
         if self.dirty_bitmap_orphans {
             messages.push("Pruned orphan rows from dirty_issues table.".to_string());
+        }
+        if self.comments_orphans {
+            messages.push("Pruned orphan rows from comments table.".to_string());
         }
         messages
     }
@@ -4952,6 +4961,117 @@ fn fix_dirty_bitmap_orphans_if_warned(
         Err(err) => {
             if !ctx.is_json() {
                 ctx.warning(&format!("Failed to prune orphan dirty_issues rows: {err}"));
+            }
+            false
+        }
+    }
+}
+
+/// Pass-5 cycle 34 — detector for `fm-caches_indexes-comments-orphans`.
+///
+/// The `comments` table declares `FOREIGN KEY (issue_id) REFERENCES
+/// issues(id) ON DELETE CASCADE` so orphan rows shouldn't normally
+/// exist, but if FK enforcement was off when issues were deleted (or
+/// a partial-rebuild path bypassed the FK pragma) orphan comments
+/// can linger and cause confusing dangling-reference exports.
+///
+/// Auto-fixable via [`fix_comments_orphans_if_warned`] below: mirrors
+/// cycle 29's dirty-bitmap surgical-DELETE pattern through the
+/// chokepoint.
+fn check_comments_orphans(conn: &Connection, checks: &mut Vec<CheckResult>) {
+    let Ok(rows) = conn.query(
+        "SELECT COUNT(*) FROM comments c LEFT JOIN issues i ON c.issue_id = i.id WHERE i.id IS NULL",
+    ) else {
+        push_check(checks, "comments.orphans", CheckStatus::Ok, None, None);
+        return;
+    };
+    let orphan_count = rows
+        .first()
+        .and_then(|row| row.values().first().cloned())
+        .and_then(|v| match v {
+            SqliteValue::Integer(n) => Some(n),
+            _ => None,
+        })
+        .unwrap_or(0);
+    if orphan_count == 0 {
+        push_check(checks, "comments.orphans", CheckStatus::Ok, None, None);
+        return;
+    }
+    let sample: Vec<String> = match conn.query(
+        "SELECT c.issue_id FROM comments c LEFT JOIN issues i ON c.issue_id = i.id WHERE i.id IS NULL LIMIT 5",
+    ) {
+        Ok(rows) => rows
+            .iter()
+            .filter_map(|row| row.values().first().cloned())
+            .filter_map(|v| match v {
+                SqliteValue::Text(s) => Some(s.to_string()),
+                _ => None,
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    push_check(
+        checks,
+        "comments.orphans",
+        CheckStatus::Warn,
+        Some(format!(
+            "{orphan_count} orphan row(s) in comments — issue_id has no matching issues row (FK guard probably bypassed during a delete)"
+        )),
+        Some(serde_json::json!({
+            "orphan_count": orphan_count,
+            "sample_issue_ids": sample,
+            "remediation": "br doctor --repair surgically prunes orphan comments rows via chokepointed DELETE",
+        })),
+    );
+}
+
+/// Pass-5 cycle 34 — fixer for `fm-caches_indexes-comments-orphans`.
+///
+/// Surgically deletes orphan rows from `comments` (rows whose
+/// `issue_id` no longer exists in `issues`) via
+/// [`chokepoint::mutate(Op::DbExec)`]. Mirrors the dirty-bitmap
+/// fixer from cycle 29 exactly: the chokepoint snapshots every row
+/// matching the orphan predicate before the DELETE fires, so
+/// `doctor undo` can restore the orphan rows from snapshot.
+fn fix_comments_orphans_if_warned(
+    db_path: &Path,
+    report: &DoctorReport,
+    ctx: &OutputContext,
+    session: Option<&mut DoctorRepairSession>,
+) -> bool {
+    let has_warning = report
+        .checks
+        .iter()
+        .any(|c| c.name == "comments.orphans" && c.status == CheckStatus::Warn);
+    if !has_warning {
+        return false;
+    }
+    let Some(session) = session else {
+        if !ctx.is_json() {
+            ctx.warning(
+                "Skipping comments-orphan prune: no doctor repair session (run-dir creation failed)",
+            );
+        }
+        return false;
+    };
+    session.set_fixer("doctor.comments_orphan_prune");
+    let op = Op::DbExec {
+        sql: "DELETE FROM comments WHERE issue_id NOT IN (SELECT id FROM issues)".to_string(),
+        args: Vec::new(),
+        affected_tables: vec!["comments".to_string()],
+        affected_predicate: Some("issue_id NOT IN (SELECT id FROM issues)".to_string()),
+    };
+    match chokepoint::mutate(&session.ctx, db_path, op) {
+        Ok(result) if result.ok => {
+            if !ctx.is_json() {
+                ctx.info("Pruned orphan rows from comments");
+            }
+            true
+        }
+        Ok(_) => false,
+        Err(err) => {
+            if !ctx.is_json() {
+                ctx.warning(&format!("Failed to prune orphan comments rows: {err}"));
             }
             false
         }
@@ -9423,6 +9543,8 @@ fn inspect_existing_doctor_database(
         // CASCADE bypassed). Uses the snapshot connection so live DB
         // family is undisturbed.
         check_dirty_bitmap_divergence(&conn, checks);
+        // Pass-5 cycle 34: orphan rows in comments (FK off during delete).
+        check_comments_orphans(&conn, checks);
         // beads_rust-m3mi: audit-suspect close_reasons (warn level)
         check_suspect_close_reasons(&conn, checks);
         if mode == DoctorInspectionMode::Full {
@@ -9935,6 +10057,24 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         };
     let _ = dirty_bitmap_orphans_repaired;
 
+    // Pass-5 cycle 34: surgically prune orphan comments rows via Op::DbExec.
+    let comments_orphans_repaired =
+        if args.repair && fixer_filter.allows("fm-caches_indexes-comments-orphans") {
+            let repaired = fix_comments_orphans_if_warned(
+                &paths.db_path,
+                &initial.report,
+                ctx,
+                session.as_mut(),
+            );
+            if repaired {
+                initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+            }
+            repaired
+        } else {
+            false
+        };
+    let _ = comments_orphans_repaired;
+
     if args.repair && (fixer_filter.has_only() || fixer_filter.has_skip()) {
         tracing::info!(
             target: "br::doctor::filter",
@@ -9959,6 +10099,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         config_yaml_secret_mode: config_yaml_secret_mode_repaired,
         inner_gitignore: inner_gitignore_repaired,
         dirty_bitmap_orphans: dirty_bitmap_orphans_repaired,
+        comments_orphans: comments_orphans_repaired,
     };
 
     if !args.repair {
@@ -11580,6 +11721,102 @@ mod tests {
             .map(Vec::len)
             .unwrap_or(0);
         assert_eq!(sample, 1);
+    }
+
+    #[test]
+    fn test_check_comments_orphans_warns_on_orphan_row() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let _storage = SqliteStorage::open(&db_path).unwrap();
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let _ = conn.execute("PRAGMA foreign_keys = OFF");
+        conn.execute_with_params(
+            "INSERT INTO comments(issue_id, body, created_at, author) VALUES (?1, ?2, ?3, ?4)",
+            &[
+                SqliteValue::Text("bd-orphan-c".into()),
+                SqliteValue::Text("orphan body".into()),
+                SqliteValue::Text("2026-05-15T00:00:00Z".into()),
+                SqliteValue::Text("ghost".into()),
+            ],
+        )
+        .unwrap();
+
+        let mut checks = Vec::new();
+        check_comments_orphans(&conn, &mut checks);
+        let check = find_check(&checks, "comments.orphans").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
+        let count = check
+            .details
+            .as_ref()
+            .and_then(|d| d.get("orphan_count"))
+            .and_then(serde_json::Value::as_i64);
+        assert_eq!(count, Some(1));
+    }
+
+    #[test]
+    fn test_check_comments_orphans_clean_workspace_ok() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let _storage = SqliteStorage::open(&db_path).unwrap();
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let mut checks = Vec::new();
+        check_comments_orphans(&conn, &mut checks);
+        let check = find_check(&checks, "comments.orphans").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn test_fix_comments_orphans_prunes_via_chokepoint() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        let _storage = SqliteStorage::open(&db_path).unwrap();
+        {
+            let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            let _ = conn.execute("PRAGMA foreign_keys = OFF");
+            conn.execute_with_params(
+                "INSERT INTO comments(issue_id, body, created_at, author) VALUES (?1, ?2, ?3, ?4)",
+                &[
+                    SqliteValue::Text("bd-orphan-fix".into()),
+                    SqliteValue::Text("orphan body".into()),
+                    SqliteValue::Text("2026-05-15T00:00:00Z".into()),
+                    SqliteValue::Text("ghost".into()),
+                ],
+            )
+            .unwrap();
+        }
+
+        let mut report = DoctorReport {
+            ok: false,
+            workspace_health: Some("degraded".to_string()),
+            reliability_audit: None,
+            checks: Vec::new(),
+        };
+        {
+            let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            check_comments_orphans(&conn, &mut report.checks);
+        }
+        assert!(report
+            .checks
+            .iter()
+            .any(|c| c.name == "comments.orphans" && matches!(c.status, CheckStatus::Warn)));
+
+        let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
+            .expect("session must build");
+        let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Text, false, true);
+        assert!(fix_comments_orphans_if_warned(
+            &db_path,
+            &report,
+            &ctx,
+            Some(&mut session),
+        ));
+
+        let mut after = Vec::new();
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        check_comments_orphans(&conn, &mut after);
+        let check = find_check(&after, "comments.orphans").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
     }
 
     #[test]
@@ -13896,6 +14133,7 @@ mod tests {
             config_yaml_secret_mode: false,
             inner_gitignore: false,
             dirty_bitmap_orphans: false,
+            comments_orphans: false,
         };
 
         assert!(summary.applied());
@@ -13952,6 +14190,7 @@ mod tests {
             config_yaml_secret_mode: false,
             inner_gitignore: false,
             dirty_bitmap_orphans: false,
+            comments_orphans: false,
         };
 
         assert!(summary.applied());
@@ -13990,6 +14229,7 @@ mod tests {
             config_yaml_secret_mode: false,
             inner_gitignore: false,
             dirty_bitmap_orphans: false,
+            comments_orphans: false,
         };
 
         assert!(summary.applied());
@@ -14028,6 +14268,7 @@ mod tests {
             config_yaml_secret_mode: false,
             inner_gitignore: false,
             dirty_bitmap_orphans: false,
+            comments_orphans: false,
         };
 
         assert!(summary.applied());
