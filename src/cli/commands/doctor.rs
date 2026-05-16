@@ -658,6 +658,7 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
     ),
     ("jsonl.duplicate_ids", "fm-state_files-jsonl-duplicate-ids"),
     ("comments.orphans", "fm-caches_indexes-comments-orphans"),
+    ("labels.orphans", "fm-caches_indexes-labels-orphans"),
     (
         "permissions.config_yaml_secrets",
         "fm-permissions-config-yaml-mode-leaks-secrets",
@@ -1493,6 +1494,7 @@ struct EarlyRepairSummary {
     inner_gitignore: bool,
     dirty_bitmap_orphans: bool,
     comments_orphans: bool,
+    labels_orphans: bool,
 }
 
 impl EarlyRepairSummary {
@@ -1513,6 +1515,7 @@ impl EarlyRepairSummary {
             || self.inner_gitignore
             || self.dirty_bitmap_orphans
             || self.comments_orphans
+            || self.labels_orphans
     }
 
     fn action_labels(self) -> Vec<String> {
@@ -1564,6 +1567,9 @@ impl EarlyRepairSummary {
         }
         if self.comments_orphans {
             actions.push("comments_orphans_pruned".to_string());
+        }
+        if self.labels_orphans {
+            actions.push("labels_orphans_pruned".to_string());
         }
         actions
     }
@@ -1624,6 +1630,9 @@ impl EarlyRepairSummary {
         }
         if self.comments_orphans {
             messages.push("Pruned orphan rows from comments table.".to_string());
+        }
+        if self.labels_orphans {
+            messages.push("Pruned orphan rows from labels table.".to_string());
         }
         messages
     }
@@ -5075,6 +5084,118 @@ fn fix_comments_orphans_if_warned(
         Err(err) => {
             if !ctx.is_json() {
                 ctx.warning(&format!("Failed to prune orphan comments rows: {err}"));
+            }
+            false
+        }
+    }
+}
+
+/// Pass-5 cycle 35 — detector for `fm-caches_indexes-labels-orphans`.
+///
+/// The `labels` table declares `FOREIGN KEY (issue_id) REFERENCES
+/// issues(id) ON DELETE CASCADE` so orphan rows shouldn't normally
+/// exist, but if FK enforcement was off when issues were deleted (or
+/// a partial-rebuild path bypassed the FK pragma) orphan label
+/// assignments can linger and cause confusing dangling-reference
+/// exports or `br ready --label` mis-filtering.
+///
+/// Auto-fixable via [`fix_labels_orphans_if_warned`] below: mirrors
+/// cycle 29's dirty-bitmap surgical-DELETE pattern through the
+/// chokepoint.
+fn check_labels_orphans(conn: &Connection, checks: &mut Vec<CheckResult>) {
+    let Ok(rows) = conn.query(
+        "SELECT COUNT(*) FROM labels l LEFT JOIN issues i ON l.issue_id = i.id WHERE i.id IS NULL",
+    ) else {
+        push_check(checks, "labels.orphans", CheckStatus::Ok, None, None);
+        return;
+    };
+    let orphan_count = rows
+        .first()
+        .and_then(|row| row.values().first().cloned())
+        .and_then(|v| match v {
+            SqliteValue::Integer(n) => Some(n),
+            _ => None,
+        })
+        .unwrap_or(0);
+    if orphan_count == 0 {
+        push_check(checks, "labels.orphans", CheckStatus::Ok, None, None);
+        return;
+    }
+    let sample: Vec<String> = match conn.query(
+        "SELECT l.issue_id FROM labels l LEFT JOIN issues i ON l.issue_id = i.id WHERE i.id IS NULL LIMIT 5",
+    ) {
+        Ok(rows) => rows
+            .iter()
+            .filter_map(|row| row.values().first().cloned())
+            .filter_map(|v| match v {
+                SqliteValue::Text(s) => Some(s.to_string()),
+                _ => None,
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    push_check(
+        checks,
+        "labels.orphans",
+        CheckStatus::Warn,
+        Some(format!(
+            "{orphan_count} orphan row(s) in labels — issue_id has no matching issues row (FK guard probably bypassed during a delete)"
+        )),
+        Some(serde_json::json!({
+            "orphan_count": orphan_count,
+            "sample_issue_ids": sample,
+            "remediation": "br doctor --repair surgically prunes orphan labels rows via chokepointed DELETE",
+        })),
+    );
+}
+
+/// Pass-5 cycle 35 — fixer for `fm-caches_indexes-labels-orphans`.
+///
+/// Surgically deletes orphan rows from `labels` (rows whose
+/// `issue_id` no longer exists in `issues`) via
+/// [`chokepoint::mutate(Op::DbExec)`]. Mirrors the dirty-bitmap and
+/// comments fixers exactly: chokepoint snapshots every orphan row
+/// before the DELETE fires, so `doctor undo` restores them from
+/// snapshot via `restore_db_exec`.
+fn fix_labels_orphans_if_warned(
+    db_path: &Path,
+    report: &DoctorReport,
+    ctx: &OutputContext,
+    session: Option<&mut DoctorRepairSession>,
+) -> bool {
+    let has_warning = report
+        .checks
+        .iter()
+        .any(|c| c.name == "labels.orphans" && c.status == CheckStatus::Warn);
+    if !has_warning {
+        return false;
+    }
+    let Some(session) = session else {
+        if !ctx.is_json() {
+            ctx.warning(
+                "Skipping labels-orphan prune: no doctor repair session (run-dir creation failed)",
+            );
+        }
+        return false;
+    };
+    session.set_fixer("doctor.labels_orphan_prune");
+    let op = Op::DbExec {
+        sql: "DELETE FROM labels WHERE issue_id NOT IN (SELECT id FROM issues)".to_string(),
+        args: Vec::new(),
+        affected_tables: vec!["labels".to_string()],
+        affected_predicate: Some("issue_id NOT IN (SELECT id FROM issues)".to_string()),
+    };
+    match chokepoint::mutate(&session.ctx, db_path, op) {
+        Ok(result) if result.ok => {
+            if !ctx.is_json() {
+                ctx.info("Pruned orphan rows from labels");
+            }
+            true
+        }
+        Ok(_) => false,
+        Err(err) => {
+            if !ctx.is_json() {
+                ctx.warning(&format!("Failed to prune orphan labels rows: {err}"));
             }
             false
         }
@@ -9548,6 +9669,8 @@ fn inspect_existing_doctor_database(
         check_dirty_bitmap_divergence(&conn, checks);
         // Pass-5 cycle 34: orphan rows in comments (FK off during delete).
         check_comments_orphans(&conn, checks);
+        // Pass-5 cycle 35: orphan rows in labels (FK off during delete).
+        check_labels_orphans(&conn, checks);
         // beads_rust-m3mi: audit-suspect close_reasons (warn level)
         check_suspect_close_reasons(&conn, checks);
         if mode == DoctorInspectionMode::Full {
@@ -10075,6 +10198,21 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     };
     let _ = comments_orphans_repaired;
 
+    // Pass-5 cycle 35: surgically prune orphan labels rows via Op::DbExec.
+    let labels_orphans_repaired = if args.repair
+        && fixer_filter.allows("fm-caches_indexes-labels-orphans")
+    {
+        let repaired =
+            fix_labels_orphans_if_warned(&paths.db_path, &initial.report, ctx, session.as_mut());
+        if repaired {
+            initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+        }
+        repaired
+    } else {
+        false
+    };
+    let _ = labels_orphans_repaired;
+
     if args.repair && (fixer_filter.has_only() || fixer_filter.has_skip()) {
         tracing::info!(
             target: "br::doctor::filter",
@@ -10100,6 +10238,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         inner_gitignore: inner_gitignore_repaired,
         dirty_bitmap_orphans: dirty_bitmap_orphans_repaired,
         comments_orphans: comments_orphans_repaired,
+        labels_orphans: labels_orphans_repaired,
     };
 
     if !args.repair {
@@ -11721,6 +11860,100 @@ mod tests {
             .map(Vec::len)
             .unwrap_or(0);
         assert_eq!(sample, 1);
+    }
+
+    #[test]
+    fn test_check_labels_orphans_warns_on_orphan_row() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let _storage = SqliteStorage::open(&db_path).unwrap();
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let _ = conn.execute("PRAGMA foreign_keys = OFF");
+        conn.execute_with_params(
+            "INSERT INTO labels(issue_id, label) VALUES (?1, ?2)",
+            &[
+                SqliteValue::Text("bd-orphan-l".into()),
+                SqliteValue::Text("doc".into()),
+            ],
+        )
+        .unwrap();
+
+        let mut checks = Vec::new();
+        check_labels_orphans(&conn, &mut checks);
+        let check = find_check(&checks, "labels.orphans").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
+        let count = check
+            .details
+            .as_ref()
+            .and_then(|d| d.get("orphan_count"))
+            .and_then(serde_json::Value::as_i64);
+        assert_eq!(count, Some(1));
+    }
+
+    #[test]
+    fn test_check_labels_orphans_clean_workspace_ok() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let _storage = SqliteStorage::open(&db_path).unwrap();
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let mut checks = Vec::new();
+        check_labels_orphans(&conn, &mut checks);
+        let check = find_check(&checks, "labels.orphans").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn test_fix_labels_orphans_prunes_via_chokepoint() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        let _storage = SqliteStorage::open(&db_path).unwrap();
+        {
+            let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            let _ = conn.execute("PRAGMA foreign_keys = OFF");
+            conn.execute_with_params(
+                "INSERT INTO labels(issue_id, label) VALUES (?1, ?2)",
+                &[
+                    SqliteValue::Text("bd-orphan-fix-l".into()),
+                    SqliteValue::Text("doc".into()),
+                ],
+            )
+            .unwrap();
+        }
+
+        let mut report = DoctorReport {
+            ok: false,
+            workspace_health: Some("degraded".to_string()),
+            reliability_audit: None,
+            checks: Vec::new(),
+        };
+        {
+            let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            check_labels_orphans(&conn, &mut report.checks);
+        }
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.name == "labels.orphans" && matches!(c.status, CheckStatus::Warn))
+        );
+
+        let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
+            .expect("session must build");
+        let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Text, false, true);
+        assert!(fix_labels_orphans_if_warned(
+            &db_path,
+            &report,
+            &ctx,
+            Some(&mut session),
+        ));
+
+        let mut after = Vec::new();
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        check_labels_orphans(&conn, &mut after);
+        let check = find_check(&after, "labels.orphans").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
     }
 
     #[test]
@@ -14136,6 +14369,7 @@ mod tests {
             inner_gitignore: false,
             dirty_bitmap_orphans: false,
             comments_orphans: false,
+            labels_orphans: false,
         };
 
         assert!(summary.applied());
@@ -14193,6 +14427,7 @@ mod tests {
             inner_gitignore: false,
             dirty_bitmap_orphans: false,
             comments_orphans: false,
+            labels_orphans: false,
         };
 
         assert!(summary.applied());
@@ -14232,6 +14467,7 @@ mod tests {
             inner_gitignore: false,
             dirty_bitmap_orphans: false,
             comments_orphans: false,
+            labels_orphans: false,
         };
 
         assert!(summary.applied());
@@ -14271,6 +14507,7 @@ mod tests {
             inner_gitignore: false,
             dirty_bitmap_orphans: false,
             comments_orphans: false,
+            labels_orphans: false,
         };
 
         assert!(summary.applied());
