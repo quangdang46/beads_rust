@@ -604,44 +604,50 @@ fn validate_relations(args: &CreateArgs, issue_id: &str) -> Result<()> {
 
     // Validate Dependencies
     for dep_str in &args.deps {
-        let (type_str, dep_id) = if dep_str.starts_with("external:") {
-            ("blocks", dep_str.as_str())
-        } else if let Some((t, i)) = dep_str.split_once(':') {
-            (t, i)
-        } else {
-            ("blocks", dep_str.as_str())
-        };
+        let (_, dep_id) = parse_create_dependency(dep_str)?;
 
         if dep_id == issue_id {
             return Err(BeadsError::validation("deps", "cannot depend on itself"));
         }
-
-        // Accept "blocked-by" as alias for "blocks" (consistent with import path)
-        let normalized_type = if type_str.eq_ignore_ascii_case("blocked-by") {
-            "blocks"
-        } else {
-            type_str
-        };
-
-        // Strict dependency type validation
-        // Note: DependencyType::from_str always returns Ok, so map_err is for clarity
-        let dep_type: DependencyType = normalized_type.parse().expect("from_str is infallible");
-
-        // Disallow accidental custom types from typos
-        if let DependencyType::Custom(_) = dep_type {
-            return Err(BeadsError::Validation {
-                field: "deps".to_string(),
-                reason: format!(
-                    "Unknown dependency type: '{type_str}'. \
-                     Allowed types: blocks, blocked-by, parent-child, conditional-blocks, waits-for, \
-                     related, discovered-from, replies-to, relates-to, duplicates, \
-                     supersedes, caused-by"
-                ),
-            });
-        }
     }
 
     Ok(())
+}
+
+fn parse_create_dependency(dep_str: &str) -> Result<(DependencyType, String)> {
+    // Match markdown import semantics: a colon only means `type:id` when the
+    // prefix is a known dependency type; otherwise it can be part of a title.
+    let (mut type_str, dep_id, valid) = parse_dependency(dep_str);
+    if !valid {
+        return Err(BeadsError::Validation {
+            field: "deps".to_string(),
+            reason: format!(
+                "Unknown dependency type: '{type_str}'. \
+                 Allowed types: blocks, blocked-by, parent-child, conditional-blocks, waits-for, \
+                 related, discovered-from, replies-to, relates-to, duplicates, \
+                 supersedes, caused-by"
+            ),
+        });
+    }
+
+    if type_str.eq_ignore_ascii_case("blocked-by") {
+        type_str = "blocks".to_string();
+    }
+
+    let dep_type = DependencyType::from_str(&type_str)?;
+    if let DependencyType::Custom(_) = dep_type {
+        return Err(BeadsError::Validation {
+            field: "deps".to_string(),
+            reason: format!(
+                "Unknown dependency type: '{type_str}'. \
+                 Allowed types: blocks, blocked-by, parent-child, conditional-blocks, waits-for, \
+                 related, discovered-from, replies-to, relates-to, duplicates, \
+                 supersedes, caused-by"
+            ),
+        });
+    }
+
+    Ok((dep_type, dep_id))
 }
 
 struct RelationContext<'a> {
@@ -682,25 +688,9 @@ fn populate_relations(
 
     // Dependencies
     for dep_str in &args.deps {
-        let (type_str, dep_id) = if dep_str.starts_with("external:") {
-            ("blocks", dep_str.as_str())
-        } else if let Some((t, i)) = dep_str.split_once(':') {
-            (t, i)
-        } else {
-            ("blocks", dep_str.as_str())
-        };
+        let (dep_type, dep_id) = parse_create_dependency(dep_str)?;
+        let resolved_dep_id = resolve_dependency_id(&resolver, ctx.storage, &dep_id)?;
 
-        // Normalize "blocked-by" to "blocks" (consistent with validation and import)
-        let normalized_type = if type_str.eq_ignore_ascii_case("blocked-by") {
-            "blocks"
-        } else {
-            type_str
-        };
-
-        let resolved_dep_id = resolve_dependency_id(&resolver, ctx.storage, dep_id)?;
-
-        // from_str is infallible - Custom types are rejected by validate_relations above
-        let dep_type: DependencyType = normalized_type.parse().expect("validated above");
         issue.dependencies.push(Dependency {
             issue_id: issue.id.clone(),
             depends_on_id: resolved_dep_id,
@@ -1300,12 +1290,9 @@ fn lookup_import_reference(
     standin_to_ids
         .get(&key)
         .or_else(|| title_to_ids.get(&key))
-        .map(|ids| {
-            if ids.len() == 1 {
-                ImportReferenceResolution::Resolved(ids[0].clone())
-            } else {
-                ImportReferenceResolution::Ambiguous(ids.clone())
-            }
+        .map(|ids| match ids.as_slice() {
+            [id] => ImportReferenceResolution::Resolved(id.clone()),
+            _ => ImportReferenceResolution::Ambiguous(ids.clone()),
         })
 }
 
@@ -1582,6 +1569,29 @@ mod tests {
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0], target.id);
         info!("test_create_issue_with_labels_and_deps: assertions passed");
+    }
+
+    #[test]
+    fn test_create_issue_dep_title_with_colon_resolves_as_title() {
+        init_test_logging();
+        info!("test_create_issue_dep_title_with_colon_resolves_as_title: starting");
+        let mut storage = setup_memory_storage();
+        let config = default_config();
+
+        let target_args = CreateArgs {
+            title: Some("Step 1: Setup Database".to_string()),
+            ..default_args()
+        };
+        let target = create_issue_impl(&mut storage, &target_args, &config).expect("create target");
+
+        let mut args = default_args();
+        args.deps = vec!["Step 1: Setup Database".to_string()];
+
+        let issue = create_issue_impl(&mut storage, &args, &config).expect("create dependent");
+
+        let deps = storage.get_dependencies(&issue.id).expect("get deps");
+        assert_eq!(deps, vec![target.id]);
+        info!("test_create_issue_dep_title_with_colon_resolves_as_title: assertions passed");
     }
 
     #[test]
