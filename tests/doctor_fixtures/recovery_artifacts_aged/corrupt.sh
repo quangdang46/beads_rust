@@ -16,23 +16,38 @@ mkdir -p "$target_dir"
 cd "$target_dir"
 "$tool_bin" init >/dev/null 2>&1
 
+set_mtime_days_ago() {
+  local days="${1:?days required}"
+  shift
+  python3 - "$days" "$@" <<'PY'
+import os
+import sys
+import time
+
+days = int(sys.argv[1])
+mtime = time.time() - days * 24 * 60 * 60
+for path in sys.argv[2:]:
+    os.utime(path, (mtime, mtime))
+PY
+}
+
 recovery="$target_dir/.beads/.br_recovery"
 mkdir -p "$recovery"
 
 # Aged: 60 days old (well past the 30-day TTL).
 aged_path="$recovery/beads.db.20250101T000000Z"
 cp .beads/beads.db "$aged_path"
-touch -d '60 days ago' "$aged_path"
+set_mtime_days_ago 60 "$aged_path"
 
 # Recent: 1 day old (well within the TTL).
 recent_path="$recovery/beads.db.20260512T000000Z"
 cp .beads/beads.db "$recent_path"
-touch -d '1 day ago' "$recent_path"
+set_mtime_days_ago 1 "$recent_path"
 
 # Aged sibling .bad_<TS> next to the live DB.
 bad_sibling="$target_dir/.beads/beads.db.bad_20250101T000000Z"
 cp .beads/beads.db "$bad_sibling"
-touch -d '60 days ago' "$bad_sibling"
+set_mtime_days_ago 60 "$bad_sibling"
 
 # Record the paths for assert.sh.
 {

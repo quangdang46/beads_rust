@@ -31,9 +31,17 @@ echo 'orphan two' > .beads/orphan-two.tmp.42
 sha256sum .beads/orphan-one.tmp | awk '{print $1}' > .fixture_orphan_one_sha256
 sha256sum .beads/orphan-two.tmp.42 | awk '{print $1}' > .fixture_orphan_two_sha256
 
-# Backdate mtime past the 1-hour threshold. `touch -d "2 hours ago"`
-# is portable on both GNU and BSD coreutils.
-touch -d '2 hours ago' .beads/orphan-one.tmp .beads/orphan-two.tmp.42
+# Backdate mtime past the 1-hour threshold. Use Python instead of
+# GNU-only `touch -d` so the fixture also runs on BSD/macOS hosts.
+python3 - .beads/orphan-one.tmp .beads/orphan-two.tmp.42 <<'PY'
+import os
+import sys
+import time
+
+mtime = time.time() - 2 * 60 * 60
+for path in sys.argv[1:]:
+    os.utime(path, (mtime, mtime))
+PY
 
 if [ -e .fixture_baseline ]; then
   echo "fixture baseline already exists; expected a fresh workspace" >&2

@@ -28,7 +28,15 @@ cat >> .beads/issues.jsonl <<'JSONL'
 JSONL
 
 # Bump JSONL mtime so freshness checks treat it as the newer authority.
-touch -d 'now + 1 hour' .beads/issues.jsonl 2>/dev/null || touch .beads/issues.jsonl
+# Use Python instead of GNU-only `touch -d` for BSD/macOS fixture hosts.
+python3 - .beads/issues.jsonl <<'PY'
+import os
+import sys
+import time
+
+mtime = time.time() + 60 * 60
+os.utime(sys.argv[1], (mtime, mtime))
+PY
 
 if [ -e .fixture_baseline ]; then
   echo "fixture baseline already exists; expected a fresh workspace" >&2
