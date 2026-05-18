@@ -71,6 +71,17 @@ struct TreeNode {
     truncated: bool,
 }
 
+/// Row emitted inside `br count --by <field> --json` under `groups[]`.
+///
+/// Keep this in sync with `cli::commands::count::CountGroup`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+struct CountGroup {
+    /// Group label, for example a status, priority, type, assignee, or label.
+    group: String,
+    /// Number of matching issues in this group.
+    count: usize,
+}
+
 #[derive(Debug, Serialize)]
 struct SchemaOutput {
     tool: &'static str,
@@ -181,6 +192,7 @@ fn build_schemas(target: SchemaTarget) -> BTreeMap<&'static str, Schema> {
             schemas.insert("StaleIssue", schema_for!(StaleIssue));
             schemas.insert("BlockedIssue", schema_for!(BlockedIssue));
             schemas.insert("TreeNode", schema_for!(TreeNode));
+            schemas.insert("CountGroup", schema_for!(CountGroup));
             schemas.insert("Statistics", schema_for!(Statistics));
             schemas.insert(
                 "CoordinationStatusOutput",
@@ -398,7 +410,24 @@ fn insert_aggregate_command_shapes(commands: &mut BTreeMap<&'static str, Command
             items_at: None,
             item_schema: None,
             error_envelope_on_stderr: false,
-            notes: Some("Scalar count under `.count`."),
+            notes: Some(
+                "Ungrouped `br count --json`; scalar count under `.count`. \
+                 Grouped variants use the `count --by` entry.",
+            ),
+        },
+    );
+    commands.insert(
+        "count --by",
+        CommandShape {
+            shape: "object",
+            jq_filter: ".groups[]",
+            items_at: Some(".groups"),
+            item_schema: Some("CountGroup"),
+            error_envelope_on_stderr: false,
+            notes: Some(
+                "For `br count --by <status|priority|type|assignee|label> --json`. \
+                 The wrapper object also includes `total`.",
+            ),
         },
     );
     commands.insert(
@@ -605,5 +634,29 @@ mod tests {
             stats.error_envelope_on_stderr,
             status.error_envelope_on_stderr
         );
+    }
+
+    #[test]
+    fn count_command_shapes_cover_ungrouped_and_grouped_envelopes() {
+        let schemas = build_schemas(SchemaTarget::All);
+        assert!(
+            schemas.contains_key("CountGroup"),
+            "schema all must include grouped count rows"
+        );
+
+        let commands = build_commands(SchemaTarget::Commands);
+        let count = commands
+            .get("count")
+            .expect("ungrouped count entry must exist");
+        assert_eq!(count.jq_filter, ".count");
+        assert_eq!(count.items_at, None);
+        assert_eq!(count.item_schema, None);
+
+        let grouped = commands
+            .get("count --by")
+            .expect("grouped count entry must exist");
+        assert_eq!(grouped.jq_filter, ".groups[]");
+        assert_eq!(grouped.items_at, Some(".groups"));
+        assert_eq!(grouped.item_schema, Some("CountGroup"));
     }
 }

@@ -43,6 +43,47 @@ fn e2e_schema_json_issue() {
 }
 
 #[test]
+fn e2e_schema_all_includes_grouped_count_contract() {
+    let _log = common::test_log("e2e_schema_all_includes_grouped_count_contract");
+    let workspace = BrWorkspace::new();
+
+    let run = run_br(
+        &workspace,
+        ["schema", "all", "--format", "json"],
+        "schema_all_grouped_count_contract",
+    );
+    assert!(
+        run.status.success(),
+        "schema all json failed: {}",
+        run.stderr
+    );
+
+    let payload = extract_json_payload(&run.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("valid JSON output");
+
+    assert!(
+        json["schemas"].get("CountGroup").is_some(),
+        "schemas should include CountGroup rows for grouped count output"
+    );
+    assert_eq!(
+        json["commands"]["count"]["jq_filter"], ".count",
+        "ungrouped count must keep the scalar .count contract"
+    );
+    assert_eq!(
+        json["commands"]["count --by"]["jq_filter"], ".groups[]",
+        "grouped count must expose the iterable groups row path"
+    );
+    assert_eq!(
+        json["commands"]["count --by"]["items_at"], ".groups",
+        "grouped count must document where rows live"
+    );
+    assert_eq!(
+        json["commands"]["count --by"]["item_schema"], "CountGroup",
+        "grouped count rows must reference the CountGroup schema"
+    );
+}
+
+#[test]
 fn e2e_schema_toon_decodes() {
     let _log = common::test_log("e2e_schema_toon_decodes");
     let workspace = BrWorkspace::new();
