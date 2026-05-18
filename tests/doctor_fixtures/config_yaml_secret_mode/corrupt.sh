@@ -32,7 +32,12 @@ chmod 0666 .beads/config.yaml
 sha256sum .beads/config.yaml | awk '{print $1}' > .fixture_config_pre_sha256
 # Snapshot the corrupted mode so post_undo can verify byte-
 # deterministic restore.
-stat -c '%a' .beads/config.yaml > .fixture_pre_mode
+python3 - .beads/config.yaml > .fixture_pre_mode <<'PY'
+import os
+import sys
+
+print(format(os.stat(sys.argv[1]).st_mode & 0o777, "o"))
+PY
 
 if [ -e .fixture_baseline ]; then
   echo "fixture baseline already exists; expected a fresh workspace" >&2

@@ -941,27 +941,42 @@ fn restore_one(
         Ok(bytes) => bytes,
         Err(step) => return step,
     };
+    let backup_mode = fs::metadata(&backup).ok().map(|m| metadata_mode(&m));
 
-    // Idempotence: if the live file already matches the (verified) backup
-    // byte-for-byte, we've already restored this action.
-    if let Ok(live) = fs::read(&target)
-        && live == backup_bytes
-    {
-        return UndoStep {
-            path: record.path.clone(),
-            op: record.op.clone(),
-            status: "skipped_idempotent".to_string(),
-            backup_used: Some(backup.to_string_lossy().into_owned()),
-        };
+    // Idempotence: bytes alone are not enough for chmod-only repairs.
+    // The backup is verbatim metadata too; skip only once both the live
+    // bytes and the live mode match the verified backup.
+    let live_bytes_match = fs::read(&target).is_ok_and(|live| live == backup_bytes);
+    if live_bytes_match {
+        let live_mode_match = backup_mode.is_none_or(|expected| {
+            fs::metadata(&target)
+                .ok()
+                .is_some_and(|metadata| metadata_mode(&metadata) == expected)
+        });
+        if live_mode_match {
+            return UndoStep {
+                path: record.path.clone(),
+                op: record.op.clone(),
+                status: "skipped_idempotent".to_string(),
+                backup_used: Some(backup.to_string_lossy().into_owned()),
+            };
+        }
+        if record.op == "chmod"
+            && let Some(mode) = backup_mode
+        {
+            return match chokepoint::mutate(ctx, &target, Op::Chmod { mode }) {
+                Ok(_) => step_with_backup(record, "restored", &backup),
+                Err(e) => step_with_backup(record, &format!("failed_mutate:{e}"), &backup),
+            };
+        }
     }
 
-    let mode = fs::metadata(&backup).ok().map(|m| metadata_mode(&m));
     match chokepoint::mutate(
         ctx,
         &target,
         Op::WriteFile {
             content: backup_bytes,
-            mode,
+            mode: backup_mode,
         },
     ) {
         Ok(_) => step_with_backup(record, "restored", &backup),
@@ -1604,9 +1619,14 @@ fn plan_one(
         Ok(bytes) => bytes,
         Err(step) => return step,
     };
-    if let Ok(live) = fs::read(&target)
-        && live == backup_bytes
-    {
+    let backup_mode = fs::metadata(&backup).ok().map(|m| metadata_mode(&m));
+    let live_bytes_match = fs::read(&target).is_ok_and(|live| live == backup_bytes);
+    let live_mode_match = backup_mode.is_none_or(|expected| {
+        fs::metadata(&target)
+            .ok()
+            .is_some_and(|metadata| metadata_mode(&metadata) == expected)
+    });
+    if live_bytes_match && live_mode_match {
         return UndoStep {
             path: record.path.clone(),
             op: record.op.clone(),
@@ -2297,6 +2317,57 @@ mod tests {
         // Idempotence: running undo again is a no-op.
         execute_undo(&args, repo).expect("undo idempotent");
         assert_eq!(fs::read(&target).unwrap(), b"original");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_undo_restores_chmod_mode_when_bytes_match() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = unique_temp_root("undo-chmod-mode");
+        let repo = tmp.path();
+        let beads = repo.join(".beads");
+        fs::create_dir_all(&beads).unwrap();
+        let target = beads.join("issues.jsonl");
+        fs::write(&target, b"{}\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o666)).unwrap();
+
+        let initial_run = run_dir::create_run_dir(repo).expect("create run");
+        let actions_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&initial_run.actions_file)
+            .unwrap();
+        let ctx = MutateContext {
+            run_id: initial_run.run_id.clone(),
+            run_dir: initial_run.root.clone(),
+            capabilities: MutateCapabilities::for_repo(repo),
+            actions_file: Mutex::new(actions_file),
+            fixer_id: "test".into(),
+            repo_root: repo.to_path_buf(),
+            dry_run: false,
+            start_ns: now_ns(),
+        };
+
+        chokepoint::mutate(&ctx, &target, Op::Chmod { mode: 0o664 }).expect("chmod");
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o664
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"{}\n");
+
+        let args = DoctorUndoArgs {
+            run_id: initial_run.run_id.clone(),
+            dry_run: false,
+            json: true,
+        };
+        execute_undo(&args, repo).expect("undo chmod");
+
+        assert_eq!(fs::read(&target).unwrap(), b"{}\n");
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o666
+        );
     }
 
     #[test]

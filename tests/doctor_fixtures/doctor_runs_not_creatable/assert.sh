@@ -13,7 +13,12 @@ tool_bin="${TOOL_BIN:-br}"
 cd "$target_dir"
 
 cur_mode() {
-  stat -c '%a' .doctor 2>/dev/null
+  python3 - .doctor <<'PY'
+import os
+import sys
+
+print(format(os.stat(sys.argv[1]).st_mode & 0o777, "o"))
+PY
 }
 
 case "$stage" in

@@ -13,7 +13,12 @@ tool_bin="${TOOL_BIN:-br}"
 cd "$target_dir"
 
 cur_mode() {
-  stat -c '%a' .beads/issues.jsonl
+  python3 - .beads/issues.jsonl <<'PY'
+import os
+import sys
+
+print(format(os.stat(sys.argv[1]).st_mode & 0o777, "o"))
+PY
 }
 
 case "$stage" in
@@ -44,7 +49,7 @@ case "$stage" in
     # World-write bit (002) MUST be cleared. Other bits (owner-
     # write, group-write) MUST be preserved — only the world-write
     # bit was the security concern.
-    if [ "$((mode & 002))" != "0" ]; then
+    if [ "$(( 8#$mode & 8#002 ))" != "0" ]; then
       echo "ASSERT FAIL[$stage]: world-write bit still set after repair (mode=$mode)" >&2
       exit 1
     fi

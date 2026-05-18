@@ -22,10 +22,15 @@ cd "$target_dir"
 # the directory has identifiable content the undo stage can verify.
 mkdir -p .doctor
 echo "fixture-seed" > .doctor/.doctor_seed_marker
-
-# Snapshot the corrupted mode so post_undo can byte-verify restore.
-stat -c '%a' .doctor > .fixture_pre_mode
 chmod 0555 .doctor
+
+# Snapshot the corrupted mode for diagnostics without relying on GNU stat.
+python3 - .doctor > .fixture_pre_mode <<'PY'
+import os
+import sys
+
+print(format(os.stat(sys.argv[1]).st_mode & 0o777, "o"))
+PY
 
 if [ -e .fixture_baseline ]; then
   echo "fixture baseline already exists; expected a fresh workspace" >&2

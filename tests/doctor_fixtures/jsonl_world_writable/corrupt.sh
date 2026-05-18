@@ -30,7 +30,12 @@ chmod 0666 .beads/issues.jsonl
 
 # Snapshot the corrupted mode so post_undo can verify byte-
 # deterministic restore.
-stat -c '%a' .beads/issues.jsonl > .fixture_pre_mode
+python3 - .beads/issues.jsonl > .fixture_pre_mode <<'PY'
+import os
+import sys
+
+print(format(os.stat(sys.argv[1]).st_mode & 0o777, "o"))
+PY
 
 if [ -e .fixture_baseline ]; then
   echo "fixture baseline already exists; expected a fresh workspace" >&2

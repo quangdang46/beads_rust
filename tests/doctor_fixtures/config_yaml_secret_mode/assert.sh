@@ -13,7 +13,12 @@ tool_bin="${TOOL_BIN:-br}"
 cd "$target_dir"
 
 cur_mode() {
-  stat -c '%a' .beads/config.yaml
+  python3 - .beads/config.yaml <<'PY'
+import os
+import sys
+
+print(format(os.stat(sys.argv[1]).st_mode & 0o777, "o"))
+PY
 }
 
 case "$stage" in
@@ -38,7 +43,7 @@ case "$stage" in
     # Both world bits (006 = world-read | world-write) MUST be
     # cleared. Owner and group bits (660 in the original 666) MUST
     # be preserved.
-    if [ "$((mode & 006))" != "0" ]; then
+    if [ "$(( 8#$mode & 8#006 ))" != "0" ]; then
       echo "ASSERT FAIL[$stage]: world bits still set after repair (mode=$mode)" >&2
       exit 1
     fi
