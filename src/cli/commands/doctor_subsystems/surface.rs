@@ -901,6 +901,22 @@ fn validate_rename_source_path(
     }
 }
 
+fn live_bytes_match(target: &Path, expected: &[u8]) -> bool {
+    fs::read(target).is_ok_and(|live| live == expected)
+}
+
+fn live_mode_matches(target: &Path, expected: Option<u32>) -> bool {
+    expected.is_none_or(|mode| {
+        fs::metadata(target)
+            .ok()
+            .is_some_and(|metadata| metadata_mode(&metadata) == mode)
+    })
+}
+
+fn live_backup_matches(target: &Path, backup_bytes: &[u8], backup_mode: Option<u32>) -> bool {
+    live_bytes_match(target, backup_bytes) && live_mode_matches(target, backup_mode)
+}
+
 fn restore_one(
     ctx: &MutateContext,
     repo_root: &Path,
@@ -946,14 +962,9 @@ fn restore_one(
     // Idempotence: bytes alone are not enough for chmod-only repairs.
     // The backup is verbatim metadata too; skip only once both the live
     // bytes and the live mode match the verified backup.
-    let live_bytes_match = fs::read(&target).is_ok_and(|live| live == backup_bytes);
-    if live_bytes_match {
-        let live_mode_match = backup_mode.is_none_or(|expected| {
-            fs::metadata(&target)
-                .ok()
-                .is_some_and(|metadata| metadata_mode(&metadata) == expected)
-        });
-        if live_mode_match {
+    let bytes_match = live_bytes_match(&target, &backup_bytes);
+    if bytes_match {
+        if live_mode_matches(&target, backup_mode) {
             return UndoStep {
                 path: record.path.clone(),
                 op: record.op.clone(),
@@ -1620,13 +1631,7 @@ fn plan_one(
         Err(step) => return step,
     };
     let backup_mode = fs::metadata(&backup).ok().map(|m| metadata_mode(&m));
-    let live_bytes_match = fs::read(&target).is_ok_and(|live| live == backup_bytes);
-    let live_mode_match = backup_mode.is_none_or(|expected| {
-        fs::metadata(&target)
-            .ok()
-            .is_some_and(|metadata| metadata_mode(&metadata) == expected)
-    });
-    if live_bytes_match && live_mode_match {
+    if live_backup_matches(&target, &backup_bytes, backup_mode) {
         return UndoStep {
             path: record.path.clone(),
             op: record.op.clone(),
