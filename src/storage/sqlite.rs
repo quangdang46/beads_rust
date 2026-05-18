@@ -20139,7 +20139,8 @@ mod tests {
                 ephemeral INTEGER,
                 pinned INTEGER,
                 is_template INTEGER,
-                source_repo_path TEXT
+                source_repo_path TEXT,
+                agent_context TEXT
             );
             CREATE TABLE blocked_issues_cache (
                 issue_id TEXT PRIMARY KEY,

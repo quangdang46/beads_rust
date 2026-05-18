@@ -2205,17 +2205,18 @@ mod tests {
             "source_repo_path column should be present after schema upgrade"
         );
 
-        // The user_version stamp must advance to the new CURRENT version so
-        // future opens take the fast path safely.
+        // The user_version stamp must advance to the migration's target so
+        // future opens take the fast path safely. This test pins the v9→v10
+        // step specifically (run_migrations_atomic above used target=10), so
+        // the assertion stays at 10 even as CURRENT_SCHEMA_VERSION advances.
         let stamped = conn
             .query_row("PRAGMA user_version")
             .ok()
             .and_then(|row| row.get(0).and_then(SqliteValue::as_integer))
             .unwrap_or(-1);
         assert_eq!(
-            stamped,
-            i64::from(CURRENT_SCHEMA_VERSION),
-            "user_version should reflect CURRENT_SCHEMA_VERSION after migration"
+            stamped, 10,
+            "user_version should reflect the v10 migration target after run_migrations_atomic(9, 10)"
         );
     }
 
