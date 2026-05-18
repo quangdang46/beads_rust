@@ -8,7 +8,7 @@ use crate::error::{BeadsError, Result};
 use crate::model::{IssueType, Priority, Status};
 use crate::util::content_hash_from_parts;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 10;
+pub const CURRENT_SCHEMA_VERSION: i32 = 11;
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 
 /// The complete SQL schema for the beads database.
@@ -60,6 +60,13 @@ pub const SCHEMA_SQL: &str = r"
         -- This keeps `EXPECTED_ISSUE_COLUMN_ORDER` consistent for both freshly-
         -- created and migrated databases. See #289 for context.
         source_repo_path TEXT,
+        -- agent_context (schema v11, #297) carries canonical-JSON governing
+        -- instructions inherited by descendants on br update --status
+        -- in_progress / --claim and br show. The on-disk shape is a JSON
+        -- string; serde_json validation happens at the CLI boundary so the
+        -- column itself stays a TEXT bag. NULL means no inherited context;
+        -- emission for descendants silently skips ancestors with NULL.
+        agent_context TEXT,
         CHECK (
             (status = 'closed' AND closed_at IS NOT NULL) OR
             (status = 'tombstone') OR
@@ -668,6 +675,10 @@ const ISSUE_COLUMNS: &[(&str, &str)] = &[
     // Appended at the end so SQLite's ALTER TABLE ADD COLUMN on existing DBs
     // produces the same final column order as a fresh SCHEMA_SQL build.
     ("source_repo_path", "TEXT"),
+    // beads_rust#297: inherited governing instructions, JSON-stored.
+    // Append-at-end keeps EXPECTED_ISSUE_COLUMN_ORDER aligned for fresh
+    // and migrated databases.
+    ("agent_context", "TEXT"),
 ];
 
 const DEPENDENCY_COLUMNS: &[(&str, &str)] = &[
@@ -781,6 +792,7 @@ const EXPECTED_ISSUE_COLUMN_ORDER: &[&str] = &[
     "pinned",
     "is_template",
     "source_repo_path",
+    "agent_context",
 ];
 
 /// Check whether the issues table has columns in the expected order.
@@ -1488,6 +1500,24 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
             "Migrating database to schema version 10 (source_repo_path on issues - beads_rust#289)"
         );
         conn.execute("ALTER TABLE issues ADD COLUMN source_repo_path TEXT")?;
+    }
+
+    // Migration v10 -> v11 (beads_rust#297): add `agent_context TEXT` to
+    // `issues` for inherited governing instructions emitted on
+    // `br update --status in_progress` / `--claim` and `br show`.
+    // Pure additive — existing rows get NULL and existing consumers ignore
+    // it. Same idempotence pattern as the v10 source_repo_path migration:
+    // skipped when the column already exists, skipped when the table was
+    // just rebuilt from scratch (rebuild already produced the v11 layout).
+    if !issues_rebuilt
+        && user_version < 11
+        && table_exists(conn, "issues")
+        && !column_exists(conn, "issues", "agent_context")
+    {
+        tracing::info!(
+            "Migrating database to schema version 11 (agent_context on issues - beads_rust#297)"
+        );
+        conn.execute("ALTER TABLE issues ADD COLUMN agent_context TEXT")?;
     }
 
     // Migration: Add missing indexes for bd parity

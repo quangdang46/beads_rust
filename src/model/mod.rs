@@ -539,6 +539,25 @@ pub struct Issue {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_repo_path: Option<String>,
 
+    /// Canonical-JSON governing instructions inherited by descendant
+    /// beads (beads_rust#297). When set on an ancestor and the project
+    /// has `inherited_context.enabled = true` in `.beads/config.yaml`,
+    /// `br update --status in_progress` / `--claim` and `br show` emit
+    /// the ancestor's `agent_context` alongside the child's normal
+    /// output so the working agent sees the constraints regardless of
+    /// context compaction or cold-start lookups.
+    ///
+    /// Storage: TEXT column holding a JSON document (typically an
+    /// object with `skills`, `constraints`, `references`, `workflow`,
+    /// `metadata` fields, but the schema is intentionally open).
+    /// `None` means "no inherited context"; emission for descendants
+    /// silently skips ancestors with `None` (no error, no noise).
+    ///
+    /// Not displayed in `br list` / `br search` — this is per-bead
+    /// governance metadata, not browsable content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_context: Option<String>,
+
     // Tombstone fields
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deleted_at: Option<DateTime<Utc>>,
@@ -609,6 +628,7 @@ impl Default for Issue {
             external_ref: None,
             source_system: None,
             source_repo_path: None,
+            agent_context: None,
             source_repo: None,
             deleted_at: None,
             deleted_by: None,
@@ -929,6 +949,7 @@ mod tests {
             defer_until: None,
             external_ref: None,
             source_repo_path: None,
+            agent_context: None,
             source_system: None,
             source_repo: None,
             deleted_at: None,
@@ -1390,6 +1411,7 @@ mod tests {
             due_at: None,
             defer_until: None,
             source_repo_path: None,
+            agent_context: None,
             external_ref: None,
             source_system: None,
             source_repo: None,

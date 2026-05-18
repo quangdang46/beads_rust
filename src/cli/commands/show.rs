@@ -266,9 +266,40 @@ fn execute_inner(
             ctx.toon_with_stats(&details_list, args.stats);
         }
         crate::cli::OutputFormat::Text | crate::cli::OutputFormat::Csv => {
+            // beads_rust#297: emit inherited governing context for each
+            // bead before its own details, when the project has opted
+            // in. Prefer the caller's preloaded storage; fall back to
+            // opening a transient read connection so the feature works
+            // from both `br show` and `br show --workspace …` paths.
+            // Failure to open is non-fatal — the alternative would be
+            // failing the entire show over an optional feature.
+            let inheritance_enabled = crate::inheritance::is_enabled(beads_dir);
+            let transient_ctx = if inheritance_enabled
+                && preloaded_storage.is_none()
+                && preloaded_storage_ctx.is_none()
+            {
+                config::open_storage_with_cli(beads_dir, cli).ok()
+            } else {
+                None
+            };
+            let inheritance_storage: Option<&SqliteStorage> = preloaded_storage
+                .or_else(|| preloaded_storage_ctx.map(|ctx| &ctx.storage))
+                .or_else(|| transient_ctx.as_ref().map(|ctx| &ctx.storage));
             for (i, details) in details_list.iter().enumerate() {
                 if i > 0 {
                     println!(); // Separate multiple issues
+                }
+                if inheritance_enabled && let Some(storage) = inheritance_storage {
+                    if let Ok(blocks) =
+                        crate::inheritance::collect_inherited_blocks(storage, &details.issue.id)
+                        && !blocks.is_empty()
+                    {
+                        let rendered = crate::inheritance::render_text(&blocks);
+                        print!("{rendered}");
+                        if !rendered.ends_with('\n') {
+                            println!();
+                        }
+                    }
                 }
                 if matches!(ctx.mode(), OutputMode::Rich) {
                     let panel = IssuePanel::from_details(details, ctx.theme());
@@ -1214,6 +1245,7 @@ mod tests {
             source_system: None,
             source_repo: None,
             source_repo_path: None,
+            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,

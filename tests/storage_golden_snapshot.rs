@@ -52,6 +52,7 @@ fn fixed_issue() -> Issue {
         source_system: None,
         source_repo: Some(".".to_string()),
         source_repo_path: None,
+        agent_context: None,
         deleted_at: None,
         deleted_by: None,
         delete_reason: None,

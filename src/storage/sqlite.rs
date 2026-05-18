@@ -409,7 +409,7 @@ impl ReadyIssueProjection {
                          due_at, defer_until, external_ref, source_system, source_repo,
                          deleted_at, deleted_by, delete_reason, original_type,
                          compaction_level, compacted_at, compacted_at_commit, original_size,
-                         sender, ephemeral, pinned, is_template, source_repo_path"
+                         sender, ephemeral, pinned, is_template, source_repo_path, agent_context"
             }
             Self::Command => {
                 r"SELECT id, title, description, acceptance_criteria, notes, status, priority,
@@ -441,7 +441,7 @@ impl SearchIssueProjection {
                          due_at, defer_until, external_ref, source_system, source_repo,
                          deleted_at, deleted_by, delete_reason, original_type,
                          compaction_level, compacted_at, compacted_at_commit, original_size,
-                         sender, ephemeral, pinned, is_template, source_repo_path
+                         sender, ephemeral, pinned, is_template, source_repo_path, agent_context
                   FROM issues
                   WHERE 1=1"
             }
@@ -472,7 +472,7 @@ impl BlockedIssueProjection {
                      i.due_at, i.defer_until, i.external_ref, i.source_system, i.source_repo,
                      i.deleted_at, i.deleted_by, i.delete_reason, i.original_type, i.compaction_level,
                      i.compacted_at, i.compacted_at_commit, i.original_size, i.sender, i.ephemeral,
-                     i.pinned, i.is_template, i.source_repo_path,
+                     i.pinned, i.is_template, i.source_repo_path, i.agent_context,
                      bc.blocked_by"
             }
             Self::Command => {
@@ -491,7 +491,7 @@ impl BlockedIssueProjection {
                      due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                      compacted_at, compacted_at_commit, original_size, sender, ephemeral,
-                     pinned, is_template, source_repo_path"
+                     pinned, is_template, source_repo_path, agent_context"
             }
             Self::Command => {
                 r"SELECT id, title, description, status, priority, issue_type,
@@ -502,9 +502,11 @@ impl BlockedIssueProjection {
 
     const fn cached_blocked_by_index(self) -> usize {
         match self {
-            // Bumped from 36 → 37 after `source_repo_path` was appended
-            // to the Full SELECT at position 36 (beads_rust#289).
-            Self::Full => 37,
+            // Bumped from 37 → 38 after `agent_context` was appended
+            // to the Full SELECT at position 37 (beads_rust#297).
+            // Source_repo_path is at 36, agent_context is at 37, so
+            // bc.blocked_by lands at 38 in the joined projection.
+            Self::Full => 38,
             Self::Command => 9,
         }
     }
@@ -1986,8 +1988,8 @@ impl SqliteStorage {
                     closed_by_session, due_at, defer_until, external_ref, source_system,
                     source_repo, source_repo_path, deleted_at, deleted_by, delete_reason, original_type,
                     compaction_level, compacted_at, compacted_at_commit, original_size,
-                    sender, ephemeral, pinned, is_template
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    sender, ephemeral, pinned, is_template, agent_context
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 &[
                     SqliteValue::from(issue.id.as_str()),
                     SqliteValue::from(content_hash.as_str()),
@@ -2026,6 +2028,7 @@ impl SqliteStorage {
                     SqliteValue::from(i64::from(i32::from(issue.ephemeral))),
                     SqliteValue::from(i64::from(i32::from(issue.pinned))),
                     SqliteValue::from(i64::from(i32::from(issue.is_template))),
+                    issue.agent_context.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
                 ],
             )?;
 
@@ -2517,6 +2520,13 @@ impl SqliteStorage {
                     val.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
                 );
             }
+            if let Some(ref val) = updates.agent_context {
+                issue.agent_context.clone_from(val);
+                add_update(
+                    "agent_context",
+                    val.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+                );
+            }
             // Use empty string instead of NULL for bd compatibility
             if let Some(ref val) = updates.close_reason {
                 issue.close_reason.clone_from(val);
@@ -2867,7 +2877,7 @@ impl SqliteStorage {
                    due_at, defer_until, external_ref, source_system, source_repo,
                    deleted_at, deleted_by, delete_reason, original_type,
                    compaction_level, compacted_at, compacted_at_commit, original_size,
-                   sender, ephemeral, pinned, is_template, source_repo_path
+                   sender, ephemeral, pinned, is_template, source_repo_path, agent_context
             FROM issues
             WHERE id = ?
         ";
@@ -2907,7 +2917,7 @@ impl SqliteStorage {
                          due_at, defer_until, external_ref, source_system, source_repo,
                          deleted_at, deleted_by, delete_reason, original_type,
                          compaction_level, compacted_at, compacted_at_commit, original_size,
-                         sender, ephemeral, pinned, is_template, source_repo_path
+                         sender, ephemeral, pinned, is_template, source_repo_path, agent_context
                   FROM issues WHERE id IN ({})",
                 placeholders.join(",")
             );
@@ -3043,7 +3053,7 @@ impl SqliteStorage {
                      due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type,
                      compaction_level, compacted_at, compacted_at_commit, original_size,
-                     sender, ephemeral, pinned, is_template, source_repo_path",
+                     sender, ephemeral, pinned, is_template, source_repo_path, agent_context",
         );
 
         let mut params: Vec<SqliteValue> = Vec::new();
@@ -3232,7 +3242,7 @@ impl SqliteStorage {
                          due_at, defer_until, external_ref, source_system, source_repo,
                          deleted_at, deleted_by, delete_reason, original_type,
                          compaction_level, compacted_at, compacted_at_commit, original_size,
-                         sender, ephemeral, pinned, is_template, source_repo_path
+                         sender, ephemeral, pinned, is_template, source_repo_path, agent_context
                   FROM issues
                   WHERE {status_filter}
                     AND (is_template = 0 OR is_template IS NULL)
@@ -3688,7 +3698,7 @@ impl SqliteStorage {
     pub fn list_stats_issues(&self) -> Result<Vec<StatsIssueRow>> {
         let rows = self.conn.query(
             r"SELECT id, status, priority, issue_type, assignee, created_at, closed_at,
-                     defer_until, ephemeral, pinned, is_template, source_repo_path
+                     defer_until, ephemeral, pinned, is_template, source_repo_path, agent_context
               FROM issues",
         )?;
         let mut issues = Vec::with_capacity(rows.len());
@@ -3706,7 +3716,7 @@ impl SqliteStorage {
     pub fn list_stats_summary_issues(&self) -> Result<Vec<StatsIssueRow>> {
         let rows = self.conn.query(
             r"SELECT id, status, issue_type, created_at, closed_at,
-                     defer_until, ephemeral, pinned, is_template, source_repo_path
+                     defer_until, ephemeral, pinned, is_template, source_repo_path, agent_context
               FROM issues",
         )?;
         let mut issues = Vec::with_capacity(rows.len());
@@ -8554,7 +8564,7 @@ impl SqliteStorage {
                            due_at, defer_until, external_ref, source_system, source_repo,
                            deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                            compacted_at, compacted_at_commit, original_size, sender, ephemeral,
-                           pinned, is_template, source_repo_path
+                           pinned, is_template, source_repo_path, agent_context
                     FROM issues
                     WHERE (ephemeral = 0 OR ephemeral IS NULL)
                       AND id NOT LIKE '%-wisp-%'
@@ -9224,6 +9234,7 @@ impl SqliteStorage {
             // in lock-step so the projection-specific blocked-by
             // accessor still finds the right column.
             source_repo_path: get_non_empty_str(36),
+            agent_context: get_non_empty_str(37),
             labels: vec![],
             dependencies: vec![],
             comments: vec![],
@@ -9276,6 +9287,7 @@ impl SqliteStorage {
             source_system: None,
             source_repo: None,
             source_repo_path: None,
+            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -9340,6 +9352,7 @@ impl SqliteStorage {
             source_system: None,
             source_repo: None,
             source_repo_path: None,
+            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -9404,6 +9417,7 @@ impl SqliteStorage {
             source_system: None,
             source_repo: None,
             source_repo_path: None,
+            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -9462,6 +9476,7 @@ impl SqliteStorage {
             source_system: None,
             source_repo: None,
             source_repo_path: None,
+            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -9526,6 +9541,7 @@ impl SqliteStorage {
             source_system: None,
             source_repo: None,
             source_repo_path: None,
+            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -9584,6 +9600,7 @@ impl SqliteStorage {
             source_system: None,
             source_repo: None,
             source_repo_path: None,
+            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -9905,6 +9922,11 @@ pub struct IssueUpdate {
     /// See #289. Use `update --source-repo-path` for ad-hoc repair after a
     /// repo is moved/copied to a new machine.
     pub source_repo_path: Option<Option<String>>,
+    /// Set inherited governing-instructions JSON (beads_rust#297).
+    /// `Some(Some(s))` writes the JSON string `s`; `Some(None)` clears
+    /// the field back to `NULL`. `None` means "do not touch this field".
+    /// Validation happens at the CLI boundary; storage is opaque TEXT.
+    pub agent_context: Option<Option<String>>,
     pub closed_at: Option<Option<DateTime<Utc>>>,
     pub close_reason: Option<Option<String>>,
     pub closed_by_session: Option<Option<String>>,
@@ -9942,6 +9964,7 @@ impl IssueUpdate {
             && self.external_ref.is_none()
             && self.source_repo.is_none()
             && self.source_repo_path.is_none()
+            && self.agent_context.is_none()
             && self.closed_at.is_none()
             && self.close_reason.is_none()
             && self.closed_by_session.is_none()
@@ -11094,7 +11117,7 @@ impl SqliteStorage {
                      due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                      compacted_at, compacted_at_commit, original_size, sender, ephemeral,
-                     pinned, is_template, source_repo_path
+                     pinned, is_template, source_repo_path, agent_context
                FROM issues WHERE external_ref = ?",
             &[SqliteValue::from(external_ref)],
         ) {
@@ -11117,7 +11140,7 @@ impl SqliteStorage {
                      due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                      compacted_at, compacted_at_commit, original_size, sender, ephemeral,
-                     pinned, is_template, source_repo_path
+                     pinned, is_template, source_repo_path, agent_context
                FROM issues WHERE content_hash = ?",
             &[SqliteValue::from(content_hash)],
         ) {
@@ -11215,6 +11238,10 @@ impl SqliteStorage {
             SqliteValue::from(i64::from(i32::from(issue.ephemeral))),
             SqliteValue::from(i64::from(i32::from(issue.pinned))),
             SqliteValue::from(i64::from(i32::from(issue.is_template))),
+            issue
+                .agent_context
+                .as_deref()
+                .map_or(SqliteValue::Null, SqliteValue::from),
         ]
     }
 
@@ -11223,7 +11250,7 @@ impl SqliteStorage {
         issue: &Issue,
         timestamps: &ImportIssueTimestampStrings,
     ) -> Result<usize> {
-        let mut insert_params = Vec::with_capacity(37);
+        let mut insert_params = Vec::with_capacity(38);
         insert_params.push(SqliteValue::from(issue.id.as_str()));
         insert_params.extend(Self::import_issue_field_values(issue, timestamps));
 
@@ -11235,9 +11262,9 @@ impl SqliteStorage {
                 due_at, defer_until, external_ref, source_system, source_repo, source_repo_path,
                 deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                 compacted_at, compacted_at_commit, original_size, sender, ephemeral,
-                pinned, is_template
+                pinned, is_template, agent_context
             ) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )",
             &insert_params,
         )?;
@@ -11262,7 +11289,7 @@ impl SqliteStorage {
                 external_ref = ?, source_system = ?, source_repo = ?, source_repo_path = ?,
                 deleted_at = ?, deleted_by = ?, delete_reason = ?, original_type = ?, compaction_level = ?,
                 compacted_at = ?, compacted_at_commit = ?, original_size = ?, sender = ?,
-                ephemeral = ?, pinned = ?, is_template = ?
+                ephemeral = ?, pinned = ?, is_template = ?, agent_context = ?
               WHERE id = ?",
             &params,
         )?;
@@ -11963,6 +11990,7 @@ mod tests {
             source_system: None,
             source_repo: None,
             source_repo_path: None,
+            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -12202,6 +12230,7 @@ mod tests {
             source_system: None,
             source_repo: None,
             source_repo_path: None,
+            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -14894,6 +14923,7 @@ mod tests {
             source_system: None,
             source_repo: None,
             source_repo_path: None,
+            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -14974,6 +15004,7 @@ mod tests {
             source_system: None,
             source_repo: None,
             source_repo_path: None,
+            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -15048,6 +15079,7 @@ mod tests {
             source_system: None,
             source_repo: None,
             source_repo_path: None,
+            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -15179,6 +15211,7 @@ mod tests {
             source_system: None,
             source_repo: None,
             source_repo_path: None,
+            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -15683,6 +15716,7 @@ mod tests {
             source_system: None,
             source_repo: None,
             source_repo_path: None,
+            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,

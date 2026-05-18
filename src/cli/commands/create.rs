@@ -405,6 +405,7 @@ pub fn create_issue_impl(
             source_system: None,
             source_repo: config.source_repo.clone(),
             source_repo_path: config.source_repo_path.clone(),
+            agent_context: None,
             deleted_at,
             deleted_by: if deleted_at.is_some() {
                 Some(config.actor.clone())
@@ -927,6 +928,7 @@ fn execute_import(
                 source_system: None,
                 source_repo: import_source_repo.clone(),
                 source_repo_path: import_source_repo_path.clone(),
+                agent_context: None,
                 deleted_at: import_deleted_at,
                 deleted_by: if import_deleted_at.is_some() {
                     Some(actor.clone())

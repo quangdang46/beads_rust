@@ -1207,6 +1207,16 @@ pub struct UpdateArgs {
     #[arg(long = "source-repo-path")]
     pub source_repo_path: Option<String>,
 
+    /// Set the `agent_context` governing-instructions JSON (beads_rust#297).
+    /// Accepts inline JSON or a `@path` to a JSON or YAML file (extension
+    /// determines parser; YAML is normalized to JSON before storage).
+    /// Pass `--agent-context ""` (empty string) to clear the field back
+    /// to NULL. Emitted on descendant `br show` / `br update --status
+    /// in_progress` / `--claim` when `inherited_context.enabled` is set
+    /// in `.beads/config.yaml`.
+    #[arg(long = "agent-context")]
+    pub agent_context: Option<String>,
+
     /// Set `closed_by_session` when closing
     #[arg(long)]
     pub session: Option<String>,

@@ -2767,6 +2767,7 @@ mod tests {
             source_system: None,
             source_repo: None,
             source_repo_path: None,
+            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,

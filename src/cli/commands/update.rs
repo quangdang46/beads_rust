@@ -262,9 +262,59 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
         ctx.json_pretty(&updated_issues);
     } else if !ctx.is_quiet() {
         print_render_items(&render_items);
+        // beads_rust#297: emit inherited governing context for any
+        // bead that just transitioned into in_progress (via --claim or
+        // --status in_progress). Done after the update summary so the
+        // child's status change is visible first, then the inherited
+        // context the agent should be operating under.
+        emit_inherited_context_for_in_progress_transitions(&beads_dir, cli, &render_items);
     }
 
     Ok(())
+}
+
+fn emit_inherited_context_for_in_progress_transitions(
+    beads_dir: &Path,
+    cli: &config::CliOverrides,
+    render_items: &[UpdateRenderItem],
+) {
+    if !crate::inheritance::is_enabled(beads_dir) {
+        return;
+    }
+    let claimed_ids: Vec<&str> = render_items
+        .iter()
+        .filter_map(|item| match item {
+            UpdateRenderItem::Summary { id, diff, .. }
+                if diff
+                    .status
+                    .as_ref()
+                    .is_some_and(|(_, new)| matches!(new, Status::InProgress)) =>
+            {
+                Some(id.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    if claimed_ids.is_empty() {
+        return;
+    }
+    // Open a transient read-only storage to walk ancestry. Failure
+    // here is non-fatal — the update has already succeeded and the
+    // child's status change is already printed.
+    let storage_ctx = match config::open_storage_with_cli(beads_dir, cli) {
+        Ok(ctx) => ctx,
+        Err(_) => return,
+    };
+    let storage = &storage_ctx.storage;
+    for id in claimed_ids {
+        let blocks = match crate::inheritance::collect_inherited_blocks(storage, id) {
+            Ok(blocks) if !blocks.is_empty() => blocks,
+            _ => continue,
+        };
+        let rendered = crate::inheritance::render_text(&blocks);
+        println!();
+        print!("{rendered}");
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -879,6 +929,7 @@ fn build_update(args: &UpdateArgs, actor: &str, claim_exclusive: bool) -> Result
         external_ref: optional_string_field(args.external_ref.as_deref()),
         source_repo: optional_string_field(args.source_repo.as_deref()),
         source_repo_path: optional_string_field(args.source_repo_path.as_deref()),
+        agent_context: agent_context_update_from_arg(args.agent_context.as_deref())?,
         closed_at,
         close_reason,
         closed_by_session,
@@ -905,6 +956,91 @@ fn optional_string_field(value: Option<&str>) -> Option<Option<String>> {
             Some(v.to_string())
         }
     })
+}
+
+/// Parse the `--agent-context` argument into an `IssueUpdate::agent_context`
+/// payload. Accepts:
+///
+/// - `None` → don't touch the field (`Option<Option<String>>::None`).
+/// - `Some("")` → clear the field back to NULL (`Some(None)`).
+/// - `Some("@path")` → read the file at `path`; parse as YAML when the
+///   extension is `.yaml`/`.yml`, otherwise as JSON. Normalize to JSON
+///   so storage is opaque TEXT but always canonical-JSON-shaped.
+/// - `Some("{...}")` → parse as JSON inline.
+///
+/// Validation happens here because the storage column is opaque TEXT —
+/// without this guard we'd happily round-trip syntactically invalid
+/// JSON through SQLite and then have the emission path discover the
+/// problem at agent claim time. (beads_rust#297)
+#[allow(clippy::option_option)]
+fn agent_context_update_from_arg(value: Option<&str>) -> Result<Option<Option<String>>> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(Some(None));
+    }
+
+    let (source_label, body): (String, String) = if let Some(path_str) = raw.strip_prefix('@') {
+        let path = std::path::Path::new(path_str);
+        let contents = std::fs::read_to_string(path).map_err(|e| {
+            BeadsError::Config(format!(
+                "agent-context: cannot read {}: {e}",
+                path.display()
+            ))
+        })?;
+        let is_yaml = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("yaml") || ext.eq_ignore_ascii_case("yml"));
+        let normalized = if is_yaml {
+            let value: serde_yml::Value = serde_yml::from_str(&contents).map_err(|e| {
+                BeadsError::Config(format!(
+                    "agent-context: YAML parse failed for {}: {e}",
+                    path.display()
+                ))
+            })?;
+            serde_json::to_string(&value).map_err(|e| {
+                BeadsError::Config(format!(
+                    "agent-context: YAML to JSON conversion failed for {}: {e}",
+                    path.display()
+                ))
+            })?
+        } else {
+            let value: serde_json::Value = serde_json::from_str(&contents).map_err(|e| {
+                BeadsError::Config(format!(
+                    "agent-context: JSON parse failed for {}: {e}",
+                    path.display()
+                ))
+            })?;
+            serde_json::to_string(&value).map_err(|e| {
+                BeadsError::Config(format!(
+                    "agent-context: JSON re-serialization failed for {}: {e}",
+                    path.display()
+                ))
+            })?
+        };
+        (path.display().to_string(), normalized)
+    } else {
+        let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
+            BeadsError::Config(format!(
+                "agent-context: inline argument is not valid JSON: {e} (hint: use \
+                 `--agent-context @path/to/instructions.yaml` for a file, or pass an \
+                 empty string to clear)"
+            ))
+        })?;
+        let normalized = serde_json::to_string(&value).map_err(|e| {
+            BeadsError::Config(format!("agent-context: JSON re-serialization failed: {e}"))
+        })?;
+        ("<inline>".to_string(), normalized)
+    };
+    tracing::debug!(
+        bytes = body.len(),
+        source = %source_label,
+        "agent-context: parsed and normalized to canonical JSON"
+    );
+    Ok(Some(Some(body)))
 }
 
 #[allow(clippy::option_option)]
