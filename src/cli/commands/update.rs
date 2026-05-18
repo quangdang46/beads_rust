@@ -301,9 +301,8 @@ fn emit_inherited_context_for_in_progress_transitions(
     // Open a transient read-only storage to walk ancestry. Failure
     // here is non-fatal — the update has already succeeded and the
     // child's status change is already printed.
-    let storage_ctx = match config::open_storage_with_cli(beads_dir, cli) {
-        Ok(ctx) => ctx,
-        Err(_) => return,
+    let Ok(storage_ctx) = config::open_storage_with_cli(beads_dir, cli) else {
+        return;
     };
     let storage = &storage_ctx.storage;
     for id in claimed_ids {

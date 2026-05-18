@@ -3698,7 +3698,7 @@ impl SqliteStorage {
     pub fn list_stats_issues(&self) -> Result<Vec<StatsIssueRow>> {
         let rows = self.conn.query(
             r"SELECT id, status, priority, issue_type, assignee, created_at, closed_at,
-                     defer_until, ephemeral, pinned, is_template, source_repo_path, agent_context
+                     defer_until, ephemeral, pinned, is_template
               FROM issues",
         )?;
         let mut issues = Vec::with_capacity(rows.len());
@@ -3716,7 +3716,7 @@ impl SqliteStorage {
     pub fn list_stats_summary_issues(&self) -> Result<Vec<StatsIssueRow>> {
         let rows = self.conn.query(
             r"SELECT id, status, issue_type, created_at, closed_at,
-                     defer_until, ephemeral, pinned, is_template, source_repo_path, agent_context
+                     defer_until, ephemeral, pinned, is_template
               FROM issues",
         )?;
         let mut issues = Vec::with_capacity(rows.len());

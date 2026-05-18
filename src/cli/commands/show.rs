@@ -289,16 +289,16 @@ fn execute_inner(
                 if i > 0 {
                     println!(); // Separate multiple issues
                 }
-                if inheritance_enabled && let Some(storage) = inheritance_storage {
-                    if let Ok(blocks) =
+                if inheritance_enabled
+                    && let Some(storage) = inheritance_storage
+                    && let Ok(blocks) =
                         crate::inheritance::collect_inherited_blocks(storage, &details.issue.id)
-                        && !blocks.is_empty()
-                    {
-                        let rendered = crate::inheritance::render_text(&blocks);
-                        print!("{rendered}");
-                        if !rendered.ends_with('\n') {
-                            println!();
-                        }
+                    && !blocks.is_empty()
+                {
+                    let rendered = crate::inheritance::render_text(&blocks);
+                    print!("{rendered}");
+                    if !rendered.ends_with('\n') {
+                        println!();
                     }
                 }
                 if matches!(ctx.mode(), OutputMode::Rich) {

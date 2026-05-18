@@ -97,7 +97,7 @@ pub fn is_enabled_from_inputs(env_val: Option<&str>, config_yaml_path: &Path) ->
     value
         .get("inherited_context")
         .and_then(|node| node.get("enabled"))
-        .and_then(|node| node.as_bool())
+        .and_then(serde_yml::Value::as_bool)
         .unwrap_or(false)
 }
 
@@ -119,19 +119,17 @@ pub fn collect_inherited_blocks(
     storage: &SqliteStorage,
     child_id: &str,
 ) -> Result<Vec<InheritedBlock>> {
-    let immediate_parent_id = match find_immediate_parent_id(storage, child_id)? {
-        Some(id) => id,
-        None => return Ok(Vec::new()),
+    let Some(immediate_parent_id) = find_immediate_parent_id(storage, child_id)? else {
+        return Ok(Vec::new());
     };
 
     let mut visited: HashSet<String> = HashSet::new();
     visited.insert(child_id.to_string());
 
-    let immediate_parent = match load_active_issue(storage, &immediate_parent_id)? {
-        Some(issue) => issue,
-        // Parent was tombstoned/deleted/missing — treat as if the
-        // child has no parent, per spec ("silently skipped").
-        None => return Ok(Vec::new()),
+    // Parent was tombstoned/deleted/missing — treat as if the child has
+    // no parent, per spec ("silently skipped").
+    let Some(immediate_parent) = load_active_issue(storage, &immediate_parent_id)? else {
+        return Ok(Vec::new());
     };
     visited.insert(immediate_parent.id.clone());
 
@@ -152,17 +150,27 @@ pub fn collect_inherited_blocks(
         }
     }
 
+    // Choose the most informative role for the immediate parent. When
+    // the parent is also the root (single-block emission), upgrade the
+    // label to "epic" if the parent is an epic — that's the case where
+    // labeling it as merely "parent" hides the strategic context the
+    // emission feature is supposed to surface. In the multi-block case
+    // the root block already carries the "epic" label so the parent
+    // block correctly stays "parent".
+    let parent_is_also_root = root.as_ref().is_some_and(|r| r.id == immediate_parent.id);
+    let parent_role =
+        if parent_is_also_root && matches!(immediate_parent.issue_type, IssueType::Epic) {
+            "epic"
+        } else {
+            "parent"
+        };
+
     if !emitted_ids.contains(&immediate_parent.id)
-        && let Some(block) = block_from_ancestor(&immediate_parent, "parent")
+        && let Some(block) = block_from_ancestor(&immediate_parent, parent_role)
     {
         emitted_ids.insert(immediate_parent.id.clone());
         blocks.push(block);
     }
-
-    // Edge: child's immediate parent IS the root — we still want to
-    // emit it once. The check `root.id != immediate_parent.id` above
-    // suppresses the root block; the parent block (added second)
-    // covers it.
 
     Ok(blocks)
 }
@@ -189,10 +197,7 @@ fn block_from_ancestor(issue: &Issue, role: &str) -> Option<InheritedBlock> {
     })
 }
 
-fn find_immediate_parent_id(
-    storage: &SqliteStorage,
-    child_id: &str,
-) -> Result<Option<String>> {
+fn find_immediate_parent_id(storage: &SqliteStorage, child_id: &str) -> Result<Option<String>> {
     // Beads uses dependency rows to encode parent relationships. The
     // canonical dependency type used by the bd ecosystem is
     // `ParentChild` with the child as the dependent and the parent as
@@ -223,9 +228,9 @@ fn walk_to_root(
     };
 
     loop {
-        let parent_id = match find_immediate_parent_id(storage, &current.id)? {
-            Some(id) => id,
-            None => break, // current is the terminal ancestor.
+        // current is the terminal ancestor if it has no parent.
+        let Some(parent_id) = find_immediate_parent_id(storage, &current.id)? else {
+            break;
         };
         if !visited.insert(parent_id.clone()) {
             eprintln!(
@@ -234,11 +239,10 @@ fn walk_to_root(
             );
             break;
         }
-        let parent = match load_active_issue(storage, &parent_id)? {
-            Some(issue) => issue,
-            // Tombstoned / missing — terminate the walk; whatever was
-            // most recently loaded is the best root candidate we have.
-            None => break,
+        // Tombstoned / missing — terminate the walk; whatever was most
+        // recently loaded is the best root candidate we have.
+        let Some(parent) = load_active_issue(storage, &parent_id)? else {
+            break;
         };
         if matches!(parent.issue_type, IssueType::Epic) {
             latest_epic = Some(parent.clone());
@@ -293,7 +297,10 @@ pub fn render_text(blocks: &[InheritedBlock]) -> String {
         if !pretty.ends_with('\n') {
             out.push('\n');
         }
-        out.push_str(&format!("--- End inherited context ({}) ---\n", block.source_id));
+        out.push_str(&format!(
+            "--- End inherited context ({}) ---\n",
+            block.source_id
+        ));
     }
     out
 }
@@ -326,12 +333,8 @@ mod tests {
             },
         ];
         let out = render_text(&blocks);
-        let epic_idx = out
-            .find("epic bd-epic")
-            .expect("epic label present");
-        let parent_idx = out
-            .find("parent bd-parent")
-            .expect("parent label present");
+        let epic_idx = out.find("epic bd-epic").expect("epic label present");
+        let parent_idx = out.find("parent bd-parent").expect("parent label present");
         assert!(epic_idx < parent_idx, "root/epic must precede parent");
         assert!(out.contains("Auth rewrite"));
         assert!(out.contains("clean-code"));
@@ -358,7 +361,10 @@ mod tests {
         assert!(is_enabled_from_inputs(Some("true"), missing_config));
         assert!(is_enabled_from_inputs(Some("TRUE"), missing_config));
         assert!(is_enabled_from_inputs(Some("yes"), missing_config));
-        assert!(is_enabled_from_inputs(Some("anything-non-empty"), missing_config));
+        assert!(is_enabled_from_inputs(
+            Some("anything-non-empty"),
+            missing_config
+        ));
         assert!(!is_enabled_from_inputs(Some("0"), missing_config));
         assert!(!is_enabled_from_inputs(Some("false"), missing_config));
         assert!(!is_enabled_from_inputs(Some("FALSE"), missing_config));
