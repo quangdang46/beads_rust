@@ -3732,6 +3732,10 @@ mod tests {
 
     #[test]
     fn update_issue_batch_rejects_invalid_comment_before_item_field_mutation() {
+        // Per-item transactional pre-flight: an invalid comment in a batch
+        // update must reject that item without applying its field mutation.
+        // Comment size is no longer a validation axis (long-form bodies are
+        // explicitly supported); use NUL-byte poison to stay invariant.
         let temp = TempDir::new().expect("tempdir");
         let state = mcp_test_state(&temp);
         insert_test_issue(&state, "br-mcp-update-invalid-comment", "comment original");
@@ -3745,7 +3749,7 @@ mod tests {
                     "updates": [{
                         "id": "br-mcp-update-invalid-comment",
                         "title": "should not mutate",
-                        "comment": "x".repeat(51_201)
+                        "comment": "valid prefix\0NUL byte poisons this comment"
                     }]
                 }),
             )
@@ -3757,7 +3761,7 @@ mod tests {
         assert!(
             batch["items"][0]["error"]["message"]
                 .as_str()
-                .is_some_and(|message| message.contains("content") && message.contains("50KB"))
+                .is_some_and(|message| message.contains("content") && message.contains("NUL"))
         );
 
         let storage = SqliteStorage::open(&state.db_path).expect("open storage");
@@ -4498,33 +4502,36 @@ mod tests {
     }
 
     #[test]
-    fn create_issue_rejects_description_over_validator_limit_without_persisting() {
+    fn create_issue_accepts_long_description_through_mcp() {
+        // Long-text issue fields are explicitly unbounded — spec write-ups,
+        // RFC text, etc. routinely exceed the prior 100KB cap. Verify the
+        // MCP path accepts and persists them.
         let temp = TempDir::new().expect("tempdir");
         let state = mcp_test_state(&temp);
         let tool = CreateIssueTool::new(Arc::clone(&state));
         let ctx = McpContext::new(Cx::for_testing(), 1);
-        let description = "x".repeat(102_401);
+        let description = "x".repeat(600_000);
 
-        let err = tool
-            .call(
-                &ctx,
-                json!({
-                    "title": "MCP validator parity",
-                    "description": description
-                }),
-            )
-            .expect_err("MCP create must enforce full issue validation");
-
-        assert_eq!(err.code, McpErrorCode::InvalidParams);
-        assert!(
-            err.message.contains("description") && err.message.contains("exceeds 100KB"),
-            "unexpected MCP error: {err:?}"
-        );
+        tool.call(
+            &ctx,
+            json!({
+                "title": "MCP long-description acceptance",
+                "description": description
+            }),
+        )
+        .expect("MCP create must accept long descriptions");
 
         let storage = SqliteStorage::open(&state.db_path).expect("open storage");
-        assert!(
-            storage.get_all_ids().expect("ids").is_empty(),
-            "invalid MCP issue should not be persisted"
+        let ids = storage.get_all_ids().expect("ids");
+        assert_eq!(ids.len(), 1, "long-description issue must be persisted");
+        let issue = storage
+            .get_issue(&ids[0])
+            .expect("lookup")
+            .expect("issue present");
+        assert_eq!(
+            issue.description.as_deref().map(str::len),
+            Some(600_000),
+            "long description preserved verbatim"
         );
     }
 
@@ -4928,6 +4935,11 @@ mod tests {
 
     #[test]
     fn update_issue_rejects_invalid_comment_before_field_mutation() {
+        // The transactional pre-flight invariant: when an UpdateIssue MCP call
+        // bundles a comment and a field mutation, an invalid comment must
+        // reject the entire call (no partial application). Comment size is
+        // no longer a validation axis, so this test uses an embedded NUL byte
+        // — still rejected by `reject_nul` for SQLite compatibility.
         let temp = TempDir::new().expect("tempdir");
         let state = mcp_test_state(&temp);
         let ctx = McpContext::new(Cx::for_testing(), 1);
@@ -4949,14 +4961,14 @@ mod tests {
                 json!({
                     "id": ids[0],
                     "title": "Mutated despite comment error",
-                    "comment": "x".repeat(51_201)
+                    "comment": "valid prefix\0NUL byte poisons this comment"
                 }),
             )
-            .expect_err("oversized comment must reject the whole MCP update");
+            .expect_err("NUL-byte comment must reject the whole MCP update");
 
         assert_eq!(err.code, McpErrorCode::InvalidParams);
         assert!(
-            err.message.contains("content") && err.message.contains("exceeds 50KB"),
+            err.message.contains("content") && err.message.contains("NUL"),
             "unexpected MCP error: {err:?}"
         );
 

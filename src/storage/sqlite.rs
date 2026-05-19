@@ -15258,18 +15258,13 @@ mod tests {
         );
         storage.create_issue(&issue, "tester").unwrap();
 
-        let long_text = "x".repeat(51_201);
-        let body_error = storage
+        // Long-content comments are explicitly permitted — spec write-ups,
+        // session transcripts, etc. routinely exceed 50KB. The prior cap
+        // rejected legitimate pre-existing JSONL records on rebuild.
+        let long_text = "x".repeat(600_000);
+        storage
             .add_comment("bd-c-invalid-input", "alice", &long_text)
-            .unwrap_err();
-        assert!(
-            matches!(
-                &body_error,
-                BeadsError::Validation { field, reason }
-                    if field == "content" && reason.contains("exceeds 50KB")
-            ),
-            "unexpected long comment error: {body_error:?}"
-        );
+            .expect("long comment bodies must be accepted");
 
         let author_error = storage
             .add_comment("bd-c-invalid-input", "", "Valid comment body")
@@ -15284,9 +15279,15 @@ mod tests {
         );
 
         let comments = storage.get_comments("bd-c-invalid-input").unwrap();
-        assert!(
-            comments.is_empty(),
-            "invalid comments must not be inserted: {comments:?}"
+        assert_eq!(
+            comments.len(),
+            1,
+            "the long-body insert above must persist; only the empty-author insert is rejected: {comments:?}"
+        );
+        assert_eq!(
+            comments[0].body.len(),
+            600_000,
+            "long comment body preserved verbatim"
         );
     }
 

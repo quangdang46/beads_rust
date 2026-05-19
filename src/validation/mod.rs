@@ -18,7 +18,6 @@ use crate::util::id::MAX_ID_LENGTH;
 use std::path::Path;
 
 const TITLE_MAX_CHARS: usize = 500;
-const LONG_TEXT_MAX_BYTES: usize = 102_400;
 const ACTOR_MAX_CHARS: usize = 200;
 const CUSTOM_VARIANT_MAX_CHARS: usize = 50;
 pub(crate) const ISSUE_LABEL_MAX_COUNT: usize = 64;
@@ -126,36 +125,25 @@ fn validate_issue_text_fields(issue: &Issue, errors: &mut Vec<ValidationError>) 
     }
     reject_nul("title", &issue.title, errors);
 
-    // Description: Optional, max 100KB.
-    reject_bounded_bytes_opt(
-        "description",
-        issue.description.as_deref(),
-        LONG_TEXT_MAX_BYTES,
-        "exceeds 100KB",
-        errors,
-    );
-
-    reject_bounded_bytes_opt(
-        "design",
-        issue.design.as_deref(),
-        LONG_TEXT_MAX_BYTES,
-        "exceeds 100KB",
-        errors,
-    );
-    reject_bounded_bytes_opt(
-        "acceptance_criteria",
-        issue.acceptance_criteria.as_deref(),
-        LONG_TEXT_MAX_BYTES,
-        "exceeds 100KB",
-        errors,
-    );
-    reject_bounded_bytes_opt(
-        "notes",
-        issue.notes.as_deref(),
-        LONG_TEXT_MAX_BYTES,
-        "exceeds 100KB",
-        errors,
-    );
+    // Long-text fields (description, design, acceptance_criteria, notes) are
+    // unbounded by design — these capture full specs, RFC text, agent
+    // session transcripts, etc. A prior 100KB cap rejected legitimate
+    // pre-existing records on JSONL rebuild and blocked workspace recovery
+    // (frankensqlite .beads had nine records up to 554KB that were valid
+    // bead bodies, not corruption). We still reject NUL bytes for SQLite
+    // compatibility.
+    if let Some(s) = issue.description.as_deref() {
+        reject_nul("description", s, errors);
+    }
+    if let Some(s) = issue.design.as_deref() {
+        reject_nul("design", s, errors);
+    }
+    if let Some(s) = issue.acceptance_criteria.as_deref() {
+        reject_nul("acceptance_criteria", s, errors);
+    }
+    if let Some(s) = issue.notes.as_deref() {
+        reject_nul("notes", s, errors);
+    }
     reject_nul("status", issue.status.as_str(), errors);
     validate_custom_status(&issue.status, errors);
     reject_nul("issue_type", issue.issue_type.as_str(), errors);
@@ -204,21 +192,6 @@ fn validate_external_ref(external_ref: Option<&str>, errors: &mut Vec<Validation
 fn reject_nul(field: &str, value: &str, errors: &mut Vec<ValidationError>) {
     if value.contains('\0') {
         errors.push(ValidationError::new(field, "cannot contain NUL bytes"));
-    }
-}
-
-fn reject_bounded_bytes_opt(
-    field: &str,
-    value: Option<&str>,
-    max_bytes: usize,
-    message: &str,
-    errors: &mut Vec<ValidationError>,
-) {
-    if let Some(value) = value {
-        reject_nul(field, value, errors);
-        if value.len() > max_bytes {
-            errors.push(ValidationError::new(field, message));
-        }
     }
 }
 
@@ -414,9 +387,9 @@ impl CommentValidator {
             errors.push(ValidationError::new("content", "cannot be empty"));
         }
 
-        if comment.body.len() > 51_200 {
-            errors.push(ValidationError::new("content", "exceeds 50KB"));
-        }
+        // Comment bodies are unbounded — same reasoning as long-text issue
+        // fields above. Reject only NUL bytes for SQLite compatibility.
+        reject_nul("content", &comment.body, &mut errors);
 
         if comment.author.trim().is_empty() {
             errors.push(ValidationError::new("author", "cannot be empty"));
@@ -684,12 +657,14 @@ mod tests {
     }
 
     #[test]
-    fn issue_validation_rejects_large_description() {
+    fn issue_validation_accepts_arbitrarily_large_description() {
+        // Long-text fields (description / design / acceptance_criteria /
+        // notes) are intentionally unbounded — spec write-ups, RFC text,
+        // and agent session transcripts routinely exceed any small cap.
         let mut issue = base_issue();
-        issue.description = Some("x".repeat(102_401));
+        issue.description = Some("x".repeat(600_000));
 
-        let errors = IssueValidator::validate(&issue).unwrap_err();
-        assert!(errors.iter().any(|err| err.field == "description"));
+        IssueValidator::validate(&issue).expect("long descriptions must validate cleanly");
     }
 
     #[test]
