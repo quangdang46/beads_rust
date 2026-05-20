@@ -14,11 +14,15 @@ cd "$target_dir"
 
 case "$stage" in
   detect)
-    out=$("$tool_bin" doctor --json 2>/dev/null) || {
-      echo "ASSERT FAIL[$stage]: br doctor --json exited non-zero" >&2
-      echo "$out" >&2
-      exit 1
-    }
+    # `br doctor` exits non-zero whenever it surfaces ANY finding (warn or
+    # degraded health), which is exactly what this fixture plants — so we
+    # capture output regardless of exit code and assert on the specific
+    # check, matching the suite-wide pattern (see gitignore_bare_pattern).
+    # Requiring exit-zero here was a latent bug: an unrelated degraded-
+    # health anomaly (e.g. `jsonl_newer` from init/flush mtime ordering)
+    # would fail the detect stage before the target finding was even
+    # inspected.
+    out=$("$tool_bin" doctor --json 2>/dev/null) || true
     # gitignore.beads_inner must be warn/error
     echo "$out" | jq -e '
       .checks[] | select(.name == "gitignore.beads_inner")
