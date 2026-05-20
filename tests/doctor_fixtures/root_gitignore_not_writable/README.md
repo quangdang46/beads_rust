@@ -25,18 +25,25 @@ unblock an otherwise-correct repair.
 
 The `doctor.gitignore_repair` fixer correctly consults the lock at
 `doctor.rs:7700-7709` and refuses to write when warn fires.
-However, there is one documented carveout: `ensure_doctor_in_gitignore`
-in `run_dir.rs:295` runs BEFORE the chokepoint to add `.doctor/` to
-the repo-root `.gitignore` (chicken-and-egg: the chokepoint's
-run-dir lives at `<repo>/.doctor/runs/<id>/`, so `.doctor/` must
-be ignored before the chokepoint can record its first action).
-This carveout does NOT consult `permissions.root_gitignore` and
-will overwrite a chmod-locked file via tmp+rename. The fixture
-works around this by pre-seeding `.doctor/` in the planted
-`.gitignore`, which makes the carveout a no-op (line 307
-`already` branch). If `ensure_doctor_in_gitignore` is ever
-upgraded to consult the lock, this corrupt-time seed becomes
-optional.
+
+There is also one pre-chokepoint carveout: `ensure_doctor_in_gitignore`
+in `run_dir.rs` runs BEFORE the chokepoint to add `.doctor/` to the
+repo-root `.gitignore` (chicken-and-egg: the chokepoint's run-dir
+lives at `<repo>/.doctor/runs/<id>/`, so `.doctor/` must be ignored
+before the chokepoint can record its first action). The original
+authoring of this fixture flagged that the carveout did NOT consult
+`permissions.root_gitignore` and would overwrite a chmod-locked file
+via tmp+rename. **That finding was resolved in cycle 57**:
+`ensure_doctor_in_gitignore` now skips the `.doctor/` addition (best-
+effort, with a tracing warning) when the repo-root `.gitignore` is
+not owner-writable, honoring the same SACRED INVARIANT. See the
+`ensure_doctor_in_gitignore_skips_readonly_gitignore` unit test.
+
+This fixture still pre-seeds `.doctor/` in the planted `.gitignore`,
+which makes the carveout a no-op (the `already`-present branch)
+regardless of binary version — so the fixture passes against both
+pre- and post-cycle-57 binaries. The pre-seed is now belt-and-
+suspenders rather than strictly required.
 
 Unix-only — the check uses POSIX mode bits and is a no-op on
 Windows where the underlying ownership model differs.

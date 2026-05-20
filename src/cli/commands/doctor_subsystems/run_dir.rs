@@ -307,6 +307,32 @@ fn ensure_doctor_in_gitignore(repo_root: &Path) -> Result<(), BeadsError> {
     if already {
         return Ok(());
     }
+
+    // SACRED INVARIANT: if the operator has locked the repo-root
+    // `.gitignore` read-only (compliance-controlled file, vendored
+    // shared config), do NOT bypass that intent. The tmp+rename below
+    // would otherwise replace the file even at mode 0o444, since rename
+    // only needs parent-directory write permission. The
+    // `permissions.root_gitignore` detector already surfaces the locked
+    // file to the operator; here we skip the `.doctor/` addition rather
+    // than silently overwriting it. Trade-off: `.doctor/` run artifacts
+    // won't be auto-ignored on a locked repo, but respecting an explicit
+    // operator chmod outranks the convenience of the carveout.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = fs::symlink_metadata(&gitignore)
+            && meta.file_type().is_file()
+            && (meta.permissions().mode() & 0o200) == 0
+        {
+            tracing::warn!(
+                path = %gitignore.display(),
+                "doctor: repo-root .gitignore is not owner-writable; skipping .doctor/ ignore-rule addition (operator-locked, see permissions.root_gitignore)"
+            );
+            return Ok(());
+        }
+    }
+
     let mut new_contents = existing;
     if !new_contents.is_empty() && !new_contents.ends_with('\n') {
         new_contents.push('\n');
@@ -574,6 +600,44 @@ mod tests {
         assert!(
             err.to_string().contains(".gitignore") || err.to_string().contains("directory"),
             "error should name the invalid gitignore surface: {err}"
+        );
+    }
+
+    /// SACRED INVARIANT regression: a repo-root `.gitignore` that the
+    /// operator has chmod'd read-only (0o444) must NOT be replaced by
+    /// the `.doctor/` carveout. The tmp+rename write only needs
+    /// parent-dir write permission, so without an explicit guard it
+    /// would bypass the operator's lock. We assert the file is left
+    /// byte- and mode-identical and that `ensure_doctor_in_gitignore`
+    /// still reports success (best-effort skip, not a hard failure).
+    #[cfg(unix)]
+    #[test]
+    fn ensure_doctor_in_gitignore_skips_readonly_gitignore() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = unique_temp_root("readonly-gitignore");
+        let gitignore = tmp.path().join(".gitignore");
+        let initial = "node_modules\nbuild/\n";
+        fs::write(&gitignore, initial).expect("seed gitignore");
+        fs::set_permissions(&gitignore, fs::Permissions::from_mode(0o444))
+            .expect("lock gitignore read-only");
+
+        ensure_doctor_in_gitignore(tmp.path())
+            .expect("locked gitignore must be a best-effort skip, not an error");
+
+        let post = fs::read_to_string(&gitignore).expect("read post");
+        assert_eq!(
+            post, initial,
+            "read-only .gitignore must not be modified by the .doctor/ carveout"
+        );
+        let mode = fs::metadata(&gitignore)
+            .expect("post meta")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o444, "operator's read-only mode must be preserved");
+        assert!(
+            !post.contains(".doctor"),
+            ".doctor/ must NOT have been appended to the locked file"
         );
     }
 

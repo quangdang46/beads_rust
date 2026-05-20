@@ -8185,10 +8185,23 @@ fn fix_export_hash_cache_divergence_if_warned(
 /// "symlink"`, the fixer renames the symlinked anchor into
 /// `<run-dir>/quarantine/.beads/beads.base.jsonl` via
 /// [`chokepoint::mutate(Op::Rename)`]. Per AGENTS.md RULE 1: rename,
-/// never delete. The chokepoint snapshots the symlink target itself
-/// (just the symlink bytes — the target's content is intentionally NOT
-/// followed) so `doctor undo` reinstates the symlink at its original
-/// path.
+/// never delete. `fs::rename` preserves the link bytes, so the
+/// quarantined entry is itself a symlink.
+///
+/// REVERSIBILITY CAVEAT: the chokepoint's verbatim backup uses
+/// `fs::read`/`fs::copy`, which FOLLOW symlinks — so the backup
+/// captures the link target's *content*, not the link bytes. On
+/// `doctor undo`, `restore_rename`'s `Path::exists()` follows the
+/// quarantined symlink's now-orphaned relative target, finds it
+/// missing, and falls back to `Op::WriteFile` with the byte backup.
+/// The net effect is that undo restores the original path as a
+/// REGULAR FILE containing the target's content, not as a symlink.
+/// This is a known reversibility gap for symlink sources (the
+/// chokepoint's data model is byte-oriented); see
+/// `tests/doctor_fixtures/base_jsonl_symlink_quarantine` for the
+/// full analysis. Forward quarantine (the security goal — getting
+/// the attacker-controlled symlink out of the merge path) is correct
+/// regardless.
 ///
 /// Scope of this cycle: SYMLINK case only. The stale-anchor case stays
 /// detect-only because regenerating the anchor is operationally what
