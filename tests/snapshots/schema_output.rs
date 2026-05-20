@@ -17,6 +17,7 @@ const EXPECTED_SCHEMA_NAMES: &[&str] = &[
     "BlockedIssue",
     "CoordinationClaimRow",
     "CoordinationStatusOutput",
+    "CountGroup",
     "ErrorEnvelope",
     "Issue",
     "IssueDetails",
