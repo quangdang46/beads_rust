@@ -2241,6 +2241,52 @@ mod tests {
                 fs::write(&target, &restored).unwrap();
                 prop_assert_eq!(fs::read(&target).unwrap(), original);
             }
+
+            /// `Op::Chmod` reversibility: the chokepoint stamps the
+            /// verbatim backup with the source's ORIGINAL mode, so undo
+            /// can restore it. Modes are drawn from `0o400..=0o777` so the
+            /// owner-read bit is always set (the chokepoint must be able to
+            /// read the file to back it up, and the test must re-read it to
+            /// assert). Content is left untouched by a chmod, so the backup
+            /// also byte-preserves it.
+            #[test]
+            fn prop_chmod_backup_preserves_original_mode(
+                content in proptest::collection::vec(any::<u8>(), 0..512),
+                m1 in 0o400u32..=0o777,
+                m2 in 0o400u32..=0o777,
+            ) {
+                let tmp = tempfile::tempdir().unwrap();
+                let beads_dir = tmp.path().join(".beads");
+                fs::create_dir_all(&beads_dir).unwrap();
+                let target = beads_dir.join("chmod-rt.bin");
+                fs::write(&target, &content).unwrap();
+                fs::set_permissions(&target, fs::Permissions::from_mode(m1)).unwrap();
+
+                let (ctx, _ap) = make_ctx(tmp.path(), false);
+                mutate(&ctx, &target, Op::Chmod { mode: m2 }).unwrap();
+
+                // Content is unchanged by a chmod.
+                prop_assert_eq!(fs::read(&target).unwrap(), content.clone());
+                // Live mode is now m2.
+                prop_assert_eq!(
+                    fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+                    m2 & 0o777
+                );
+                // Backup preserved BOTH the original bytes and the original mode.
+                let backup = ctx.run_dir.join("backups/.beads/chmod-rt.bin");
+                prop_assert_eq!(fs::read(&backup).unwrap(), content);
+                prop_assert_eq!(
+                    fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+                    m1 & 0o777
+                );
+                // Logical undo (restore the backup's mode) → mode back to m1.
+                let backup_mode = fs::metadata(&backup).unwrap().permissions().mode() & 0o777;
+                fs::set_permissions(&target, fs::Permissions::from_mode(backup_mode)).unwrap();
+                prop_assert_eq!(
+                    fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+                    m1 & 0o777
+                );
+            }
         }
     }
 }

@@ -14643,6 +14643,70 @@ mod tests {
         assert!(!filter.allows("fm-c"));
     }
 
+    /// Property-based generalization of the FixerFilter contract
+    /// (hardens blast_radius_containment: `--only`/`--skip` scoping is
+    /// what keeps a targeted `--repair` from touching unrelated FMs).
+    /// The example-based tests above pin specific cases; this cross-checks
+    /// the implementation against an INDEPENDENT set-semantics reference
+    /// over arbitrary only/skip/query combinations, drawn from a small id
+    /// space so only/skip/query overlap frequently.
+    mod filter_props {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn id_strategy() -> impl Strategy<Value = String> {
+            proptest::sample::select(vec!["fm-a", "fm-b", "fm-c", "fm-d", "fm-e"])
+                .prop_map(ToString::to_string)
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(128))]
+
+            /// allows(q) == (only empty OR only contains q) AND NOT skip contains q.
+            #[test]
+            fn prop_filter_matches_set_semantics(
+                only in proptest::collection::vec(id_strategy(), 0..5),
+                skip in proptest::collection::vec(id_strategy(), 0..5),
+                query in id_strategy(),
+            ) {
+                let filter = FixerFilter::from_args(&only, &skip);
+                let only_set: std::collections::HashSet<&str> =
+                    only.iter().map(String::as_str).collect();
+                let skip_set: std::collections::HashSet<&str> =
+                    skip.iter().map(String::as_str).collect();
+                let expected = (only_set.is_empty() || only_set.contains(query.as_str()))
+                    && !skip_set.contains(query.as_str());
+                prop_assert_eq!(filter.allows(&query), expected);
+            }
+
+            /// skip ALWAYS wins: an id in skip is denied even when also in only.
+            #[test]
+            fn prop_filter_skip_always_overrides_only(query in id_strategy()) {
+                let filter = FixerFilter::from_args(
+                    std::slice::from_ref(&query),
+                    std::slice::from_ref(&query),
+                );
+                prop_assert!(!filter.allows(&query));
+            }
+
+            /// Whitespace padding and interleaved empty strings are
+            /// normalized away and do not change the decision.
+            #[test]
+            fn prop_filter_normalizes_whitespace(base in id_strategy()) {
+                let clean = FixerFilter::from_args(std::slice::from_ref(&base), &[]);
+                let messy = FixerFilter::from_args(
+                    &[String::new(), format!("  {base}  "), "   ".to_string()],
+                    &[],
+                );
+                prop_assert!(messy.allows(&base));
+                prop_assert_eq!(clean.allows(&base), messy.allows(&base));
+                // An id NOT in the (normalized) allowlist is still denied identically.
+                let other = if base.as_str() == "fm-a" { "fm-b" } else { "fm-a" };
+                prop_assert_eq!(clean.allows(other), messy.allows(other));
+            }
+        }
+    }
+
     #[test]
     fn test_recoverable_db_state_filter_preserves_sidecar_fm() {
         let sidecar_only = FixerFilter::from_args(&[FM_WAL_SHM_SIDECAR_ORPHAN.to_string()], &[]);
