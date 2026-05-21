@@ -2148,4 +2148,99 @@ mod tests {
             "warning field should be absent now that DDL routing is wired: {v}"
         );
     }
+
+    /// Property-based reversibility fuzzing (hardens the `reversibility`
+    /// and `test_coverage_of_repair` rubric dimensions).
+    ///
+    /// The chokepoint's whole reversibility guarantee rests on ONE
+    /// invariant: every `mutate()` captures a byte-faithful verbatim
+    /// backup of the pre-mutation file, and records a `before_hash` that
+    /// is exactly the SHA-256 of those bytes. If that holds for ARBITRARY
+    /// content, then `doctor undo` (which is restore-from-backup for the
+    /// file ops) is correct by construction.
+    ///
+    /// These properties fuzz the invariant across random byte payloads —
+    /// empty files, binary content, embedded NULs and newlines, and
+    /// content that does or doesn't already coincide with the new bytes —
+    /// the exact edge cases hand-written fixtures tend to miss. Each case
+    /// drives the real `mutate()` forward and then performs the logical
+    /// undo (rewrite the backup bytes to the path), asserting
+    /// byte-identity with the original.
+    mod reversibility_props {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(64))]
+
+            /// `Op::WriteFile` over arbitrary original/updated byte vectors:
+            /// the backup must equal the original, `before_hash` must be the
+            /// original's SHA-256, and the logical undo must restore the
+            /// original byte-for-byte.
+            #[test]
+            fn prop_writefile_backup_roundtrips_any_bytes(
+                original in proptest::collection::vec(any::<u8>(), 0..2048),
+                updated in proptest::collection::vec(any::<u8>(), 0..2048),
+            ) {
+                let tmp = tempfile::tempdir().unwrap();
+                let beads_dir = tmp.path().join(".beads");
+                fs::create_dir_all(&beads_dir).unwrap();
+                let target = beads_dir.join("rt.bin");
+                fs::write(&target, &original).unwrap();
+
+                let (ctx, _ap) = make_ctx(tmp.path(), false);
+                let result = mutate(
+                    &ctx,
+                    &target,
+                    Op::WriteFile { content: updated.clone(), mode: None },
+                ).unwrap();
+
+                // Forward mutation applied.
+                prop_assert_eq!(fs::read(&target).unwrap(), updated.clone());
+                // before_hash is the SHA-256 of the ORIGINAL bytes.
+                prop_assert_eq!(&result.before_hash, &sha256_hex_prefixed(&original));
+                // Verbatim backup byte-equals the original.
+                let backup = ctx.run_dir.join("backups/.beads/rt.bin");
+                prop_assert_eq!(fs::read(&backup).unwrap(), original.clone());
+                // Logical undo (restore backup bytes) → byte-identical original.
+                let restored = fs::read(&backup).unwrap();
+                fs::write(&target, &restored).unwrap();
+                prop_assert_eq!(fs::read(&target).unwrap(), original);
+            }
+
+            /// `Op::AppendFile` over arbitrary original/suffix byte vectors:
+            /// the live file becomes original++suffix, the backup preserves
+            /// the pre-append original, and the logical undo restores it.
+            #[test]
+            fn prop_appendfile_backup_roundtrips_any_bytes(
+                original in proptest::collection::vec(any::<u8>(), 1..2048),
+                suffix in proptest::collection::vec(any::<u8>(), 0..2048),
+            ) {
+                let tmp = tempfile::tempdir().unwrap();
+                let beads_dir = tmp.path().join(".beads");
+                fs::create_dir_all(&beads_dir).unwrap();
+                let target = beads_dir.join("append-rt.bin");
+                fs::write(&target, &original).unwrap();
+
+                let (ctx, _ap) = make_ctx(tmp.path(), false);
+                mutate(
+                    &ctx,
+                    &target,
+                    Op::AppendFile { content: suffix.clone() },
+                ).unwrap();
+
+                // Forward: target is original ++ suffix.
+                let mut expected = original.clone();
+                expected.extend_from_slice(&suffix);
+                prop_assert_eq!(fs::read(&target).unwrap(), expected);
+                // Backup byte-equals the pre-append original.
+                let backup = ctx.run_dir.join("backups/.beads/append-rt.bin");
+                prop_assert_eq!(fs::read(&backup).unwrap(), original.clone());
+                // Logical undo restores the original.
+                let restored = fs::read(&backup).unwrap();
+                fs::write(&target, &restored).unwrap();
+                prop_assert_eq!(fs::read(&target).unwrap(), original);
+            }
+        }
+    }
 }
