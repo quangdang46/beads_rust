@@ -1501,6 +1501,7 @@ struct EarlyRepairSummary {
     labels_orphans: bool,
     dependencies_orphans: bool,
     wal_checkpoint: bool,
+    null_defaults: bool,
 }
 
 impl EarlyRepairSummary {
@@ -1524,6 +1525,7 @@ impl EarlyRepairSummary {
             || self.labels_orphans
             || self.dependencies_orphans
             || self.wal_checkpoint
+            || self.null_defaults
     }
 
     fn action_labels(self) -> Vec<String> {
@@ -1584,6 +1586,9 @@ impl EarlyRepairSummary {
         }
         if self.wal_checkpoint {
             actions.push("wal_checkpoint_truncated".to_string());
+        }
+        if self.null_defaults {
+            actions.push("null_defaults_backfilled".to_string());
         }
         actions
     }
@@ -1653,6 +1658,11 @@ impl EarlyRepairSummary {
         }
         if self.wal_checkpoint {
             messages.push("Truncated the SQLite WAL via PRAGMA wal_checkpoint.".to_string());
+        }
+        if self.null_defaults {
+            messages.push(
+                "Backfilled schema-declared defaults into NULL NOT-NULL columns.".to_string(),
+            );
         }
         messages
     }
@@ -5888,6 +5898,104 @@ fn check_null_defaults(conn: &Connection, checks: &mut Vec<CheckResult>) {
             Some(serde_json::json!({ "findings": null_findings })),
         );
     }
+}
+
+/// Pass-8 cycle 61 — fixer for the NULL-defaults subset of
+/// `fm-schemas-missing-required-column`.
+///
+/// When `check_null_defaults` warns, backfills each flagged NOT-NULL
+/// column's schema-declared DEFAULT into its NULL slots via
+/// [`chokepoint::mutate(Op::DbExec)`], one predicate-scoped UPDATE per
+/// (table, column). Legacy rows inserted before a `DEFAULT` was added to
+/// the schema carry NULLs that violate the NOT-NULL invariant and corrupt
+/// JSONL export; the repair is unambiguous (there is exactly one correct
+/// value — the column's DEFAULT) and data-corrective.
+///
+/// SAFETY / blast radius: each UPDATE is scoped by `typeof(<col>) =
+/// 'null'`, so only the offending rows are touched, and the chokepoint
+/// snapshots exactly those rows (predicate-matched) before the write so
+/// `doctor undo` restores the NULLs. The SQL is taken from the vetted
+/// `NULL_DEFAULT_CHECKS` constant, never from the report — a tampered
+/// report can only select WHICH vetted (table, column) pairs to act on,
+/// not inject SQL.
+///
+/// Lifts the NULL-defaults shape from Tier B to Tier A. The sibling
+/// missing-column shape of the same FM stays detect-only (adding a column
+/// requires a migration, not a backfill).
+fn fix_null_defaults_if_warned(
+    db_path: &Path,
+    report: &DoctorReport,
+    ctx: &OutputContext,
+    session: Option<&mut DoctorRepairSession>,
+) -> bool {
+    let Some(finding) = report
+        .checks
+        .iter()
+        .find(|c| c.name == "db.null_defaults" && c.status == CheckStatus::Warn)
+    else {
+        return false;
+    };
+    let Some(session) = session else {
+        if !ctx.is_json() {
+            ctx.warning(
+                "Skipping null-defaults backfill: no doctor repair session (run-dir creation failed)",
+            );
+        }
+        return false;
+    };
+    // The (table, column) pairs the detector flagged. We act only on these,
+    // and only with vetted SQL from NULL_DEFAULT_CHECKS.
+    let flagged: Vec<(String, String)> = finding
+        .details
+        .as_ref()
+        .and_then(|d| d.get("findings"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|f| {
+                    Some((
+                        f.get("table")?.as_str()?.to_string(),
+                        f.get("column")?.as_str()?.to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if flagged.is_empty() {
+        return false;
+    }
+    session.set_fixer("doctor.null_defaults_backfill");
+    let mut any = false;
+    for &(table, column, fix_sql) in NULL_DEFAULT_CHECKS {
+        if !flagged
+            .iter()
+            .any(|(t, c)| t.as_str() == table && c.as_str() == column)
+        {
+            continue;
+        }
+        let predicate = format!("typeof({column}) = 'null'");
+        let op = Op::DbExec {
+            sql: fix_sql.to_string(),
+            args: Vec::new(),
+            affected_tables: vec![table.to_string()],
+            affected_predicate: Some(predicate),
+        };
+        match chokepoint::mutate(&session.ctx, db_path, op) {
+            Ok(result) if result.ok => any = true,
+            Ok(_) => {}
+            Err(err) => {
+                if !ctx.is_json() {
+                    ctx.warning(&format!(
+                        "Failed to backfill {table}.{column} default: {err}"
+                    ));
+                }
+            }
+        }
+    }
+    if any && !ctx.is_json() {
+        ctx.info("Backfilled schema defaults into NULL columns");
+    }
+    any
 }
 
 fn check_issue_write_probe(conn: &Connection, checks: &mut Vec<CheckResult>) {
@@ -10508,6 +10616,21 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         };
     let _ = wal_checkpoint_repaired;
 
+    // Pass-8 cycle 61: backfill schema-declared defaults into NULL NOT-NULL
+    // columns (legacy rows predating a `DEFAULT` addition) via Op::DbExec.
+    let null_defaults_repaired =
+        if args.repair && fixer_filter.allows("fm-schemas-missing-required-column") {
+            let repaired =
+                fix_null_defaults_if_warned(&paths.db_path, &initial.report, ctx, session.as_mut());
+            if repaired {
+                initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+            }
+            repaired
+        } else {
+            false
+        };
+    let _ = null_defaults_repaired;
+
     if args.repair && (fixer_filter.has_only() || fixer_filter.has_skip()) {
         tracing::info!(
             target: "br::doctor::filter",
@@ -10536,6 +10659,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         labels_orphans: labels_orphans_repaired,
         dependencies_orphans: dependencies_orphans_repaired,
         wal_checkpoint: wal_checkpoint_repaired,
+        null_defaults: null_defaults_repaired,
     };
 
     if !args.repair {
@@ -10666,6 +10790,18 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 );
             }
         } else {
+            // Early-only repair path: when the initial report is OK and no
+            // local-repair-eligible anomalies are present, only the early
+            // fixers (gitignore, merge artifacts, inner_gitignore_append,
+            // orphan rows, WAL checkpoint, null defaults, etc.) may have
+            // fired. Each early fixer re-collects the report on success
+            // (`initial = collect_doctor_report_for_cli(...)` after every
+            // fix), so `initial.report` here is already the post-repair
+            // state — emit it as `post_repair` and surface the
+            // `verified` invariant the test contract / repair surface
+            // expects from any RepairApplied outcome (see
+            // assert_repair_applied_surface in tests/workspace_failure_replay.rs).
+            let verified = repair_report_verified(&initial.report);
             let recovery_audit = early_repair.audit_record();
             emit_recovery_audit_record(&recovery_audit);
             if ctx.is_json() {
@@ -10673,7 +10809,9 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                     "report": initial.report,
                     "repaired": early_repair.applied(),
                     "recovery_audit": recovery_audit,
-                    "message": repair_outcome_message_from_parts(early_repair.messages(), None, None)
+                    "message": repair_outcome_message_from_parts(early_repair.messages(), None, None),
+                    "post_repair": initial.report,
+                    "verified": verified,
                 }));
             } else {
                 print_report(&initial.report, ctx)?;
@@ -12574,6 +12712,74 @@ mod tests {
         check_comments_orphans(&conn, &mut after);
         let check = find_check(&after, "comments.orphans").expect("check present");
         assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+    }
+
+    #[test]
+    fn test_fix_null_defaults_backfills_via_chokepoint() {
+        // Inject a legacy NULL into events.actor (schema: NOT NULL DEFAULT '').
+        // Real-world these arise from rows predating the DEFAULT addition;
+        // here we insert one directly to exercise the backfill fixer.
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        let _storage = SqliteStorage::open(&db_path).unwrap();
+        {
+            let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            conn.execute_with_params(
+                "INSERT INTO events(issue_id, event_type, actor, created_at) VALUES (?1, ?2, ?3, ?4)",
+                &[
+                    SqliteValue::Text("bd-null-fix".into()),
+                    SqliteValue::Text("created".into()),
+                    SqliteValue::Null,
+                    SqliteValue::Text("2026-05-15T00:00:00Z".into()),
+                ],
+            )
+            .unwrap();
+        }
+
+        let mut report = DoctorReport {
+            ok: false,
+            workspace_health: Some("degraded".to_string()),
+            reliability_audit: None,
+            checks: Vec::new(),
+        };
+        {
+            let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            check_null_defaults(&conn, &mut report.checks);
+        }
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.name == "db.null_defaults" && matches!(c.status, CheckStatus::Warn)),
+            "precondition: detector must warn on the injected NULL"
+        );
+
+        let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
+            .expect("session must build");
+        let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Text, false, true);
+        assert!(fix_null_defaults_if_warned(
+            &db_path,
+            &report,
+            &ctx,
+            Some(&mut session),
+        ));
+
+        // Detector now clean, and the NULL was backfilled to the schema default ''.
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let mut after = Vec::new();
+        check_null_defaults(&conn, &mut after);
+        let check = find_check(&after, "db.null_defaults").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+        let rows = conn
+            .query("SELECT actor FROM events WHERE issue_id = 'bd-null-fix'")
+            .unwrap();
+        let actor = rows.first().and_then(|row| row.values().first().cloned());
+        assert!(
+            matches!(actor, Some(SqliteValue::Text(ref s)) if s.is_empty()),
+            "actor should be backfilled to '': {actor:?}"
+        );
     }
 
     #[test]
@@ -15055,6 +15261,7 @@ mod tests {
             labels_orphans: false,
             dependencies_orphans: false,
             wal_checkpoint: false,
+            null_defaults: false,
         };
 
         assert!(summary.applied());
@@ -15094,6 +15301,49 @@ mod tests {
     }
 
     #[test]
+    fn test_early_repair_summary_reports_null_defaults_backfill() {
+        let summary = EarlyRepairSummary {
+            gitignore: false,
+            merge_artifacts: false,
+            startup_cache: false,
+            recovery_aged: false,
+            export_hash: false,
+            base_jsonl_symlink: false,
+            base_jsonl_stale: false,
+            orphan_tmp: false,
+            jsonl_eof_newline: false,
+            jsonl_bom: false,
+            jsonl_crlf: false,
+            jsonl_world_writable: false,
+            config_yaml_secret_mode: false,
+            inner_gitignore: false,
+            dirty_bitmap_orphans: false,
+            comments_orphans: false,
+            labels_orphans: false,
+            dependencies_orphans: false,
+            wal_checkpoint: false,
+            null_defaults: true,
+        };
+
+        assert!(summary.applied());
+        assert_eq!(
+            summary.action_labels(),
+            vec!["null_defaults_backfilled".to_string()]
+        );
+        assert_eq!(
+            repair_outcome_message_from_parts(summary.messages(), None, None),
+            "Backfilled schema-declared defaults into NULL NOT-NULL columns."
+        );
+        let audit = summary.audit_record();
+        assert_eq!(audit.phase, "doctor.early_repair");
+        assert_eq!(audit.outcome, "null_defaults_backfilled");
+        assert_eq!(
+            audit.applied_actions,
+            vec!["null_defaults_backfilled".to_string()]
+        );
+    }
+
+    #[test]
     fn test_early_repair_summary_reports_base_jsonl_symlink_quarantine() {
         let summary = EarlyRepairSummary {
             gitignore: false,
@@ -15115,6 +15365,7 @@ mod tests {
             labels_orphans: false,
             dependencies_orphans: false,
             wal_checkpoint: false,
+            null_defaults: false,
         };
 
         assert!(summary.applied());
@@ -15157,6 +15408,7 @@ mod tests {
             labels_orphans: false,
             dependencies_orphans: false,
             wal_checkpoint: false,
+            null_defaults: false,
         };
 
         assert!(summary.applied());
@@ -15199,6 +15451,7 @@ mod tests {
             labels_orphans: false,
             dependencies_orphans: false,
             wal_checkpoint: false,
+            null_defaults: false,
         };
 
         assert!(summary.applied());
