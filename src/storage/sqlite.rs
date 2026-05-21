@@ -295,6 +295,14 @@ pub struct SqliteStorage {
     conn: Connection,
     /// Track mutations to trigger periodic WAL checkpoints.
     mutation_count: u32,
+    /// When set, this storage owns an ephemeral on-disk temp database (created
+    /// by [`SqliteStorage::open_memory`]) that must be unlinked — together with
+    /// its WAL/SHM/journal sidecars — when the connection is dropped. FrankenSQLite
+    /// requires real file paths for WAL and schema operations, so the "in-memory"
+    /// path is backed by a real temp file rather than `:memory:`; without this
+    /// cleanup the files accumulate in `TMPDIR` (#299). `None` for persistent
+    /// databases, which must never be deleted on drop.
+    temp_db_path: Option<PathBuf>,
 }
 
 /// Context for a mutation operation, tracking side effects.
@@ -938,6 +946,7 @@ impl SqliteStorage {
         Ok(Self {
             conn,
             mutation_count: 0,
+            temp_db_path: None,
         })
     }
 
@@ -955,10 +964,20 @@ impl SqliteStorage {
         Ok(Some(Self {
             conn,
             mutation_count: 0,
+            temp_db_path: None,
         }))
     }
 
-    /// Open an in-memory database for testing.
+    /// Open an ephemeral, single-process scratch database.
+    ///
+    /// FrankenSQLite requires real file paths for WAL and schema operations, so
+    /// this cannot use `:memory:`; instead it opens a uniquely-named temp file
+    /// (`beads_mem_<pid>_<count>.db`) under [`std::env::temp_dir`]. The file —
+    /// and any `-wal`/`-shm`/`-journal` sidecars SQLite creates alongside it —
+    /// is unlinked when the returned [`SqliteStorage`] is dropped (#299), and
+    /// also if construction fails partway through, so no stale files are left in
+    /// `TMPDIR`. The path is unique per process, so it is never shared with
+    /// another process and is always safe to delete on teardown.
     ///
     /// # Errors
     ///
@@ -968,6 +987,20 @@ impl SqliteStorage {
         let count = MEM_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path =
             std::env::temp_dir().join(format!("beads_mem_{}_{}.db", std::process::id(), count));
+
+        // Build the storage on a fallible path so that any failure after the
+        // file has been created still removes it (the partial `Connection` /
+        // file would otherwise be orphaned without a live `Drop` to clean it).
+        match Self::build_memory(&path) {
+            Ok(storage) => Ok(storage),
+            Err(e) => {
+                remove_temp_db_files(&path);
+                Err(e)
+            }
+        }
+    }
+
+    fn build_memory(path: &Path) -> Result<Self> {
         let conn = Connection::open(path.to_string_lossy().into_owned())?;
 
         conn.execute(&format!("PRAGMA busy_timeout={DEFAULT_BUSY_TIMEOUT_MS}"))?;
@@ -979,6 +1012,7 @@ impl SqliteStorage {
         Ok(Self {
             conn,
             mutation_count: 0,
+            temp_db_path: Some(path.to_path_buf()),
         })
     }
 
@@ -9809,6 +9843,30 @@ fn finish_issue_mutation_write_probe(
     }
 }
 
+/// Best-effort removal of an ephemeral temp database and its SQLite sidecars.
+///
+/// SQLite may create `-wal`, `-shm`, and `-journal` files next to the main
+/// database file; all of them must go so nothing is left in `TMPDIR` (#299).
+/// Missing files are ignored; this is invoked on teardown and on a failed
+/// open, so errors are intentionally swallowed (logged at debug level).
+fn remove_temp_db_files(path: &Path) {
+    let mut targets = vec![path.to_path_buf()];
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        for suffix in ["-wal", "-shm", "-journal"] {
+            targets.push(path.with_file_name(format!("{name}{suffix}")));
+        }
+    }
+    for target in targets {
+        match std::fs::remove_file(&target) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::debug!(path = %target.display(), error = %e, "failed to remove temp db file");
+            }
+        }
+    }
+}
+
 fn database_header_user_version(path: &Path) -> Option<u32> {
     if path == Path::new(":memory:") || !path.is_file() {
         return None;
@@ -11927,6 +11985,13 @@ impl Drop for SqliteStorage {
         }
         // Explicitly close the connection to avoid fsqlite drop_close warnings.
         let _ = self.conn.close_in_place();
+        // Ephemeral temp databases (open_memory) are unlinked here, after the
+        // connection is closed, so the file and its WAL/SHM/journal sidecars are
+        // not left behind in TMPDIR (#299). Persistent databases have
+        // `temp_db_path == None` and are never touched.
+        if let Some(path) = self.temp_db_path.take() {
+            remove_temp_db_files(&path);
+        }
     }
 }
 
@@ -12199,6 +12264,81 @@ mod tests {
     fn test_open_memory() {
         let storage = SqliteStorage::open_memory();
         assert!(storage.is_ok(), "open_memory failed: {:?}", storage.err());
+    }
+
+    /// Regression for #299: `open_memory` is backed by a real temp file (because
+    /// FrankenSQLite cannot use `:memory:`), and that file plus any WAL/SHM/
+    /// journal sidecars must be unlinked when the storage is dropped — otherwise
+    /// `beads_mem_*` files accumulate in `TMPDIR`.
+    #[test]
+    fn open_memory_temp_files_removed_on_drop() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let db_path = storage
+            .temp_db_path
+            .clone()
+            .expect("open_memory must record its temp db path");
+
+        // Perform a mutation so SQLite actually materializes the WAL sidecar,
+        // exercising the sidecar-cleanup path and not just the base .db file.
+        let issue = make_issue(
+            "bd-1",
+            "tmp leak repro",
+            Status::Open,
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+
+        assert!(
+            db_path.exists(),
+            "temp db file should exist while storage is open: {}",
+            db_path.display()
+        );
+
+        drop(storage);
+
+        // The base file and every sidecar SQLite may have created must be gone.
+        let name = db_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("temp db name");
+        let leftovers: Vec<PathBuf> = std::iter::once(db_path.clone())
+            .chain(
+                ["-wal", "-shm", "-journal"]
+                    .iter()
+                    .map(|s| db_path.with_file_name(format!("{name}{s}"))),
+            )
+            .filter(|p| p.exists())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp db files left behind after drop: {leftovers:?}"
+        );
+    }
+
+    /// A failed `open_memory` (or its drop) must not leave files behind either:
+    /// `remove_temp_db_files` cleans up the base file and sidecars and tolerates
+    /// missing files.
+    #[test]
+    fn remove_temp_db_files_clears_all_sidecars() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("beads_mem_test_0.db");
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            fs::write(
+                dir.path().join(format!("beads_mem_test_0.db{suffix}")),
+                b"x",
+            )
+            .unwrap();
+        }
+        remove_temp_db_files(&base);
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let p = dir.path().join(format!("beads_mem_test_0.db{suffix}"));
+            assert!(!p.exists(), "should have been removed: {}", p.display());
+        }
+        // Idempotent / tolerant of already-missing files.
+        remove_temp_db_files(&base);
     }
 
     #[test]
@@ -20159,6 +20299,7 @@ mod tests {
         let storage = SqliteStorage {
             conn,
             mutation_count: 0,
+            temp_db_path: None,
         };
         let timestamp = Utc.with_ymd_and_hms(2026, 3, 11, 0, 0, 0).unwrap();
         let stamp = timestamp.to_rfc3339();
