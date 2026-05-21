@@ -15,6 +15,34 @@ This changelog is organized by capability rather than diff order. Each version s
 
 ---
 
+## v0.2.11 -- 2026-05-21 (Release)
+
+This version stops the ephemeral "in-memory" storage path from leaking
+temporary database files into `TMPDIR`.
+
+### Fixes
+
+- `SqliteStorage::open_memory()` is backed by a real temp file
+  (`beads_mem_<pid>_<count>.db`) rather than `:memory:`, because FrankenSQLite
+  requires real file paths for WAL and schema operations. That file -- and any
+  `-wal`/`-shm`/`-journal` sidecars SQLite created next to it -- was never
+  cleaned up, so JSONL-only / in-memory paths (`br sync --import-only`, `br
+  ready --no-db`, `br list --no-db`, and similar) left stale `beads_mem_*`
+  files in the user temp directory on every invocation. Under high-frequency
+  agent/CI use these accumulated into real disk pressure
+  ([#299](https://github.com/Dicklesworthstone/beads_rust/issues/299)).
+- The storage layer now tracks the ephemeral temp path and removes the base
+  file plus all sidecars on `Drop` (including the signal-induced shutdown
+  path), and also cleans up if construction fails partway through. Persistent
+  databases are never touched.
+
+### Validation
+
+- Reproduced the issue's exact scenario against a release build and confirmed
+  zero `beads_mem_*` files remain in `TMPDIR` after each command exits.
+- Added regression tests asserting the temp file exists while the storage is
+  open and is gone (with sidecars) after drop.
+
 ## v0.2.10 -- 2026-05-14 (Release)
 
 This version supersedes `v0.2.9` by fixing the remaining Windows release-build
