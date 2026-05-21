@@ -2289,4 +2289,127 @@ mod tests {
             }
         }
     }
+
+    /// Metamorphic idempotence properties (hardens the idempotence
+    /// dimension at the op level).
+    ///
+    /// The fixture `REPLAY_IDEMPOTENCE=1` gate proves the FIXER level
+    /// ("a second `--repair` is a no-op") end-to-end. These properties
+    /// pin the OP-level basis underneath it, and — importantly — encode
+    /// the asymmetry that explains WHY append-based fixers must
+    /// detect-guard while write/chmod-based fixers need not:
+    ///
+    /// - `WriteFile` and `Chmod` CONVERGE: re-applying the same op to its
+    ///   own output is a content/mode no-op.
+    /// - `AppendFile` does NOT converge: the chokepoint never dedupes, so
+    ///   appending the same suffix twice duplicates it. Fixers using
+    ///   AppendFile (trailing-newline, inner-gitignore) therefore MUST
+    ///   only fire when the detector says the content is missing.
+    mod idempotence_props {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Build a MutateContext for repo `tmp` with a distinct `run` id.
+        /// Each `br doctor --repair` invocation gets its own run-dir, so
+        /// modelling "repair twice" requires two distinct run-dirs — a
+        /// single shared ctx would collide on the backup path (and a
+        /// chmod-to-readonly would even make the shared backup
+        /// un-overwritable on the second call).
+        fn ctx_with_run(tmp: &Path, run: &str) -> MutateContext {
+            let run_dir = tmp.join(".doctor/runs").join(run);
+            fs::create_dir_all(run_dir.join("backups")).unwrap();
+            let actions_file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(run_dir.join("actions.jsonl"))
+                .unwrap();
+            MutateContext {
+                run_id: run.to_string(),
+                run_dir,
+                capabilities: Capabilities::for_repo(tmp),
+                actions_file: Mutex::new(actions_file),
+                fixer_id: "test-fixer".to_string(),
+                repo_root: tmp.to_path_buf(),
+                dry_run: false,
+                start_ns: now_ns(),
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(64))]
+
+            /// Re-writing the same content is a content no-op: the second
+            /// run's before_hash == after_hash and the file is unchanged.
+            #[test]
+            fn prop_writefile_second_apply_is_content_noop(
+                original in proptest::collection::vec(any::<u8>(), 0..1024),
+                target_content in proptest::collection::vec(any::<u8>(), 0..1024),
+            ) {
+                let tmp = tempfile::tempdir().unwrap();
+                let beads_dir = tmp.path().join(".beads");
+                fs::create_dir_all(&beads_dir).unwrap();
+                let target = beads_dir.join("idem-write.bin");
+                fs::write(&target, &original).unwrap();
+
+                let ctx1 = ctx_with_run(tmp.path(), "run-1");
+                mutate(&ctx1, &target, Op::WriteFile { content: target_content.clone(), mode: None }).unwrap();
+                let ctx2 = ctx_with_run(tmp.path(), "run-2");
+                let r2 = mutate(&ctx2, &target, Op::WriteFile { content: target_content.clone(), mode: None }).unwrap();
+
+                // Second application converged: no content change.
+                prop_assert_eq!(&r2.before_hash, &r2.after_hash);
+                prop_assert_eq!(fs::read(&target).unwrap(), target_content);
+            }
+
+            /// Re-applying the same mode is a no-op.
+            #[test]
+            fn prop_chmod_second_apply_is_mode_noop(
+                content in proptest::collection::vec(any::<u8>(), 0..256),
+                m in 0o400u32..=0o777,
+            ) {
+                let tmp = tempfile::tempdir().unwrap();
+                let beads_dir = tmp.path().join(".beads");
+                fs::create_dir_all(&beads_dir).unwrap();
+                let target = beads_dir.join("idem-chmod.bin");
+                fs::write(&target, &content).unwrap();
+                fs::set_permissions(&target, fs::Permissions::from_mode(m)).unwrap();
+
+                let ctx1 = ctx_with_run(tmp.path(), "run-1");
+                mutate(&ctx1, &target, Op::Chmod { mode: m }).unwrap();
+                let ctx2 = ctx_with_run(tmp.path(), "run-2");
+                mutate(&ctx2, &target, Op::Chmod { mode: m }).unwrap();
+
+                prop_assert_eq!(
+                    fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+                    m & 0o777
+                );
+            }
+
+            /// AppendFile does NOT converge: two appends of the same
+            /// non-empty suffix duplicate it. Encodes the design invariant
+            /// that append fixers must detect-guard.
+            #[test]
+            fn prop_appendfile_is_not_idempotent(
+                original in proptest::collection::vec(any::<u8>(), 0..512),
+                suffix in proptest::collection::vec(any::<u8>(), 1..512),
+            ) {
+                let tmp = tempfile::tempdir().unwrap();
+                let beads_dir = tmp.path().join(".beads");
+                fs::create_dir_all(&beads_dir).unwrap();
+                let target = beads_dir.join("idem-append.bin");
+                fs::write(&target, &original).unwrap();
+
+                let ctx1 = ctx_with_run(tmp.path(), "run-1");
+                mutate(&ctx1, &target, Op::AppendFile { content: suffix.clone() }).unwrap();
+                let ctx2 = ctx_with_run(tmp.path(), "run-2");
+                mutate(&ctx2, &target, Op::AppendFile { content: suffix.clone() }).unwrap();
+
+                // original ++ suffix ++ suffix — the append was NOT deduped.
+                let mut expected = original.clone();
+                expected.extend_from_slice(&suffix);
+                expected.extend_from_slice(&suffix);
+                prop_assert_eq!(fs::read(&target).unwrap(), expected);
+            }
+        }
+    }
 }
