@@ -12716,16 +12716,33 @@ mod tests {
 
     #[test]
     fn test_fix_null_defaults_backfills_via_chokepoint() {
-        // Inject a legacy NULL into events.actor (schema: NOT NULL DEFAULT '').
-        // Real-world these arise from rows predating the DEFAULT addition;
-        // here we insert one directly to exercise the backfill fixer.
+        // The canonical events.actor is `TEXT NOT NULL DEFAULT ''`, and fsqlite
+        // enforces NOT NULL at INSERT — so to reproduce the detector's intended
+        // target (rows predating a NOT NULL DEFAULT addition during schema
+        // migration, where the storage retained pre-existing NULLs in older
+        // rows) we DROP and recreate `events` locally without NOT NULL on
+        // `actor`. The detector and fixer only touch that column, so a minimal
+        // column set suffices. No FKs reference events.id, so the drop is safe.
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
         fs::create_dir_all(&beads_dir).unwrap();
         let db_path = beads_dir.join("beads.db");
-        let _storage = SqliteStorage::open(&db_path).unwrap();
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        drop(storage);
         {
             let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            conn.execute("DROP TABLE events").unwrap();
+            conn.execute(
+                "CREATE TABLE events (
+                    id INTEGER PRIMARY KEY,
+                    issue_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL DEFAULT '',
+                    actor TEXT,
+                    created_at TEXT NOT NULL DEFAULT '',
+                    metadata TEXT
+                )",
+            )
+            .unwrap();
             conn.execute_with_params(
                 "INSERT INTO events(issue_id, event_type, actor, created_at) VALUES (?1, ?2, ?3, ?4)",
                 &[
