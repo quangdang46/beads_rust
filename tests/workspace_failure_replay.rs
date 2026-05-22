@@ -246,14 +246,6 @@ fn assert_doctor_clean_surface(fixture: &FixtureWorkspace, context: &str, json: 
         "{context} should be clean: {json}"
     );
     assert_doctor_reliability_audit(fixture, context, json);
-    if fixture.metadata.name == "db_jsonl_disagreement" {
-        let counts = doctor_check(json, "counts.db_vs_jsonl");
-        assert_eq!(
-            counts["status"].as_str(),
-            Some("warn"),
-            "db_jsonl_disagreement should warn on DB/JSONL drift: {json}"
-        );
-    }
 }
 
 fn reliability_audit_anomalies<'a>(
@@ -361,6 +353,14 @@ fn assert_doctor_reliability_audit(fixture: &FixtureWorkspace, context: &str, js
                 has_code("db_jsonl_count_mismatch"),
                 "{context} should surface DB/JSONL drift diagnostics: {json}"
             );
+            if fixture.metadata.name == "db_jsonl_disagreement" {
+                let counts = doctor_check(json, "counts.db_vs_jsonl");
+                assert_eq!(
+                    counts["status"].as_str(),
+                    Some("warn"),
+                    "db_jsonl_disagreement should warn on DB/JSONL drift: {json}"
+                );
+            }
         }
         "legacy_schema_drift" => {
             assert!(

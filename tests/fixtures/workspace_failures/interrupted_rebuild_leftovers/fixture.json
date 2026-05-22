@@ -18,7 +18,7 @@
     },
     {
       "surface": "doctor --repair",
-      "outcome": "fails_repeated_repair"
+      "outcome": "repair_applied"
     },
     {
       "surface": "sync --status",
