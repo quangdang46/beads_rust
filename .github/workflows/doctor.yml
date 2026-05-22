@@ -55,7 +55,14 @@ jobs:
         id: health
         run: |
           set -euo pipefail
-          ./target/release/br doctor health --json | tee /tmp/doctor_health.json
+          # `br doctor health` exits 1 when findings are present
+          # (DoctorExitCode::FindingsPresent). Under `set -euo pipefail` that
+          # exit propagates through the pipe and kills the step BEFORE the
+          # informational `::warning::` branch below has a chance to fire.
+          # Tolerate the non-zero exit so the conditional can run; the JSON
+          # payload still gets tee'd to /tmp for the uploaded artifact and
+          # the downstream `jq` step.
+          ./target/release/br doctor health --json | tee /tmp/doctor_health.json || true
           status="$(jq -r '.status // empty' /tmp/doctor_health.json)"
           echo "status=$status" >>"$GITHUB_OUTPUT"
           if [ "$status" != "healthy" ]; then
