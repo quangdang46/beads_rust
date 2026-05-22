@@ -1502,6 +1502,7 @@ struct EarlyRepairSummary {
     dependencies_orphans: bool,
     wal_checkpoint: bool,
     null_defaults: bool,
+    db_bloat_vacuum: bool,
 }
 
 impl EarlyRepairSummary {
@@ -1526,6 +1527,7 @@ impl EarlyRepairSummary {
             || self.dependencies_orphans
             || self.wal_checkpoint
             || self.null_defaults
+            || self.db_bloat_vacuum
     }
 
     fn action_labels(self) -> Vec<String> {
@@ -1589,6 +1591,9 @@ impl EarlyRepairSummary {
         }
         if self.null_defaults {
             actions.push("null_defaults_backfilled".to_string());
+        }
+        if self.db_bloat_vacuum {
+            actions.push("db_bloat_vacuumed".to_string());
         }
         actions
     }
@@ -1662,6 +1667,12 @@ impl EarlyRepairSummary {
         if self.null_defaults {
             messages.push(
                 "Backfilled schema-declared defaults into NULL NOT-NULL columns.".to_string(),
+            );
+        }
+        if self.db_bloat_vacuum {
+            messages.push(
+                "Compacted database via VACUUM to reclaim freelist space (--unsafe-auto-fix opt-in)."
+                    .to_string(),
             );
         }
         messages
@@ -3220,6 +3231,78 @@ fn checkpoint_wal_truncate(db_path: &Path) -> Result<()> {
         )));
     }
 
+    Ok(())
+}
+
+/// Pass-10 cycle 62 — `--unsafe-auto-fix`-gated fixer for
+/// `fm-caches_indexes-db-bloat-vs-jsonl`.
+///
+/// When the operator passes `--unsafe-auto-fix` AND `db_bloat` warns,
+/// runs `VACUUM` against the database via the legacy chokepoint wrapper.
+/// `VACUUM` is normally detect-only because it rewrites every page in the
+/// DB (slow on large databases) and operators typically prefer to time
+/// these themselves — but it is data-equivalent and reversible via the
+/// chokepoint's verbatim DB+WAL+SHM snapshot, so an opt-in is safe.
+///
+/// Distinct from the existing `repair_via_vacuum` legacy path: that path
+/// fires on detected page CORRUPTION (Error level) and runs
+/// `VACUUM` + `VACUUM INTO`. This fixer fires on BLOAT (Warn level) and
+/// runs just `VACUUM` — enough to reclaim freelist space without the
+/// compaction-copy round trip.
+///
+/// Like `fix_wal_oversized_if_warned`, this uses `record_legacy_mutation`
+/// (NOT `Op::DbExec`) because `VACUUM` cannot run inside a transaction.
+fn fix_db_bloat_via_vacuum_if_warned(
+    db_path: &Path,
+    report: &DoctorReport,
+    ctx: &OutputContext,
+    session: Option<&mut DoctorRepairSession>,
+) -> bool {
+    let has_warning = report
+        .checks
+        .iter()
+        .any(|c| c.name == "db_bloat" && c.status == CheckStatus::Warn);
+    if !has_warning {
+        return false;
+    }
+    let Some(session) = session else {
+        if !ctx.is_json() {
+            ctx.warning(
+                "Skipping db-bloat VACUUM: no doctor repair session (run-dir creation failed)",
+            );
+        }
+        return false;
+    };
+    let wal_path = sqlite_wal_sidecar_path(db_path);
+    let shm_path = sqlite_shm_sidecar_path(db_path);
+    match session.record_legacy_mutation(
+        "doctor.db_bloat_vacuum",
+        &[db_path, &wal_path, &shm_path],
+        || vacuum_database(db_path),
+    ) {
+        Ok(()) => {
+            if !ctx.is_json() {
+                ctx.info(
+                    "Compacted database via VACUUM (--unsafe-auto-fix opt-in, bloat-triggered)",
+                );
+            }
+            true
+        }
+        Err(err) => {
+            if !ctx.is_json() {
+                ctx.warning(&format!("Failed to VACUUM database: {err}"));
+            }
+            false
+        }
+    }
+}
+
+/// Open the database, run `VACUUM`, close. Used by
+/// [`fix_db_bloat_via_vacuum_if_warned`] under the chokepoint's
+/// legacy-mutation wrapper so the DB family is snapshotted for undo.
+fn vacuum_database(db_path: &Path) -> Result<()> {
+    let storage = SqliteStorage::open(db_path)?;
+    storage.execute_raw("VACUUM")?;
     Ok(())
 }
 
@@ -10631,6 +10714,29 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         };
     let _ = null_defaults_repaired;
 
+    // Pass-10 cycle 62: `--unsafe-auto-fix`-gated VACUUM on db bloat.
+    // VACUUM is normally detect-only (expensive, operator-timed) but
+    // data-equivalent + reversible via the legacy chokepoint snapshot,
+    // so an explicit opt-in is safe.
+    let db_bloat_vacuum_repaired = if args.repair
+        && args.unsafe_auto_fix
+        && fixer_filter.allows("fm-caches_indexes-db-bloat-vs-jsonl")
+    {
+        let repaired = fix_db_bloat_via_vacuum_if_warned(
+            &paths.db_path,
+            &initial.report,
+            ctx,
+            session.as_mut(),
+        );
+        if repaired {
+            initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+        }
+        repaired
+    } else {
+        false
+    };
+    let _ = db_bloat_vacuum_repaired;
+
     if args.repair && (fixer_filter.has_only() || fixer_filter.has_skip()) {
         tracing::info!(
             target: "br::doctor::filter",
@@ -10660,6 +10766,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         dependencies_orphans: dependencies_orphans_repaired,
         wal_checkpoint: wal_checkpoint_repaired,
         null_defaults: null_defaults_repaired,
+        db_bloat_vacuum: db_bloat_vacuum_repaired,
     };
 
     if !args.repair {
@@ -15279,6 +15386,7 @@ mod tests {
             dependencies_orphans: false,
             wal_checkpoint: false,
             null_defaults: false,
+            db_bloat_vacuum: false,
         };
 
         assert!(summary.applied());
@@ -15318,6 +15426,47 @@ mod tests {
     }
 
     #[test]
+    fn test_early_repair_summary_reports_db_bloat_vacuum() {
+        let summary = EarlyRepairSummary {
+            gitignore: false,
+            merge_artifacts: false,
+            startup_cache: false,
+            recovery_aged: false,
+            export_hash: false,
+            base_jsonl_symlink: false,
+            base_jsonl_stale: false,
+            orphan_tmp: false,
+            jsonl_eof_newline: false,
+            jsonl_bom: false,
+            jsonl_crlf: false,
+            jsonl_world_writable: false,
+            config_yaml_secret_mode: false,
+            inner_gitignore: false,
+            dirty_bitmap_orphans: false,
+            comments_orphans: false,
+            labels_orphans: false,
+            dependencies_orphans: false,
+            wal_checkpoint: false,
+            null_defaults: false,
+            db_bloat_vacuum: true,
+        };
+
+        assert!(summary.applied());
+        assert_eq!(
+            summary.action_labels(),
+            vec!["db_bloat_vacuumed".to_string()]
+        );
+        assert_eq!(
+            repair_outcome_message_from_parts(summary.messages(), None, None),
+            "Compacted database via VACUUM to reclaim freelist space (--unsafe-auto-fix opt-in)."
+        );
+        let audit = summary.audit_record();
+        assert_eq!(audit.phase, "doctor.early_repair");
+        assert_eq!(audit.outcome, "db_bloat_vacuumed");
+        assert_eq!(audit.applied_actions, vec!["db_bloat_vacuumed".to_string()]);
+    }
+
+    #[test]
     fn test_early_repair_summary_reports_null_defaults_backfill() {
         let summary = EarlyRepairSummary {
             gitignore: false,
@@ -15340,6 +15489,7 @@ mod tests {
             dependencies_orphans: false,
             wal_checkpoint: false,
             null_defaults: true,
+            db_bloat_vacuum: false,
         };
 
         assert!(summary.applied());
@@ -15383,6 +15533,7 @@ mod tests {
             dependencies_orphans: false,
             wal_checkpoint: false,
             null_defaults: false,
+            db_bloat_vacuum: false,
         };
 
         assert!(summary.applied());
@@ -15426,6 +15577,7 @@ mod tests {
             dependencies_orphans: false,
             wal_checkpoint: false,
             null_defaults: false,
+            db_bloat_vacuum: false,
         };
 
         assert!(summary.applied());
@@ -15469,6 +15621,7 @@ mod tests {
             dependencies_orphans: false,
             wal_checkpoint: false,
             null_defaults: false,
+            db_bloat_vacuum: false,
         };
 
         assert!(summary.applied());
@@ -18889,6 +19042,7 @@ version = "2026-05-11-abc123"
             quick: false,
             only: Vec::new(),
             skip: Vec::new(),
+            unsafe_auto_fix: false,
             subcommand: None,
         };
         let ctx = OutputContext::from_flags(false, true, true);
@@ -18967,6 +19121,7 @@ version = "2026-05-11-abc123"
             quick: false,
             only: Vec::new(),
             skip: Vec::new(),
+            unsafe_auto_fix: false,
             subcommand: None,
         };
         let ctx = OutputContext::from_flags(false, true, true);
@@ -19252,6 +19407,7 @@ version = "2026-05-11-abc123"
             quick: false,
             only: Vec::new(),
             skip: Vec::new(),
+            unsafe_auto_fix: false,
             subcommand: None,
         };
         let ctx = OutputContext::from_flags(false, true, true);
@@ -19305,6 +19461,7 @@ version = "2026-05-11-abc123"
             quick: false,
             only: Vec::new(),
             skip: Vec::new(),
+            unsafe_auto_fix: false,
             subcommand: None,
         };
         let ctx = OutputContext::from_flags(false, true, true);
@@ -19359,6 +19516,7 @@ version = "2026-05-11-abc123"
             quick: false,
             only: Vec::new(),
             skip: Vec::new(),
+            unsafe_auto_fix: false,
             subcommand: None,
         };
         let ctx = OutputContext::from_flags(false, true, true);

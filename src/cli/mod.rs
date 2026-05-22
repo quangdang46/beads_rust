@@ -2749,6 +2749,24 @@ pub struct DoctorArgs {
     #[arg(long, value_delimiter = ',', num_args = 1..)]
     pub skip: Vec<String>,
 
+    /// Pass-10 cycle 62: opt-in to fixers that are normally detect-only
+    /// because the fix is expensive, operator-timed, or has subtle
+    /// trade-offs the doctor's default safety posture refuses to make
+    /// autonomously. Currently enables:
+    ///
+    /// - VACUUM on `fm-caches_indexes-db-bloat-vs-jsonl` — compacts the
+    ///   SQLite database in place to reclaim freelist space. Bloat is
+    ///   normally detect-only because VACUUM rewrites every page (slow
+    ///   on large DBs) and operators typically schedule it deliberately.
+    ///
+    /// NEVER pass this in CI without inspecting the planned actions
+    /// first (use `--dry-run` together with this flag). The opt-in is
+    /// load-bearing: the same fixers without this flag are intentionally
+    /// detect-only to preserve the doctor's "doctor mutates only when
+    /// the operator has consented" SACRED INVARIANT.
+    #[arg(long = "unsafe-auto-fix")]
+    pub unsafe_auto_fix: bool,
+
     /// Optional WP6 subcommand. When `None`, the flat doctor handler
     /// (above) runs as it always has.
     #[command(subcommand)]
