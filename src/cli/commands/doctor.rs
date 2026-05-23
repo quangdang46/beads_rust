@@ -10737,6 +10737,44 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     };
     let _ = db_bloat_vacuum_repaired;
 
+    // Replay-idempotence reconciliation: the export-hash-cache fixer
+    // above runs BEFORE the JSONL-mutating fixers (BOM strip, CRLF,
+    // trailing-newline, world-writable mode-strip). If any of those
+    // rewrote the JSONL bytes, the cached `metadata.jsonl_content_hash`
+    // is now stale even though the cache fixer's first pass reported
+    // success. Re-run the cache fixer at the end so the workspace is
+    // genuinely quiescent — the second `--repair` invocation under
+    // REPLAY_IDEMPOTENCE=1 finds nothing to do, and the chokepoint
+    // emits zero actions on the no-op replay run.
+    //
+    // The first-pass `export_hash_repaired` flag retains its semantics
+    // (it tracks whether the FIRST cache mismatch was repaired); this
+    // tail call is reported under the same fixer-id and recorded in
+    // actions.jsonl exactly like the first pass.
+    let jsonl_was_mutated = jsonl_bom_repaired
+        || jsonl_crlf_repaired
+        || jsonl_eof_newline_repaired
+        || jsonl_world_writable_repaired;
+    let export_hash_reconciled = if args.repair
+        && jsonl_was_mutated
+        && fixer_filter.allows("fm-caches_indexes-export-hash-cache-divergence")
+    {
+        let reconciled = fix_export_hash_cache_divergence_if_warned(
+            &paths.db_path,
+            initial.jsonl_path.as_deref(),
+            &initial.report,
+            ctx,
+            session.as_mut(),
+        );
+        if reconciled {
+            initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+        }
+        reconciled
+    } else {
+        false
+    };
+    let _ = export_hash_reconciled;
+
     if args.repair && (fixer_filter.has_only() || fixer_filter.has_skip()) {
         tracing::info!(
             target: "br::doctor::filter",

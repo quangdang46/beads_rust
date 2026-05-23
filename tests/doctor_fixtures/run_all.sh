@@ -149,8 +149,19 @@ run_fixture() {
     fi
 
     # Stage 3: --repair (don't abort on non-zero exit — assert.sh judges).
+    local runs_dir="$tmp/.doctor/runs"
+    local before_first_repair="$diag/runs_before_first_repair"
+    list_run_ids "$runs_dir" > "$before_first_repair"
     ( cd "$tmp" && "${doctor_env[@]}" "$TOOL_BIN" doctor --repair --json ) \
         > "$diag/repair.json" 2> "$diag/repair.stderr" || true
+    # Snapshot the run-ids created by the FIRST --repair. Under
+    # REPLAY_IDEMPOTENCE=1 a second --repair below may add a
+    # no-op run-dir that becomes the new "latest", so we resolve
+    # the undo target explicitly against this pre-replay snapshot.
+    local after_first_repair="$diag/runs_after_first_repair"
+    list_run_ids "$runs_dir" > "$after_first_repair"
+    local first_repair_run_id
+    first_repair_run_id="$(comm -13 "$before_first_repair" "$after_first_repair" | tail -n1)"
 
     # Stage 3.5 (pass-3, opt-in): idempotence replay gate. The
     # chokepoint contract requires that running `--repair` twice
@@ -159,12 +170,12 @@ run_fixture() {
     # the detector is impure (mutates a side-channel) or the fixer
     # isn't idempotent.
     #
-    # OPT-IN: REPLAY_IDEMPOTENCE=1 enables the gate. Default off
-    # because the default suite's post_undo stages assert that
-    # `undo latest` reverses the FIRST repair; a second --repair
-    # creates a no-op run-dir that becomes the new "latest",
-    # which would break post_undo for fixtures whose corruption
-    # the repair successfully clears (e.g., gitignore fixers).
+    # OPT-IN: REPLAY_IDEMPOTENCE=1 enables the gate. The
+    # post-replay `undo` target below is resolved against the
+    # FIRST repair's run-id (not `latest`), so fixtures whose
+    # post_undo asserts byte-deterministic restore of the first
+    # repair are robust against the no-op replay run becoming
+    # the new "latest".
     #
     # CI / pass-3 idempotence-audit invocation:
     #   REPLAY_IDEMPOTENCE=1 \
@@ -173,6 +184,10 @@ run_fixture() {
     #
     # Per-fixture opt-out (independent of the suite-level gate):
     # drop a `.skip_replay` marker file inside the fixture dir.
+    # Historically these were needed because stage-5 used `undo
+    # latest`; the explicit-run-id resolution above makes most of
+    # them unnecessary, but the opt-out is retained for fixtures
+    # whose detectors are genuinely non-idempotent.
     if [ "${REPLAY_IDEMPOTENCE:-0}" = "1" ]; then
         local skip_replay=0
         if [ -n "${REPLAY_IDEMPOTENCE_SKIP:-}" ]; then
@@ -188,7 +203,6 @@ run_fixture() {
             skip_replay=1
         fi
         if [ "$skip_replay" -eq 0 ]; then
-            local runs_dir="$tmp/.doctor/runs"
             local before_runs="$diag/replay_runs.before"
             local after_runs="$diag/replay_runs.after"
             list_run_ids "$runs_dir" > "$before_runs"
@@ -228,8 +242,17 @@ run_fixture() {
         return 1
     fi
 
-    # Stage 5: undo latest (best-effort).
-    ( cd "$tmp" && "${doctor_env[@]}" "$TOOL_BIN" doctor undo latest --json ) \
+    # Stage 5: undo the FIRST repair (best-effort). We pin to the
+    # specific run-id captured before any replay so that a no-op
+    # second --repair under REPLAY_IDEMPOTENCE=1 doesn't shadow
+    # the meaningful run via the `latest` alias. If for any
+    # reason we failed to capture a first-repair run-id (e.g., a
+    # detector that emits zero findings), fall back to `latest`.
+    local undo_target="${first_repair_run_id:-latest}"
+    if [ -z "$undo_target" ]; then
+        undo_target="latest"
+    fi
+    ( cd "$tmp" && "${doctor_env[@]}" "$TOOL_BIN" doctor undo "$undo_target" --json ) \
         > "$diag/undo.json" 2> "$diag/undo.stderr" || true
 
     # Stage 6: post_undo assertions.
