@@ -3212,9 +3212,23 @@ pub mod catalog {
             "where_after_stress",
         ));
         steps.push(sync_flush_step("flush_after_stress"));
-        steps.push(command_step(
-            vec!["doctor".to_string(), "--json".to_string()],
-            "doctor_after_stress",
+        // Per the post-#292 doctor contract (commits 96c3fad2, 1c3c4fe1):
+        // any non-OK check — WARN or ERROR — now flips `ok` to false and
+        // exits 1. The stress harness legitimately produces WARN-level
+        // findings (RUST_LOG=beads_rust=debug set by the test runner,
+        // WAL-without-SHM "expected for frankensqlite", missing
+        // beads.base.jsonl anchor after the final flush, and a
+        // .beads/.gitignore that doesn't list `.write.lock` because
+        // `br init` writes a minimal one). None of those degrade the
+        // workspace's semantic health, so the e2e test asserts
+        // `workspace_health == "healthy"` on the JSON payload rather
+        // than exit-code success; the step itself is `allow_either`
+        // so the workspace-evolution executor doesn't trip on exit 1.
+        steps.push(WorkspaceEvolutionStep::command(
+            WorkspaceEvolutionCommand::new(
+                ScenarioCommand::new(["doctor", "--json"]).with_label("doctor_after_stress"),
+            )
+            .allow_either(),
         ));
 
         WorkspaceEvolutionPlan::new("long_lived_mixed_order_stress", seed)

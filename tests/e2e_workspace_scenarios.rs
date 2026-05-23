@@ -563,9 +563,65 @@ fn scenario_long_lived_single_workspace_stress_suite() {
         .event("doctor_after_stress")
         .and_then(|event| event.command_result.as_ref())
         .expect("final doctor event");
+    // Per the post-#292 doctor contract (commits 96c3fad2, 1c3c4fe1):
+    // any non-OK check — WARN or ERROR — now flips top-level `ok` to
+    // false and exits 1. The stress harness legitimately produces a
+    // handful of benign WARN findings (test runner sets
+    // `RUST_LOG=beads_rust=debug` which trips `rust_log`; frankensqlite
+    // leaves a WAL sidecar without a matching SHM file which trips
+    // `db.sidecars`; the post-flush merge anchor
+    // `beads.base.jsonl` is not produced by `sync --flush-only` so
+    // `base_jsonl.missing_post_flush` warns; and `br init` writes a
+    // minimal `.beads/.gitignore` that omits the `.write.lock`
+    // pattern so `gitignore.beads_inner_present` warns). None of
+    // those degrade the workspace's semantic health, so we assert on
+    // the JSON payload's `workspace_health`/`reliability_audit.health`
+    // rather than the now-broader-than-necessary exit-code contract.
+    let doctor_json = parse_json_stdout(&final_doctor.stdout, "doctor_after_stress");
+    let workspace_health = doctor_json
+        .get("workspace_health")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    assert_eq!(
+        workspace_health, "healthy",
+        "stress workspace should finish workspace_health=healthy: \
+         exit={} stdout={} stderr={}",
+        final_doctor.exit_code, final_doctor.stdout, final_doctor.stderr
+    );
+    let audit_health = doctor_json
+        .pointer("/reliability_audit/health")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    assert_eq!(
+        audit_health, "healthy",
+        "stress workspace should finish reliability_audit.health=healthy: \
+         exit={} stdout={} stderr={}",
+        final_doctor.exit_code, final_doctor.stdout, final_doctor.stderr
+    );
+    let anomaly_count = doctor_json
+        .pointer("/reliability_audit/anomaly_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(u64::MAX);
+    assert_eq!(
+        anomaly_count, 0,
+        "stress workspace should finish with zero reliability anomalies: \
+         exit={} stdout={} stderr={}",
+        final_doctor.exit_code, final_doctor.stdout, final_doctor.stderr
+    );
+    // Belt-and-suspenders: assert no `error`-level check leaks through
+    // (WARN is acceptable for the benign findings catalogued above).
+    let checks = doctor_json
+        .get("checks")
+        .and_then(Value::as_array)
+        .expect("doctor JSON should contain checks array");
     assert!(
-        final_doctor.success,
-        "stress workspace should finish doctor-clean: {}",
+        checks
+            .iter()
+            .all(|check| check["status"].as_str() != Some("error")),
+        "stress workspace doctor output should not contain any error-status checks: \
+         exit={} stdout={} stderr={}",
+        final_doctor.exit_code,
+        final_doctor.stdout,
         final_doctor.stderr
     );
 
