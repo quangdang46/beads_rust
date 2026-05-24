@@ -223,8 +223,10 @@ task
     );
 }
 
+// `br create --dry-run --file <md>` validates the bulk import file and reports
+// what would be created without persisting to storage or JSONL. (#300)
 #[test]
-fn test_markdown_import_rejects_dry_run() {
+fn test_markdown_import_dry_run_validates_without_persisting() {
     let workspace = BrWorkspace::new();
 
     let output = run_br(&workspace, ["init"], "init_dry_run");
@@ -234,6 +236,10 @@ fn test_markdown_import_rejects_dry_run() {
     let content = r"## DryRun Issue
 ### Type
 task
+
+## Second DryRun Issue
+### Type
+bug
 ";
     fs::write(&md_path, content).expect("write md");
 
@@ -242,11 +248,66 @@ task
         ["create", "--file", "issues.md", "--dry-run"],
         "create_dry_run",
     );
-    assert!(!output.status.success(), "dry-run should fail with --file");
     assert!(
-        output
-            .stderr
-            .contains("--dry-run is not supported with --file")
+        output.status.success(),
+        "dry-run with --file should succeed; stderr={}",
+        output.stderr
+    );
+    assert!(
+        output.stdout.contains("Dry run: would create 2 issues"),
+        "expected dry-run summary in stdout, got: {}",
+        output.stdout
+    );
+    assert!(output.stdout.contains("DryRun Issue"));
+    assert!(output.stdout.contains("Second DryRun Issue"));
+
+    // Storage side-effects: nothing should be persisted.
+    let list = run_br(&workspace, ["list"], "list_after_dry_run");
+    assert!(list.status.success());
+    assert!(
+        !list.stdout.contains("DryRun Issue"),
+        "dry-run must not write issues to storage; list output: {}",
+        list.stdout
+    );
+}
+
+// Dry-run JSON output must still emit the would-create payload so callers can
+// pipe it into validation tools — even though nothing is persisted. (#300)
+#[test]
+fn test_markdown_import_dry_run_emits_json() {
+    let workspace = BrWorkspace::new();
+
+    let output = run_br(&workspace, ["init"], "init_dry_run_json");
+    assert!(output.status.success(), "init failed");
+
+    let md_path = workspace.root.join("issues.md");
+    let content = r"## JsonDryRun Issue
+### Type
+task
+";
+    fs::write(&md_path, content).expect("write md");
+
+    let output = run_br(
+        &workspace,
+        ["create", "--file", "issues.md", "--dry-run", "--json"],
+        "create_dry_run_json",
+    );
+    assert!(
+        output.status.success(),
+        "dry-run --json with --file should succeed; stderr={}",
+        output.stderr
+    );
+    let payload = extract_json_payload(&output.stdout);
+    let parsed: Value =
+        serde_json::from_str(&payload).expect("dry-run --json must emit valid JSON");
+    let issues = parsed
+        .as_array()
+        .or_else(|| parsed.get("issues").and_then(Value::as_array))
+        .expect("expected an array of would-create issues");
+    assert_eq!(issues.len(), 1, "expected one would-create issue");
+    assert_eq!(
+        issues[0].get("title").and_then(Value::as_str),
+        Some("JsonDryRun Issue")
     );
 }
 

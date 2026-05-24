@@ -141,12 +141,6 @@ pub fn execute_with_storage(
                 "--external-ref is not supported with --file",
             ));
         }
-        if args.dry_run {
-            return Err(BeadsError::validation(
-                "dry_run",
-                "--dry-run is not supported with --file",
-            ));
-        }
         return execute_import(file_path, args, cli, ctx, pre_opened);
     }
 
@@ -992,6 +986,14 @@ fn execute_import(
                 });
             }
 
+            if args.dry_run {
+                // Skip persistence: dry-run validates the bulk file and reports what
+                // would be created without writing to storage or JSONL.
+                created_issues.push(issue.clone());
+                final_id = id;
+                created = true;
+                break;
+            }
             match storage.create_issue(&issue, &actor) {
                 Ok(()) => {
                     final_id = id;
