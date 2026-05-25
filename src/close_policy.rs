@@ -34,8 +34,19 @@ pub const ENV_HARNESS: &str = "BR_HARNESS";
 pub const ENV_MODEL: &str = "BR_MODEL";
 
 /// Top-level policy document loaded from `.beads/policy.yaml`.
+///
+/// Close-policy structs intentionally accept unknown fields rather than
+/// hard-failing the parse: a single typo in `policy.yaml` used to take
+/// down `br close` for every operator on the project, with no recovery
+/// path (even `--bypass-policy` couldn't help because the parse fires
+/// before bypass logic runs). See beads_rust#302.
+///
+/// Unknown fields surface via [`load_for_beads_dir`], which emits a
+/// `tracing::warn!` listing every unknown key it discovered. Operators
+/// who want strict parsing back can wire up a future `--strict-policy`
+/// flag (out of scope for the #302 fix).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct PolicyDocument {
     /// Close-time gates.
     pub close_policy: ClosePolicy,
@@ -59,8 +70,11 @@ const fn default_true() -> bool {
 }
 
 /// Close-time policy gates.
+///
+/// Unknown fields are tolerated and surfaced via `tracing::warn!` at load
+/// time (see `PolicyDocument` doc-comment and beads_rust#302).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct ClosePolicy {
     /// Reject closes whose `--reason` text is shorter than `min_length` or
     /// fails the optional anchored regex.
@@ -107,7 +121,7 @@ impl ClosePolicy {
 /// value. We deliberately don't require URL-like values — the point
 /// is queryability, not URL validation.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct RequireTypedReferences {
     pub enabled: bool,
     /// Reference kinds the close reason must contain (logical OR — any one
@@ -128,14 +142,14 @@ const BUILTIN_TYPED_REFERENCE_KINDS: &[&str] = &[
 
 /// Bare on/off toggle.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct ToggleGate {
     pub enabled: bool,
 }
 
 /// Required close-reason gate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct RequireCloseReason {
     pub enabled: bool,
     /// Minimum trimmed character count. `0` disables length checking.
@@ -156,7 +170,7 @@ impl Default for RequireCloseReason {
 
 /// Agent-attribution capture configuration.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct Attribution {
     pub tier: AttributionTier,
     /// Optional list of fields the project wants captured. When omitted, all
@@ -671,6 +685,22 @@ fn parse_unchecked_box(line: &str) -> Option<String> {
 /// file exists but cannot be read or parsed — never silently downgrades a
 /// broken config to "permissive."
 ///
+/// # Unknown fields (beads_rust#302)
+///
+/// Close-policy structs deliberately accept unknown fields rather than
+/// hard-failing the parse. A typo or project-local experimental gate
+/// previously took down `br close` for every operator on the project,
+/// with `--bypass-policy` powerless to recover because the parse fires
+/// before bypass logic runs. We now warn instead of erroring; the trade
+/// is loss of typo-at-parse-time detection, but the cost (full project
+/// close-pathway outage from one typo) was much worse.
+///
+/// Unknown fields are surfaced exactly once per load via
+/// [`detect_unknown_policy_fields`] and emitted as a `tracing::warn!`
+/// event. The warning lists every unknown path with a dotted scope
+/// (e.g. `close_policy.require_new_experimental_field`) so operators
+/// can find typos without re-reading the file.
+///
 /// # Errors
 ///
 /// Returns an error if the file exists but cannot be read or parsed.
@@ -683,7 +713,129 @@ pub fn load_for_beads_dir(beads_dir: &Path) -> Result<PolicyDocument> {
     let document: PolicyDocument = serde_yml::from_str(&raw).map_err(|err| {
         BeadsError::Config(format!("failed to parse {}: {}", path.display(), err))
     })?;
+
+    // Re-parse the raw YAML into a free-form value tree so we can diff it
+    // against the typed schema and surface unknown fields without failing
+    // the load. Failure to re-parse as a `Value` is impossible here (the
+    // typed parse above already succeeded), but if it ever did, we'd
+    // rather skip the warning than spurious-error the load — that's the
+    // whole point of #302.
+    if let Ok(raw_value) = serde_yml::from_str::<serde_yml::Value>(&raw) {
+        let unknown = detect_unknown_policy_fields(&raw_value);
+        if !unknown.is_empty() {
+            tracing::warn!(
+                policy_path = %path.display(),
+                unknown_fields = ?unknown,
+                "policy.yaml contains {} unknown field(s) under close_policy structs; \
+                 these were ignored (beads_rust#302). Check for typos: {}",
+                unknown.len(),
+                unknown.join(", "),
+            );
+        }
+    }
+
     Ok(document)
+}
+
+/// Walk a parsed `policy.yaml` value tree and collect dotted paths to any
+/// keys not recognized by the typed close-policy schema.
+///
+/// We use a hard-coded recursive walk (rather than `serde(flatten)` with
+/// `extras` fields on every struct) so the typed public API stays simple
+/// and the extras maps don't leak into round-trip serialization. Adding
+/// a new canonical field becomes a one-line update in [`PolicyNode`].
+///
+/// Returns a sorted, de-duplicated list of dotted paths
+/// (e.g. `["close_policy.require_new_experimental_field"]`). Empty when
+/// the document only uses canonical fields.
+#[must_use]
+pub fn detect_unknown_policy_fields(root: &serde_yml::Value) -> Vec<String> {
+    let mut unknown = Vec::new();
+    walk_policy_node(root, PolicyNode::Document, "", &mut unknown);
+    unknown.sort();
+    unknown.dedup();
+    unknown
+}
+
+/// Schema-tree node used by [`detect_unknown_policy_fields`] to recognise
+/// which keys are canonical at each depth of `policy.yaml`. Leaves (`Scalar`)
+/// terminate the walk; mappings descend per the `key -> child-node` table.
+#[derive(Clone, Copy)]
+enum PolicyNode {
+    /// Top-level `policy.yaml` mapping.
+    Document,
+    /// `close_policy:` block.
+    ClosePolicy,
+    /// `close_policy.require_close_reason:` block.
+    RequireCloseReason,
+    /// Any plain `{enabled: bool}` toggle gate.
+    ToggleGate,
+    /// `close_policy.attribution:` block.
+    Attribution,
+    /// `close_policy.require_typed_references:` block.
+    RequireTypedReferences,
+    /// Terminal scalar / list — descent stops here.
+    Scalar,
+}
+
+impl PolicyNode {
+    /// Canonical keys at this depth, plus the child node each key descends
+    /// into. Keys absent from this table are reported as unknown.
+    const fn child_table(self) -> &'static [(&'static str, Self)] {
+        match self {
+            Self::Document => &[
+                ("close_policy", Self::ClosePolicy),
+                ("allow_bypass", Self::Scalar),
+            ],
+            Self::ClosePolicy => &[
+                ("require_close_reason", Self::RequireCloseReason),
+                ("require_acceptance_criteria_satisfied", Self::ToggleGate),
+                ("forbid_self_close_after_in_progress", Self::ToggleGate),
+                ("attribution", Self::Attribution),
+                ("require_typed_references", Self::RequireTypedReferences),
+            ],
+            Self::RequireCloseReason => &[
+                ("enabled", Self::Scalar),
+                ("min_length", Self::Scalar),
+                ("regex", Self::Scalar),
+            ],
+            Self::ToggleGate => &[("enabled", Self::Scalar)],
+            Self::Attribution => &[("tier", Self::Scalar), ("fields", Self::Scalar)],
+            Self::RequireTypedReferences => {
+                &[("enabled", Self::Scalar), ("required_kinds", Self::Scalar)]
+            }
+            Self::Scalar => &[],
+        }
+    }
+}
+
+fn walk_policy_node(
+    value: &serde_yml::Value,
+    node: PolicyNode,
+    scope: &str,
+    out: &mut Vec<String>,
+) {
+    if matches!(node, PolicyNode::Scalar) {
+        return;
+    }
+    let Some(map) = value.as_mapping() else {
+        return;
+    };
+    let table = node.child_table();
+    for (key, sub) in map {
+        let Some(key_str) = key.as_str() else {
+            continue;
+        };
+        let path = if scope.is_empty() {
+            key_str.to_string()
+        } else {
+            format!("{scope}.{key_str}")
+        };
+        match table.iter().find(|(k, _)| *k == key_str) {
+            Some((_, child)) => walk_policy_node(sub, *child, &path, out),
+            None => out.push(path),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1075,16 +1227,100 @@ allow_bypass: false
         assert!(policy.close_policy.is_active());
     }
 
+    /// beads_rust#302: unknown fields used to hard-fail and take down `br
+    /// close` project-wide. They are now tolerated — the parse succeeds and
+    /// the unknown keys surface via [`detect_unknown_policy_fields`].
     #[test]
-    fn loader_rejects_unknown_top_level_keys() {
+    fn loader_tolerates_unknown_top_level_keys() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let yaml = "unknown_key: 1\n";
+        let yaml = "unknown_key: 1\nclose_policy:\n  require_close_reason:\n    enabled: true\n";
         std::fs::write(dir.path().join(POLICY_FILE_NAME), yaml).unwrap();
-        let err = load_for_beads_dir(dir.path()).unwrap_err();
+        let policy = load_for_beads_dir(dir.path()).expect("load must succeed");
         assert!(
-            matches!(&err, BeadsError::Config(msg) if msg.contains("unknown_key")),
-            "expected Config error containing unknown_key, got {err:?}"
+            policy.close_policy.require_close_reason.enabled,
+            "known fields must still parse"
         );
+
+        let raw: serde_yml::Value = serde_yml::from_str(yaml).unwrap();
+        let unknown = detect_unknown_policy_fields(&raw);
+        assert_eq!(unknown, vec!["unknown_key".to_string()]);
+    }
+
+    /// beads_rust#302: unknown fields nested under `close_policy:` (the
+    /// regression class the issue specifically called out — a typo or
+    /// experimental gate) must also be tolerated and surfaced as a dotted
+    /// path so operators can find them.
+    #[test]
+    fn loader_tolerates_unknown_field_under_close_policy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let yaml = r"
+close_policy:
+  require_close_reason:
+    enabled: true
+    min_length: 20
+  require_new_experimental_field:
+    enabled: true
+";
+        std::fs::write(dir.path().join(POLICY_FILE_NAME), yaml).unwrap();
+        let policy = load_for_beads_dir(dir.path()).expect("load must succeed");
+        assert!(policy.close_policy.require_close_reason.enabled);
+        assert_eq!(policy.close_policy.require_close_reason.min_length, 20);
+
+        let raw: serde_yml::Value = serde_yml::from_str(yaml).unwrap();
+        let unknown = detect_unknown_policy_fields(&raw);
+        assert_eq!(
+            unknown,
+            vec!["close_policy.require_new_experimental_field".to_string()]
+        );
+    }
+
+    /// Typos buried deeper (under known sub-blocks) also surface with
+    /// their full dotted path.
+    #[test]
+    fn detect_unknown_policy_fields_walks_nested_structs() {
+        let yaml = r#"
+close_policy:
+  require_close_reason:
+    enabled: true
+    min_lenght: 20            # typo: should be min_length
+  attribution:
+    tier: capture
+    fileds: ["agent_name"]    # typo: should be fields
+"#;
+        let raw: serde_yml::Value = serde_yml::from_str(yaml).unwrap();
+        let unknown = detect_unknown_policy_fields(&raw);
+        assert_eq!(
+            unknown,
+            vec![
+                "close_policy.attribution.fileds".to_string(),
+                "close_policy.require_close_reason.min_lenght".to_string(),
+            ]
+        );
+    }
+
+    /// A fully-canonical document produces no unknown-field reports.
+    #[test]
+    fn detect_unknown_policy_fields_is_empty_for_canonical_doc() {
+        let yaml = r#"
+allow_bypass: false
+close_policy:
+  require_close_reason:
+    enabled: true
+    min_length: 30
+    regex: "^Fix: "
+  require_acceptance_criteria_satisfied:
+    enabled: true
+  forbid_self_close_after_in_progress:
+    enabled: true
+  require_typed_references:
+    enabled: true
+    required_kinds: ["commit", "reviewer"]
+  attribution:
+    tier: capture
+    fields: ["agent_name", "harness", "model"]
+"#;
+        let raw: serde_yml::Value = serde_yml::from_str(yaml).unwrap();
+        assert!(detect_unknown_policy_fields(&raw).is_empty());
     }
 
     #[test]
