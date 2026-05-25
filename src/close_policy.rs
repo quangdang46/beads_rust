@@ -760,7 +760,7 @@ pub fn detect_unknown_policy_fields(root: &serde_yml::Value) -> Vec<String> {
 /// Schema-tree node used by [`detect_unknown_policy_fields`] to recognise
 /// which keys are canonical at each depth of `policy.yaml`. Leaves (`Scalar`)
 /// terminate the walk; mappings descend per the `key -> child-node` table.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum PolicyNode {
     /// Top-level `policy.yaml` mapping.
     Document,
@@ -1470,5 +1470,150 @@ close_policy:
         let violations = evaluate(&policy, &evidence);
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].gate, "typed_references_required_kind_missing");
+    }
+
+    /// Drift guard for beads_rust#302: `PolicyNode::child_table()` is a
+    /// hand-maintained mirror of the typed close-policy struct fields. If a
+    /// new field is added to one of the structs without also being added
+    /// to the table, `detect_unknown_policy_fields` will fire a
+    /// **false-positive** "unknown field" warning on every canonical
+    /// document containing that field. The owner explicitly acknowledged
+    /// this sync hazard in the commit message — this test makes the drift
+    /// impossible to ship: it serialises a `Default` instance of every
+    /// close-policy struct and asserts the produced key set is a subset of
+    /// the corresponding `PolicyNode`'s `child_table()` keys.
+    ///
+    /// We assert "subset" rather than "equality" because table keys may
+    /// intentionally list `Option<T>` fields that serialise to nothing in
+    /// the default form (none today, but future-proofing).
+    #[test]
+    fn policy_node_child_table_covers_every_typed_struct_field() {
+        fn field_names_of<T: serde::Serialize + Default>() -> Vec<String> {
+            let value =
+                serde_yml::to_value(T::default()).expect("default struct must serialise to value");
+            let mapping = value
+                .as_mapping()
+                .expect("default struct must serialise as a mapping");
+            mapping
+                .iter()
+                .filter_map(|(k, _)| k.as_str().map(String::from))
+                .collect()
+        }
+
+        fn assert_table_covers(node: PolicyNode, struct_fields: &[String], struct_name: &str) {
+            let table_keys: std::collections::HashSet<&'static str> =
+                node.child_table().iter().map(|(k, _)| *k).collect();
+            for field in struct_fields {
+                assert!(
+                    table_keys.contains(field.as_str()),
+                    "PolicyNode::{node:?}::child_table() is missing key `{field}` declared on \
+                     struct `{struct_name}`. `detect_unknown_policy_fields` would emit a \
+                     FALSE-POSITIVE 'unknown field' warning on every canonical policy.yaml that \
+                     uses this field. Add the entry to `child_table()` (see beads_rust#302).",
+                );
+            }
+        }
+
+        assert_table_covers(
+            PolicyNode::Document,
+            &field_names_of::<PolicyDocument>(),
+            "PolicyDocument",
+        );
+        assert_table_covers(
+            PolicyNode::ClosePolicy,
+            &field_names_of::<ClosePolicy>(),
+            "ClosePolicy",
+        );
+        assert_table_covers(
+            PolicyNode::RequireCloseReason,
+            &field_names_of::<RequireCloseReason>(),
+            "RequireCloseReason",
+        );
+        assert_table_covers(
+            PolicyNode::ToggleGate,
+            &field_names_of::<ToggleGate>(),
+            "ToggleGate",
+        );
+        assert_table_covers(
+            PolicyNode::Attribution,
+            &field_names_of::<Attribution>(),
+            "Attribution",
+        );
+        assert_table_covers(
+            PolicyNode::RequireTypedReferences,
+            &field_names_of::<RequireTypedReferences>(),
+            "RequireTypedReferences",
+        );
+    }
+
+    /// Inverse drift guard: every key listed in `PolicyNode::child_table()`
+    /// must correspond to an actual field on the typed struct. Otherwise a
+    /// stale entry would silently SUPPRESS the unknown-field warning for a
+    /// field that no longer exists (false negative: typo in YAML matches a
+    /// dead table entry → no warning, but the field is also not honoured by
+    /// the typed parse).
+    ///
+    /// `regex: Option<String>` is in the default serialised mapping as a
+    /// null entry, so it counts as "present" for this check.
+    #[test]
+    fn policy_node_child_table_has_no_stale_entries() {
+        fn field_names_of<T: serde::Serialize + Default>() -> std::collections::HashSet<String> {
+            let value =
+                serde_yml::to_value(T::default()).expect("default struct must serialise to value");
+            let mapping = value
+                .as_mapping()
+                .expect("default struct must serialise as a mapping");
+            mapping
+                .iter()
+                .filter_map(|(k, _)| k.as_str().map(String::from))
+                .collect()
+        }
+
+        fn assert_no_stale(
+            node: PolicyNode,
+            struct_fields: &std::collections::HashSet<String>,
+            struct_name: &str,
+        ) {
+            for (key, _) in node.child_table() {
+                assert!(
+                    struct_fields.contains(*key),
+                    "PolicyNode::{node:?}::child_table() lists key `{key}` that does not exist \
+                     on struct `{struct_name}`. A typo of this key in policy.yaml would NOT be \
+                     reported as unknown even though it is silently ignored by the typed parse \
+                     (see beads_rust#302).",
+                );
+            }
+        }
+
+        assert_no_stale(
+            PolicyNode::Document,
+            &field_names_of::<PolicyDocument>(),
+            "PolicyDocument",
+        );
+        assert_no_stale(
+            PolicyNode::ClosePolicy,
+            &field_names_of::<ClosePolicy>(),
+            "ClosePolicy",
+        );
+        assert_no_stale(
+            PolicyNode::RequireCloseReason,
+            &field_names_of::<RequireCloseReason>(),
+            "RequireCloseReason",
+        );
+        assert_no_stale(
+            PolicyNode::ToggleGate,
+            &field_names_of::<ToggleGate>(),
+            "ToggleGate",
+        );
+        assert_no_stale(
+            PolicyNode::Attribution,
+            &field_names_of::<Attribution>(),
+            "Attribution",
+        );
+        assert_no_stale(
+            PolicyNode::RequireTypedReferences,
+            &field_names_of::<RequireTypedReferences>(),
+            "RequireTypedReferences",
+        );
     }
 }
