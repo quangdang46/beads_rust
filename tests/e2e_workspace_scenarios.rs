@@ -510,6 +510,7 @@ fn scenario_workspace_lifecycle() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn scenario_long_lived_single_workspace_stress_suite() {
     let iterations = std::env::var("BR_LONG_STRESS_ITERATIONS")
         .ok()

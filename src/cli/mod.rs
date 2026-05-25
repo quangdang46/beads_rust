@@ -1137,7 +1137,9 @@ pub struct UpdateArgs {
     #[arg(long)]
     pub notes: Option<String>,
 
-    /// Change status
+    /// Change status. Terminal states (`closed`, `tombstone`) are refused —
+    /// use the dedicated `br close` / `br delete` commands so close-policy
+    /// and dependency-rewiring are enforced (beads_rust#301).
     #[arg(long, short = 's', add = ArgValueCompleter::new(status_completer))]
     pub status: Option<String>,
 

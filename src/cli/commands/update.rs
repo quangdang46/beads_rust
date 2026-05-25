@@ -151,7 +151,14 @@ struct PreparedUpdateRoute {
 /// # Errors
 ///
 /// Returns an error if database operations fail or validation errors occur.
+#[allow(clippy::too_many_lines)]
 pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
+    // Refuse terminal-state transitions before doing any I/O. `br update`
+    // is a data-only field mutator; terminal-state transitions
+    // (closed, tombstone) must go through their dedicated commands so the
+    // close-policy / delete pipelines are applied (see beads_rust#301).
+    reject_terminal_status_transition(args.status.as_deref())?;
+
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let mut target_inputs = args.ids.clone();
     if target_inputs.is_empty() {
@@ -877,6 +884,48 @@ fn validate_mutable_target_issues(
     Ok(())
 }
 
+/// Reject `br update --status <terminal>` and direct the user at the
+/// dedicated command for that transition.
+///
+/// `br update` is a data-only field mutator. Terminal-state transitions
+/// (`closed`, `tombstone`) own their own audit / policy pipelines:
+///
+/// * `closed`    → `br close`  (close-policy gates: close-reason, AC, attribution, ...)
+/// * `tombstone` → `br delete` (tombstone metadata, dependency rewiring)
+///
+/// Allowing both paths to reach the same terminal state would give the
+/// project two different audit contracts depending on which command the
+/// operator reached for — see beads_rust#301 for the regression that
+/// motivated this gate.
+///
+/// This deliberately runs *before* any I/O (route discovery, locking,
+/// SQLite open) so a misuse fails instantly rather than after acquiring
+/// the workspace write lock.
+fn reject_terminal_status_transition(raw_status: Option<&str>) -> Result<()> {
+    let Some(raw) = raw_status else {
+        return Ok(());
+    };
+    let parsed: Status = raw.parse()?;
+    match parsed {
+        Status::Closed => Err(BeadsError::validation(
+            "status",
+            "refusing to close via `br update --status closed`: \
+             terminal-state transitions must go through `br close` so close-policy \
+             (close-reason / AC / attribution) is enforced. \
+             Use `br close <id> --reason \"...\"` instead, or `br close <id> \
+             --bypass-policy --bypass-reason \"...\"` to opt out explicitly. \
+             See https://github.com/Dicklesworthstone/beads_rust/issues/301.",
+        )),
+        Status::Tombstone => Err(BeadsError::validation(
+            "status",
+            "refusing to tombstone via `br update --status tombstone`: \
+             use `br delete <id>` instead so dependency rewiring and tombstone \
+             metadata are applied correctly.",
+        )),
+        _ => Ok(()),
+    }
+}
+
 fn build_update(args: &UpdateArgs, actor: &str, claim_exclusive: bool) -> Result<IssueUpdate> {
     let status = if args.claim {
         Some(Status::InProgress)
@@ -1278,20 +1327,10 @@ mod tests {
     fn test_build_update_with_status() {
         init_test_logging();
         info!("test_build_update_with_status: starting");
-        let args = UpdateArgs {
-            status: Some("closed".to_string()),
-            session: Some("session-123".to_string()),
-            ..Default::default()
-        };
-        let update = build_update(&args, "test_actor", false).unwrap();
-        assert_eq!(update.status, Some(Status::Closed));
-        // closed_at should be set
-        assert!(update.closed_at.is_some());
-        assert_eq!(
-            update.closed_by_session,
-            Some(Some("session-123".to_string()))
-        );
-
+        // Non-terminal status transitions still flow through build_update.
+        // Terminal transitions (closed/tombstone) are rejected up-front by
+        // `reject_terminal_status_transition` — see beads_rust#301 and the
+        // dedicated tests below.
         let args_blocked = UpdateArgs {
             status: Some("blocked".to_string()),
             ..Default::default()
@@ -1302,7 +1341,87 @@ mod tests {
         assert_eq!(update_blocked.closed_at, Some(None));
         assert_eq!(update_blocked.close_reason, Some(None));
         assert_eq!(update_blocked.closed_by_session, Some(None));
+
+        let args_in_progress = UpdateArgs {
+            status: Some("in_progress".to_string()),
+            ..Default::default()
+        };
+        let update_in_progress = build_update(&args_in_progress, "test_actor", false).unwrap();
+        assert_eq!(update_in_progress.status, Some(Status::InProgress));
         info!("test_build_update_with_status: assertions passed");
+    }
+
+    /// beads_rust#301: `br update --status closed` must refuse and direct
+    /// the operator at `br close` so close-policy fires.
+    #[test]
+    fn reject_terminal_status_transition_refuses_closed() {
+        init_test_logging();
+        let err = reject_terminal_status_transition(Some("closed")).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("br close"),
+            "error must point at br close; got: {msg}"
+        );
+        assert!(
+            msg.contains("close-policy"),
+            "error must mention close-policy; got: {msg}"
+        );
+        assert!(
+            msg.contains("#301") || msg.contains("issues/301"),
+            "error must link the originating issue; got: {msg}"
+        );
+    }
+
+    /// beads_rust#301: tombstone is also a terminal state with a dedicated
+    /// command (`br delete`); refuse the update path so dependency rewiring
+    /// is not skipped.
+    #[test]
+    fn reject_terminal_status_transition_refuses_tombstone() {
+        init_test_logging();
+        let err = reject_terminal_status_transition(Some("tombstone")).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("br delete"),
+            "error must point at br delete; got: {msg}"
+        );
+    }
+
+    /// Non-terminal statuses (open/in_progress/blocked/deferred/draft) and
+    /// the absence of `--status` must keep working unchanged — the rejection
+    /// is scoped to terminal states only.
+    #[test]
+    fn reject_terminal_status_transition_allows_non_terminal_and_absent() {
+        init_test_logging();
+        reject_terminal_status_transition(None).expect("no --status must pass through");
+        for ok in &[
+            "open",
+            "in_progress",
+            "inprogress",
+            "blocked",
+            "deferred",
+            "draft",
+            "pinned",
+        ] {
+            let result = reject_terminal_status_transition(Some(ok));
+            assert!(
+                result.is_ok(),
+                "status {ok} must be accepted; got {:?}",
+                result.err()
+            );
+        }
+    }
+
+    /// Status comparison is case-insensitive and matches known aliases —
+    /// neither `CLOSED` nor `Closed` should sneak past the gate.
+    #[test]
+    fn reject_terminal_status_transition_is_case_insensitive() {
+        init_test_logging();
+        for terminal in &["Closed", "CLOSED", "Tombstone", "TOMBSTONE"] {
+            let result = reject_terminal_status_transition(Some(terminal));
+            assert!(result.is_err(), "status {terminal} must be rejected");
+            let err = result.unwrap_err();
+            assert!(!err.to_string().is_empty());
+        }
     }
 
     #[test]
