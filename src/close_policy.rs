@@ -85,6 +85,11 @@ pub struct ClosePolicy {
     /// Reject closes when the closing actor matches the actor who last set
     /// status to `in_progress`.
     pub forbid_self_close_after_in_progress: ToggleGate,
+    /// Reject closes when the issue has a `blocks` edge to a dependent that
+    /// is currently in `deferred` status (beads_rust#303). Closing a prereq
+    /// is the natural touch-point that forces the closer to confront every
+    /// deferred dependent before the prereq disappears from the graph.
+    pub forbid_close_with_deferred_dependents: ToggleGate,
     /// Tier 1 attribution capture (default: off).
     pub attribution: Attribution,
     /// Typed structured references gate (capability #3 of #274). When
@@ -103,6 +108,7 @@ impl ClosePolicy {
         self.require_close_reason.enabled
             || self.require_acceptance_criteria_satisfied.enabled
             || self.forbid_self_close_after_in_progress.enabled
+            || self.forbid_close_with_deferred_dependents.enabled
             || self.require_typed_references.enabled
             || self.attribution.tier != AttributionTier::Off
     }
@@ -541,6 +547,58 @@ fn evaluate_self_close(evidence: &CloseEvidence<'_>, out: &mut Vec<PolicyViolati
     }
 }
 
+/// Gate identifier emitted by [`deferred_dependents_violation`] and recorded
+/// in close metadata. Mirrors the `policy.yaml` key for grep-ability.
+pub const GATE_FORBID_CLOSE_WITH_DEFERRED_DEPENDENTS: &str =
+    "forbid_close_with_deferred_dependents";
+
+/// Build the policy violation for the `forbid_close_with_deferred_dependents`
+/// gate (beads_rust#303), given the issue being closed and the IDs of its
+/// dependents (issues with a `blocks` edge *from* `issue_id`) that are
+/// currently in `deferred` status.
+///
+/// Returns `None` when there are no deferred dependents (gate satisfied).
+/// The storage-backed dependent lookup lives in the close command — this
+/// function is the pure, unit-testable message/shape builder so the gate's
+/// error contract is covered without a database.
+///
+/// The error names every offending dependent ID and instructs the closer to
+/// either reopen each (`br update <dep> --status=open`) or close-as-superseded
+/// with a `duplicate_of` edge before closing the prereq.
+#[must_use]
+pub fn deferred_dependents_violation(
+    issue_id: &str,
+    deferred_dependent_ids: &[String],
+) -> Option<PolicyViolation> {
+    if deferred_dependent_ids.is_empty() {
+        return None;
+    }
+
+    // Stable, de-duplicated ordering so the message and detail are
+    // deterministic regardless of query/iteration order.
+    let mut ids: Vec<String> = deferred_dependent_ids.to_vec();
+    ids.sort();
+    ids.dedup();
+
+    let id_list = ids.join(", ");
+    let message = format!(
+        "deferred-dependents policy: cannot close {issue_id}: it has {count} deferred dependent(s): {id_list}. \
+         Reopen each (`br update <dep> --status=open`) or close-as-superseded with a duplicate_of edge \
+         before closing {issue_id}.",
+        count = ids.len(),
+    );
+
+    Some(PolicyViolation {
+        gate: GATE_FORBID_CLOSE_WITH_DEFERRED_DEPENDENTS.to_string(),
+        message,
+        detail: Some(serde_json::json!({
+            "issue_id": issue_id,
+            "deferred_dependents": ids,
+            "deferred_dependent_count": ids.len(),
+        })),
+    })
+}
+
 /// Locate unchecked `- [ ]` items inside the canonical acceptance criteria
 /// section. Recognises both an `## Acceptance Criteria` header (any heading
 /// level) and a body that is itself the acceptance-criteria block (the case
@@ -791,6 +849,7 @@ impl PolicyNode {
                 ("require_close_reason", Self::RequireCloseReason),
                 ("require_acceptance_criteria_satisfied", Self::ToggleGate),
                 ("forbid_self_close_after_in_progress", Self::ToggleGate),
+                ("forbid_close_with_deferred_dependents", Self::ToggleGate),
                 ("attribution", Self::Attribution),
                 ("require_typed_references", Self::RequireTypedReferences),
             ],
@@ -1106,6 +1165,81 @@ mod tests {
         evidence.in_progress_actor = None;
 
         assert!(evaluate(&policy, &evidence).is_empty());
+    }
+
+    // =========================================================================
+    // Deferred-dependents gate (beads_rust#303)
+    // =========================================================================
+
+    #[test]
+    fn deferred_dependents_gate_default_off() {
+        let policy = ClosePolicy::default();
+        assert!(!policy.forbid_close_with_deferred_dependents.enabled);
+        assert!(!policy.is_active());
+    }
+
+    #[test]
+    fn deferred_dependents_gate_makes_policy_active_when_enabled() {
+        let policy = ClosePolicy {
+            forbid_close_with_deferred_dependents: ToggleGate { enabled: true },
+            ..Default::default()
+        };
+        assert!(policy.is_active());
+    }
+
+    #[test]
+    fn deferred_dependents_violation_none_when_empty() {
+        assert!(deferred_dependents_violation("bd-1", &[]).is_none());
+    }
+
+    #[test]
+    fn deferred_dependents_violation_names_offending_ids() {
+        let violation =
+            deferred_dependents_violation("bd-1", &["bd-3".to_string(), "bd-2".to_string()])
+                .expect("violation expected");
+        assert_eq!(
+            violation.gate,
+            GATE_FORBID_CLOSE_WITH_DEFERRED_DEPENDENTS
+        );
+        // IDs are sorted deterministically and both are named.
+        assert!(violation.message.contains("bd-2"), "{}", violation.message);
+        assert!(violation.message.contains("bd-3"), "{}", violation.message);
+        assert!(
+            violation.message.contains("2 deferred dependent"),
+            "{}",
+            violation.message
+        );
+        // Remediation guidance is present.
+        assert!(
+            violation.message.contains("br update <dep> --status=open"),
+            "{}",
+            violation.message
+        );
+        assert!(
+            violation.message.contains("duplicate_of"),
+            "{}",
+            violation.message
+        );
+
+        let detail = violation.detail.as_ref().unwrap();
+        assert_eq!(detail["issue_id"], "bd-1");
+        assert_eq!(detail["deferred_dependent_count"], 2);
+        assert_eq!(
+            detail["deferred_dependents"],
+            serde_json::json!(["bd-2", "bd-3"])
+        );
+    }
+
+    #[test]
+    fn deferred_dependents_violation_dedupes_ids() {
+        let violation = deferred_dependents_violation(
+            "bd-1",
+            &["bd-2".to_string(), "bd-2".to_string(), "bd-3".to_string()],
+        )
+        .expect("violation expected");
+        let detail = violation.detail.as_ref().unwrap();
+        assert_eq!(detail["deferred_dependent_count"], 2);
+        assert!(violation.message.contains("2 deferred dependent"));
     }
 
     #[test]

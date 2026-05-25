@@ -146,8 +146,45 @@ fn evaluate_close_policy(
         in_progress_actor: in_progress_actor.as_deref(),
     };
 
-    let violations = close_policy::evaluate(policy, &evidence);
+    let mut violations = close_policy::evaluate(policy, &evidence);
+
+    // Deferred-dependents gate (beads_rust#303). Storage-backed, so it lives
+    // here rather than in the pure `close_policy::evaluate`. We only query when
+    // the gate is enabled to avoid a dependency lookup per close otherwise.
+    if policy.forbid_close_with_deferred_dependents.enabled {
+        let deferred_dependents = collect_deferred_blocks_dependents(storage, issue_id)?;
+        if let Some(violation) =
+            close_policy::deferred_dependents_violation(issue_id, &deferred_dependents)
+        {
+            violations.push(violation);
+        }
+    }
+
     Ok(EvaluatedGates { violations })
+}
+
+/// Collect the IDs of issues that have a `blocks` edge *from* `issue_id`
+/// (i.e. depend on `issue_id` as a prerequisite) and are currently in
+/// `deferred` status. Used by the `forbid_close_with_deferred_dependents`
+/// gate (beads_rust#303).
+///
+/// Edge direction: a `blocks` dependency row
+/// `(issue_id=DEP, depends_on_id=PREREQ)` means "PREREQ blocks DEP" / "DEP
+/// depends on PREREQ". `get_dependents_with_metadata` returns the `DEP` rows
+/// for a given `PREREQ`, which is exactly the set we filter.
+fn collect_deferred_blocks_dependents(
+    storage: &SqliteStorage,
+    issue_id: &str,
+) -> Result<Vec<String>> {
+    let dependents = storage.get_dependents_with_metadata(issue_id)?;
+    Ok(dependents
+        .into_iter()
+        .filter(|dependent| {
+            dependent.dep_type == crate::model::DependencyType::Blocks.as_str()
+                && dependent.status == Status::Deferred
+        })
+        .map(|dependent| dependent.id)
+        .collect())
 }
 
 fn summarize_violations(violations: &[PolicyViolation]) -> String {
@@ -1086,6 +1123,13 @@ mod tests {
         }
     }
 
+    fn make_issue_with_status(id: &str, title: &str, status: Status) -> Issue {
+        Issue {
+            status,
+            ..make_issue(id, title)
+        }
+    }
+
     // =========================================================================
     // CloseArgs tests
     // =========================================================================
@@ -1861,5 +1905,228 @@ mod tests {
                 .is_none(),
             "repos without an active policy should retain the no-observable-change invariant"
         );
+    }
+
+    // =========================================================================
+    // forbid_close_with_deferred_dependents gate (beads_rust#303)
+    // =========================================================================
+
+    const DEFERRED_DEPENDENTS_POLICY: &str =
+        "close_policy:\n  forbid_close_with_deferred_dependents:\n    enabled: true\n";
+
+    /// Build a prereq bead `bd-prereq` and a dependent bead `bd-dep` with a
+    /// `blocks` edge from the prereq (so `bd-dep` depends on `bd-prereq`),
+    /// where the dependent has the supplied status.
+    fn setup_prereq_and_dependent(
+        beads_dir: &std::path::Path,
+        db_path: &std::path::Path,
+        dependent_status: Status,
+    ) {
+        let mut storage = SqliteStorage::open(db_path).expect("storage");
+        storage
+            .create_issue(&make_issue("bd-prereq", "Prerequisite"), "tester")
+            .expect("create prereq");
+        storage
+            .create_issue(
+                &make_issue_with_status("bd-dep", "Dependent", dependent_status),
+                "tester",
+            )
+            .expect("create dependent");
+        // Row (issue_id=bd-dep, depends_on_id=bd-prereq, type=blocks):
+        // "bd-prereq blocks bd-dep" / "bd-dep depends on bd-prereq".
+        storage
+            .add_dependency(
+                "bd-dep",
+                "bd-prereq",
+                DependencyType::Blocks.as_str(),
+                "tester",
+            )
+            .expect("add dependency");
+        storage.rebuild_blocked_cache(true).expect("rebuild cache");
+        drop(storage);
+        // No policy.yaml written by default — callers add it when needed.
+        let _ = beads_dir;
+    }
+
+    #[test]
+    fn deferred_dependents_gate_off_allows_close_by_default() {
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = TempDir::new().expect("tempdir");
+        let ctx = OutputContext::from_flags(false, false, true);
+        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        // Deferred dependent present, but NO policy.yaml => gate is off.
+        setup_prereq_and_dependent(&beads_dir, &db_path, Status::Deferred);
+
+        let _guard = DirGuard::new(temp.path());
+        let args = CloseArgs {
+            ids: vec!["bd-prereq".to_string()],
+            reason: Some("done".to_string()),
+            ..CloseArgs::default()
+        };
+        execute_with_args(&args, false, &CliOverrides::default(), &ctx)
+            .expect("close should succeed when gate is off (backwards compatible)");
+
+        let storage = SqliteStorage::open(&db_path).expect("reopen storage");
+        let prereq = storage
+            .get_issue("bd-prereq")
+            .expect("get prereq")
+            .expect("prereq exists");
+        assert_eq!(prereq.status, Status::Closed);
+    }
+
+    #[test]
+    fn deferred_dependents_gate_on_rejects_close_and_names_ids() {
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = TempDir::new().expect("tempdir");
+        let ctx = OutputContext::from_flags(false, false, true);
+        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        setup_prereq_and_dependent(&beads_dir, &db_path, Status::Deferred);
+        std::fs::write(
+            beads_dir.join(close_policy::POLICY_FILE_NAME),
+            DEFERRED_DEPENDENTS_POLICY,
+        )
+        .expect("write policy");
+
+        let _guard = DirGuard::new(temp.path());
+        let args = CloseArgs {
+            ids: vec!["bd-prereq".to_string()],
+            reason: Some("done".to_string()),
+            ..CloseArgs::default()
+        };
+        let err = execute_with_args(&args, false, &CliOverrides::default(), &ctx)
+            .expect_err("close should be rejected by the deferred-dependents gate");
+
+        match err {
+            BeadsError::PolicyViolation {
+                issue_id,
+                summary,
+                violations,
+            } => {
+                assert_eq!(issue_id, "bd-prereq");
+                assert!(summary.contains("bd-dep"), "summary: {summary}");
+                assert!(
+                    violations.iter().any(|v| v.gate
+                        == close_policy::GATE_FORBID_CLOSE_WITH_DEFERRED_DEPENDENTS),
+                    "expected deferred-dependents gate to fire: {violations:?}"
+                );
+            }
+            other => panic!("expected PolicyViolation, got {other:?}"),
+        }
+
+        // The prereq must NOT have been closed.
+        let storage = SqliteStorage::open(&db_path).expect("reopen storage");
+        let prereq = storage
+            .get_issue("bd-prereq")
+            .expect("get prereq")
+            .expect("prereq exists");
+        assert_ne!(prereq.status, Status::Closed);
+    }
+
+    #[test]
+    fn deferred_dependents_gate_on_allows_when_dependent_not_deferred() {
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = TempDir::new().expect("tempdir");
+        let ctx = OutputContext::from_flags(false, false, true);
+        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        // Dependent is open, not deferred => gate is satisfied.
+        setup_prereq_and_dependent(&beads_dir, &db_path, Status::Open);
+        std::fs::write(
+            beads_dir.join(close_policy::POLICY_FILE_NAME),
+            DEFERRED_DEPENDENTS_POLICY,
+        )
+        .expect("write policy");
+
+        let _guard = DirGuard::new(temp.path());
+        let args = CloseArgs {
+            ids: vec!["bd-prereq".to_string()],
+            reason: Some("done".to_string()),
+            ..CloseArgs::default()
+        };
+        execute_with_args(&args, false, &CliOverrides::default(), &ctx)
+            .expect("close should succeed when no dependent is deferred");
+
+        let storage = SqliteStorage::open(&db_path).expect("reopen storage");
+        let prereq = storage
+            .get_issue("bd-prereq")
+            .expect("get prereq")
+            .expect("prereq exists");
+        assert_eq!(prereq.status, Status::Closed);
+    }
+
+    #[test]
+    fn deferred_dependents_gate_on_allows_after_reopening_dependent() {
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = TempDir::new().expect("tempdir");
+        let ctx = OutputContext::from_flags(false, false, true);
+        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        setup_prereq_and_dependent(&beads_dir, &db_path, Status::Deferred);
+        std::fs::write(
+            beads_dir.join(close_policy::POLICY_FILE_NAME),
+            DEFERRED_DEPENDENTS_POLICY,
+        )
+        .expect("write policy");
+
+        // First attempt is rejected.
+        {
+            let _guard = DirGuard::new(temp.path());
+            let args = CloseArgs {
+                ids: vec!["bd-prereq".to_string()],
+                reason: Some("done".to_string()),
+                ..CloseArgs::default()
+            };
+            execute_with_args(&args, false, &CliOverrides::default(), &ctx)
+                .expect_err("close should be rejected while dependent is deferred");
+        }
+
+        // Reopen the deferred dependent (`br update bd-dep --status=open`).
+        {
+            let mut storage = SqliteStorage::open(&db_path).expect("storage");
+            let update = IssueUpdate {
+                status: Some(Status::Open),
+                ..Default::default()
+            };
+            storage
+                .update_issue("bd-dep", &update, "tester")
+                .expect("reopen dependent");
+        }
+
+        // Second attempt now succeeds.
+        {
+            let _guard = DirGuard::new(temp.path());
+            let args = CloseArgs {
+                ids: vec!["bd-prereq".to_string()],
+                reason: Some("done".to_string()),
+                ..CloseArgs::default()
+            };
+            execute_with_args(&args, false, &CliOverrides::default(), &ctx)
+                .expect("close should succeed after the dependent is reopened");
+        }
+
+        let storage = SqliteStorage::open(&db_path).expect("reopen storage");
+        let prereq = storage
+            .get_issue("bd-prereq")
+            .expect("get prereq")
+            .expect("prereq exists");
+        assert_eq!(prereq.status, Status::Closed);
     }
 }
