@@ -128,6 +128,85 @@ bug
     assert!(payload.contains("\"Two\""));
 }
 
+/// beads_rust#304: `### Agent Context` maps to the issue's `agent_context`
+/// field and surfaces in `--json` output when set; issues without the
+/// section omit the field.
+#[test]
+fn test_markdown_import_agent_context_json() {
+    let workspace = BrWorkspace::new();
+
+    let output = run_br(&workspace, ["init"], "init_agent_ctx");
+    assert!(output.status.success(), "init failed");
+
+    let md_path = workspace.root.join("issues.md");
+    let content = r#"## With Context
+### Type
+epic
+### Agent Context
+{"skills": ["porting-to-rust"], "constraints": ["no rusqlite; fsqlite only"]}
+
+## Without Context
+### Type
+task
+"#;
+    fs::write(&md_path, content).expect("write md");
+
+    let output = run_br(
+        &workspace,
+        ["create", "--file", "issues.md", "--json"],
+        "create_agent_ctx_json",
+    );
+    assert!(
+        output.status.success(),
+        "create --file --json failed: {}",
+        output.stderr
+    );
+
+    let payload = extract_json_payload(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&payload).expect("json parse");
+    let array = json.as_array().expect("json array");
+    assert_eq!(array.len(), 2);
+
+    let with_ctx = array
+        .iter()
+        .find(|issue| issue.get("title").and_then(Value::as_str) == Some("With Context"))
+        .expect("expected an issue titled \"With Context\"");
+    let agent_context = with_ctx
+        .get("agent_context")
+        .and_then(Value::as_str)
+        .expect("agent_context must be present in JSON when set");
+    assert!(
+        agent_context.contains("porting-to-rust"),
+        "agent_context content not preserved: {agent_context}"
+    );
+    assert!(
+        agent_context.contains("no rusqlite; fsqlite only"),
+        "agent_context content not preserved: {agent_context}"
+    );
+
+    let without_ctx = array
+        .iter()
+        .find(|issue| issue.get("title").and_then(Value::as_str) == Some("Without Context"))
+        .expect("expected an issue titled \"Without Context\"");
+    assert!(
+        without_ctx.get("agent_context").is_none(),
+        "agent_context must be omitted from JSON when unset, got: {without_ctx}"
+    );
+
+    // Confirm persistence: `br show --json` echoes the stored agent_context.
+    let with_id = with_ctx
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("created issue must have an id");
+    let show = run_br(&workspace, ["show", with_id, "--json"], "show_agent_ctx");
+    assert!(show.status.success(), "show failed: {}", show.stderr);
+    assert!(
+        show.stdout.contains("porting-to-rust"),
+        "stored agent_context should round-trip through show --json: {}",
+        show.stdout
+    );
+}
+
 #[test]
 fn test_markdown_import_updates_last_touched_context() {
     let workspace = BrWorkspace::new();

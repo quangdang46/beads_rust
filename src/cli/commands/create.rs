@@ -809,6 +809,7 @@ fn execute_import(
         let assignee = parsed.assignee.or_else(|| args.assignee.clone());
         let design = parsed.design.clone();
         let acceptance_criteria = parsed.acceptance_criteria.clone();
+        let agent_context = parsed.agent_context.clone();
 
         // Resolve parent (item-specific header or CLI global fallback)
         let parent_candidate = parsed.parent.as_deref().or(args.parent.as_deref());
@@ -922,7 +923,7 @@ fn execute_import(
                 source_system: None,
                 source_repo: import_source_repo.clone(),
                 source_repo_path: import_source_repo_path.clone(),
-                agent_context: None,
+                agent_context: agent_context.clone(),
                 deleted_at: import_deleted_at,
                 deleted_by: if import_deleted_at.is_some() {
                     Some(actor.clone())
