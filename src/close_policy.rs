@@ -1197,10 +1197,7 @@ mod tests {
         let violation =
             deferred_dependents_violation("bd-1", &["bd-3".to_string(), "bd-2".to_string()])
                 .expect("violation expected");
-        assert_eq!(
-            violation.gate,
-            GATE_FORBID_CLOSE_WITH_DEFERRED_DEPENDENTS
-        );
+        assert_eq!(violation.gate, GATE_FORBID_CLOSE_WITH_DEFERRED_DEPENDENTS);
         // IDs are sorted deterministically and both are named.
         assert!(violation.message.contains("bd-2"), "{}", violation.message);
         assert!(violation.message.contains("bd-3"), "{}", violation.message);

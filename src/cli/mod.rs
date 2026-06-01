@@ -2237,6 +2237,12 @@ pub struct ReadyArgs {
     #[arg(long, short = 'r')]
     pub recursive: bool,
 
+    /// Scope to an epic: ready issues anywhere beneath the given epic/parent
+    /// ID (sugar for `--parent <id> --recursive`, depth-unbounded and
+    /// cycle-safe). Composes with --label/--type/--priority/--limit.
+    #[arg(long, conflicts_with = "parent", add = ArgValueCompleter::new(issue_id_completer))]
+    pub epic: Option<String>,
+
     /// Wrap long lines instead of truncating in text output
     #[arg(long)]
     pub wrap: bool,

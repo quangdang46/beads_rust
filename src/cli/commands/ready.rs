@@ -114,9 +114,10 @@ fn execute_inner(
         None => None,
     };
 
-    let resolved_parent = args
-        .parent
-        .as_deref()
+    // `--epic <id>` is sugar for `--parent <id> --recursive` (they conflict at
+    // the clap layer, so at most one of these is set).
+    let parent_spec = args.epic.as_deref().or(args.parent.as_deref());
+    let resolved_parent = parent_spec
         .map(|parent| {
             let config_layer = load_config_layer()?;
             let id_config = config::id_config_from_layer(&config_layer);
@@ -136,7 +137,9 @@ fn execute_inner(
         // Fetch all candidates to allow post-filtering of external blockers
         limit: None,
         parent: resolved_parent,
-        recursive: args.recursive,
+        // --epic implies descent through the whole subtree.
+        recursive: args.recursive || args.epic.is_some(),
+        parent_member_ids: None,
     };
 
     let sort_policy = match args.sort {
@@ -191,9 +194,11 @@ fn execute_inner(
     }
     match output_format {
         OutputFormat::Json => {
+            hydrate_ready_labels(storage, &mut ready_issues)?;
             early_ctx.json_array(ready_issues.into_iter().map(ReadyIssue::from));
         }
         OutputFormat::Toon => {
+            hydrate_ready_labels(storage, &mut ready_issues)?;
             let ready_output: Vec<ReadyIssue> =
                 ready_issues.into_iter().map(ReadyIssue::from).collect();
             early_ctx.toon_with_stats(&ready_output, args.stats);
@@ -246,6 +251,25 @@ fn execute_inner(
         }
     }
 
+    Ok(())
+}
+
+/// Populate `labels` on ready issues for structured output (#309).
+///
+/// The ready candidate query hydrates only the columns stored directly on the
+/// `issues` row; labels live in a separate table, so JSON/TOON consumers need a
+/// single extra batched lookup to get full parity with `br list --json`.
+fn hydrate_ready_labels(storage: &SqliteStorage, issues: &mut [crate::model::Issue]) -> Result<()> {
+    if issues.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<String> = issues.iter().map(|issue| issue.id.clone()).collect();
+    let mut labels_by_id = storage.get_labels_for_issues(&ids)?;
+    for issue in issues.iter_mut() {
+        if let Some(labels) = labels_by_id.remove(&issue.id) {
+            issue.labels = labels;
+        }
+    }
     Ok(())
 }
 

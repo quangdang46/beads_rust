@@ -921,7 +921,12 @@ second line of opaque text
 
     #[test]
     fn test_agent_context_aliases() {
-        for header in ["Agent Context", "agent-context", "AGENT CONTEXT", "agent_context"] {
+        for header in [
+            "Agent Context",
+            "agent-context",
+            "AGENT CONTEXT",
+            "agent_context",
+        ] {
             let content = format!("## Issue\n### {header}\nopaque body\n");
             let issues = parse_markdown_content(&content).unwrap();
             assert_eq!(

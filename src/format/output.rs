@@ -37,6 +37,12 @@ pub struct ReadyIssue {
     pub estimated_minutes: Option<i32>,
     pub id: String,
     pub issue_type: IssueType,
+    /// Labels attached to the issue.
+    ///
+    /// Always emitted (as `[]` when empty) so downstream consumers can filter
+    /// `br ready --json` output on labels the same way they filter
+    /// `br list --json` (#309).
+    pub labels: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -58,6 +64,7 @@ impl From<Issue> for ReadyIssue {
             estimated_minutes: issue.estimated_minutes,
             id: issue.id,
             issue_type: issue.issue_type,
+            labels: issue.labels,
             notes: issue.notes,
             owner: issue.owner,
             priority: issue.priority,
