@@ -153,6 +153,11 @@ pub fn execute_with_storage(
     };
     let layer = storage_ctx.load_config(cli)?;
 
+    // Strict status-workflow enforcement (issue #311). Reject an out-of-set
+    // `--status` before any write when the project configures
+    // `workflow.strict: true`. No-op when the workflow section is absent.
+    enforce_workflow_status(&storage_ctx.paths.beads_dir, args.status.as_deref())?;
+
     let config = CreateConfig {
         id_config: config::id_config_from_layer(&layer),
         default_priority: config::default_priority_from_layer(&layer)?,
@@ -241,6 +246,27 @@ pub fn execute_with_storage(
     }
     auto_flush_after_create(&mut storage_ctx, ctx);
     Ok(())
+}
+
+/// Enforce the project's strict status-workflow policy (issue #311) against a
+/// caller-supplied `--status`. A `None` status (default `open`) is always
+/// permitted: an empty allowed set already forbids enforcement, and a strict
+/// set that omits `open` would otherwise make `br create` unusable. Returns
+/// `Ok(())` when the workflow section is absent or non-strict.
+///
+/// # Errors
+///
+/// Returns a validation error when strict enforcement is configured and
+/// `raw_status` is not in the allowed set.
+fn enforce_workflow_status(beads_dir: &Path, raw_status: Option<&str>) -> Result<()> {
+    let Some(raw) = raw_status else {
+        return Ok(());
+    };
+    let policy = crate::close_policy::load_for_beads_dir(beads_dir)?;
+    // Parse to the canonical string so a custom-cased config entry and the
+    // canonical name (`In_Progress` vs `in_progress`) compare equal.
+    let parsed: Status = raw.parse()?;
+    policy.workflow.validate_status(parsed.as_str())
 }
 
 fn auto_flush_after_create(storage_ctx: &mut config::OpenStorageResult, ctx: &OutputContext) {
@@ -726,6 +752,9 @@ fn execute_import(
         config::open_storage_with_cli(&beads_dir, cli)?
     };
     let layer = storage_ctx.load_config(cli)?;
+
+    // Strict status-workflow enforcement (issue #311); see `execute`.
+    enforce_workflow_status(&storage_ctx.paths.beads_dir, args.status.as_deref())?;
 
     let id_config = config::id_config_from_layer(&layer);
     let default_priority = config::default_priority_from_layer(&layer)?;

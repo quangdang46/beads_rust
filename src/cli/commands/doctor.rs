@@ -737,6 +737,10 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
         "audit.suspect_close_reasons",
         "fm-agent_coordination-suspect-close-reason",
     ),
+    (
+        "policy.workflow_statuses",
+        "fm-agent_coordination-workflow-status-out-of-set",
+    ),
     // routes_external
     ("routes_jsonl", "fm-routes_external-routes-jsonl-corrupt"),
     ("routes.targets", "fm-routes_external-route-target-missing"),
@@ -5730,6 +5734,105 @@ fn check_suspect_close_reasons(conn: &Connection, checks: &mut Vec<CheckResult>)
     );
 }
 
+/// Detector (issue #311): flag live issues whose current `status` is not in
+/// the project's configured strict `workflow.statuses` set. Only runs when
+/// `.beads/policy.yaml` configures `workflow.strict: true` with a non-empty
+/// status set; otherwise it is a silent no-op (no check emitted at all) so
+/// repos without the policy see no new doctor output.
+///
+/// Non-conforming statuses can exist even with enforcement on the write path
+/// — e.g. statuses written before the policy was added, or imported from an
+/// external source — so this read-side audit closes the gap.
+fn check_workflow_statuses(conn: &Connection, beads_dir: &Path, checks: &mut Vec<CheckResult>) {
+    let policy = match crate::close_policy::load_for_beads_dir(beads_dir) {
+        Ok(policy) => policy,
+        Err(err) => {
+            push_check(
+                checks,
+                "policy.workflow_statuses",
+                CheckStatus::Warn,
+                Some(format!(
+                    "Failed to load .beads/policy.yaml for workflow-status audit: {err}"
+                )),
+                None,
+            );
+            return;
+        }
+    };
+    let workflow = &policy.workflow;
+    if !workflow.is_enforced() {
+        // No strict workflow configured — stay silent.
+        return;
+    }
+
+    let rows =
+        match conn.query("SELECT id, status FROM issues WHERE status IS NOT NULL ORDER BY id") {
+            Ok(rows) => rows,
+            Err(err) => {
+                push_check(
+                    checks,
+                    "policy.workflow_statuses",
+                    CheckStatus::Warn,
+                    Some(format!(
+                        "Failed to query issue statuses for workflow audit: {err}"
+                    )),
+                    None,
+                );
+                return;
+            }
+        };
+
+    let mut offenders: Vec<serde_json::Value> = Vec::new();
+    for row in rows {
+        let id = row
+            .get(0)
+            .and_then(SqliteValue::as_text)
+            .unwrap_or("")
+            .to_string();
+        let status = row
+            .get(1)
+            .and_then(SqliteValue::as_text)
+            .unwrap_or("")
+            .to_string();
+        if id.is_empty() || status.is_empty() {
+            continue;
+        }
+        if !workflow.allows(&status) {
+            offenders.push(serde_json::json!({
+                "bead_id": id,
+                "status": status,
+            }));
+        }
+    }
+
+    if offenders.is_empty() {
+        push_check(
+            checks,
+            "policy.workflow_statuses",
+            CheckStatus::Ok,
+            None,
+            None,
+        );
+        return;
+    }
+
+    let count = offenders.len();
+    push_check(
+        checks,
+        "policy.workflow_statuses",
+        CheckStatus::Warn,
+        Some(format!(
+            "{count} issue(s) have a status outside the strict workflow set ({}). \
+             Update each with `br update <id> --status <allowed>`.",
+            workflow.allowed_list()
+        )),
+        Some(serde_json::json!({
+            "allowed_statuses": workflow.statuses,
+            "offenders": offenders,
+        })),
+    );
+}
+
 fn check_recoverable_anomalies(conn: &Connection, checks: &mut Vec<CheckResult>) -> Result<()> {
     let duplicate_schema_rows = conn.query(
         "SELECT type, name, COUNT(*) AS row_count
@@ -10127,6 +10230,9 @@ fn inspect_existing_doctor_database(
         check_dependencies_orphans(&conn, checks);
         // beads_rust-m3mi: audit-suspect close_reasons (warn level)
         check_suspect_close_reasons(&conn, checks);
+        // issue #311: flag issues whose status falls outside a strict
+        // workflow.statuses set (no-op unless configured).
+        check_workflow_statuses(&conn, real_beads_dir, checks);
         if mode == DoctorInspectionMode::Full {
             if let Err(err) = check_db_count(&conn, jsonl_count, jsonl_path, checks) {
                 push_inspection_error(
@@ -12617,6 +12723,100 @@ mod tests {
         check_dependencies_orphans(&conn, &mut checks);
         let check = find_check(&checks, "dependencies.orphans").expect("check present");
         assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    /// issue #311: write a strict workflow policy and a non-conforming issue;
+    /// the detector must Warn and name the offender.
+    #[test]
+    fn test_check_workflow_statuses_warns_on_out_of_set_status() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path();
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        // Conforming issue.
+        storage
+            .create_issue(&sample_issue("bd-ok", "Open issue"), "tester")
+            .unwrap();
+        // Non-conforming issue: custom status outside the allowed set.
+        let mut bad = sample_issue("bd-bad", "Has bogus status");
+        bad.status = Status::Custom("completed".to_string());
+        storage.create_issue(&bad, "tester").unwrap();
+        drop(storage);
+
+        fs::write(
+            beads_dir.join(crate::close_policy::POLICY_FILE_NAME),
+            "workflow:\n  strict: true\n  statuses: [\"open\", \"in_progress\", \"closed\"]\n",
+        )
+        .unwrap();
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let mut checks = Vec::new();
+        check_workflow_statuses(&conn, beads_dir, &mut checks);
+        let check = find_check(&checks, "policy.workflow_statuses").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
+        let offenders = check
+            .details
+            .as_ref()
+            .and_then(|d| d.get("offenders"))
+            .and_then(serde_json::Value::as_array)
+            .expect("offenders array");
+        assert_eq!(offenders.len(), 1);
+        assert_eq!(
+            offenders[0].get("bead_id").and_then(|v| v.as_str()),
+            Some("bd-bad")
+        );
+        assert_eq!(
+            offenders[0].get("status").and_then(|v| v.as_str()),
+            Some("completed")
+        );
+    }
+
+    /// issue #311: when every issue conforms, the detector reports Ok.
+    #[test]
+    fn test_check_workflow_statuses_ok_when_all_conform() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path();
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        storage
+            .create_issue(&sample_issue("bd-ok-1", "Open issue"), "tester")
+            .unwrap();
+        drop(storage);
+
+        fs::write(
+            beads_dir.join(crate::close_policy::POLICY_FILE_NAME),
+            "workflow:\n  strict: true\n  statuses: [\"open\", \"closed\"]\n",
+        )
+        .unwrap();
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let mut checks = Vec::new();
+        check_workflow_statuses(&conn, beads_dir, &mut checks);
+        let check = find_check(&checks, "policy.workflow_statuses").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+    }
+
+    /// issue #311: with no workflow policy configured the detector stays
+    /// silent — it emits no check at all, so repos without the policy see no
+    /// new doctor output.
+    #[test]
+    fn test_check_workflow_statuses_silent_without_policy() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path();
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let mut bad = sample_issue("bd-x", "Weird status");
+        bad.status = Status::Custom("completed".to_string());
+        storage.create_issue(&bad, "tester").unwrap();
+        drop(storage);
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let mut checks = Vec::new();
+        check_workflow_statuses(&conn, beads_dir, &mut checks);
+        assert!(
+            find_check(&checks, "policy.workflow_statuses").is_none(),
+            "no check should be emitted without a strict workflow policy"
+        );
     }
 
     #[test]

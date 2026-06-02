@@ -342,6 +342,16 @@ fn prepare_single_route(
 
     let claim_exclusive = config::claim_exclusive_from_layer(&config_layer);
     let update = build_update(args, &actor, claim_exclusive)?;
+
+    // Strict status-workflow enforcement (issue #311). When the project's
+    // `.beads/policy.yaml` configures `workflow.strict: true` with a non-empty
+    // `workflow.statuses` set, a target status outside that set is rejected.
+    // Absent/non-strict workflow config is a no-op, so existing repos are
+    // unaffected.
+    if let Some(new_status) = update.status.as_ref() {
+        let policy = crate::close_policy::load_for_beads_dir(beads_dir)?;
+        policy.workflow.validate_status(new_status.as_str())?;
+    }
     let has_updates = !update.is_empty()
         || !args.add_label.is_empty()
         || !args.remove_label.is_empty()

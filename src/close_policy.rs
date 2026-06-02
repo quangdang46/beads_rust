@@ -50,6 +50,10 @@ pub const ENV_MODEL: &str = "BR_MODEL";
 pub struct PolicyDocument {
     /// Close-time gates.
     pub close_policy: ClosePolicy,
+    /// Status-workflow policy (issue #311). Optional; when the `workflow:`
+    /// section is absent the default is permissive (no enforcement), so
+    /// existing repos are unaffected.
+    pub workflow: Workflow,
     /// When `false`, the `--bypass-policy` CLI flag is rejected. Defaults to
     /// `true` so projects retain the standard escape hatch.
     #[serde(default = "default_true")]
@@ -60,6 +64,7 @@ impl Default for PolicyDocument {
     fn default() -> Self {
         Self {
             close_policy: ClosePolicy::default(),
+            workflow: Workflow::default(),
             allow_bypass: default_true(),
         }
     }
@@ -111,6 +116,90 @@ impl ClosePolicy {
             || self.forbid_close_with_deferred_dependents.enabled
             || self.require_typed_references.enabled
             || self.attribution.tier != AttributionTier::Off
+    }
+}
+
+/// Status-workflow policy (issue #311).
+///
+/// The `workflow:` namespace owns everything about the allowed status set and
+/// (in the future, issue #312) transitions and per-transition gates. It is
+/// deliberately a self-contained section so #312's `transitions:` /
+/// per-transition gate config can hang off the same block without reworking
+/// the schema:
+///
+/// ```yaml
+/// workflow:
+///   strict: true
+///   statuses: [open, in_progress, blocked, deferred, draft, closed]
+///   # transitions: {...}   # reserved for issue #312
+/// ```
+///
+/// When the section is absent the default (`strict: false`, empty `statuses`)
+/// means no enforcement, matching pre-#311 behavior exactly.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Workflow {
+    /// When `true` *and* `statuses` is non-empty, a status outside the
+    /// configured set is rejected on `create`/`update` and flagged by
+    /// `br doctor`. When `false`, `statuses` is advisory only (no
+    /// enforcement).
+    pub strict: bool,
+    /// The allowed status set. Each entry is a canonical-or-custom status
+    /// string (e.g. `open`, `in_progress`, `closed`, or a project-specific
+    /// value). Empty disables enforcement even when `strict` is `true`.
+    #[serde(default)]
+    pub statuses: Vec<String>,
+}
+
+impl Workflow {
+    /// True when strict enforcement is configured: `strict` is on *and* at
+    /// least one allowed status is listed. Enforcement and the doctor
+    /// detector short-circuit on `false`.
+    #[must_use]
+    pub fn is_enforced(&self) -> bool {
+        self.strict && !self.statuses.is_empty()
+    }
+
+    /// True when `status` (case-insensitively) is in the configured set.
+    /// Comparison mirrors [`crate::model::Status`] parsing: canonical names
+    /// are matched case-insensitively, so a config entry of `In_Progress`
+    /// still admits the canonical `in_progress`.
+    #[must_use]
+    pub fn allows(&self, status: &str) -> bool {
+        let target = status.to_lowercase();
+        self.statuses
+            .iter()
+            .any(|allowed| allowed.to_lowercase() == target)
+    }
+
+    /// Comma-separated, source-order list of the allowed statuses for error
+    /// messages. Empty string when nothing is configured.
+    #[must_use]
+    pub fn allowed_list(&self) -> String {
+        self.statuses.join(", ")
+    }
+
+    /// Validate a target status against the workflow policy. Returns `Ok(())`
+    /// when enforcement is off, the status set is empty, or the status is in
+    /// the set. Returns a [`BeadsError::Validation`] naming the allowed values
+    /// otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when strict enforcement is configured and
+    /// `status` is not in the allowed set.
+    pub fn validate_status(&self, status: &str) -> Result<()> {
+        if !self.is_enforced() || self.allows(status) {
+            return Ok(());
+        }
+        Err(BeadsError::validation(
+            "status",
+            format!(
+                "status '{status}' is not permitted by the project workflow policy \
+                 (.beads/policy.yaml workflow.strict). Allowed statuses: {}.",
+                self.allowed_list()
+            ),
+        ))
     }
 }
 
@@ -832,6 +921,8 @@ enum PolicyNode {
     Attribution,
     /// `close_policy.require_typed_references:` block.
     RequireTypedReferences,
+    /// `workflow:` block (issue #311).
+    Workflow,
     /// Terminal scalar / list — descent stops here.
     Scalar,
 }
@@ -843,6 +934,7 @@ impl PolicyNode {
         match self {
             Self::Document => &[
                 ("close_policy", Self::ClosePolicy),
+                ("workflow", Self::Workflow),
                 ("allow_bypass", Self::Scalar),
             ],
             Self::ClosePolicy => &[
@@ -863,6 +955,7 @@ impl PolicyNode {
             Self::RequireTypedReferences => {
                 &[("enabled", Self::Scalar), ("required_kinds", Self::Scalar)]
             }
+            Self::Workflow => &[("strict", Self::Scalar), ("statuses", Self::Scalar)],
             Self::Scalar => &[],
         }
     }
@@ -1675,6 +1768,11 @@ close_policy:
             &field_names_of::<RequireTypedReferences>(),
             "RequireTypedReferences",
         );
+        assert_table_covers(
+            PolicyNode::Workflow,
+            &field_names_of::<Workflow>(),
+            "Workflow",
+        );
     }
 
     /// Inverse drift guard: every key listed in `PolicyNode::child_table()`
@@ -1746,5 +1844,143 @@ close_policy:
             &field_names_of::<RequireTypedReferences>(),
             "RequireTypedReferences",
         );
+        assert_no_stale(
+            PolicyNode::Workflow,
+            &field_names_of::<Workflow>(),
+            "Workflow",
+        );
+    }
+
+    // =========================================================================
+    // Status-workflow policy (issue #311)
+    // =========================================================================
+
+    fn strict_workflow() -> Workflow {
+        Workflow {
+            strict: true,
+            statuses: vec![
+                "open".to_string(),
+                "in_progress".to_string(),
+                "closed".to_string(),
+            ],
+        }
+    }
+
+    #[test]
+    fn workflow_default_is_not_enforced() {
+        let workflow = Workflow::default();
+        assert!(!workflow.is_enforced());
+        // With enforcement off every status is permitted.
+        assert!(workflow.validate_status("anything-at-all").is_ok());
+    }
+
+    #[test]
+    fn workflow_strict_but_empty_statuses_is_not_enforced() {
+        let workflow = Workflow {
+            strict: true,
+            statuses: vec![],
+        };
+        assert!(!workflow.is_enforced());
+        assert!(workflow.validate_status("bogus").is_ok());
+    }
+
+    #[test]
+    fn workflow_rejects_status_outside_the_set() {
+        let workflow = strict_workflow();
+        let err = workflow
+            .validate_status("completed")
+            .expect_err("out-of-set status must be rejected");
+        let message = err.to_string();
+        assert!(message.contains("completed"), "{message}");
+        // The error names the allowed values so the user can self-correct.
+        assert!(message.contains("open"), "{message}");
+        assert!(message.contains("in_progress"), "{message}");
+        assert!(message.contains("closed"), "{message}");
+    }
+
+    #[test]
+    fn workflow_allows_status_in_the_set() {
+        let workflow = strict_workflow();
+        assert!(workflow.validate_status("open").is_ok());
+        assert!(workflow.validate_status("in_progress").is_ok());
+        assert!(workflow.validate_status("closed").is_ok());
+    }
+
+    #[test]
+    fn workflow_status_match_is_case_insensitive() {
+        let workflow = Workflow {
+            strict: true,
+            statuses: vec!["In_Progress".to_string()],
+        };
+        assert!(workflow.allows("in_progress"));
+        assert!(workflow.validate_status("in_progress").is_ok());
+    }
+
+    #[test]
+    fn workflow_supports_custom_statuses() {
+        let workflow = Workflow {
+            strict: true,
+            statuses: vec!["open".to_string(), "in_review".to_string()],
+        };
+        assert!(workflow.validate_status("in_review").is_ok());
+        assert!(workflow.validate_status("blocked").is_err());
+    }
+
+    #[test]
+    fn loader_parses_workflow_section() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let yaml = r#"
+workflow:
+  strict: true
+  statuses: ["open", "in_progress", "closed"]
+"#;
+        std::fs::write(dir.path().join(POLICY_FILE_NAME), yaml).unwrap();
+        let policy = load_for_beads_dir(dir.path()).expect("load");
+        assert!(policy.workflow.is_enforced());
+        assert_eq!(
+            policy.workflow.statuses,
+            vec![
+                "open".to_string(),
+                "in_progress".to_string(),
+                "closed".to_string()
+            ]
+        );
+        assert!(policy.workflow.validate_status("open").is_ok());
+        assert!(policy.workflow.validate_status("completed").is_err());
+    }
+
+    #[test]
+    fn loader_absent_workflow_section_is_permissive() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A policy.yaml that configures close gates but NO workflow section
+        // must not enforce any status set.
+        let yaml = "close_policy:\n  forbid_self_close_after_in_progress:\n    enabled: true\n";
+        std::fs::write(dir.path().join(POLICY_FILE_NAME), yaml).unwrap();
+        let policy = load_for_beads_dir(dir.path()).expect("load");
+        assert!(!policy.workflow.is_enforced());
+        assert!(policy.workflow.validate_status("whatever").is_ok());
+    }
+
+    #[test]
+    fn detect_unknown_policy_fields_walks_workflow_typos() {
+        let yaml = r#"
+workflow:
+  strict: true
+  statusses: ["open"]   # typo: should be statuses
+"#;
+        let raw: serde_yml::Value = serde_yml::from_str(yaml).unwrap();
+        let unknown = detect_unknown_policy_fields(&raw);
+        assert_eq!(unknown, vec!["workflow.statusses".to_string()]);
+    }
+
+    #[test]
+    fn detect_unknown_policy_fields_accepts_canonical_workflow() {
+        let yaml = r#"
+workflow:
+  strict: true
+  statuses: ["open", "closed"]
+"#;
+        let raw: serde_yml::Value = serde_yml::from_str(yaml).unwrap();
+        assert!(detect_unknown_policy_fields(&raw).is_empty());
     }
 }
