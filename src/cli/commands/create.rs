@@ -254,18 +254,29 @@ pub fn execute_with_storage(
 /// set that omits `open` would otherwise make `br create` unusable. Returns
 /// `Ok(())` when the workflow section is absent or non-strict.
 ///
+/// The *effective* starting status is validated — the explicit `--status` when
+/// given, otherwise the create default (`open`, matching the default applied
+/// below). Validating the default too keeps `br create`, `br create --status
+/// open`, and `br update --status open` consistent: if a strict workflow omits
+/// the starting status, `br create` must name a valid one rather than silently
+/// producing a bead whose status `br doctor` will immediately flag.
+///
 /// # Errors
 ///
-/// Returns a validation error when strict enforcement is configured and
-/// `raw_status` is not in the allowed set.
+/// Returns a validation error when strict enforcement is configured and the
+/// effective status is not in the allowed set.
 fn enforce_workflow_status(beads_dir: &Path, raw_status: Option<&str>) -> Result<()> {
-    let Some(raw) = raw_status else {
-        return Ok(());
-    };
     let policy = crate::close_policy::load_for_beads_dir(beads_dir)?;
+    if !policy.workflow.is_enforced() {
+        return Ok(());
+    }
     // Parse to the canonical string so a custom-cased config entry and the
-    // canonical name (`In_Progress` vs `in_progress`) compare equal.
-    let parsed: Status = raw.parse()?;
+    // canonical name (`In_Progress` vs `in_progress`) compare equal. When
+    // `--status` is omitted the effective status is the create default, `Open`.
+    let parsed: Status = match raw_status {
+        Some(raw) => raw.parse()?,
+        None => Status::Open,
+    };
     policy.workflow.validate_status(parsed.as_str())
 }
 
