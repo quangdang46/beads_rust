@@ -519,16 +519,18 @@ pub fn backup_before_export(
         // so the file is current; we just don't keep a near-duplicate snapshot
         // per edit. A future (older-than-floor) edit takes the next snapshot.
         if config.min_interval_secs > 0 {
-            let age = Utc::now().signed_duration_since(latest.timestamp);
-            let floor = chrono::Duration::seconds(
-                i64::try_from(config.min_interval_secs).unwrap_or(i64::MAX),
-            );
-            // `age >= zero` guards against a future-dated latest (clock skew):
+            // Compare in whole seconds: building a chrono `Duration` from a
+            // possibly-huge `min_interval_secs` could overflow/panic. `age_secs
+            // >= 0` guards against a future-dated latest backup (clock skew): we
             // never skip based on a backup that appears newer than "now".
-            if age >= chrono::Duration::zero() && age < floor {
+            let age_secs = Utc::now()
+                .signed_duration_since(latest.timestamp)
+                .num_seconds();
+            // `try_from` fails for a negative age (future-dated latest / clock
+            // skew), so we never throttle on a backup that appears newer than now.
+            if u64::try_from(age_secs).is_ok_and(|age| age < config.min_interval_secs) {
                 tracing::debug!(
-                    "Skipping backup: throttled ({}s since latest < {}s floor)",
-                    age.num_seconds(),
+                    "Skipping backup: throttled ({age_secs}s since latest < {}s floor)",
                     config.min_interval_secs
                 );
                 return Ok(());
