@@ -698,16 +698,14 @@ fn validate_transition_to_in_progress(
     }
 
     for id in ids {
-        if storage.is_blocked(id)? {
-            let blockers = storage.get_blockers(id)?;
-            let blocker_list = if blockers.is_empty() {
-                "blocking dependencies".to_string()
-            } else {
-                blockers.join(", ")
-            };
+        // Use start-blockers (not `is_blocked`), so an epic that is only
+        // "blocked" by its own still-open children — a close-ordering rollup,
+        // not a real dependency — can still be claimed and worked on (#315).
+        let blockers = storage.get_start_blockers(id)?;
+        if !blockers.is_empty() {
             return Err(BeadsError::validation(
                 "claim",
-                format!("cannot claim blocked issue: {blocker_list}"),
+                format!("cannot claim blocked issue: {}", blockers.join(", ")),
             ));
         }
     }

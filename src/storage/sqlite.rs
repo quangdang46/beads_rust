@@ -276,6 +276,15 @@ const IMPORT_DEPENDENCY_CHUNK_SIZE: usize = 140;
 const DEPENDENCY_TRAVERSAL_MAX_DEPTH: usize = 500;
 const BLOCKED_CACHE_STATE_KEY: &str = "blocked_cache_state";
 const BLOCKED_CACHE_STATE_STALE: &str = "stale";
+/// Annotation suffix appended to a blocker ref when an epic is "blocked" purely
+/// because it still has an open child (e.g. `bd-42:child-open`).
+///
+/// This is a **close-ordering** marker — an epic should not be *closed* while it
+/// has open children — and must never prevent the epic from being *started*
+/// (claimed / moved to `in_progress`). The producer queries embed this suffix in
+/// `blocked_issues_cache`; [`SqliteStorage::get_start_blockers`] filters it back
+/// out so claim/start guards ignore it (#315).
+const CHILD_OPEN_BLOCKER_SUFFIX: &str = ":child-open";
 const NEEDS_FLUSH_KEY: &str = "needs_flush";
 const METADATA_EMPTY_VALUE: &str = "";
 const METADATA_FALSE_VALUE: &str = "false";
@@ -5253,6 +5262,39 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_blockers(&self, issue_id: &str) -> Result<Vec<String>> {
+        Ok(Self::blocker_refs_to_issue_ids(
+            &self.get_blocker_refs(issue_id)?,
+        ))
+    }
+
+    /// Get the blockers that prevent *starting* work on an issue (claiming it or
+    /// moving it to `in_progress`).
+    ///
+    /// This is [`get_blockers`](Self::get_blockers) minus the `:child-open`
+    /// rollup markers. Those markers encode a *close-ordering* constraint — an
+    /// epic should not be closed while it still has open children — but they
+    /// must NOT prevent the epic from being claimed and worked on (#315). Real
+    /// start-blocking edges (`blocks`, `conditional-blocks`, `waits-for`, and a
+    /// propagated `parent-blocked` state) are retained.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_start_blockers(&self, issue_id: &str) -> Result<Vec<String>> {
+        let start_blocker_refs: Vec<String> = self
+            .get_blocker_refs(issue_id)?
+            .into_iter()
+            .filter(|blocker| !blocker.ends_with(CHILD_OPEN_BLOCKER_SUFFIX))
+            .collect();
+        Ok(Self::blocker_refs_to_issue_ids(&start_blocker_refs))
+    }
+
+    /// Return the raw, annotation-bearing blocker refs for an issue (e.g.
+    /// `bd-123:open`, `bd-456:parent-blocked`, `bd-789:child-open`), or an empty
+    /// vec if the issue is not blocked. Callers that only need issue IDs should
+    /// use [`get_blockers`](Self::get_blockers); callers enforcing start/claim
+    /// ordering should use [`get_start_blockers`](Self::get_start_blockers).
+    fn get_blocker_refs(&self, issue_id: &str) -> Result<Vec<String>> {
         // Read-only path: if the cache is stale, compute in memory instead of
         // persisting (issue #216 — read ops must not write).
         if self.blocked_cache_marked_stale()? {
@@ -5260,11 +5302,9 @@ impl SqliteStorage {
                 Ok(map) => map,
                 Err(error) => self.recover_blocked_issues_map("get_blockers_stale", &error)?,
             };
-            return Ok(Self::blocker_refs_to_issue_ids(
-                blocked_issues_map
-                    .get(issue_id)
-                    .map_or(&[][..], Vec::as_slice),
-            ));
+            return Ok(blocked_issues_map
+                .get(issue_id)
+                .map_or_else(Vec::new, Clone::clone));
         }
         let rows = match self.conn.query_with_params(
             "SELECT blocked_by FROM blocked_issues_cache WHERE issue_id = ?",
@@ -5274,11 +5314,9 @@ impl SqliteStorage {
             Err(error) => {
                 let blocked_issues_map =
                     self.recover_blocked_issues_map("get_blockers_query", &error)?;
-                return Ok(Self::blocker_refs_to_issue_ids(
-                    blocked_issues_map
-                        .get(issue_id)
-                        .map_or(&[][..], Vec::as_slice),
-                ));
+                return Ok(blocked_issues_map
+                    .get(issue_id)
+                    .map_or_else(Vec::new, Clone::clone));
             }
         };
         let Some(row) = rows.first() else {
@@ -5286,15 +5324,13 @@ impl SqliteStorage {
         };
 
         match parse_blocked_by_json(issue_id, row.get(0).and_then(SqliteValue::as_text)) {
-            Ok(blockers) => Ok(Self::blocker_refs_to_issue_ids(&blockers)),
+            Ok(blockers) => Ok(blockers),
             Err(error) => {
                 let blocked_issues_map =
                     self.recover_blocked_issues_map("get_blockers_parse", &error)?;
-                Ok(Self::blocker_refs_to_issue_ids(
-                    blocked_issues_map
-                        .get(issue_id)
-                        .map_or(&[][..], Vec::as_slice),
-                ))
+                Ok(blocked_issues_map
+                    .get(issue_id)
+                    .map_or_else(Vec::new, Clone::clone))
             }
         }
     }
@@ -5988,8 +6024,8 @@ impl SqliteStorage {
         // dangling rows can accumulate.  Without this guard the subsequent
         // INSERT into `blocked_issues_cache` (which *does* have a FK on
         // `issue_id`) fails with "FOREIGN KEY constraint failed" (#215).
-        let rows = conn.query(
-            "SELECT DISTINCT d.depends_on_id as parent_id, d.issue_id || ':child-open' as blocker
+        let rows = conn.query(&format!(
+            "SELECT DISTINCT d.depends_on_id as parent_id, d.issue_id || '{CHILD_OPEN_BLOCKER_SUFFIX}' as blocker
              FROM dependencies d
              JOIN issues i ON d.issue_id = i.id
              JOIN issues p ON d.depends_on_id = p.id
@@ -5999,7 +6035,7 @@ impl SqliteStorage {
                AND (i.is_template = 0 OR i.is_template IS NULL)
                AND d.depends_on_id NOT LIKE 'external:%'
                AND d.issue_id NOT LIKE 'external:%'",
-        )?;
+        ))?;
         let mut map: HashMap<String, Vec<String>> = HashMap::new();
         for row in &rows {
             let Some(parent_id) = row.get(0).and_then(SqliteValue::as_text) else {
@@ -6037,7 +6073,7 @@ impl SqliteStorage {
             // blocked by open children" rollup is epic-specific, not a
             // property of every parent-child edge.
             let sql = format!(
-                "SELECT DISTINCT d.depends_on_id as parent_id, d.issue_id || ':child-open' as blocker
+                "SELECT DISTINCT d.depends_on_id as parent_id, d.issue_id || '{CHILD_OPEN_BLOCKER_SUFFIX}' as blocker
                  FROM dependencies d
                  JOIN issues i ON d.issue_id = i.id
                  JOIN issues p ON d.depends_on_id = p.id
@@ -16324,6 +16360,95 @@ mod tests {
         assert_eq!(
             storage.get_blockers("bd-unrelated").unwrap(),
             vec!["bd-unrelated-blocker".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_get_start_blockers_ignores_child_open_but_keeps_real_blockers() {
+        // #315: an epic that is "blocked" only by its own still-open children
+        // must remain claimable / startable (the child-open rollup is a
+        // close-ordering constraint, not a real dependency). A genuine `blocks`
+        // edge must still prevent starting, and the child-open marker must be
+        // filtered out of the reported start-blockers.
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let now = Utc::now();
+
+        let mut epic = make_issue("bd-epic", "Epic", Status::Open, 2, None, now, None);
+        epic.issue_type = IssueType::Epic;
+        let mut blocked_epic = make_issue(
+            "bd-epic-blocked",
+            "Blocked epic",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        blocked_epic.issue_type = IssueType::Epic;
+        for issue in [
+            epic,
+            make_issue("bd-epic.1", "Child", Status::Open, 2, None, now, None),
+            blocked_epic,
+            make_issue(
+                "bd-epic-blocked.1",
+                "Child of blocked epic",
+                Status::Open,
+                2,
+                None,
+                now,
+                None,
+            ),
+            make_issue(
+                "bd-real-blocker",
+                "Real blocker",
+                Status::Open,
+                2,
+                None,
+                now,
+                None,
+            ),
+        ] {
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        storage
+            .add_dependency("bd-epic.1", "bd-epic", "parent-child", "tester")
+            .unwrap();
+        storage
+            .add_dependency(
+                "bd-epic-blocked.1",
+                "bd-epic-blocked",
+                "parent-child",
+                "tester",
+            )
+            .unwrap();
+        storage
+            .add_dependency("bd-epic-blocked", "bd-real-blocker", "blocks", "tester")
+            .unwrap();
+
+        // Both epics are "blocked" in the close-ordering sense (open children).
+        assert!(storage.is_blocked("bd-epic").unwrap());
+        assert!(storage.is_blocked("bd-epic-blocked").unwrap());
+
+        // An epic blocked ONLY by open children has no start-blockers: claimable.
+        assert!(
+            storage.get_start_blockers("bd-epic").unwrap().is_empty(),
+            "epic with only open children must be startable (#315)"
+        );
+        // The close-ordering view (get_blockers) is unchanged — still rolls up.
+        assert_eq!(
+            storage.get_blockers("bd-epic").unwrap(),
+            vec!["bd-epic.1".to_string()]
+        );
+
+        // An epic with a real `blocks` dependency is still start-blocked, and
+        // the child-open marker is filtered out of the reported blockers.
+        assert_eq!(
+            storage.get_start_blockers("bd-epic-blocked").unwrap(),
+            vec!["bd-real-blocker".to_string()],
+            "real blocks edge must still block starting; child-open filtered (#315)"
         );
     }
 
