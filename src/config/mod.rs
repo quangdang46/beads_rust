@@ -2599,6 +2599,9 @@ impl OpenStorageResult {
         if let Some(enabled) = history_enabled_from_layer(&self.bootstrap_layer) {
             cfg.enabled = enabled;
         }
+        if let Some(secs) = history_min_interval_secs_from_env() {
+            cfg.min_interval_secs = secs;
+        }
         cfg
     }
 }
@@ -2909,6 +2912,21 @@ pub fn no_auto_flush_from_layer(layer: &ConfigLayer) -> Option<bool> {
 /// <https://github.com/Dicklesworthstone/beads_rust/issues/293> — operators who
 /// want `issues.jsonl` to be the single durable state file can flip this and
 /// stop the `.br_history/` directory from being created.
+/// Resolve an override for the `.br_history` snapshot throttle (#313) from the
+/// `BEADS_HISTORY_MIN_INTERVAL_SECS` environment variable.
+///
+/// The throttle collapses bursts of `br` mutations into at most one snapshot per
+/// interval (default 5s — see [`crate::sync::history::HistoryConfig`]). Set this
+/// to `0` to disable the throttle (snapshot on every export), or to a larger
+/// value to snapshot less often. Returns `None` when unset/unparsable so the
+/// default applies.
+#[must_use]
+pub fn history_min_interval_secs_from_env() -> Option<u64> {
+    std::env::var("BEADS_HISTORY_MIN_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
 #[must_use]
 pub fn history_enabled_from_layer(layer: &ConfigLayer) -> Option<bool> {
     if let Some(v) = get_startup_value(

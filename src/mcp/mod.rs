@@ -444,6 +444,9 @@ impl BeadsState {
             if let Some(enabled) = config::history_enabled_from_layer(&layer) {
                 cfg.enabled = enabled;
             }
+            if let Some(secs) = config::history_min_interval_secs_from_env() {
+                cfg.min_interval_secs = secs;
+            }
             cfg
         })
         .unwrap_or_default();
