@@ -2913,7 +2913,7 @@ pub fn no_auto_flush_from_layer(layer: &ConfigLayer) -> Option<bool> {
 /// want `issues.jsonl` to be the single durable state file can flip this and
 /// stop the `.br_history/` directory from being created.
 /// Resolve an override for the `.br_history` snapshot throttle (#313) from the
-/// `BEADS_HISTORY_MIN_INTERVAL_SECS` environment variable.
+/// `BR_HISTORY_MIN_INTERVAL_SECS` environment variable.
 ///
 /// The throttle collapses bursts of `br` mutations into at most one snapshot per
 /// interval (default 5s — see [`crate::sync::history::HistoryConfig`]). Set this
@@ -2922,7 +2922,7 @@ pub fn no_auto_flush_from_layer(layer: &ConfigLayer) -> Option<bool> {
 /// default applies.
 #[must_use]
 pub fn history_min_interval_secs_from_env() -> Option<u64> {
-    std::env::var("BEADS_HISTORY_MIN_INTERVAL_SECS")
+    std::env::var("BR_HISTORY_MIN_INTERVAL_SECS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
 }

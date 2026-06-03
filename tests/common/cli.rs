@@ -192,7 +192,7 @@ where
     // chronology, prune, restore) observe one `.br_history` snapshot per
     // mutation. Set before caller `env_vars` so a test can override this to
     // exercise the #313 snapshot throttle.
-    cmd.env("BEADS_HISTORY_MIN_INTERVAL_SECS", "0");
+    cmd.env("BR_HISTORY_MIN_INTERVAL_SECS", "0");
     cmd.envs(env_vars);
     cmd.env("NO_COLOR", "1");
     cmd.env("RUST_LOG", "beads_rust=debug");
