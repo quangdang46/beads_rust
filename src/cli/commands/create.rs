@@ -267,7 +267,7 @@ pub fn execute_with_storage(
 /// effective status is not in the allowed set.
 fn enforce_workflow_status(beads_dir: &Path, raw_status: Option<&str>) -> Result<()> {
     let policy = crate::close_policy::load_for_beads_dir(beads_dir)?;
-    if !policy.workflow.is_enforced() {
+    if !policy.workflow.is_enforced() && !policy.workflow.transitions_enforced() {
         return Ok(());
     }
     // Parse to the canonical string so a custom-cased config entry and the
@@ -277,7 +277,12 @@ fn enforce_workflow_status(beads_dir: &Path, raw_status: Option<&str>) -> Result
         Some(raw) => raw.parse()?,
         None => Status::Open,
     };
-    policy.workflow.validate_status(parsed.as_str())
+    // Status-set enforcement (issue #311).
+    policy.workflow.validate_status(parsed.as_str())?;
+    // Initial-transition enforcement (issue #312, layer 1): a create has no
+    // prior status, so the effective starting status is validated against the
+    // reserved `initial` key (no-op when `transitions`/`initial` is absent).
+    policy.workflow.validate_transition(None, parsed.as_str())
 }
 
 fn auto_flush_after_create(storage_ctx: &mut config::OpenStorageResult, ctx: &OutputContext) {

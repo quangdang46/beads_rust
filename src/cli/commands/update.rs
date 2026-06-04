@@ -343,14 +343,31 @@ fn prepare_single_route(
     let claim_exclusive = config::claim_exclusive_from_layer(&config_layer);
     let update = build_update(args, &actor, claim_exclusive)?;
 
-    // Strict status-workflow enforcement (issue #311). When the project's
-    // `.beads/policy.yaml` configures `workflow.strict: true` with a non-empty
-    // `workflow.statuses` set, a target status outside that set is rejected.
-    // Absent/non-strict workflow config is a no-op, so existing repos are
-    // unaffected.
+    // Strict status-workflow enforcement (issue #311) + transition rules
+    // (issue #312, layer 1). When the project's `.beads/policy.yaml` configures
+    // `workflow.strict: true` with a non-empty `workflow.statuses` set, a target
+    // status outside that set is rejected. When `workflow.strict: true` with a
+    // non-empty `workflow.transitions` map, a `from -> to` status change that is
+    // not an allowed transition is rejected. Absent/non-strict workflow config
+    // is a no-op, so existing repos are unaffected.
     if let Some(new_status) = update.status.as_ref() {
         let policy = crate::close_policy::load_for_beads_dir(beads_dir)?;
         policy.workflow.validate_status(new_status.as_str())?;
+        if policy.workflow.transitions_enforced() {
+            for id in &resolved_ids {
+                // The current status is the `from` state for the transition
+                // check. An issue that cannot be read (missing/unresolved)
+                // validates against the `initial` key (from = None), mirroring
+                // a create.
+                let current = storage_ctx
+                    .storage
+                    .get_issue(id)?
+                    .map(|issue| issue.status.as_str().to_string());
+                policy
+                    .workflow
+                    .validate_transition(current.as_deref(), new_status.as_str())?;
+            }
+        }
     }
     let has_updates = !update.is_empty()
         || !args.add_label.is_empty()

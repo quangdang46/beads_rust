@@ -131,25 +131,64 @@ impl ClosePolicy {
 /// workflow:
 ///   strict: true
 ///   statuses: [open, in_progress, blocked, deferred, draft, closed]
-///   # transitions: {...}   # reserved for issue #312
+///   transitions:                       # issue #312, layer 1
+///     open: [in_progress, deferred, closed]
+///     in_progress: [in_review, blocked, open]
+///     in_review: [closed, in_progress]
+///     blocked: [open, in_progress]
+///     deferred: [open]
+///     # initial: [open, draft]         # statuses allowed when current is unknown
+///     # any: [closed]                  # to-statuses allowed from EVERY from-status
 /// ```
 ///
-/// When the section is absent the default (`strict: false`, empty `statuses`)
-/// means no enforcement, matching pre-#311 behavior exactly.
+/// When the section is absent the default (`strict: false`, empty `statuses`,
+/// empty `transitions`) means no enforcement, matching pre-#311 behavior
+/// exactly.
+///
+/// Transition enforcement (issue #312, layer 1) is opt-in via a non-empty
+/// `transitions:` map and is independently gated on `strict`: when
+/// `strict: true` *and* `transitions` is non-empty, a status change whose
+/// `from -> to` pair is not listed is rejected on `br update`. Absent or
+/// empty `transitions` leaves transition behavior exactly as before.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Workflow {
     /// When `true` *and* `statuses` is non-empty, a status outside the
     /// configured set is rejected on `create`/`update` and flagged by
     /// `br doctor`. When `false`, `statuses` is advisory only (no
-    /// enforcement).
+    /// enforcement). The same flag gates transition enforcement (see
+    /// `transitions`).
     pub strict: bool,
     /// The allowed status set. Each entry is a canonical-or-custom status
     /// string (e.g. `open`, `in_progress`, `closed`, or a project-specific
     /// value). Empty disables enforcement even when `strict` is `true`.
     #[serde(default)]
     pub statuses: Vec<String>,
+    /// Allowed status transitions (issue #312, layer 1). A map of
+    /// `from-status -> [allowed to-statuses]`. Two reserved keys widen the
+    /// rules:
+    ///
+    /// - `any` — its to-statuses are allowed *from every* from-status (a
+    ///   wildcard source; e.g. allow `closed` from anywhere).
+    /// - `initial` — the to-statuses allowed when there is no recorded
+    ///   current status (e.g. a `create`, or an issue whose status the caller
+    ///   could not resolve). Absent `initial` means any initial status is
+    ///   accepted, since there is no `from` state to validate against.
+    ///
+    /// Comparison is case-insensitive, mirroring `statuses`. A no-op
+    /// transition (`from == to`) is always allowed and never consults the
+    /// map. Empty map disables transition enforcement entirely (backward
+    /// compatible).
+    #[serde(default)]
+    pub transitions: std::collections::BTreeMap<String, Vec<String>>,
 }
+
+/// Reserved `transitions` key whose to-statuses are allowed from every
+/// from-status (wildcard source).
+pub const TRANSITION_ANY_FROM: &str = "any";
+/// Reserved `transitions` key whose to-statuses are allowed when there is no
+/// recorded current status (e.g. a create, or an unresolved current status).
+pub const TRANSITION_INITIAL: &str = "initial";
 
 impl Workflow {
     /// True when strict enforcement is configured: `strict` is on *and* at
@@ -200,6 +239,131 @@ impl Workflow {
                 self.allowed_list()
             ),
         ))
+    }
+
+    /// True when transition enforcement is configured: `strict` is on *and*
+    /// at least one `from -> [to...]` rule is listed. Enforcement
+    /// short-circuits on `false`.
+    #[must_use]
+    pub fn transitions_enforced(&self) -> bool {
+        self.strict && !self.transitions.is_empty()
+    }
+
+    /// Case-insensitive lookup of the to-statuses listed for `from`. Returns
+    /// `None` when `from` has no entry in the map.
+    fn transitions_from(&self, from: &str) -> Option<&Vec<String>> {
+        let target = from.to_lowercase();
+        self.transitions
+            .iter()
+            .find(|(key, _)| key.to_lowercase() == target)
+            .map(|(_, tos)| tos)
+    }
+
+    /// Collect every to-status reachable from `from`, merging the explicit
+    /// `from` entry with the wildcard `any` entry. Returns the source-order,
+    /// de-duplicated list used for error messages and membership checks.
+    #[must_use]
+    pub fn allowed_targets_from(&self, from: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let push_unique = |list: &Vec<String>, out: &mut Vec<String>| {
+            for value in list {
+                if !out.iter().any(|seen| seen.eq_ignore_ascii_case(value)) {
+                    out.push(value.clone());
+                }
+            }
+        };
+        if let Some(explicit) = self.transitions_from(from) {
+            push_unique(explicit, &mut out);
+        }
+        if let Some(wildcard) = self.transitions_from(TRANSITION_ANY_FROM) {
+            push_unique(wildcard, &mut out);
+        }
+        out
+    }
+
+    /// True when moving `from -> to` is permitted by the configured
+    /// transition rules. A no-op (`from == to`, case-insensitive) is always
+    /// allowed. Otherwise the target must appear either under the explicit
+    /// `from` key or under the wildcard `any` key.
+    #[must_use]
+    pub fn allows_transition(&self, from: &str, to: &str) -> bool {
+        if from.eq_ignore_ascii_case(to) {
+            return true;
+        }
+        self.allowed_targets_from(from)
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(to))
+    }
+
+    /// True when `to` is permitted as an initial status (no recorded `from`).
+    /// When no `initial` key is configured, any initial status is accepted —
+    /// there is no prior state to validate against.
+    #[must_use]
+    pub fn allows_initial(&self, to: &str) -> bool {
+        match self.transitions_from(TRANSITION_INITIAL) {
+            None => true,
+            Some(allowed) => allowed.iter().any(|s| s.eq_ignore_ascii_case(to)),
+        }
+    }
+
+    /// Validate a status *change* against the workflow transition rules.
+    ///
+    /// `from` is the issue's current status, or `None` when there is no
+    /// recorded current status (a create, or an unresolved current status —
+    /// validated against the reserved `initial` key).
+    ///
+    /// Returns `Ok(())` when transition enforcement is off, the move is a
+    /// no-op, or the move is permitted. Returns a [`BeadsError::Validation`]
+    /// naming the current status, the attempted status, and the valid next
+    /// statuses otherwise — mirroring the `validate_status` error style.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when transition enforcement is configured
+    /// and the `from -> to` move is not in the allowed set.
+    pub fn validate_transition(&self, from: Option<&str>, to: &str) -> Result<()> {
+        if !self.transitions_enforced() {
+            return Ok(());
+        }
+
+        match from {
+            None => {
+                if self.allows_initial(to) {
+                    return Ok(());
+                }
+                let allowed = self
+                    .transitions_from(TRANSITION_INITIAL)
+                    .map(|tos| tos.join(", "))
+                    .unwrap_or_default();
+                Err(BeadsError::validation(
+                    "status",
+                    format!(
+                        "initial status '{to}' is not permitted by the project workflow policy \
+                         (.beads/policy.yaml workflow.transitions, key 'initial'). \
+                         Allowed initial statuses: {allowed}."
+                    ),
+                ))
+            }
+            Some(from) => {
+                if self.allows_transition(from, to) {
+                    return Ok(());
+                }
+                let allowed = self.allowed_targets_from(from);
+                let allowed_list = if allowed.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    allowed.join(", ")
+                };
+                Err(BeadsError::validation(
+                    "status",
+                    format!(
+                        "transition '{from}' -> '{to}' is not permitted by the project workflow \
+                         policy (.beads/policy.yaml workflow.transitions). \
+                         Valid next statuses from '{from}': {allowed_list}."
+                    ),
+                ))
+            }
+        }
     }
 }
 
@@ -955,7 +1119,11 @@ impl PolicyNode {
             Self::RequireTypedReferences => {
                 &[("enabled", Self::Scalar), ("required_kinds", Self::Scalar)]
             }
-            Self::Workflow => &[("strict", Self::Scalar), ("statuses", Self::Scalar)],
+            Self::Workflow => &[
+                ("strict", Self::Scalar),
+                ("statuses", Self::Scalar),
+                ("transitions", Self::Scalar),
+            ],
             Self::Scalar => &[],
         }
     }
@@ -1863,6 +2031,7 @@ close_policy:
                 "in_progress".to_string(),
                 "closed".to_string(),
             ],
+            ..Default::default()
         }
     }
 
@@ -1879,6 +2048,7 @@ close_policy:
         let workflow = Workflow {
             strict: true,
             statuses: vec![],
+            ..Default::default()
         };
         assert!(!workflow.is_enforced());
         assert!(workflow.validate_status("bogus").is_ok());
@@ -1911,6 +2081,7 @@ close_policy:
         let workflow = Workflow {
             strict: true,
             statuses: vec!["In_Progress".to_string()],
+            ..Default::default()
         };
         assert!(workflow.allows("in_progress"));
         assert!(workflow.validate_status("in_progress").is_ok());
@@ -1921,6 +2092,7 @@ close_policy:
         let workflow = Workflow {
             strict: true,
             statuses: vec!["open".to_string(), "in_review".to_string()],
+            ..Default::default()
         };
         assert!(workflow.validate_status("in_review").is_ok());
         assert!(workflow.validate_status("blocked").is_err());
@@ -1979,6 +2151,276 @@ workflow:
 workflow:
   strict: true
   statuses: ["open", "closed"]
+"#;
+        let raw: serde_yml::Value = serde_yml::from_str(yaml).unwrap();
+        assert!(detect_unknown_policy_fields(&raw).is_empty());
+    }
+
+    // =========================================================================
+    // Status-transition rules (issue #312, layer 1)
+    // =========================================================================
+
+    fn transition_workflow() -> Workflow {
+        let mut transitions = std::collections::BTreeMap::new();
+        transitions.insert(
+            "open".to_string(),
+            vec!["in_progress".to_string(), "closed".to_string()],
+        );
+        transitions.insert(
+            "in_progress".to_string(),
+            vec!["in_review".to_string(), "blocked".to_string()],
+        );
+        transitions.insert("in_review".to_string(), vec!["closed".to_string()]);
+        Workflow {
+            strict: true,
+            statuses: vec![],
+            transitions,
+        }
+    }
+
+    #[test]
+    fn transitions_default_is_not_enforced() {
+        let workflow = Workflow::default();
+        assert!(!workflow.transitions_enforced());
+        // With enforcement off every transition is permitted.
+        assert!(workflow.validate_transition(Some("open"), "bogus").is_ok());
+        assert!(workflow.validate_transition(None, "bogus").is_ok());
+    }
+
+    #[test]
+    fn transitions_present_but_not_strict_is_not_enforced() {
+        let mut workflow = transition_workflow();
+        workflow.strict = false;
+        assert!(!workflow.transitions_enforced());
+        // Not strict => transitions advisory only, nothing rejected.
+        assert!(
+            workflow
+                .validate_transition(Some("open"), "deferred")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn transitions_strict_but_empty_map_is_not_enforced() {
+        let workflow = Workflow {
+            strict: true,
+            statuses: vec![],
+            transitions: std::collections::BTreeMap::new(),
+        };
+        assert!(!workflow.transitions_enforced());
+        assert!(
+            workflow
+                .validate_transition(Some("open"), "blocked")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn transition_valid_move_is_allowed() {
+        let workflow = transition_workflow();
+        assert!(workflow.allows_transition("open", "in_progress"));
+        assert!(
+            workflow
+                .validate_transition(Some("open"), "in_progress")
+                .is_ok()
+        );
+        assert!(
+            workflow
+                .validate_transition(Some("in_progress"), "in_review")
+                .is_ok()
+        );
+        assert!(
+            workflow
+                .validate_transition(Some("in_review"), "closed")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn transition_invalid_move_is_rejected_with_actionable_error() {
+        let workflow = transition_workflow();
+        let err = workflow
+            .validate_transition(Some("open"), "in_review")
+            .expect_err("open -> in_review is not configured");
+        let message = err.to_string();
+        // Names current, attempted, and the valid next statuses.
+        assert!(message.contains("'open'"), "{message}");
+        assert!(message.contains("'in_review'"), "{message}");
+        assert!(message.contains("in_progress"), "{message}");
+        assert!(message.contains("closed"), "{message}");
+        assert!(message.contains("workflow.transitions"), "{message}");
+    }
+
+    #[test]
+    fn transition_from_status_with_no_rule_rejects_with_none_targets() {
+        let workflow = transition_workflow();
+        // `blocked` has no entry and there is no `any` wildcard.
+        let err = workflow
+            .validate_transition(Some("blocked"), "open")
+            .expect_err("blocked has no allowed targets");
+        let message = err.to_string();
+        assert!(message.contains("(none)"), "{message}");
+    }
+
+    #[test]
+    fn transition_no_op_is_always_allowed() {
+        let workflow = transition_workflow();
+        // Same status, even when there is no explicit self-loop rule.
+        assert!(workflow.validate_transition(Some("open"), "open").is_ok());
+        // Even for a status with no rule at all.
+        assert!(
+            workflow
+                .validate_transition(Some("blocked"), "blocked")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn transition_is_case_insensitive() {
+        let workflow = transition_workflow();
+        assert!(
+            workflow
+                .validate_transition(Some("OPEN"), "In_Progress")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn transition_any_wildcard_allows_target_from_every_status() {
+        let mut workflow = transition_workflow();
+        workflow
+            .transitions
+            .insert("any".to_string(), vec!["deferred".to_string()]);
+        // `deferred` now allowed from any from-status, including ones with
+        // their own rules and ones with none.
+        assert!(
+            workflow
+                .validate_transition(Some("open"), "deferred")
+                .is_ok()
+        );
+        assert!(
+            workflow
+                .validate_transition(Some("blocked"), "deferred")
+                .is_ok()
+        );
+        // Wildcard targets are merged into the error message's "valid next".
+        let err = workflow
+            .validate_transition(Some("open"), "bogus")
+            .expect_err("bogus is not reachable");
+        assert!(err.to_string().contains("deferred"), "{err}");
+    }
+
+    #[test]
+    fn transition_initial_key_restricts_creates() {
+        let mut workflow = transition_workflow();
+        workflow.transitions.insert(
+            "initial".to_string(),
+            vec!["open".to_string(), "draft".to_string()],
+        );
+        // No prior status => validated against `initial`.
+        assert!(workflow.validate_transition(None, "open").is_ok());
+        assert!(workflow.validate_transition(None, "draft").is_ok());
+        let err = workflow
+            .validate_transition(None, "in_progress")
+            .expect_err("in_progress is not an allowed initial status");
+        let message = err.to_string();
+        assert!(message.contains("initial"), "{message}");
+        assert!(message.contains("'in_progress'"), "{message}");
+        assert!(message.contains("open"), "{message}");
+        assert!(message.contains("draft"), "{message}");
+    }
+
+    #[test]
+    fn transition_absent_initial_key_accepts_any_initial_status() {
+        // `transition_workflow()` has no `initial` key — any starting status
+        // is accepted since there is no prior state to validate against.
+        let workflow = transition_workflow();
+        assert!(workflow.validate_transition(None, "open").is_ok());
+        assert!(workflow.validate_transition(None, "anything").is_ok());
+    }
+
+    #[test]
+    fn allowed_targets_from_dedupes_and_merges_wildcard() {
+        let mut workflow = transition_workflow();
+        // Overlap between explicit `open` targets and the wildcard.
+        workflow.transitions.insert(
+            "any".to_string(),
+            vec!["closed".to_string(), "deferred".to_string()],
+        );
+        let targets = workflow.allowed_targets_from("open");
+        // explicit: in_progress, closed; wildcard adds deferred (closed deduped).
+        assert_eq!(
+            targets,
+            vec![
+                "in_progress".to_string(),
+                "closed".to_string(),
+                "deferred".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn loader_parses_workflow_transitions_section() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let yaml = r#"
+workflow:
+  strict: true
+  transitions:
+    open: [in_progress, deferred, closed]
+    in_progress: [in_review, blocked, open]
+    any: [closed]
+    initial: [open, draft]
+"#;
+        std::fs::write(dir.path().join(POLICY_FILE_NAME), yaml).unwrap();
+        let policy = load_for_beads_dir(dir.path()).expect("load");
+        let workflow = &policy.workflow;
+        assert!(workflow.transitions_enforced());
+        assert!(
+            workflow
+                .validate_transition(Some("open"), "in_progress")
+                .is_ok()
+        );
+        assert!(
+            workflow
+                .validate_transition(Some("open"), "in_review")
+                .is_err()
+        );
+        // `any: [closed]` allows close from a from-status without an explicit rule.
+        assert!(
+            workflow
+                .validate_transition(Some("blocked"), "closed")
+                .is_ok()
+        );
+        // `initial` gates creates.
+        assert!(workflow.validate_transition(None, "open").is_ok());
+        assert!(workflow.validate_transition(None, "closed").is_err());
+    }
+
+    #[test]
+    fn loader_absent_transitions_is_not_enforced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Strict status enforcement but NO transitions map: status moves are
+        // unconstrained (backward compatible with #311-only configs).
+        let yaml = "workflow:\n  strict: true\n  statuses: [open, in_progress, closed]\n";
+        std::fs::write(dir.path().join(POLICY_FILE_NAME), yaml).unwrap();
+        let policy = load_for_beads_dir(dir.path()).expect("load");
+        assert!(policy.workflow.is_enforced());
+        assert!(!policy.workflow.transitions_enforced());
+        assert!(
+            policy
+                .workflow
+                .validate_transition(Some("closed"), "open")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn detect_unknown_policy_fields_accepts_canonical_transitions() {
+        let yaml = r#"
+workflow:
+  strict: true
+  transitions:
+    open: [in_progress]
 "#;
         let raw: serde_yml::Value = serde_yml::from_str(yaml).unwrap();
         assert!(detect_unknown_policy_fields(&raw).is_empty());
