@@ -2362,7 +2362,7 @@ workflow:
     #[test]
     fn loader_parses_workflow_transitions_section() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let yaml = r#"
+        let yaml = r"
 workflow:
   strict: true
   transitions:
@@ -2370,7 +2370,7 @@ workflow:
     in_progress: [in_review, blocked, open]
     any: [closed]
     initial: [open, draft]
-"#;
+";
         std::fs::write(dir.path().join(POLICY_FILE_NAME), yaml).unwrap();
         let policy = load_for_beads_dir(dir.path()).expect("load");
         let workflow = &policy.workflow;
@@ -2416,12 +2416,12 @@ workflow:
 
     #[test]
     fn detect_unknown_policy_fields_accepts_canonical_transitions() {
-        let yaml = r#"
+        let yaml = r"
 workflow:
   strict: true
   transitions:
     open: [in_progress]
-"#;
+";
         let raw: serde_yml::Value = serde_yml::from_str(yaml).unwrap();
         assert!(detect_unknown_policy_fields(&raw).is_empty());
     }
