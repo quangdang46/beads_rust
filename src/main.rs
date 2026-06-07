@@ -1210,6 +1210,9 @@ mod tests {
             dry_run: false,
             silent: false,
             file: None,
+            agent_name: None,
+            harness: None,
+            model: None,
         }
     }
 

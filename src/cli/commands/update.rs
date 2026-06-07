@@ -12,7 +12,7 @@ use crate::error::{BeadsError, Result};
 use crate::format::{format_status_label, format_type_label, sanitize_terminal_inline};
 use crate::model::{Issue, IssueType, Priority, Status};
 use crate::output::OutputContext;
-use crate::storage::{IssueUpdate, SqliteStorage};
+use crate::storage::{EventAttribution, IssueUpdate, SqliteStorage};
 use crate::util::id::{IdResolver, ResolverConfig};
 use crate::util::time::parse_flexible_timestamp;
 use crate::validation::LabelValidator;
@@ -143,6 +143,9 @@ struct PreparedUpdateRoute {
     valid_set_labels: Vec<String>,
     resolved_parent: ParentUpdatePlan,
     auto_flush_external: bool,
+    /// Tier 1 attribution (issue #312, Layer 3 capture-only) staged onto each
+    /// mutation's audit events. Recorded only — never gated or enforced on.
+    attribution: EventAttribution,
     _routed_write_lock: RoutedWorkspaceWriteLock,
 }
 
@@ -434,6 +437,11 @@ fn prepare_single_route(
         valid_set_labels,
         resolved_parent,
         auto_flush_external,
+        attribution: EventAttribution::new(
+            args.agent_name.as_deref(),
+            args.harness.as_deref(),
+            args.model.as_deref(),
+        ),
         _routed_write_lock: routed_write_lock,
     })
 }
@@ -468,6 +476,13 @@ fn execute_prepared_route(
         if !prepared.update.is_empty() {
             let mut issue_update = prepared.update.clone();
             issue_update.skip_cache_rebuild = defer_blocked_cache_rebuild;
+            // Stage Tier 1 attribution (issue #312, Layer 3 capture-only) so the
+            // update / status-change audit events record the self-reported agent
+            // identity. Recorded ONLY — never gates or alters the transition.
+            prepared
+                .storage_ctx
+                .storage
+                .set_pending_event_attribution(prepared.attribution.clone());
             let update_result = update_issue_with_recovery(
                 &mut prepared.storage_ctx,
                 !route_has_mutated,
@@ -1858,6 +1873,7 @@ mod tests {
             valid_set_labels: Vec::new(),
             resolved_parent: ParentUpdatePlan::Unchanged,
             auto_flush_external: false,
+            attribution: EventAttribution::default(),
             _routed_write_lock: RoutedWorkspaceWriteLock::local(),
         };
 

@@ -1370,7 +1370,13 @@ fn show_issue_json(storage: &SqliteStorage, id: &str) -> McpResult<Value> {
                             "actor": e.actor,
                             "old_value": e.old_value,
                             "new_value": e.new_value,
-                            "created_at": e.created_at
+                            "created_at": e.created_at,
+                            // Tier 1 attribution (issue #312, Layer 3
+                            // capture-only); null when not supplied. Recorded
+                            // only — never gated on.
+                            "agent_name": e.agent_name,
+                            "harness": e.harness,
+                            "model": e.model
                         })
                     })
                     .collect::<Vec<_>>()

@@ -5,7 +5,7 @@ use crate::error::{BeadsError, Result};
 use crate::format::{format_type_label, sanitize_terminal_inline};
 use crate::model::{Dependency, DependencyType, Issue, IssueType, Priority, Status};
 use crate::output::OutputContext;
-use crate::storage::SqliteStorage;
+use crate::storage::{EventAttribution, SqliteStorage};
 use crate::util::id::{IdGenerationInput, IdGenerator, IdResolver, ResolverConfig, child_id};
 use crate::util::markdown_import::{parse_dependency, parse_markdown_file};
 use crate::util::time::parse_flexible_timestamp;
@@ -484,6 +484,16 @@ pub fn create_issue_impl(
         if args.dry_run {
             return Ok(issue);
         }
+
+        // Stage Tier 1 attribution (issue #312, Layer 3 capture-only) so the
+        // creation audit event records the self-reported agent identity. This
+        // is recorded ONLY — it never gates or alters the create. Re-staged on
+        // every loop iteration because `mutate()` consumes it on each attempt.
+        storage.set_pending_event_attribution(EventAttribution::new(
+            args.agent_name.as_deref(),
+            args.harness.as_deref(),
+            args.model.as_deref(),
+        ));
 
         // 8. Create (atomic)
         match storage.create_issue(&issue, &config.actor) {
@@ -1040,6 +1050,13 @@ fn execute_import(
                 created = true;
                 break;
             }
+            // Stage Tier 1 attribution (issue #312, Layer 3 capture-only) for
+            // the bulk-import creation audit event. Recorded only; never gated.
+            storage.set_pending_event_attribution(EventAttribution::new(
+                args.agent_name.as_deref(),
+                args.harness.as_deref(),
+                args.model.as_deref(),
+            ));
             match storage.create_issue(&issue, &actor) {
                 Ok(()) => {
                     final_id = id;
@@ -1398,6 +1415,9 @@ mod tests {
             dry_run: false,
             silent: false,
             file: None,
+            agent_name: None,
+            harness: None,
+            model: None,
         }
     }
 

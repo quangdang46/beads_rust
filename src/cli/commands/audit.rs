@@ -108,6 +108,13 @@ struct AuditEventOutput {
     new_value: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     comment: Option<String>,
+    // Tier 1 attribution (issue #312, Layer 3 capture-only). Recorded only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    harness: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -324,6 +331,9 @@ fn map_event_to_output(event: &crate::model::Event) -> AuditEventOutput {
         old_value: event.old_value.clone(),
         new_value: event.new_value.clone(),
         comment: event.comment.clone(),
+        agent_name: event.agent_name.clone(),
+        harness: event.harness.clone(),
+        model: event.model.clone(),
     }
 }
 
@@ -933,6 +943,10 @@ fn render_audit_log_rich(issue_id: &str, events: &[crate::model::Event], ctx: &O
             );
         }
 
+        if let Some(attribution) = format_event_attribution(event) {
+            content.append_styled(&format!("   {attribution}\n"), theme.dimmed.clone());
+        }
+
         content.append("\n");
     }
 
@@ -975,7 +989,32 @@ fn render_audit_log_plain(issue_id: &str, events: &[crate::model::Event]) {
         if let Some(comment) = &event.comment {
             println!("   \"{}\"", sanitize_terminal_text(comment));
         }
+        if let Some(attribution) = format_event_attribution(event) {
+            println!("   {attribution}");
+        }
         println!();
+    }
+}
+
+/// Format the captured Tier 1 attribution (issue #312, Layer 3 capture-only)
+/// for display, e.g. `via agent=foo harness=bar model=baz`. Returns `None`
+/// when the event carries no attribution. Recorded/displayed only — never
+/// used for any gating decision.
+fn format_event_attribution(event: &crate::model::Event) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(agent) = &event.agent_name {
+        parts.push(format!("agent={}", sanitize_terminal_inline(agent)));
+    }
+    if let Some(harness) = &event.harness {
+        parts.push(format!("harness={}", sanitize_terminal_inline(harness)));
+    }
+    if let Some(model) = &event.model {
+        parts.push(format!("model={}", sanitize_terminal_inline(model)));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(format!("via {}", parts.join(" ")))
     }
 }
 

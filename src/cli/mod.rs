@@ -1084,6 +1084,21 @@ pub struct CreateArgs {
     /// Create issues from a markdown file (bulk import)
     #[arg(long, short = 'f')]
     pub file: Option<std::path::PathBuf>,
+
+    // Tier 1 attribution (issue #312, Layer 3 — capture-only). Recorded on the
+    // creation audit event as a trail; NEVER gated or enforced on. Match the
+    // flag/env names used by `br close`.
+    /// Tier 1 attribution: agent name (env: BR_AGENT_NAME). Recorded only.
+    #[arg(long, value_name = "NAME", env = "BR_AGENT_NAME")]
+    pub agent_name: Option<String>,
+
+    /// Tier 1 attribution: harness identifier (env: BR_HARNESS). Recorded only.
+    #[arg(long, value_name = "HARNESS", env = "BR_HARNESS")]
+    pub harness: Option<String>,
+
+    /// Tier 1 attribution: model identifier (env: BR_MODEL). Recorded only.
+    #[arg(long, value_name = "MODEL", env = "BR_MODEL")]
+    pub model: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -1228,6 +1243,21 @@ pub struct UpdateArgs {
     /// Set `closed_by_session` when closing
     #[arg(long)]
     pub session: Option<String>,
+
+    // Tier 1 attribution (issue #312, Layer 3 — capture-only). Recorded on the
+    // update/status-change audit event as a trail; NEVER gated or enforced on.
+    // Match the flag/env names used by `br close`.
+    /// Tier 1 attribution: agent name (env: BR_AGENT_NAME). Recorded only.
+    #[arg(long, value_name = "NAME", env = "BR_AGENT_NAME")]
+    pub agent_name: Option<String>,
+
+    /// Tier 1 attribution: harness identifier (env: BR_HARNESS). Recorded only.
+    #[arg(long, value_name = "HARNESS", env = "BR_HARNESS")]
+    pub harness: Option<String>,
+
+    /// Tier 1 attribution: model identifier (env: BR_MODEL). Recorded only.
+    #[arg(long, value_name = "MODEL", env = "BR_MODEL")]
+    pub model: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -2237,6 +2267,20 @@ pub struct DeferArgs {
     /// Machine-readable output (alias for --json)
     #[arg(long)]
     pub robot: bool,
+
+    // Tier 1 attribution (issue #312, Layer 3 — capture-only). Recorded on the
+    // defer status-change audit event; NEVER gated or enforced on.
+    /// Tier 1 attribution: agent name (env: BR_AGENT_NAME). Recorded only.
+    #[arg(long, value_name = "NAME", env = "BR_AGENT_NAME")]
+    pub agent_name: Option<String>,
+
+    /// Tier 1 attribution: harness identifier (env: BR_HARNESS). Recorded only.
+    #[arg(long, value_name = "HARNESS", env = "BR_HARNESS")]
+    pub harness: Option<String>,
+
+    /// Tier 1 attribution: model identifier (env: BR_MODEL). Recorded only.
+    #[arg(long, value_name = "MODEL", env = "BR_MODEL")]
+    pub model: Option<String>,
 }
 
 /// Arguments for the undefer command.
@@ -2249,6 +2293,20 @@ pub struct UndeferArgs {
     /// Machine-readable output (alias for --json)
     #[arg(long)]
     pub robot: bool,
+
+    // Tier 1 attribution (issue #312, Layer 3 — capture-only). Recorded on the
+    // undefer status-change audit event; NEVER gated or enforced on.
+    /// Tier 1 attribution: agent name (env: BR_AGENT_NAME). Recorded only.
+    #[arg(long, value_name = "NAME", env = "BR_AGENT_NAME")]
+    pub agent_name: Option<String>,
+
+    /// Tier 1 attribution: harness identifier (env: BR_HARNESS). Recorded only.
+    #[arg(long, value_name = "HARNESS", env = "BR_HARNESS")]
+    pub harness: Option<String>,
+
+    /// Tier 1 attribution: model identifier (env: BR_MODEL). Recorded only.
+    #[arg(long, value_name = "MODEL", env = "BR_MODEL")]
+    pub model: Option<String>,
 }
 
 /// Arguments for the ready command.
@@ -2467,6 +2525,20 @@ pub struct ReopenArgs {
     /// Machine-readable output (alias for --json)
     #[arg(long)]
     pub robot: bool,
+
+    // Tier 1 attribution (issue #312, Layer 3 — capture-only). Recorded on the
+    // reopen status-change audit event; NEVER gated or enforced on.
+    /// Tier 1 attribution: agent name (env: BR_AGENT_NAME). Recorded only.
+    #[arg(long, value_name = "NAME", env = "BR_AGENT_NAME")]
+    pub agent_name: Option<String>,
+
+    /// Tier 1 attribution: harness identifier (env: BR_HARNESS). Recorded only.
+    #[arg(long, value_name = "HARNESS", env = "BR_HARNESS")]
+    pub harness: Option<String>,
+
+    /// Tier 1 attribution: model identifier (env: BR_MODEL). Recorded only.
+    #[arg(long, value_name = "MODEL", env = "BR_MODEL")]
+    pub model: Option<String>,
 }
 
 /// Sort policy for ready command.

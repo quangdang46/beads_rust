@@ -906,6 +906,17 @@ pub struct Event {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
     pub created_at: DateTime<Utc>,
+    /// Tier 1 attribution: self-reported agent name (issue #312, Layer 3
+    /// capture-only). Recorded as an audit trail; never gated/enforced on.
+    /// `None` when the mutating command supplied no attribution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
+    /// Tier 1 attribution: self-reported harness identifier (capture-only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    /// Tier 1 attribution: self-reported model identifier (capture-only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 #[cfg(test)]
@@ -1875,6 +1886,9 @@ mod tests {
             new_value: Some("closed".to_string()),
             comment: None,
             created_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            agent_name: Some("agent-1".to_string()),
+            harness: Some("codex-cli".to_string()),
+            model: Some("opus-4".to_string()),
         };
 
         let json = serde_json::to_string(&event).unwrap();

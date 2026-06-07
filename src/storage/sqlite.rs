@@ -312,12 +312,61 @@ pub struct SqliteStorage {
     /// cleanup the files accumulate in `TMPDIR` (#299). `None` for persistent
     /// databases, which must never be deleted on drop.
     temp_db_path: Option<PathBuf>,
+    /// Tier 1 attribution to stamp onto the audit events of the NEXT mutation
+    /// (issue #312, Layer 3 capture-only). Set via
+    /// [`SqliteStorage::set_pending_event_attribution`] immediately before a
+    /// `create`/`update` call so the command layer can attach self-reported
+    /// agent identity without threading it through every storage signature.
+    /// Consumed (taken) by `mutate()` and cleared after each mutation, so it
+    /// never leaks into unrelated subsequent operations. Capture-only — never
+    /// used for gating.
+    pending_event_attribution: Option<EventAttribution>,
 }
 
 /// Context for a mutation operation, tracking side effects.
+/// Tier 1 attribution captured on status-mutating commands (issue #312,
+/// Layer 3 capture-only). Self-reported agent/harness/model identity that is
+/// recorded onto emitted audit events as a trail ONLY — it is never gated or
+/// enforced on. Empty/whitespace-only inputs are coerced to `None` so absent
+/// attribution never produces blank-string noise in the audit log.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EventAttribution {
+    pub agent_name: Option<String>,
+    pub harness: Option<String>,
+    pub model: Option<String>,
+}
+
+impl EventAttribution {
+    /// Build attribution from raw CLI/env inputs, normalizing empty or
+    /// whitespace-only values to `None`.
+    #[must_use]
+    pub fn new(agent_name: Option<&str>, harness: Option<&str>, model: Option<&str>) -> Self {
+        let norm = |v: Option<&str>| {
+            v.map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+        };
+        Self {
+            agent_name: norm(agent_name),
+            harness: norm(harness),
+            model: norm(model),
+        }
+    }
+
+    /// True when no attribution value was supplied.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.agent_name.is_none() && self.harness.is_none() && self.model.is_none()
+    }
+}
+
 pub struct MutationContext {
     pub op_name: String,
     pub actor: String,
+    /// Attribution stamped onto every event this context records (issue #312,
+    /// Layer 3 capture-only). Defaults to empty; set per-command before the
+    /// mutation runs. Capture-only — never used for gating.
+    pub attribution: EventAttribution,
     pub events: Vec<Event>,
     pub dirty_ids: HashSet<String>,
     pub invalidate_blocked_cache: bool,
@@ -542,6 +591,7 @@ impl MutationContext {
         Self {
             op_name: op_name.to_string(),
             actor: actor.to_string(),
+            attribution: EventAttribution::default(),
             events: Vec::new(),
             dirty_ids: HashSet::new(),
             invalidate_blocked_cache: false,
@@ -561,6 +611,9 @@ impl MutationContext {
             new_value: None,
             comment: details,
             created_at: Utc::now(),
+            agent_name: self.attribution.agent_name.clone(),
+            harness: self.attribution.harness.clone(),
+            model: self.attribution.model.clone(),
         });
     }
 
@@ -582,6 +635,9 @@ impl MutationContext {
             new_value,
             comment,
             created_at: Utc::now(),
+            agent_name: self.attribution.agent_name.clone(),
+            harness: self.attribution.harness.clone(),
+            model: self.attribution.model.clone(),
         });
     }
 
@@ -956,6 +1012,7 @@ impl SqliteStorage {
             conn,
             mutation_count: 0,
             temp_db_path: None,
+            pending_event_attribution: None,
         })
     }
 
@@ -974,6 +1031,7 @@ impl SqliteStorage {
             conn,
             mutation_count: 0,
             temp_db_path: None,
+            pending_event_attribution: None,
         }))
     }
 
@@ -1022,6 +1080,7 @@ impl SqliteStorage {
             conn,
             mutation_count: 0,
             temp_db_path: Some(path.to_path_buf()),
+            pending_event_attribution: None,
         })
     }
 
@@ -1918,6 +1977,20 @@ impl SqliteStorage {
             .collect())
     }
 
+    /// Stage Tier 1 attribution for the next mutation (issue #312, Layer 3
+    /// capture-only). The values are stamped onto every audit event produced by
+    /// the immediately following `create`/`update`/status-mutating call, then
+    /// cleared. Pass an empty [`EventAttribution`] (or never call this) to record
+    /// no attribution. This is a recorded audit trail only — it is never used to
+    /// gate, reject, or alter any transition.
+    pub fn set_pending_event_attribution(&mut self, attribution: EventAttribution) {
+        self.pending_event_attribution = if attribution.is_empty() {
+            None
+        } else {
+            Some(attribution)
+        };
+    }
+
     /// Execute a mutation with the 4-step transaction protocol.
     ///
     /// Retries on all transient BUSY errors (from BEGIN, DML, or COMMIT) with
@@ -1945,13 +2018,19 @@ impl SqliteStorage {
         // within the mutation closures.
         self.conn.execute("PRAGMA foreign_keys = OFF")?;
 
+        // Take any per-command attribution staged for this mutation. Consuming
+        // it here (rather than borrowing) guarantees it stamps exactly one
+        // mutation and never leaks into a later, unrelated operation.
+        let pending_attribution = self.pending_event_attribution.take().unwrap_or_default();
+
         let tx_result: Result<_> = self.with_write_transaction(|storage| {
             let mut ctx = MutationContext::new(op, actor);
+            ctx.attribution = pending_attribution.clone();
             let result = f(&storage.conn, &mut ctx)?;
 
             // Write events
             if !ctx.events.is_empty() {
-                let sql = "INSERT INTO events (issue_id, event_type, actor, old_value, new_value, comment, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)";
+                let sql = "INSERT INTO events (issue_id, event_type, actor, old_value, new_value, comment, created_at, agent_name, harness, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
                 for event in &ctx.events {
                     let params = vec![
                         SqliteValue::from(event.issue_id.as_str()),
@@ -1970,6 +2049,18 @@ impl SqliteStorage {
                             .as_deref()
                             .map_or(SqliteValue::Null, SqliteValue::from),
                         SqliteValue::from(event.created_at.to_rfc3339()),
+                        event
+                            .agent_name
+                            .as_deref()
+                            .map_or(SqliteValue::Null, SqliteValue::from),
+                        event
+                            .harness
+                            .as_deref()
+                            .map_or(SqliteValue::Null, SqliteValue::from),
+                        event
+                            .model
+                            .as_deref()
+                            .map_or(SqliteValue::Null, SqliteValue::from),
                     ];
                     storage.conn.execute_with_params(sql, &params)?;
                 }
@@ -20775,6 +20866,7 @@ mod tests {
             conn,
             mutation_count: 0,
             temp_db_path: None,
+            pending_event_attribution: None,
         };
         let timestamp = Utc.with_ymd_and_hms(2026, 3, 11, 0, 0, 0).unwrap();
         let stamp = timestamp.to_rfc3339();
@@ -22026,5 +22118,120 @@ mod tests {
             err_msg.contains("conn test error"),
             "should propagate body error, got: {err_msg}"
         );
+    }
+
+    // ========================================================================
+    // Issue #312, Layer 3 — attribution capture-only tests
+    // ========================================================================
+
+    #[test]
+    fn pending_attribution_is_stamped_onto_create_event() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 6, 7, 12, 0, 0).unwrap();
+        let issue = make_issue(
+            "bd-attr-1",
+            "Attributed create",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+
+        storage.set_pending_event_attribution(EventAttribution::new(
+            Some("agent-7"),
+            Some("codex-cli"),
+            Some("opus-4"),
+        ));
+        storage.create_issue(&issue, "tester").expect("create");
+
+        let events = storage.get_events("bd-attr-1", 0).expect("events");
+        let created = events
+            .iter()
+            .find(|e| e.event_type == EventType::Created)
+            .expect("created event present");
+        assert_eq!(created.agent_name.as_deref(), Some("agent-7"));
+        assert_eq!(created.harness.as_deref(), Some("codex-cli"));
+        assert_eq!(created.model.as_deref(), Some("opus-4"));
+    }
+
+    #[test]
+    fn pending_attribution_is_stamped_onto_update_status_change_without_blocking() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 6, 7, 12, 0, 0).unwrap();
+        let issue = make_issue(
+            "bd-attr-2",
+            "Attributed update",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        storage.create_issue(&issue, "tester").expect("create");
+
+        storage.set_pending_event_attribution(EventAttribution::new(
+            Some("agent-9"),
+            None,
+            Some("opus-4"),
+        ));
+        let update = IssueUpdate {
+            status: Some(Status::InProgress),
+            ..Default::default()
+        };
+        // The transition must NOT be gated/rejected by the attribution; it is a
+        // recorded audit trail only.
+        let updated = storage
+            .update_issue("bd-attr-2", &update, "tester")
+            .expect("status change should not be blocked by attribution");
+        assert_eq!(updated.status, Status::InProgress);
+
+        let events = storage.get_events("bd-attr-2", 0).expect("events");
+        let status_event = events
+            .iter()
+            .find(|e| e.event_type == EventType::StatusChanged)
+            .expect("status_changed event present");
+        assert_eq!(status_event.agent_name.as_deref(), Some("agent-9"));
+        assert!(status_event.harness.is_none());
+        assert_eq!(status_event.model.as_deref(), Some("opus-4"));
+    }
+
+    #[test]
+    fn absent_attribution_records_no_values_and_does_not_leak() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 6, 7, 12, 0, 0).unwrap();
+
+        // First create stages attribution...
+        storage.set_pending_event_attribution(EventAttribution::new(Some("agent-x"), None, None));
+        let first = make_issue("bd-attr-3", "First", Status::Open, 2, None, now, None);
+        storage
+            .create_issue(&first, "tester")
+            .expect("create first");
+
+        // ...the second create stages NONE, so it must record no attribution
+        // (the prior staging must not leak into this unrelated mutation).
+        let second = make_issue("bd-attr-4", "Second", Status::Open, 2, None, now, None);
+        storage
+            .create_issue(&second, "tester")
+            .expect("create second");
+
+        let second_events = storage.get_events("bd-attr-4", 0).expect("events");
+        let created = second_events
+            .iter()
+            .find(|e| e.event_type == EventType::Created)
+            .expect("created event present");
+        assert!(created.agent_name.is_none());
+        assert!(created.harness.is_none());
+        assert!(created.model.is_none());
+    }
+
+    #[test]
+    fn event_attribution_normalizes_blank_inputs_to_none() {
+        let attribution = EventAttribution::new(Some("  "), Some(""), Some("opus-4"));
+        assert!(attribution.agent_name.is_none());
+        assert!(attribution.harness.is_none());
+        assert_eq!(attribution.model.as_deref(), Some("opus-4"));
+        assert!(!attribution.is_empty());
+        assert!(EventAttribution::new(None, None, None).is_empty());
     }
 }

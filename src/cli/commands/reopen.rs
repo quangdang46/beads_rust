@@ -267,6 +267,15 @@ fn execute_route(
             ..Default::default()
         };
 
+        // Stage Tier 1 attribution (issue #312, Layer 3 capture-only) for the
+        // reopen status-change audit event. Recorded only — never gated.
+        storage_ctx
+            .storage
+            .set_pending_event_attribution(crate::storage::EventAttribution::new(
+                args.agent_name.as_deref(),
+                args.harness.as_deref(),
+                args.model.as_deref(),
+            ));
         let update_result = update_issue_with_recovery(
             &mut storage_ctx,
             !cache_dirty,
@@ -518,6 +527,7 @@ mod tests {
             ids: vec!["bd-reopen-deferred".to_string()],
             reason: None,
             robot: false,
+            ..Default::default()
         };
         let overrides = CliOverrides {
             db: Some(db_path.clone()),
@@ -575,6 +585,7 @@ mod tests {
             ids: vec!["bd-reopen-tombstone".to_string()],
             reason: None,
             robot: false,
+            ..Default::default()
         };
         let overrides = CliOverrides {
             db: Some(db_path.clone()),

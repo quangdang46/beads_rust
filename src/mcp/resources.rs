@@ -696,6 +696,11 @@ impl ResourceHandler for EventsResource {
                             "old_value": e.old_value,
                             "new_value": e.new_value,
                             "created_at": e.created_at,
+                            // Tier 1 attribution (issue #312, Layer 3
+                            // capture-only); null when not supplied.
+                            "agent_name": e.agent_name,
+                            "harness": e.harness,
+                            "model": e.model,
                         })
                     }).collect::<Vec<_>>(),
                 }))

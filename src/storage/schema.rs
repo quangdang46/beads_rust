@@ -8,7 +8,7 @@ use crate::error::{BeadsError, Result};
 use crate::model::{IssueType, Priority, Status};
 use crate::util::content_hash_from_parts;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 12;
+pub const CURRENT_SCHEMA_VERSION: i32 = 13;
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 
 /// The complete SQL schema for the beads database.
@@ -167,6 +167,15 @@ pub const SCHEMA_SQL: &str = r"
         new_value TEXT,
         comment TEXT,
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        -- Tier 1 attribution captured on status-mutating commands (issue #312,
+        -- Layer 3 capture-only). Self-reported agent/harness/model identity is
+        -- recorded as an audit trail ONLY — never gated/enforced on. All three
+        -- are nullable so events without attribution (the common case) and
+        -- older databases stay valid. Like `close_metadata` attribution these
+        -- columns are DB-only and are not part of the JSONL sync surface.
+        agent_name TEXT,
+        harness TEXT,
+        model TEXT,
         FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_events_issue ON events(issue_id);
@@ -719,6 +728,11 @@ const EVENT_COLUMNS: &[(&str, &str)] = &[
     ("new_value", "TEXT"),
     ("comment", "TEXT"),
     ("created_at", "DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP"),
+    // Tier 1 attribution audit columns (issue #312, Layer 3 capture-only).
+    // Nullable and additive: older databases gain them via ensure_columns().
+    ("agent_name", "TEXT"),
+    ("harness", "TEXT"),
+    ("model", "TEXT"),
 ];
 
 fn ensure_columns(conn: &Connection, table: &str, columns: &[(&str, &str)]) -> Result<()> {
@@ -1564,6 +1578,20 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
             CREATE INDEX IF NOT EXISTS idx_gate_results_issue ON gate_results(issue_id);
         ",
         )?;
+    }
+
+    // Migration v12 -> v13 (beads_rust#312, Layer 3 capture-only): add Tier 1
+    // attribution columns (`agent_name`, `harness`, `model`) to the `events`
+    // table so create/update/status-mutating commands can record self-reported
+    // agent identity as an audit trail. Pure additive, nullable columns — no
+    // existing rows change, no enforcement is performed, and the JSONL sync
+    // surface is unaffected (events are DB-only). Idempotent: ensure_columns
+    // skips columns that already exist, mirroring the v10/v11 ADD COLUMN guards.
+    if user_version < 13 && table_exists(conn, "events") {
+        tracing::info!(
+            "Migrating database to schema version 13 (events attribution columns - beads_rust#312)"
+        );
+        ensure_columns(conn, "events", EVENT_COLUMNS)?;
     }
 
     // Migration: Add missing indexes for bd parity

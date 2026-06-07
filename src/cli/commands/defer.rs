@@ -282,6 +282,15 @@ fn execute_defer_route(
             ..Default::default()
         };
 
+        // Stage Tier 1 attribution (issue #312, Layer 3 capture-only) for the
+        // defer status-change audit event. Recorded only — never gated.
+        storage_ctx
+            .storage
+            .set_pending_event_attribution(crate::storage::EventAttribution::new(
+                args.agent_name.as_deref(),
+                args.harness.as_deref(),
+                args.model.as_deref(),
+            ));
         let update_result = update_issue_with_recovery(
             &mut storage_ctx,
             !cache_dirty,
@@ -536,6 +545,15 @@ fn execute_undefer_route(
             ..Default::default()
         };
 
+        // Stage Tier 1 attribution (issue #312, Layer 3 capture-only) for the
+        // undefer status-change audit event. Recorded only — never gated.
+        storage_ctx
+            .storage
+            .set_pending_event_attribution(crate::storage::EventAttribution::new(
+                args.agent_name.as_deref(),
+                args.harness.as_deref(),
+                args.model.as_deref(),
+            ));
         let update_result = update_issue_with_recovery(
             &mut storage_ctx,
             !cache_dirty,
@@ -1115,6 +1133,7 @@ mod tests {
             ids: vec![issue_id.clone()],
             until: Some("+1d".to_string()),
             robot: true,
+            ..Default::default()
         };
         execute_defer(&args, true, &cli, &ctx).expect("defer");
 
@@ -1152,6 +1171,7 @@ mod tests {
             ids: vec![issue_id.clone()],
             until: None,
             robot: true,
+            ..Default::default()
         };
         execute_defer(&args, true, &cli, &ctx).expect("defer");
 
@@ -1194,12 +1214,14 @@ mod tests {
             ids: vec![issue_id.clone()],
             until: Some("+1d".to_string()),
             robot: true,
+            ..Default::default()
         };
         execute_defer(&defer_args, true, &cli, &ctx).expect("defer");
 
         let undefer_args = UndeferArgs {
             ids: vec![issue_id.clone()],
             robot: true,
+            ..Default::default()
         };
         execute_undefer(&undefer_args, true, &cli, &ctx).expect("undefer");
 
@@ -1239,6 +1261,7 @@ mod tests {
         let undefer_args = UndeferArgs {
             ids: vec![issue_id.clone()],
             robot: true,
+            ..Default::default()
         };
         execute_undefer(&undefer_args, true, &cli, &ctx).expect("undefer");
 
@@ -1277,6 +1300,7 @@ mod tests {
         let undefer_args = UndeferArgs {
             ids: vec![issue_id.clone()],
             robot: true,
+            ..Default::default()
         };
         execute_undefer(&undefer_args, true, &cli, &ctx)?;
 
