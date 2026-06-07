@@ -799,6 +799,12 @@ pub enum Commands {
         command: EpicCommands,
     },
 
+    /// Workflow gate engine: record and inspect gate results (issue #312)
+    Gate {
+        #[command(subcommand)]
+        command: GateCommands,
+    },
+
     /// Visualize dependency graph
     Graph(GraphArgs),
 
@@ -1506,6 +1512,10 @@ pub const fn command_requests_robot_json(cmd: &Commands) -> bool {
         Commands::Orphans(args) => args.robot,
         Commands::Changelog(args) => args.robot,
         Commands::Sync(args) => args.robot,
+        Commands::Gate { command } => match command {
+            GateCommands::Report(args) => args.robot,
+            GateCommands::List(args) => args.robot,
+        },
         _ => false,
     }
 }
@@ -1765,6 +1775,64 @@ pub struct EpicCloseEligibleArgs {
     /// Preview only, no changes
     #[arg(long)]
     pub dry_run: bool,
+}
+
+/// Subcommands for the workflow gate engine (issue #312, layer 2).
+#[derive(Subcommand, Debug)]
+pub enum GateCommands {
+    /// Record a gate result for an issue (external systems / reviewers report here)
+    Report(GateReportArgs),
+    /// List recorded gate results and required-gate status for an issue
+    List(GateListArgs),
+}
+
+/// Status reported for a gate result.
+#[derive(ValueEnum, Debug, Clone, Copy, Eq, PartialEq)]
+pub enum GateStatus {
+    /// The gate passed.
+    Pass,
+    /// The gate failed.
+    Fail,
+}
+
+/// Arguments for `br gate report`.
+#[derive(Args, Debug, Clone)]
+pub struct GateReportArgs {
+    /// Issue ID to record the gate result against
+    #[arg(add = ArgValueCompleter::new(issue_id_completer))]
+    pub id: String,
+
+    /// Gate name (e.g. ci_green, security_sign_off, min_reviewers)
+    #[arg(long)]
+    pub gate: String,
+
+    /// Reporting provider (e.g. ci, security, reviewer:alice)
+    #[arg(long)]
+    pub provider: String,
+
+    /// Result status: pass or fail
+    #[arg(long, value_enum)]
+    pub status: GateStatus,
+
+    /// Optional free-form note recorded with the result
+    #[arg(long)]
+    pub note: Option<String>,
+
+    /// Emit machine-readable JSON
+    #[arg(long)]
+    pub robot: bool,
+}
+
+/// Arguments for `br gate list`.
+#[derive(Args, Debug, Clone)]
+pub struct GateListArgs {
+    /// Issue ID whose gate results to show
+    #[arg(add = ArgValueCompleter::new(issue_id_completer))]
+    pub id: String,
+
+    /// Emit machine-readable JSON
+    #[arg(long)]
+    pub robot: bool,
 }
 
 #[derive(Args, Debug, Default)]

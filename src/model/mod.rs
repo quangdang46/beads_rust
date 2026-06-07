@@ -28,6 +28,30 @@ where
     serializer.serialize_i32(value.unwrap_or(0))
 }
 
+/// Deserialize an optional metadata string, coercing a degenerate empty (or
+/// whitespace-only) string to `None`.
+///
+/// Legacy JSONL written by older `br`/`bd` versions serialized absent
+/// dependency metadata as `"metadata":""` rather than omitting the field or
+/// writing `"{}"`. The empty string is not valid JSON, so downstream consumers
+/// that parse `metadata` as JSON (e.g. the JSONL → SQLite rebuild/import path)
+/// would reject such records with an opaque `EOF while parsing` error.
+///
+/// Treating `""` as absent is lossless: a present-but-empty metadata field
+/// carries no information, and the import path already materializes `None` as
+/// the empty JSON object `"{}"`. Genuine metadata (any non-blank string) is
+/// preserved verbatim so real data is never discarded.
+fn deserialize_optional_metadata<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(s) if s.trim().is_empty() => None,
+        other => other,
+    })
+}
+
 /// Issue lifecycle status.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Default, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -841,7 +865,15 @@ pub struct Dependency {
     pub created_by: Option<String>,
 
     /// Optional metadata (JSON).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// A degenerate empty (or whitespace-only) string is coerced to `None` on
+    /// deserialization to tolerate legacy JSONL that wrote `"metadata":""`
+    /// instead of omitting the field. See [`deserialize_optional_metadata`].
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_metadata",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub metadata: Option<String>,
 
     /// Thread ID for conversation linking.
@@ -1783,6 +1815,49 @@ mod tests {
         let json = r#"{"issue_id":"bd-1","depends_on_id":"bd-2","type":"blocks","created_at":"2026-01-01T00:00:00Z"}"#;
         let dep: Dependency = serde_json::from_str(json).unwrap();
         assert_eq!(dep.dep_type, DependencyType::Blocks);
+    }
+
+    #[test]
+    fn dependency_empty_string_metadata_coerced_to_none() {
+        // Regression for issue #323: legacy JSONL serialized absent dependency
+        // metadata as `"metadata":""`, which is not valid JSON. Deserialization
+        // must tolerate it by coercing the degenerate empty string to `None`
+        // (lossless: the import path materializes `None` as `"{}"`).
+        let json = r#"{
+            "issue_id": "example-1",
+            "depends_on_id": "example-0",
+            "type": "blocks",
+            "created_at": "2026-01-01T00:00:00Z",
+            "created_by": "user",
+            "metadata": "",
+            "thread_id": ""
+        }"#;
+        let dep: Dependency = serde_json::from_str(json).expect("empty metadata must deserialize");
+        assert_eq!(
+            dep.metadata, None,
+            "empty-string metadata should become None"
+        );
+        // thread_id intentionally has no coercion: only `metadata` is parsed as
+        // JSON downstream, so only it needs the empty-string tolerance.
+    }
+
+    #[test]
+    fn dependency_whitespace_metadata_coerced_to_none() {
+        let json = r#"{"issue_id":"a","depends_on_id":"b","type":"blocks","created_at":"2026-01-01T00:00:00Z","metadata":"   "}"#;
+        let dep: Dependency = serde_json::from_str(json).unwrap();
+        assert_eq!(dep.metadata, None);
+    }
+
+    #[test]
+    fn dependency_real_metadata_preserved() {
+        // Genuine JSON metadata must round-trip unchanged (no data loss).
+        let json = r#"{"issue_id":"a","depends_on_id":"b","type":"blocks","created_at":"2026-01-01T00:00:00Z","metadata":"{\"k\":\"v\"}"}"#;
+        let dep: Dependency = serde_json::from_str(json).unwrap();
+        assert_eq!(dep.metadata.as_deref(), Some(r#"{"k":"v"}"#));
+        // And it survives a serialize round-trip.
+        let reser = serde_json::to_string(&dep).unwrap();
+        let dep2: Dependency = serde_json::from_str(&reser).unwrap();
+        assert_eq!(dep, dep2);
     }
 
     // ========================================================================

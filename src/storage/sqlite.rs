@@ -1840,6 +1840,84 @@ impl SqliteStorage {
         }))
     }
 
+    /// Record a workflow gate result (issue #312, layer 2 / beads_rust#319).
+    ///
+    /// Upserts one row per `(issue_id, gate, provider)`: a provider's
+    /// most-recent verdict for a named gate on an issue. A re-report from the
+    /// same provider for the same gate overwrites the prior verdict, so the
+    /// table always reflects the currently-effective gate state.
+    ///
+    /// Gate results are auxiliary, project-local metadata: like
+    /// `close_metadata`, they are not part of the JSONL sync surface (the
+    /// audit trail is the DB), so this writes directly rather than going
+    /// through the dirty-issue export path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database write fails.
+    pub fn record_gate_result(
+        &self,
+        issue_id: &str,
+        gate: &str,
+        provider: &str,
+        passed: bool,
+        note: Option<&str>,
+        recorded_by: &str,
+    ) -> Result<()> {
+        self.conn.execute_with_params(
+            "INSERT OR REPLACE INTO gate_results (
+                issue_id, gate, provider, passed, note, recorded_by, recorded_at
+            ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+            &[
+                SqliteValue::from(issue_id),
+                SqliteValue::from(gate),
+                SqliteValue::from(provider),
+                SqliteValue::from(i64::from(passed)),
+                note.map_or(SqliteValue::Null, SqliteValue::from),
+                SqliteValue::from(recorded_by),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Read every recorded gate result for `issue_id`, ordered by gate then
+    /// provider for deterministic output. Returns an empty vec when the
+    /// `gate_results` table is absent (e.g. a database that predates the v12
+    /// migration and has not been reopened) or no results exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_gate_results(&self, issue_id: &str) -> Result<Vec<crate::close_policy::GateResult>> {
+        if !crate::storage::schema::table_exists(&self.conn, "gate_results") {
+            return Ok(Vec::new());
+        }
+        let rows = self.conn.query_with_params(
+            "SELECT gate, provider, passed, note FROM gate_results \
+             WHERE issue_id = ? ORDER BY gate, provider",
+            &[SqliteValue::from(issue_id)],
+        )?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| {
+                let gate = row.get(0).and_then(SqliteValue::as_text)?.to_string();
+                let provider = row.get(1).and_then(SqliteValue::as_text)?.to_string();
+                let passed = row
+                    .get(2)
+                    .and_then(SqliteValue::as_integer)
+                    .unwrap_or_default()
+                    != 0;
+                let note = row.get(3).and_then(SqliteValue::as_text).map(String::from);
+                Some(crate::close_policy::GateResult {
+                    gate,
+                    provider,
+                    passed,
+                    note,
+                })
+            })
+            .collect())
+    }
+
     /// Execute a mutation with the 4-step transaction protocol.
     ///
     /// Retries on all transient BUSY errors (from BEGIN, DML, or COMMIT) with
@@ -6826,16 +6904,23 @@ impl SqliteStorage {
             });
         }
 
-        let metadata = if let Some(metadata) = metadata {
-            serde_json::from_str::<serde_json::Value>(metadata).map_err(|err| {
-                BeadsError::Validation {
-                    field: "metadata".to_string(),
-                    reason: format!("dependency metadata must be valid JSON: {err}"),
-                }
-            })?;
-            metadata
-        } else {
-            "{}"
+        // Tolerate a degenerate empty/whitespace-only metadata string the same
+        // way JSONL deserialization does: treat it as absent rather than
+        // rejecting it as invalid JSON.
+        let metadata = match metadata {
+            Some(metadata) if !metadata.trim().is_empty() => {
+                serde_json::from_str::<serde_json::Value>(metadata).map_err(|err| {
+                    BeadsError::Validation {
+                        field: "metadata".to_string(),
+                        reason: format!(
+                            "dependency metadata must be valid JSON for {issue_id} -> \
+                             {depends_on_id} (type={dep_type}); found {metadata:?}: {err}"
+                        ),
+                    }
+                })?;
+                metadata
+            }
+            _ => "{}",
         };
 
         let dep_type = Self::canonical_standard_dependency_type(dep_type).unwrap_or(dep_type);
@@ -11648,7 +11733,7 @@ impl SqliteStorage {
     ) -> Result<Vec<&'a Dependency>> {
         let mut seen_deps = HashSet::new();
         let mut unique_deps = Vec::new();
-        for dep in dependencies {
+        for (dep_index, dep) in dependencies.iter().enumerate() {
             if dep.issue_id != issue_id {
                 return Err(BeadsError::validation(
                     "dependency.issue_id",
@@ -11666,8 +11751,23 @@ impl SqliteStorage {
             if let Some(metadata) = dep.metadata.as_deref() {
                 serde_json::from_str::<serde_json::Value>(metadata).map_err(|err| {
                     BeadsError::Validation {
-                        field: "metadata".to_string(),
-                        reason: format!("dependency metadata must be valid JSON: {err}"),
+                        field: format!("dependencies[{dep_index}].metadata"),
+                        reason: format!(
+                            "dependency metadata must be valid JSON for issue {issue_id} -> \
+                             {target} (type={dep_type}); found {value}: {err}{hint}",
+                            target = dep.depends_on_id,
+                            dep_type = dep.dep_type.as_str(),
+                            value = if metadata.is_empty() {
+                                "empty string".to_string()
+                            } else {
+                                format!("{metadata:?}")
+                            },
+                            hint = if metadata.trim().is_empty() {
+                                " (suggested fix: replace \"\" with \"{}\")"
+                            } else {
+                                ""
+                            },
+                        ),
                     }
                 })?;
             }
@@ -14127,7 +14227,16 @@ mod tests {
         let err = storage
             .sync_dependencies_for_import(&issue.id, &[invalid_metadata])
             .expect_err("invalid dependency metadata must fail before deleting old dependencies");
-        assert!(matches!(err, BeadsError::Validation { field, .. } if field == "metadata"));
+        assert!(
+            matches!(&err, BeadsError::Validation { field, .. } if field == "dependencies[0].metadata"),
+            "metadata validation error must name the offending dependency field: {err:?}"
+        );
+        // #323: the error must be actionable — naming the issue and target.
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&issue.id) && msg.contains(&stable_parent.id),
+            "metadata error must name issue and target: {msg}"
+        );
         assert_stable_dependency_unchanged(&storage, &issue.id, &stable_parent.id);
 
         let invalid_parent = crate::model::Dependency {
@@ -14907,6 +15016,46 @@ mod tests {
             deps[0].metadata.as_deref(),
             Some(r#"{"source":"cli","reason":"gate"}"#)
         );
+    }
+
+    #[test]
+    fn test_import_dependency_with_legacy_empty_metadata_rebuilds() {
+        // Regression for issue #323: legacy JSONL with `"metadata":""` (an
+        // empty string that is not valid JSON) must rebuild cleanly through the
+        // JSONL deserialize -> SQLite import path, materializing as the empty
+        // JSON object `"{}"` with no data loss.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 2, 0, 0, 0).unwrap();
+
+        let issue_a = make_issue("bd-a1", "A", Status::Open, 2, None, t1, None);
+        let issue_b = make_issue("bd-b1", "B", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue_a, "tester").unwrap();
+        storage.create_issue(&issue_b, "tester").unwrap();
+
+        // Deserialize exactly as a JSONL rebuild would (not constructing the
+        // Dependency directly) so the empty-string coercion is exercised.
+        let dep_json = r#"{
+            "issue_id": "bd-a1",
+            "depends_on_id": "bd-b1",
+            "type": "blocks",
+            "created_at": "2026-01-01T00:00:00Z",
+            "created_by": "import",
+            "metadata": "",
+            "thread_id": ""
+        }"#;
+        let dep: crate::model::Dependency =
+            serde_json::from_str(dep_json).expect("legacy empty metadata must deserialize");
+        assert_eq!(dep.metadata, None, "empty metadata must coerce to None");
+
+        storage
+            .sync_dependencies_for_import("bd-a1", &[dep])
+            .expect("rebuild with legacy empty metadata must succeed");
+
+        let deps = storage.get_dependencies_full("bd-a1").unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].depends_on_id, "bd-b1");
+        // None is materialized as "{}" on insert.
+        assert_eq!(deps[0].metadata.as_deref(), Some("{}"));
     }
 
     #[test]

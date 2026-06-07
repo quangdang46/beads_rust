@@ -371,6 +371,7 @@ fn main() {
                 commands::epic::execute(&command, cli.json, &overrides, &output_ctx)
             }
         }
+        Commands::Gate { command } => commands::gate::execute(&command, &overrides, &output_ctx),
         Commands::Label { command } => {
             if let Some(res) = storage_result.as_ref() {
                 match commands::label::execute_with_storage(
@@ -927,6 +928,7 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Dep { .. }
         | Commands::Label { .. }
         | Commands::Epic { .. }
+        | Commands::Gate { .. }
         | Commands::Query { .. } => true,
 
         Commands::Init { .. }

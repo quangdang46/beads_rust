@@ -34,6 +34,7 @@ Comprehensive reference for all `br` (beads_rust) commands.
   - [defer / undefer](#defer--undefer)
   - [orphans](#orphans)
   - [query (saved queries)](#query-saved-queries)
+  - [gate](#gate)
 - [Sync & Config](#sync--config)
   - [sync](#sync)
   - [config](#config)
@@ -924,6 +925,63 @@ br query <COMMAND>
 
 `query save` and `query run` use the same filter flags as `br list`; there is
 no free-form query string argument.
+
+---
+
+### gate
+
+Record and inspect workflow gate results (issue #312, layer 2). Gates are
+conditions a project can require before a status transition is allowed, defined
+in `.beads/policy.yaml` under `workflow.gates` as a map of `"from -> to"`
+transitions to required gate conditions. Enforcement happens at the
+close/transition chokepoint: a move into a gated state is rejected until every
+required gate passes. Gate results are project-local metadata and are not synced
+through JSONL.
+
+```bash
+br gate report <ID> --gate <NAME> --provider <NAME> --status pass|fail [OPTIONS]
+br gate list <ID> [OPTIONS]
+```
+
+**Subcommands:**
+| Command | Description |
+|---------|-------------|
+| `report <ID> --gate <NAME> --provider <NAME> --status pass\|fail` | Record a gate result (external systems / reviewers report here) |
+| `list <ID>` | List recorded gate results and the computed required-gate status for the issue's next transitions |
+
+**`report` options:**
+| Option | Description |
+|--------|-------------|
+| `--gate <NAME>` | Gate name (e.g. `ci_green`, `security_sign_off`, `min_reviewers`) |
+| `--provider <NAME>` | Reporting provider (e.g. `ci`, `security`, `reviewer:alice`) |
+| `--status <pass\|fail>` | Result status |
+| `--note <TEXT>` | Optional free-form note recorded with the result |
+| `--robot` | Machine-readable JSON output |
+
+**`list` options:**
+| Option | Description |
+|--------|-------------|
+| `--robot` | Machine-readable JSON output |
+
+A re-report from the same provider for the same gate overwrites the prior
+verdict. The built-in `min_reviewers` gate is satisfied by at least N distinct
+reviewer providers (provider name `reviewer`, or namespaced `reviewer:<who>` /
+`reviewer-<who>`) reporting `pass`. Example policy:
+
+```yaml
+workflow:
+  strict: true
+  gates:
+    "in_review -> closed":
+      require_all:
+        - ci_green
+        - min_reviewers: 1
+      require_if:
+        - label: security-sensitive
+          gate: security_sign_off
+        - priority: [0, 1]
+          gate: security_sign_off
+```
 
 ---
 

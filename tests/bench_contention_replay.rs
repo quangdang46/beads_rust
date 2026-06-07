@@ -661,9 +661,9 @@ fn doctor_reports_no_errors(run: &CommandRun) -> bool {
     let Some(checks) = value.get("checks").and_then(serde_json::Value::as_array) else {
         return run.exit_code == 0;
     };
-    checks.iter().all(|check| {
-        check.get("status").and_then(serde_json::Value::as_str) != Some("error")
-    })
+    checks
+        .iter()
+        .all(|check| check.get("status").and_then(serde_json::Value::as_str) != Some("error"))
 }
 
 fn create_title_from_command(command: &[String]) -> Option<&str> {

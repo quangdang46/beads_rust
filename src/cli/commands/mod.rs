@@ -28,6 +28,7 @@ pub mod dep;
 pub mod doctor;
 pub mod doctor_subsystems;
 pub mod epic;
+pub mod gate;
 pub mod graph;
 pub mod history;
 pub mod info;

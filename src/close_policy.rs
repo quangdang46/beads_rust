@@ -181,6 +181,365 @@ pub struct Workflow {
     /// compatible).
     #[serde(default)]
     pub transitions: std::collections::BTreeMap<String, Vec<String>>,
+    /// Per-transition gate rules (issue #312, layer 2). A map of
+    /// `"from -> to"` (the transition the gates guard) to the set of gate
+    /// conditions required before that move is allowed.
+    ///
+    /// ```yaml
+    /// workflow:
+    ///   gates:
+    ///     "in_review -> closed":
+    ///       require_all:
+    ///         - ci_green
+    ///         - min_reviewers: 1
+    ///       require_if:
+    ///         - label: security-sensitive
+    ///           gate: security_sign_off
+    ///         - priority: [0, 1]
+    ///           gate: security_sign_off
+    /// ```
+    ///
+    /// The transition key is parsed leniently: `from`/`to` are split on the
+    /// first `->` (surrounding whitespace ignored), matched case-insensitively
+    /// against the actual `from`/`to` of a status change. An empty map (the
+    /// default) disables gate enforcement entirely — projects with no `gates:`
+    /// block behave exactly as before layer 2.
+    #[serde(default)]
+    pub gates: std::collections::BTreeMap<String, GateRule>,
+}
+
+/// The set of gate conditions guarding a single `"from -> to"` transition.
+///
+/// All `require_all` gates must pass unconditionally. Each `require_if` entry
+/// adds its `gate` to the required set only when its condition (a `label` or a
+/// `priority`) matches the issue being moved. The two lists compose: a gate
+/// can be listed in both, and a conditional gate that does not match simply
+/// drops out of the required set for that issue.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GateRule {
+    /// Gates required unconditionally for this transition.
+    #[serde(default)]
+    pub require_all: Vec<GateSpec>,
+    /// Gates required only when their condition matches the issue.
+    #[serde(default)]
+    pub require_if: Vec<ConditionalGate>,
+}
+
+/// A single gate condition. Two shapes are accepted in YAML, mirroring the
+/// issue spec:
+///
+/// - A bare string naming an external/internal provider gate
+///   (`ci_green`, `security_sign_off`, ...): `- ci_green`.
+/// - A single-key mapping `{ min_reviewers: N }` for the built-in
+///   reviewer-count gate: `- min_reviewers: 1`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateSpec {
+    /// A named gate satisfied by a recorded `pass` result from a provider of
+    /// the same name (`br gate report <id> --provider <name> --status pass`).
+    Named(String),
+    /// The built-in `min_reviewers` gate: at least `n` distinct reviewers must
+    /// have reported `pass` (provider name `reviewer`, or any provider whose
+    /// name starts with `reviewer`).
+    MinReviewers(u32),
+}
+
+impl GateSpec {
+    /// Stable identifier for this gate, used as the required-gate key and in
+    /// `report`/`list` output. `min_reviewers` collapses to the canonical
+    /// `min_reviewers` name regardless of `n`.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Named(name) => name.as_str(),
+            Self::MinReviewers(_) => GATE_MIN_REVIEWERS,
+        }
+    }
+}
+
+impl Serialize for GateSpec {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            Self::Named(name) => serializer.serialize_str(name),
+            Self::MinReviewers(n) => {
+                use serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry(GATE_MIN_REVIEWERS, n)?;
+                map.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for GateSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Named(String),
+            Map(std::collections::BTreeMap<String, serde_yml::Value>),
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Named(name) => Ok(Self::Named(name)),
+            Raw::Map(map) => {
+                if let Some(value) = map.get(GATE_MIN_REVIEWERS) {
+                    let n = value.as_u64().ok_or_else(|| {
+                        serde::de::Error::custom("min_reviewers must be a non-negative integer")
+                    })?;
+                    let n = u32::try_from(n)
+                        .map_err(|_| serde::de::Error::custom("min_reviewers is too large"))?;
+                    Ok(Self::MinReviewers(n))
+                } else if let Some((key, _)) = map.iter().next() {
+                    Err(serde::de::Error::custom(format!(
+                        "unknown gate spec key '{key}' (expected a bare gate name or `min_reviewers: N`)"
+                    )))
+                } else {
+                    Err(serde::de::Error::custom(
+                        "empty gate spec (expected a bare gate name or `min_reviewers: N`)",
+                    ))
+                }
+            }
+        }
+    }
+}
+
+/// A conditionally-required gate. The condition (`label` and/or `priority`)
+/// is matched against the issue being transitioned; when it matches, `gate`
+/// is added to the required set.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConditionalGate {
+    /// Required label (case-insensitive). When set, the issue must carry this
+    /// label for the condition to match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Required priorities. When non-empty, the issue's priority must be one
+    /// of these for the condition to match.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub priority: Vec<i32>,
+    /// The gate to require when the condition matches. May be a named gate or
+    /// the built-in `min_reviewers` form via `allowed_*`/`min_reviewers`.
+    #[serde(default)]
+    pub gate: GateSpec,
+}
+
+impl Default for GateSpec {
+    fn default() -> Self {
+        Self::Named(String::new())
+    }
+}
+
+/// Canonical name of the built-in reviewer-count gate.
+pub const GATE_MIN_REVIEWERS: &str = "min_reviewers";
+/// Provider-name prefix recognised as a reviewer for the `min_reviewers` gate.
+pub const REVIEWER_PROVIDER_PREFIX: &str = "reviewer";
+
+/// A single recorded gate result for an issue (one provider's verdict).
+///
+/// `passed` is the effective verdict. `provider` is the reporting system /
+/// person (`ci`, `security`, `reviewer:alice`, ...). Stored per
+/// `(issue_id, gate, provider)`; a re-report from the same provider for the
+/// same gate overwrites the prior verdict.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateResult {
+    pub gate: String,
+    pub provider: String,
+    pub passed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+impl Workflow {
+    /// True when gate enforcement is configured: `strict` is on *and* at least
+    /// one `"from -> to"` gate rule is listed. Enforcement short-circuits on
+    /// `false`, so projects with no `gates:` block are unaffected.
+    #[must_use]
+    pub fn gates_enforced(&self) -> bool {
+        self.strict && !self.gates.is_empty()
+    }
+
+    /// Look up the gate rule guarding the `from -> to` transition, matching the
+    /// transition key case-insensitively. Returns `None` when no rule guards
+    /// this move.
+    #[must_use]
+    pub fn gate_rule_for(&self, from: &str, to: &str) -> Option<&GateRule> {
+        self.gates.iter().find_map(|(key, rule)| {
+            parse_transition_key(key).filter(|(rule_from, rule_to)| {
+                rule_from.eq_ignore_ascii_case(from) && rule_to.eq_ignore_ascii_case(to)
+            })?;
+            Some(rule)
+        })
+    }
+
+    /// Compute the set of gates required to move `from -> to` for an issue with
+    /// the given `labels` and `priority`. Combines `require_all` (always) with
+    /// any matching `require_if` entries. Returns an empty vec when no rule
+    /// guards the transition. De-duplicated by gate id, preserving source
+    /// order (require_all first, then require_if).
+    #[must_use]
+    pub fn required_gates_for(
+        &self,
+        from: &str,
+        to: &str,
+        labels: &[String],
+        priority: i32,
+    ) -> Vec<GateSpec> {
+        let Some(rule) = self.gate_rule_for(from, to) else {
+            return Vec::new();
+        };
+        let mut out: Vec<GateSpec> = Vec::new();
+        let push_unique = |spec: &GateSpec, out: &mut Vec<GateSpec>| {
+            if !out
+                .iter()
+                .any(|seen| seen.id().eq_ignore_ascii_case(spec.id()))
+            {
+                out.push(spec.clone());
+            }
+        };
+        for spec in &rule.require_all {
+            push_unique(spec, &mut out);
+        }
+        for conditional in &rule.require_if {
+            if conditional_matches(conditional, labels, priority) {
+                push_unique(&conditional.gate, &mut out);
+            }
+        }
+        out
+    }
+}
+
+/// Parse a `"from -> to"` transition key into its two sides, trimming
+/// whitespace. Returns `None` when the key has no `->` separator or either
+/// side is empty.
+fn parse_transition_key(key: &str) -> Option<(&str, &str)> {
+    let (from, to) = key.split_once("->")?;
+    let from = from.trim();
+    let to = to.trim();
+    if from.is_empty() || to.is_empty() {
+        return None;
+    }
+    Some((from, to))
+}
+
+/// True when a conditional gate's condition matches the issue. An empty
+/// condition (no `label`, no `priority`) always matches. When both are set,
+/// both must match (logical AND).
+fn conditional_matches(conditional: &ConditionalGate, labels: &[String], priority: i32) -> bool {
+    if let Some(required_label) = conditional.label.as_deref()
+        && !labels
+            .iter()
+            .any(|label| label.eq_ignore_ascii_case(required_label))
+    {
+        return false;
+    }
+    if !conditional.priority.is_empty() && !conditional.priority.contains(&priority) {
+        return false;
+    }
+    true
+}
+
+/// Evaluate the configured gates for a `from -> to` transition against the
+/// recorded gate results, returning a [`PolicyViolation`] per unsatisfied gate
+/// (empty when every required gate passes or no rule guards the move).
+///
+/// A `Named` gate is satisfied by at least one recorded `pass` from a provider
+/// of the same name. `MinReviewers(n)` is satisfied by at least `n` distinct
+/// reviewer providers (provider == `reviewer` or starting with `reviewer`)
+/// that recorded `pass`.
+#[must_use]
+pub fn evaluate_gates(
+    workflow: &Workflow,
+    issue_id: &str,
+    from: &str,
+    to: &str,
+    labels: &[String],
+    priority: i32,
+    results: &[GateResult],
+) -> Vec<PolicyViolation> {
+    let required = workflow.required_gates_for(from, to, labels, priority);
+    let mut violations = Vec::new();
+    for spec in &required {
+        match spec {
+            GateSpec::Named(name) => {
+                let passed = results
+                    .iter()
+                    .any(|r| r.gate.eq_ignore_ascii_case(name) && r.passed);
+                if !passed {
+                    let failing: Vec<&str> = results
+                        .iter()
+                        .filter(|r| r.gate.eq_ignore_ascii_case(name) && !r.passed)
+                        .map(|r| r.provider.as_str())
+                        .collect();
+                    let detail_note = if failing.is_empty() {
+                        "no provider has reported a pass".to_string()
+                    } else {
+                        format!("failing provider(s): {}", failing.join(", "))
+                    };
+                    violations.push(PolicyViolation {
+                        gate: format!("gate_{name}"),
+                        message: format!(
+                            "transition '{from}' -> '{to}' requires gate '{name}' to pass for {issue_id}, \
+                             but {detail_note}. Record a result with \
+                             `br gate report {issue_id} --gate {name} --provider <name> --status pass`."
+                        ),
+                        detail: Some(serde_json::json!({
+                            "issue_id": issue_id,
+                            "gate": name,
+                            "from": from,
+                            "to": to,
+                            "failing_providers": failing,
+                        })),
+                    });
+                }
+            }
+            GateSpec::MinReviewers(n) => {
+                let mut reviewers: Vec<&str> = results
+                    .iter()
+                    .filter(|r| r.passed && is_reviewer_provider(&r.provider))
+                    .map(|r| r.provider.as_str())
+                    .collect();
+                reviewers.sort_unstable();
+                reviewers.dedup();
+                let count = u32::try_from(reviewers.len()).unwrap_or(u32::MAX);
+                if count < *n {
+                    violations.push(PolicyViolation {
+                        gate: format!("gate_{GATE_MIN_REVIEWERS}"),
+                        message: format!(
+                            "transition '{from}' -> '{to}' requires at least {n} reviewer(s) to pass for \
+                             {issue_id}, but only {count} distinct reviewer(s) have. Record a review with \
+                             `br gate report {issue_id} --gate {GATE_MIN_REVIEWERS} --provider reviewer:<who> --status pass`."
+                        ),
+                        detail: Some(serde_json::json!({
+                            "issue_id": issue_id,
+                            "gate": GATE_MIN_REVIEWERS,
+                            "from": from,
+                            "to": to,
+                            "required": n,
+                            "actual": count,
+                            "reviewers": reviewers,
+                        })),
+                    });
+                }
+            }
+        }
+    }
+    violations
+}
+
+/// True when `provider` is recognised as a reviewer for the `min_reviewers`
+/// gate: the bare `reviewer` provider, or a namespaced `reviewer:<who>` /
+/// `reviewer-<who>` provider.
+#[must_use]
+pub fn is_reviewer_provider(provider: &str) -> bool {
+    let lower = provider.to_ascii_lowercase();
+    lower == REVIEWER_PROVIDER_PREFIX
+        || lower.starts_with(&format!("{REVIEWER_PROVIDER_PREFIX}:"))
+        || lower.starts_with(&format!("{REVIEWER_PROVIDER_PREFIX}-"))
 }
 
 /// Reserved `transitions` key whose to-statuses are allowed from every
@@ -1123,6 +1482,11 @@ impl PolicyNode {
                 ("strict", Self::Scalar),
                 ("statuses", Self::Scalar),
                 ("transitions", Self::Scalar),
+                // The gate rules are a free-form map of `"from -> to"` keys to
+                // gate specs; we don't descend into them for unknown-field
+                // detection (their shape is validated at parse time by the
+                // typed `GateRule`/`GateSpec` deserialisers).
+                ("gates", Self::Scalar),
             ],
             Self::Scalar => &[],
         }
@@ -2175,6 +2539,7 @@ workflow:
             strict: true,
             statuses: vec![],
             transitions,
+            ..Default::default()
         }
     }
 
@@ -2206,6 +2571,7 @@ workflow:
             strict: true,
             statuses: vec![],
             transitions: std::collections::BTreeMap::new(),
+            ..Default::default()
         };
         assert!(!workflow.transitions_enforced());
         assert!(
@@ -2422,6 +2788,284 @@ workflow:
   transitions:
     open: [in_progress]
 ";
+        let raw: serde_yml::Value = serde_yml::from_str(yaml).unwrap();
+        assert!(detect_unknown_policy_fields(&raw).is_empty());
+    }
+
+    // =========================================================================
+    // Workflow gate engine (issue #312, layer 2 / beads_rust#319)
+    // =========================================================================
+
+    /// Parse the full gate schema from the issue spec and assert it round-trips
+    /// into the typed structs (named gates, min_reviewers, conditional gates by
+    /// label and by priority).
+    #[test]
+    fn gates_config_parses_full_issue_schema() {
+        let yaml = r#"
+workflow:
+  strict: true
+  gates:
+    "in_review -> closed":
+      require_all:
+        - ci_green
+        - min_reviewers: 2
+      require_if:
+        - label: security-sensitive
+          gate: security_sign_off
+        - priority: [0, 1]
+          gate: security_sign_off
+"#;
+        let doc: PolicyDocument = serde_yml::from_str(yaml).expect("parse gates");
+        assert!(doc.workflow.gates_enforced());
+        let rule = doc
+            .workflow
+            .gate_rule_for("in_review", "closed")
+            .expect("rule present");
+        assert_eq!(rule.require_all.len(), 2);
+        assert_eq!(rule.require_all[0], GateSpec::Named("ci_green".to_string()));
+        assert_eq!(rule.require_all[1], GateSpec::MinReviewers(2));
+        assert_eq!(rule.require_if.len(), 2);
+        assert_eq!(
+            rule.require_if[0].label.as_deref(),
+            Some("security-sensitive")
+        );
+        assert_eq!(rule.require_if[1].priority, vec![0, 1]);
+        assert_eq!(
+            rule.require_if[1].gate,
+            GateSpec::Named("security_sign_off".to_string())
+        );
+    }
+
+    #[test]
+    fn gates_disabled_when_strict_false_or_empty() {
+        // strict false → not enforced even with a gate rule
+        let yaml =
+            "workflow:\n  strict: false\n  gates:\n    \"a -> b\":\n      require_all: [ci]\n";
+        let doc: PolicyDocument = serde_yml::from_str(yaml).unwrap();
+        assert!(!doc.workflow.gates_enforced());
+        // strict true but no gates → not enforced (backward compatible)
+        let doc2: PolicyDocument = serde_yml::from_str("workflow:\n  strict: true\n").unwrap();
+        assert!(!doc2.workflow.gates_enforced());
+    }
+
+    #[test]
+    fn gates_key_parsing_is_whitespace_and_case_insensitive() {
+        let yaml = "workflow:\n  strict: true\n  gates:\n    \"In_Review->Closed\":\n      require_all: [ci_green]\n";
+        let doc: PolicyDocument = serde_yml::from_str(yaml).unwrap();
+        assert!(doc.workflow.gate_rule_for("in_review", "closed").is_some());
+        assert!(doc.workflow.gate_rule_for("IN_REVIEW", "CLOSED").is_some());
+        assert!(doc.workflow.gate_rule_for("open", "closed").is_none());
+    }
+
+    fn gate_workflow() -> Workflow {
+        let yaml = r#"
+strict: true
+gates:
+  "in_review -> closed":
+    require_all:
+      - ci_green
+      - min_reviewers: 1
+    require_if:
+      - label: security-sensitive
+        gate: security_sign_off
+      - priority: [0]
+        gate: p0_sign_off
+"#;
+        serde_yml::from_str(yaml).expect("parse gate workflow")
+    }
+
+    #[test]
+    fn required_gates_includes_unconditional_only_when_no_condition_matches() {
+        let workflow = gate_workflow();
+        let required = workflow.required_gates_for("in_review", "closed", &[], 3);
+        let ids: Vec<&str> = required.iter().map(GateSpec::id).collect();
+        assert_eq!(ids, vec!["ci_green", "min_reviewers"]);
+    }
+
+    #[test]
+    fn required_gates_adds_conditional_on_label_match() {
+        let workflow = gate_workflow();
+        let labels = vec!["security-sensitive".to_string()];
+        let required = workflow.required_gates_for("in_review", "closed", &labels, 3);
+        assert!(
+            required
+                .iter()
+                .map(GateSpec::id)
+                .any(|id| id == "security_sign_off")
+        );
+    }
+
+    #[test]
+    fn required_gates_adds_conditional_on_priority_match() {
+        let workflow = gate_workflow();
+        let required = workflow.required_gates_for("in_review", "closed", &[], 0);
+        assert!(
+            required
+                .iter()
+                .map(GateSpec::id)
+                .any(|id| id == "p0_sign_off")
+        );
+        // Non-P0 does not pick it up.
+        let required_p3 = workflow.required_gates_for("in_review", "closed", &[], 3);
+        assert!(
+            !required_p3
+                .iter()
+                .map(GateSpec::id)
+                .any(|id| id == "p0_sign_off")
+        );
+    }
+
+    #[test]
+    fn evaluate_gates_blocks_when_required_named_gate_missing() {
+        let workflow = gate_workflow();
+        let violations = evaluate_gates(&workflow, "bd-1", "in_review", "closed", &[], 3, &[]);
+        // ci_green (missing) + min_reviewers (0 reviewers) both fire.
+        let gate_ids: Vec<&str> = violations.iter().map(|v| v.gate.as_str()).collect();
+        assert!(gate_ids.contains(&"gate_ci_green"));
+        assert!(gate_ids.contains(&"gate_min_reviewers"));
+    }
+
+    #[test]
+    fn evaluate_gates_passes_when_named_gate_has_a_pass() {
+        let workflow = gate_workflow();
+        let results = vec![
+            GateResult {
+                gate: "ci_green".to_string(),
+                provider: "ci".to_string(),
+                passed: true,
+                note: None,
+            },
+            GateResult {
+                gate: "min_reviewers".to_string(),
+                provider: "reviewer:alice".to_string(),
+                passed: true,
+                note: None,
+            },
+        ];
+        let violations = evaluate_gates(&workflow, "bd-1", "in_review", "closed", &[], 3, &results);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn evaluate_gates_named_gate_fail_does_not_satisfy() {
+        let workflow = gate_workflow();
+        let results = vec![GateResult {
+            gate: "ci_green".to_string(),
+            provider: "ci".to_string(),
+            passed: false,
+            note: None,
+        }];
+        let violations = evaluate_gates(&workflow, "bd-1", "in_review", "closed", &[], 3, &results);
+        assert!(violations.iter().any(|v| v.gate == "gate_ci_green"));
+        // The message should name the failing provider for actionability.
+        let ci_violation = violations
+            .iter()
+            .find(|v| v.gate == "gate_ci_green")
+            .unwrap();
+        assert!(
+            ci_violation.message.contains("ci"),
+            "{}",
+            ci_violation.message
+        );
+    }
+
+    #[test]
+    fn min_reviewers_counts_distinct_reviewer_providers() {
+        let yaml =
+            "strict: true\ngates:\n  \"a -> b\":\n    require_all:\n      - min_reviewers: 2\n";
+        let workflow: Workflow = serde_yml::from_str(yaml).unwrap();
+        // One distinct reviewer → still short.
+        let one = vec![GateResult {
+            gate: "min_reviewers".to_string(),
+            provider: "reviewer:alice".to_string(),
+            passed: true,
+            note: None,
+        }];
+        assert_eq!(
+            evaluate_gates(&workflow, "bd-1", "a", "b", &[], 0, &one).len(),
+            1
+        );
+        // Two distinct reviewers → satisfied.
+        let two = vec![
+            GateResult {
+                gate: "min_reviewers".to_string(),
+                provider: "reviewer:alice".to_string(),
+                passed: true,
+                note: None,
+            },
+            GateResult {
+                gate: "min_reviewers".to_string(),
+                provider: "reviewer:bob".to_string(),
+                passed: true,
+                note: None,
+            },
+        ];
+        assert!(evaluate_gates(&workflow, "bd-1", "a", "b", &[], 0, &two).is_empty());
+    }
+
+    #[test]
+    fn min_reviewers_dedupes_same_reviewer() {
+        let yaml =
+            "strict: true\ngates:\n  \"a -> b\":\n    require_all:\n      - min_reviewers: 2\n";
+        let workflow: Workflow = serde_yml::from_str(yaml).unwrap();
+        // Same reviewer reporting twice counts once.
+        let dupes = vec![
+            GateResult {
+                gate: "min_reviewers".to_string(),
+                provider: "reviewer:alice".to_string(),
+                passed: true,
+                note: Some("first".to_string()),
+            },
+            GateResult {
+                gate: "min_reviewers".to_string(),
+                provider: "reviewer:alice".to_string(),
+                passed: true,
+                note: Some("again".to_string()),
+            },
+        ];
+        assert_eq!(
+            evaluate_gates(&workflow, "bd-1", "a", "b", &[], 0, &dupes).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn is_reviewer_provider_recognises_namespaced_forms() {
+        assert!(is_reviewer_provider("reviewer"));
+        assert!(is_reviewer_provider("reviewer:alice"));
+        assert!(is_reviewer_provider("reviewer-bob"));
+        assert!(is_reviewer_provider("Reviewer:Carol"));
+        assert!(!is_reviewer_provider("ci"));
+        assert!(!is_reviewer_provider("reviewers")); // no separator
+    }
+
+    #[test]
+    fn evaluate_gates_no_rule_is_backward_compatible() {
+        let workflow = gate_workflow();
+        // No rule guards open -> in_progress → no violations regardless of state.
+        let violations = evaluate_gates(&workflow, "bd-1", "open", "in_progress", &[], 0, &[]);
+        assert!(violations.is_empty());
+        // A default (no gates) workflow never produces violations.
+        let empty = Workflow::default();
+        assert!(evaluate_gates(&empty, "bd-1", "in_review", "closed", &[], 0, &[]).is_empty());
+    }
+
+    #[test]
+    fn unknown_gate_spec_key_is_rejected_at_parse() {
+        let yaml = "strict: true\ngates:\n  \"a -> b\":\n    require_all:\n      - bogus_key: 3\n";
+        let parsed: std::result::Result<Workflow, _> = serde_yml::from_str(yaml);
+        assert!(parsed.is_err(), "unknown gate spec key must fail parse");
+    }
+
+    #[test]
+    fn gates_key_recognised_by_unknown_field_detector() {
+        let yaml = r#"
+workflow:
+  strict: true
+  gates:
+    "in_review -> closed":
+      require_all: [ci_green]
+"#;
         let raw: serde_yml::Value = serde_yml::from_str(yaml).unwrap();
         assert!(detect_unknown_policy_fields(&raw).is_empty());
     }

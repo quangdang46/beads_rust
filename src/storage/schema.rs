@@ -8,7 +8,7 @@ use crate::error::{BeadsError, Result};
 use crate::model::{IssueType, Priority, Status};
 use crate::util::content_hash_from_parts;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 11;
+pub const CURRENT_SCHEMA_VERSION: i32 = 12;
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 
 /// The complete SQL schema for the beads database.
@@ -249,6 +249,23 @@ pub const SCHEMA_SQL: &str = r"
     CREATE INDEX IF NOT EXISTS idx_close_metadata_bypassed
         ON close_metadata(bypassed_policy)
         WHERE bypassed_policy = 1;
+
+    -- Workflow gate results (issue #312, layer 2). One row per
+    -- (issue, gate, provider): a provider's most-recent pass/fail verdict for
+    -- a named gate on an issue. A re-report from the same provider for the
+    -- same gate overwrites the prior verdict (INSERT OR REPLACE).
+    CREATE TABLE IF NOT EXISTS gate_results (
+        issue_id TEXT NOT NULL,
+        gate TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        passed INTEGER NOT NULL DEFAULT 0,
+        note TEXT,
+        recorded_by TEXT,
+        recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (issue_id, gate, provider),
+        FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_gate_results_issue ON gate_results(issue_id);
 ";
 
 /// Split a SQL script into individual statements, respecting string literals,
@@ -1518,6 +1535,35 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
             "Migrating database to schema version 11 (agent_context on issues - beads_rust#297)"
         );
         conn.execute("ALTER TABLE issues ADD COLUMN agent_context TEXT")?;
+    }
+
+    // Migration v11 -> v12 (beads_rust#319): add the `gate_results` table for
+    // workflow gate engine (#312, layer 2). Pure additive — a new table, no
+    // existing-row rewrite. Idempotent via CREATE TABLE IF NOT EXISTS, so it
+    // is safe to run on every open regardless of `user_version`. The canonical
+    // DDL also lives in SCHEMA_SQL for fresh databases; re-asserting here keeps
+    // upgraded databases in lock-step.
+    if user_version < 12 {
+        tracing::info!(
+            "Migrating database to schema version 12 (gate_results table - beads_rust#319)"
+        );
+        execute_batch(
+            conn,
+            r"
+            CREATE TABLE IF NOT EXISTS gate_results (
+                issue_id TEXT NOT NULL,
+                gate TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                passed INTEGER NOT NULL DEFAULT 0,
+                note TEXT,
+                recorded_by TEXT,
+                recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (issue_id, gate, provider),
+                FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_gate_results_issue ON gate_results(issue_id);
+        ",
+        )?;
     }
 
     // Migration: Add missing indexes for bd parity
