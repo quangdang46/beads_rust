@@ -2413,6 +2413,13 @@ impl OpenStorageResult {
             ));
         }
 
+        // Preserve any attribution staged on the storage being replaced so the
+        // post-recovery retry can still stamp it (#312 hardening, F1). The
+        // failed first write did NOT commit, so `mutate()` left the staged value
+        // intact — but recovery swaps in a brand-new `SqliteStorage`, which would
+        // otherwise start with an empty pending slot and drop the attribution.
+        let preserved_attribution = self.storage.take_pending_event_attribution();
+
         // Close the old connection before rebuilding at the same path.
         // fsqlite tracks pages by file path, so keeping the old connection
         // open while creating a new database at the same path causes
@@ -2429,6 +2436,9 @@ impl OpenStorageResult {
             self.allow_external_jsonl,
         )?;
         self.storage = storage;
+        if let Some(attribution) = preserved_attribution {
+            self.storage.set_pending_event_attribution(attribution);
+        }
         self.loaded_jsonl_hash = None;
         self.auto_rebuilt = true;
         self.pending_recovery_backup = None;

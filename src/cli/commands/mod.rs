@@ -827,6 +827,68 @@ mod tests {
     }
 
     #[test]
+    fn retry_preserves_staged_attribution_across_jsonl_recovery() {
+        // #312 hardening (F1): attribution staged ONCE before the retry helper
+        // must survive a recoverable first-attempt failure and still be stamped
+        // by the post-recovery retry. The attribution is staged exactly once,
+        // OUTSIDE the operation closure, so this genuinely exercises the
+        // take-after-commit fix (not a re-stage workaround).
+        let (_temp, mut storage_ctx) = storage_ctx_with_exported_issue();
+        let mut attempts = 0;
+
+        storage_ctx
+            .storage
+            .set_pending_event_attribution(crate::storage::EventAttribution::new(
+                Some("agent-recovered"),
+                None,
+                Some("opus-4"),
+            ));
+
+        retry_mutation_with_jsonl_recovery(
+            &mut storage_ctx,
+            true,
+            "update_issue",
+            Some("bd-1"),
+            |storage| {
+                attempts += 1;
+                if attempts == 1 {
+                    // First attempt: a recoverable corruption error that does NOT
+                    // commit. The staged attribution must NOT be consumed.
+                    Err(BeadsError::Database(FrankenError::DatabaseCorrupt {
+                        detail: "synthetic corruption".to_string(),
+                    }))
+                } else {
+                    // Post-recovery retry: a real committing mutation that should
+                    // stamp the still-staged attribution onto its event.
+                    let update = crate::storage::IssueUpdate {
+                        status: Some(crate::model::Status::InProgress),
+                        ..Default::default()
+                    };
+                    storage.update_issue("bd-1", &update, "tester").map(|_| ())
+                }
+            },
+        )
+        .expect("recovered mutation should stamp staged attribution");
+
+        assert_eq!(attempts, 2, "should recover and retry exactly once");
+
+        let events = storage_ctx
+            .storage
+            .get_events("bd-1", 0)
+            .expect("load events");
+        let status_event = events
+            .iter()
+            .find(|e| e.event_type == crate::model::EventType::StatusChanged)
+            .expect("status_changed event present after recovery");
+        assert_eq!(
+            status_event.agent_name.as_deref(),
+            Some("agent-recovered"),
+            "attribution must survive the JSONL-recovery retry (F1)"
+        );
+        assert_eq!(status_event.model.as_deref(), Some("opus-4"));
+    }
+
+    #[test]
     fn mutation_recovery_can_be_signaled_by_probe_after_constraint_style_error() {
         let (_temp, storage_ctx) = storage_ctx_with_exported_issue();
         let operation_err = BeadsError::Database(FrankenError::Internal(

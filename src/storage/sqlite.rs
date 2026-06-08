@@ -317,9 +317,11 @@ pub struct SqliteStorage {
     /// [`SqliteStorage::set_pending_event_attribution`] immediately before a
     /// `create`/`update` call so the command layer can attach self-reported
     /// agent identity without threading it through every storage signature.
-    /// Consumed (taken) by `mutate()` and cleared after each mutation, so it
-    /// never leaks into unrelated subsequent operations. Capture-only — never
-    /// used for gating.
+    /// Consumed by exactly one COMMITTING `mutate()` (cleared only after the
+    /// write transaction commits, so a JSONL-recovery retry can still stamp it),
+    /// or cleared by any staged-mutation entry point that returns without
+    /// committing (e.g. an empty-`updates` no-op). It therefore never leaks into
+    /// an unrelated subsequent operation. Capture-only — never used for gating.
     pending_event_attribution: Option<EventAttribution>,
 }
 
@@ -1991,6 +1993,16 @@ impl SqliteStorage {
         };
     }
 
+    /// Remove and return any staged Tier 1 attribution without consuming it via
+    /// a mutation (issue #312, Layer 3). Used by the JSONL-recovery path to
+    /// carry a not-yet-committed staged value across a storage rebuild so the
+    /// post-recovery retry can still stamp it (F1). Preserves the invariant that
+    /// pending attribution is consumed by exactly one committing mutation, or
+    /// transferred/cleared — it never leaks into an unrelated operation.
+    pub(crate) fn take_pending_event_attribution(&mut self) -> Option<EventAttribution> {
+        self.pending_event_attribution.take()
+    }
+
     /// Execute a mutation with the 4-step transaction protocol.
     ///
     /// Retries on all transient BUSY errors (from BEGIN, DML, or COMMIT) with
@@ -2018,10 +2030,20 @@ impl SqliteStorage {
         // within the mutation closures.
         self.conn.execute("PRAGMA foreign_keys = OFF")?;
 
-        // Take any per-command attribution staged for this mutation. Consuming
-        // it here (rather than borrowing) guarantees it stamps exactly one
-        // mutation and never leaks into a later, unrelated operation.
-        let pending_attribution = self.pending_event_attribution.take().unwrap_or_default();
+        // Peek (clone) — do NOT take — the per-command attribution staged for
+        // this mutation. We must not permanently consume the staged value until
+        // the mutation is known to COMMIT: if `with_write_transaction` returns a
+        // recoverable `Database(_)` error, `retry_mutation_with_jsonl_recovery`
+        // re-invokes this `mutate()` after rebuilding the DB from JSONL, and the
+        // staged slot must still be present so the recovered write records the
+        // attribution (#312 hardening, F1). Cloning here also means the internal
+        // BUSY-retry loop inside `with_write_transaction` re-applies the SAME
+        // value on each attempt and stamps exactly once on the committing run.
+        //
+        // Invariant: pending attribution is consumed by exactly one committing
+        // mutation, or cleared — it never leaks into a later, unrelated
+        // operation. It is `.take()`n below only after a successful commit.
+        let pending_attribution = self.pending_event_attribution.clone().unwrap_or_default();
 
         let tx_result: Result<_> = self.with_write_transaction(|storage| {
             let mut ctx = MutationContext::new(op, actor);
@@ -2109,6 +2131,13 @@ impl SqliteStorage {
 
             Ok((result, blocked_cache_plan))
         });
+
+        // Consume the staged attribution only now that the transaction has
+        // COMMITTED (#312 hardening, F1). On a recoverable error the slot is
+        // intentionally left intact so the JSONL-recovery retry can re-stamp it.
+        if tx_result.is_ok() {
+            self.pending_event_attribution = None;
+        }
 
         // Re-enable FK enforcement after the transaction completes
         // (regardless of success or failure).
@@ -2440,6 +2469,13 @@ impl SqliteStorage {
     #[allow(clippy::too_many_lines)]
     pub fn update_issue(&mut self, id: &str, updates: &IssueUpdate, actor: &str) -> Result<Issue> {
         if updates.is_empty() {
+            // No-op update: this path returns WITHOUT calling `mutate()`, so we
+            // must clear any staged attribution ourselves. Otherwise a value set
+            // by `set_pending_event_attribution` would survive onto the NEXT,
+            // unrelated `mutate()` (#312 hardening, F2). Invariant: pending
+            // attribution is consumed by exactly one committing mutation, or
+            // cleared.
+            self.pending_event_attribution = None;
             return self
                 .get_issue(id)?
                 .ok_or_else(|| BeadsError::IssueNotFound { id: id.to_string() });
@@ -22233,5 +22269,104 @@ mod tests {
         assert_eq!(attribution.model.as_deref(), Some("opus-4"));
         assert!(!attribution.is_empty());
         assert!(EventAttribution::new(None, None, None).is_empty());
+    }
+
+    // ---- #312 hardening (F1): attribution survives a non-committing mutation
+    // and is consumed only after a successful commit -----------------------
+
+    #[test]
+    fn pending_attribution_survives_failed_mutation_and_stamps_on_retry() {
+        // Models the JSONL-recovery retry path: the first `mutate()` does NOT
+        // commit (its closure errors → rollback), so the staged attribution must
+        // remain available for the *next* `mutate()` to stamp. Previously the
+        // start-of-`mutate()` `.take()` consumed it on the failed attempt,
+        // dropping attribution from the recovered write (F1).
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        storage.set_pending_event_attribution(EventAttribution::new(
+            Some("agent-retry"),
+            None,
+            Some("opus-4"),
+        ));
+
+        // A mutation whose closure fails with a non-transient error: it rolls
+        // back and never commits. The staged slot must be left intact.
+        let failed: Result<()> = storage.mutate("noop_fail", "tester", |_conn, _ctx| {
+            Err(BeadsError::Config("simulated mutation failure".into()))
+        });
+        assert!(failed.is_err(), "mutation closure error should propagate");
+        assert!(
+            storage.pending_event_attribution.is_some(),
+            "attribution must survive a non-committing mutation so the recovery \
+             retry can still stamp it",
+        );
+
+        // The retry: a committing mutation must now record the (still-staged)
+        // attribution onto its events.
+        let now = Utc.with_ymd_and_hms(2026, 6, 7, 12, 0, 0).unwrap();
+        let issue = make_issue("bd-attr-retry", "Retried", Status::Open, 2, None, now, None);
+        storage.create_issue(&issue, "tester").expect("create");
+
+        let events = storage.get_events("bd-attr-retry", 0).expect("events");
+        let created = events
+            .iter()
+            .find(|e| e.event_type == EventType::Created)
+            .expect("created event present");
+        assert_eq!(created.agent_name.as_deref(), Some("agent-retry"));
+        assert_eq!(created.model.as_deref(), Some("opus-4"));
+
+        // And after the committing mutation, the slot is cleared (consumed once).
+        assert!(
+            storage.pending_event_attribution.is_none(),
+            "attribution must be consumed by exactly one committing mutation",
+        );
+    }
+
+    // ---- #312 hardening (F2): no-op update clears the staged slot ----------
+
+    #[test]
+    fn empty_update_clears_pending_attribution_so_it_does_not_leak() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 6, 7, 12, 0, 0).unwrap();
+        let issue = make_issue(
+            "bd-attr-noop",
+            "No-op target",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        storage.create_issue(&issue, "tester").expect("create");
+
+        // Stage attribution, then call update_issue with EMPTY updates: this
+        // early-returns without calling `mutate()`, but must still drain the
+        // staged slot so it cannot leak onto the next, unrelated mutation (F2).
+        storage.set_pending_event_attribution(EventAttribution::new(
+            Some("agent-leak"),
+            None,
+            None,
+        ));
+        let empty = IssueUpdate::default();
+        storage
+            .update_issue("bd-attr-noop", &empty, "tester")
+            .expect("empty update is a no-op read");
+        assert!(
+            storage.pending_event_attribution.is_none(),
+            "empty-update no-op must clear the staged attribution",
+        );
+
+        // Confirm no leak: a subsequent create (which stages nothing) records
+        // no attribution.
+        let next = make_issue("bd-attr-next", "Next", Status::Open, 2, None, now, None);
+        storage.create_issue(&next, "tester").expect("create next");
+        let events = storage.get_events("bd-attr-next", 0).expect("events");
+        let created = events
+            .iter()
+            .find(|e| e.event_type == EventType::Created)
+            .expect("created event present");
+        assert!(created.agent_name.is_none());
+        assert!(created.harness.is_none());
+        assert!(created.model.is_none());
     }
 }
