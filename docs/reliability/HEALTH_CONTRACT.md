@@ -23,7 +23,7 @@ Executable implementation: `src/health.rs`.
 | `DatabaseCorrupt` | Recoverable | fsqlite open / integrity_check | Rebuild from JSONL |
 | `DuplicateSchemaRows` | Recoverable | sqlite_master GROUP BY HAVING | Rebuild from JSONL |
 | `DuplicateConfigKeys` | Recoverable | Config table duplicate probe | DELETE+INSERT dedup |
-| `DuplicateMetadataKeys` | Recoverable | Metadata table duplicate probe | DELETE+INSERT dedup |
+| `DuplicateMetadataKeys` | Recoverable | Metadata table duplicate probe | Harmonize rows on metadata write; doctor rebuild collapses duplicates |
 | `NullInNotNullColumn` | Degraded | Schema-aware NULL scan | Backfill or rebuild |
 | `WriteProbeFailed` | Recoverable | Rollback-only doctor write probe | Rebuild from JSONL before writes continue |
 

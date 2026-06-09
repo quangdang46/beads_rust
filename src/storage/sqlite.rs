@@ -764,7 +764,7 @@ impl SqliteStorage {
                 SqliteValue::from(value),
             ],
         )?;
-        if updated == 0 && !Self::metadata_equals(conn, key, value)? {
+        if updated == 0 && !Self::metadata_key_exists(conn, key)? {
             conn.execute_with_params(
                 "INSERT INTO metadata (key, value) VALUES (?, ?)",
                 &[SqliteValue::from(key), SqliteValue::from(value)],
@@ -773,22 +773,38 @@ impl SqliteStorage {
         Ok(())
     }
 
+    fn insert_metadata_default_if_missing(
+        conn: &Connection,
+        key: &str,
+        default_value: &str,
+    ) -> Result<()> {
+        conn.execute_with_params(
+            "INSERT INTO metadata (key, value)
+             SELECT ?, ?
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM metadata WHERE key = ? LIMIT 1
+             )",
+            &[
+                SqliteValue::from(key),
+                SqliteValue::from(default_value),
+                SqliteValue::from(key),
+            ],
+        )?;
+        Ok(())
+    }
+
     fn ensure_known_metadata_defaults(conn: &Connection) -> Result<()> {
-        // Read-first, write-only-if-missing pattern (#243).  The read
-        // (`metadata_key_exists`) needs no write lock, so it works even when
-        // another process holds the WAL write lock.  If the key IS missing,
-        // the INSERT may fail with SQLITE_BUSY under concurrency; that's
-        // benign — the key either already exists from a racing writer or
-        // will be inserted on the next run.  This avoids the old explicit
-        // BEGIN IMMEDIATE wrapper that would block concurrent openers.
+        // Read-first, write-only-if-missing pattern (#243). The read
+        // (`metadata_key_exists`) needs no write lock, so ordinary opens do
+        // not contend with active writers. If a key is missing, the INSERT
+        // re-checks existence inside the statement because `metadata.key` is
+        // intentionally not unique; `INSERT OR IGNORE` would not protect
+        // against duplicate default rows.
         for (key, default_value) in KNOWN_METADATA_DEFAULTS {
             if Self::metadata_key_exists(conn, key)? {
                 continue;
             }
-            match conn.execute_with_params(
-                "INSERT OR IGNORE INTO metadata (key, value) VALUES (?, ?)",
-                &[SqliteValue::from(key), SqliteValue::from(default_value)],
-            ) {
+            match Self::insert_metadata_default_if_missing(conn, key, default_value) {
                 Ok(_) => {}
                 Err(e) if e.is_transient() => {
                     // BUSY — another writer is active. The default will be
@@ -803,7 +819,7 @@ impl SqliteStorage {
 
     fn metadata_equals(conn: &Connection, key: &str, expected: &str) -> Result<bool> {
         match conn.query_row_with_params(
-            "SELECT value FROM metadata WHERE key = ?",
+            "SELECT value FROM metadata WHERE key = ? ORDER BY rowid DESC LIMIT 1",
             &[SqliteValue::from(key)],
         ) {
             Ok(row) => Ok(row.get(0).and_then(SqliteValue::as_text) == Some(expected)),
@@ -816,17 +832,17 @@ impl SqliteStorage {
         let sql = if include_deferred {
             "SELECT
                 EXISTS(SELECT 1 FROM issues WHERE status IN ('open', 'deferred') LIMIT 1),
-                EXISTS(SELECT 1 FROM metadata WHERE key = ? AND value = ? LIMIT 1)"
+                COALESCE((SELECT value = ? FROM metadata WHERE key = ? ORDER BY rowid DESC LIMIT 1), 0)"
         } else {
             "SELECT
                 EXISTS(SELECT 1 FROM issues WHERE status = 'open' LIMIT 1),
-                EXISTS(SELECT 1 FROM metadata WHERE key = ? AND value = ? LIMIT 1)"
+                COALESCE((SELECT value = ? FROM metadata WHERE key = ? ORDER BY rowid DESC LIMIT 1), 0)"
         };
         let row = self.conn.query_row_with_params(
             sql,
             &[
-                SqliteValue::from(BLOCKED_CACHE_STATE_KEY),
                 SqliteValue::from(BLOCKED_CACHE_STATE_STALE),
+                SqliteValue::from(BLOCKED_CACHE_STATE_KEY),
             ],
         )?;
 
@@ -9316,7 +9332,7 @@ impl SqliteStorage {
     /// Returns an error if the database query fails.
     pub fn get_metadata(&self, key: &str) -> Result<Option<String>> {
         match self.conn.query_row_with_params(
-            "SELECT value FROM metadata WHERE key = ?",
+            "SELECT value FROM metadata WHERE key = ? ORDER BY rowid DESC LIMIT 1",
             &[SqliteValue::from(key)],
         ) {
             Ok(row) => Ok(row
@@ -21553,6 +21569,56 @@ mod tests {
     }
 
     #[test]
+    fn test_metadata_default_insert_rechecks_existing_key() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("metadata-default-race.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        storage
+            .conn
+            .execute_with_params(
+                "DELETE FROM metadata WHERE key = ?",
+                &[SqliteValue::from(METADATA_JSONL_SIZE)],
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute_with_params(
+                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                &[
+                    SqliteValue::from(METADATA_JSONL_SIZE),
+                    SqliteValue::from("racing-writer"),
+                ],
+            )
+            .unwrap();
+
+        SqliteStorage::insert_metadata_default_if_missing(
+            &storage.conn,
+            METADATA_JSONL_SIZE,
+            METADATA_EMPTY_VALUE,
+        )
+        .unwrap();
+
+        let rows = storage
+            .conn
+            .query_with_params(
+                "SELECT value FROM metadata WHERE key = ? ORDER BY rowid ASC",
+                &[SqliteValue::from(METADATA_JSONL_SIZE)],
+            )
+            .unwrap();
+        let values: Vec<String> = rows
+            .iter()
+            .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(str::to_string))
+            .collect();
+
+        assert_eq!(
+            values,
+            vec!["racing-writer".to_string()],
+            "default seeding must not duplicate or overwrite a key inserted by a racing opener"
+        );
+    }
+
+    #[test]
     fn test_metadata_state_updates_keep_single_seeded_row() {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("metadata-state.db");
@@ -21592,6 +21658,109 @@ mod tests {
             Some("false".to_string())
         );
         assert_eq!(storage.get_metadata(BLOCKED_CACHE_STATE_KEY).unwrap(), None);
+    }
+
+    #[test]
+    fn test_metadata_duplicate_rows_read_latest_and_harmonize_on_write() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("metadata-duplicates.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+
+        storage
+            .conn
+            .execute_with_params(
+                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                &[
+                    SqliteValue::from(METADATA_JSONL_CONTENT_HASH),
+                    SqliteValue::from("stale-hash"),
+                ],
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute_with_params(
+                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                &[
+                    SqliteValue::from(METADATA_JSONL_CONTENT_HASH),
+                    SqliteValue::from("latest-hash"),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            storage.get_metadata(METADATA_JSONL_CONTENT_HASH).unwrap(),
+            Some("latest-hash".to_string()),
+            "metadata reads must use the latest duplicate row"
+        );
+
+        storage
+            .set_metadata(METADATA_JSONL_CONTENT_HASH, "rewritten-hash")
+            .unwrap();
+
+        let rows = storage
+            .conn
+            .query_with_params(
+                "SELECT value FROM metadata WHERE key = ? ORDER BY rowid ASC",
+                &[SqliteValue::from(METADATA_JSONL_CONTENT_HASH)],
+            )
+            .unwrap();
+        let values: Vec<String> = rows
+            .iter()
+            .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(String::from))
+            .collect();
+
+        assert_eq!(
+            values,
+            vec![
+                "rewritten-hash".to_string(),
+                "rewritten-hash".to_string(),
+                "rewritten-hash".to_string(),
+            ],
+            "metadata writes must harmonize every duplicate row for the key"
+        );
+    }
+
+    #[test]
+    fn test_ready_readiness_probe_uses_latest_blocked_cache_state_duplicate() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("ready-stale-duplicate.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+
+        storage
+            .create_issue(
+                &make_issue("bd-ready", "Ready issue", Status::Open, 1, None, now, None),
+                "tester",
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute_with_params(
+                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                &[
+                    SqliteValue::from(BLOCKED_CACHE_STATE_KEY),
+                    SqliteValue::from(BLOCKED_CACHE_STATE_STALE),
+                ],
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute_with_params(
+                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                &[
+                    SqliteValue::from(BLOCKED_CACHE_STATE_KEY),
+                    SqliteValue::from(METADATA_EMPTY_VALUE),
+                ],
+            )
+            .unwrap();
+
+        let readiness = storage.ready_readiness_probe(false).unwrap();
+
+        assert!(readiness.has_candidate_status);
+        assert!(
+            !readiness.blocked_cache_stale,
+            "an older duplicate stale marker must not force the ready path to bypass the cache"
+        );
     }
 
     /// Regression: the Drop checkpoint heuristic from #270 fires only

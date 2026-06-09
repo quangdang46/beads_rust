@@ -194,7 +194,9 @@ pub const SCHEMA_SQL: &str = r"
     CREATE INDEX IF NOT EXISTS idx_config_key ON config(key);
 
     -- Metadata
-    -- Same rationale as config: keep it as key-value with explicit index.
+    -- Same rationale as config: keep it as key-value with an explicit index.
+    -- Storage code reads the newest duplicate row and harmonizes duplicate
+    -- rows on write; doctor still reports duplicates as recoverable anomalies.
     CREATE TABLE IF NOT EXISTS metadata (
         key TEXT NOT NULL,
         value TEXT NOT NULL

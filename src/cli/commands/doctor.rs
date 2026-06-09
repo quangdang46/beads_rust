@@ -1041,9 +1041,29 @@ fn append_doctor_check_anomalies(check: &CheckResult, anomalies: &mut Vec<Anomal
         }
         "sync.metadata" => {
             let message = check.message.as_deref().unwrap_or_default();
-            if message.contains("External changes pending import") {
+            let pending_import = check
+                .details
+                .as_ref()
+                .and_then(|details| details.get("pending_import"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or_else(|| {
+                    message.contains("External changes pending import")
+                        || message.contains("Database and JSONL have diverged")
+                });
+            let pending_export = check
+                .details
+                .as_ref()
+                .and_then(|details| details.get("pending_export"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or_else(|| {
+                    message.contains("Local changes pending export")
+                        || message.contains("Local changes exist but no export is recorded")
+                        || message.contains("Database and JSONL have diverged")
+                });
+            if pending_import {
                 push_anomaly(anomalies, AnomalyClass::JsonlNewer);
-            } else if message.contains("Local changes pending export") {
+            }
+            if pending_export {
                 push_anomaly(anomalies, AnomalyClass::DbNewer);
             }
         }
@@ -2936,6 +2956,20 @@ fn check_integrity(conn: &Connection, checks: &mut Vec<CheckResult>) {
     }
 }
 
+fn latest_metadata_value(conn: &Connection, key: &str) -> Option<String> {
+    conn.query_row_with_params(
+        "SELECT value FROM metadata WHERE key = ? ORDER BY rowid DESC LIMIT 1",
+        &[SqliteValue::from(key)],
+    )
+    .ok()
+    .and_then(|row| {
+        row.get(0)
+            .and_then(SqliteValue::as_text)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
 /// Pass-4 cycle 4 — detector for `fm-caches_indexes-export-hash-cache-divergence`.
 ///
 /// Compares the value of `metadata.jsonl_content_hash` (the cached
@@ -2963,42 +2997,31 @@ fn check_export_hash_cache_divergence(
         push_check(checks, "db.export_hash_cache", CheckStatus::Ok, None, None);
         return;
     }
-    let stored = match conn.query("SELECT value FROM metadata WHERE key='jsonl_content_hash'") {
-        Ok(rows) => rows
-            .first()
-            .and_then(|row| row.values().first().cloned())
-            .and_then(|v| match v {
-                SqliteValue::Text(s) => Some(s.to_string()),
-                _ => None,
-            }),
-        Err(_) => None,
+    let Some(stored) = latest_metadata_value(conn, "jsonl_content_hash") else {
+        // No cached row at all (or only the empty default sentinel):
+        // first sync has not populated the hash yet, so avoid hashing
+        // the JSONL just to report OK.
+        push_check(checks, "db.export_hash_cache", CheckStatus::Ok, None, None);
+        return;
     };
     let Ok(computed) = crate::sync::compute_jsonl_hash(jsonl) else {
         // JSONL unreadable: a different FM owns this surface.
         push_check(checks, "db.export_hash_cache", CheckStatus::Ok, None, None);
         return;
     };
-    match stored.as_deref() {
-        Some(s) if s == computed => {
-            push_check(checks, "db.export_hash_cache", CheckStatus::Ok, None, None);
-        }
-        Some(s) => {
-            push_check(
-                checks,
-                "db.export_hash_cache",
-                CheckStatus::Warn,
-                Some("Top-level JSONL content hash in `metadata` differs from computed hash. Cache is stale; doctor --repair will recompute.".to_string()),
-                Some(serde_json::json!({
-                    "stored_top_hash": s,
-                    "computed_top_hash": computed,
-                })),
-            );
-        }
-        None => {
-            // No cached row at all — first sync hasn't run yet. Not a
-            // failure mode for this FM.
-            push_check(checks, "db.export_hash_cache", CheckStatus::Ok, None, None);
-        }
+    if stored == computed {
+        push_check(checks, "db.export_hash_cache", CheckStatus::Ok, None, None);
+    } else {
+        push_check(
+            checks,
+            "db.export_hash_cache",
+            CheckStatus::Warn,
+            Some("Top-level JSONL content hash in `metadata` differs from computed hash. Cache is stale; doctor --repair will recompute.".to_string()),
+            Some(serde_json::json!({
+                "stored_top_hash": stored,
+                "computed_top_hash": computed,
+            })),
+        );
     }
 }
 
@@ -3033,16 +3056,7 @@ fn check_base_jsonl_missing_post_flush(
         );
         return;
     }
-    let last_export = match conn.query("SELECT value FROM metadata WHERE key='last_export_time'") {
-        Ok(rows) => rows
-            .first()
-            .and_then(|row| row.values().first().cloned())
-            .and_then(|v| match v {
-                SqliteValue::Text(s) => Some(s.to_string()),
-                _ => None,
-            }),
-        Err(_) => None,
-    };
+    let last_export = latest_metadata_value(conn, "last_export_time");
     match last_export {
         Some(stamp) if !stamp.is_empty() => {
             push_check(
@@ -5862,13 +5876,6 @@ fn check_recoverable_anomalies(conn: &Connection, checks: &mut Vec<CheckResult>)
          LIMIT 1",
     )?;
 
-    let blocked_cache_stale = conn.query(
-        "SELECT value
-         FROM metadata
-         WHERE key = 'blocked_cache_state'
-         LIMIT 1",
-    )?;
-
     let mut findings = Vec::new();
 
     if let Some(row) = duplicate_schema_rows.first() {
@@ -5908,11 +5915,7 @@ fn check_recoverable_anomalies(conn: &Connection, checks: &mut Vec<CheckResult>)
         ));
     }
 
-    if blocked_cache_stale
-        .first()
-        .and_then(|row| row.get(0).and_then(SqliteValue::as_text))
-        == Some("stale")
-    {
+    if latest_metadata_value(conn, "blocked_cache_state").as_deref() == Some("stale") {
         findings.push(BLOCKED_CACHE_STALE_FINDING.to_string());
     }
     let blocked_cache_health = SqliteStorage::blocked_cache_projection_health(conn);
@@ -9447,35 +9450,9 @@ fn check_sync_metadata(
     checks: &mut Vec<CheckResult>,
 ) {
     // Get metadata for diagnostic details
-    let last_import: Option<String> = conn
-        .query_row("SELECT value FROM metadata WHERE key = 'last_import_time'")
-        .ok()
-        .and_then(|row| {
-            row.get(0)
-                .and_then(SqliteValue::as_text)
-                .filter(|value| !value.is_empty())
-                .map(String::from)
-        });
-
-    let last_export: Option<String> = conn
-        .query_row("SELECT value FROM metadata WHERE key = 'last_export_time'")
-        .ok()
-        .and_then(|row| {
-            row.get(0)
-                .and_then(SqliteValue::as_text)
-                .filter(|value| !value.is_empty())
-                .map(String::from)
-        });
-
-    let jsonl_hash: Option<String> = conn
-        .query_row("SELECT value FROM metadata WHERE key = 'jsonl_content_hash'")
-        .ok()
-        .and_then(|row| {
-            row.get(0)
-                .and_then(SqliteValue::as_text)
-                .filter(|value| !value.is_empty())
-                .map(String::from)
-        });
+    let last_import = latest_metadata_value(conn, "last_import_time");
+    let last_export = latest_metadata_value(conn, "last_export_time");
+    let jsonl_hash = latest_metadata_value(conn, "jsonl_content_hash");
 
     // Check dirty issues count
     let dirty_count: i64 = conn
@@ -9501,71 +9478,71 @@ fn check_sync_metadata(
     // Determine staleness using the canonical compute_staleness() from sync module.
     // This avoids duplicating logic that accounts for last_export_time, mtime witness
     // fast-path, and content hash verification (issue #173).
-    let (jsonl_newer, db_newer) = if let Some(p) = jsonl_path {
+    let (jsonl_exists, jsonl_newer, db_newer) = if let Some(p) = jsonl_path {
         match SqliteStorage::open(db_path).and_then(|storage| compute_staleness(&storage, p)) {
-            Ok(staleness) => (staleness.jsonl_newer, staleness.db_newer),
+            Ok(staleness) => (
+                staleness.jsonl_exists,
+                staleness.jsonl_newer,
+                staleness.db_newer,
+            ),
             Err(err) => {
                 tracing::warn!(
                     error = %err,
                     "compute_staleness failed in doctor; falling back to dirty-count only"
                 );
-                (false, dirty_count > 0)
+                (p.exists(), false, dirty_count > 0)
             }
         }
     } else {
-        (false, dirty_count > 0)
+        (false, false, dirty_count > 0)
     };
+    details["jsonl_exists"] = serde_json::json!(jsonl_exists);
+    details["jsonl_newer"] = serde_json::json!(jsonl_newer);
+    details["db_newer"] = serde_json::json!(db_newer);
+    details["pending_import"] = serde_json::json!(jsonl_newer);
+    details["pending_export"] = serde_json::json!(db_newer);
 
-    // Check 1: Metadata consistency
-    if last_export.is_none() && dirty_count > 0 {
-        push_check(
-            checks,
-            "sync.metadata",
-            CheckStatus::Warn,
-            Some(
-                "JSONL exists but no export recorded; consider running sync --flush-only"
-                    .to_string(),
-            ),
-            Some(details),
-        );
-    } else {
-        match (jsonl_newer, db_newer) {
-            (false, false) => {
-                push_check(
-                    checks,
-                    "sync.metadata",
-                    CheckStatus::Ok,
-                    Some("Database and JSONL are in sync".to_string()),
-                    Some(details),
-                );
-            }
-            (true, false) => {
-                push_check(
-                    checks,
-                    "sync.metadata",
-                    CheckStatus::Ok, // Acceptable state
-                    Some("External changes pending import".to_string()),
-                    Some(details),
-                );
-            }
-            (false, true) => {
-                push_check(
-                    checks,
-                    "sync.metadata",
-                    CheckStatus::Ok, // Acceptable state
-                    Some("Local changes pending export".to_string()),
-                    Some(details),
-                );
-            }
-            (true, true) => {
-                push_check(
-                    checks,
-                    "sync.metadata",
-                    CheckStatus::Warn,
-                    Some("Database and JSONL have diverged (merge required)".to_string()),
-                    Some(details),
-                );
-            }
+    match (jsonl_newer, db_newer) {
+        (false, false) => {
+            push_check(
+                checks,
+                "sync.metadata",
+                CheckStatus::Ok,
+                Some("Database and JSONL are in sync".to_string()),
+                Some(details),
+            );
+        }
+        (true, false) => {
+            push_check(
+                checks,
+                "sync.metadata",
+                CheckStatus::Ok,
+                Some("External changes pending import".to_string()),
+                Some(details),
+            );
+        }
+        (false, true) => {
+            let message = if last_export.is_none() && dirty_count > 0 {
+                "Local changes exist but no export is recorded; consider running sync --flush-only"
+            } else {
+                "Local changes pending export"
+            };
+            push_check(
+                checks,
+                "sync.metadata",
+                CheckStatus::Warn,
+                Some(message.to_string()),
+                Some(details),
+            );
+        }
+        (true, true) => {
+            push_check(
+                checks,
+                "sync.metadata",
+                CheckStatus::Warn,
+                Some("Database and JSONL have diverged (merge required)".to_string()),
+                Some(details),
+            );
         }
     }
 }
@@ -11756,6 +11733,180 @@ mod tests {
             }),
             "expected count mismatch anomaly: {:?}",
             classification.anomalies
+        );
+    }
+
+    #[test]
+    fn test_classify_doctor_checks_prefers_sync_metadata_booleans_over_message() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let jsonl_path = temp.path().join("issues.jsonl");
+        let checks = vec![CheckResult {
+            name: "sync.metadata".to_string(),
+            status: CheckStatus::Ok,
+            message: Some("External changes pending import".to_string()),
+            details: Some(serde_json::json!({
+                "pending_import": false,
+                "pending_export": false,
+                "jsonl_newer": false,
+                "db_newer": false,
+            })),
+        }];
+
+        let classification = classify_doctor_checks(&db_path, &jsonl_path, &checks);
+
+        assert_eq!(classification.health, WorkspaceHealth::Healthy);
+        assert!(
+            classification.anomalies.is_empty(),
+            "machine sync booleans must override stale prose: {:?}",
+            classification.anomalies
+        );
+    }
+
+    #[test]
+    fn test_classify_doctor_checks_records_ok_pending_import_as_degraded_advisory() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let jsonl_path = temp.path().join("issues.jsonl");
+        let checks = vec![CheckResult {
+            name: "sync.metadata".to_string(),
+            status: CheckStatus::Ok,
+            message: Some("External changes pending import".to_string()),
+            details: Some(serde_json::json!({
+                "pending_import": true,
+                "pending_export": false,
+                "jsonl_newer": true,
+                "db_newer": false,
+            })),
+        }];
+
+        let classification = classify_doctor_checks(&db_path, &jsonl_path, &checks);
+
+        assert_eq!(classification.health, WorkspaceHealth::Degraded);
+        assert!(
+            classification
+                .anomalies
+                .iter()
+                .any(|anomaly| matches!(anomaly, AnomalyClass::JsonlNewer)),
+            "pending import remains an advisory health anomaly: {:?}",
+            classification.anomalies
+        );
+        assert!(
+            !classification
+                .anomalies
+                .iter()
+                .any(|anomaly| matches!(anomaly, AnomalyClass::DbNewer)),
+            "one-way import must not invent DB-newer evidence: {:?}",
+            classification.anomalies
+        );
+    }
+
+    #[test]
+    fn test_classify_doctor_checks_records_both_sync_metadata_directions() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let jsonl_path = temp.path().join("issues.jsonl");
+        let checks = vec![CheckResult {
+            name: "sync.metadata".to_string(),
+            status: CheckStatus::Warn,
+            message: Some("Database and JSONL have diverged (merge required)".to_string()),
+            details: Some(serde_json::json!({
+                "pending_import": true,
+                "pending_export": true,
+                "jsonl_newer": true,
+                "db_newer": true,
+            })),
+        }];
+
+        let classification = classify_doctor_checks(&db_path, &jsonl_path, &checks);
+
+        assert_eq!(classification.health, WorkspaceHealth::Degraded);
+        assert!(
+            classification
+                .anomalies
+                .iter()
+                .any(|anomaly| matches!(anomaly, AnomalyClass::JsonlNewer)),
+            "expected JSONL-newer anomaly: {:?}",
+            classification.anomalies
+        );
+        assert!(
+            classification
+                .anomalies
+                .iter()
+                .any(|anomaly| matches!(anomaly, AnomalyClass::DbNewer)),
+            "expected DB-newer anomaly: {:?}",
+            classification.anomalies
+        );
+    }
+
+    #[test]
+    fn test_classify_doctor_checks_falls_back_to_sync_metadata_message() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let jsonl_path = temp.path().join("issues.jsonl");
+        let checks = vec![
+            CheckResult {
+                name: "sync.metadata".to_string(),
+                status: CheckStatus::Warn,
+                message: Some("Database and JSONL have diverged (merge required)".to_string()),
+                details: None,
+            },
+            CheckResult {
+                name: "sync.metadata".to_string(),
+                status: CheckStatus::Warn,
+                message: Some(
+                    "Local changes exist but no export is recorded; consider running sync --flush-only"
+                        .to_string(),
+                ),
+                details: None,
+            },
+        ];
+
+        let classification = classify_doctor_checks(&db_path, &jsonl_path, &checks);
+
+        assert_eq!(classification.health, WorkspaceHealth::Degraded);
+        assert!(
+            classification
+                .anomalies
+                .iter()
+                .any(|anomaly| matches!(anomaly, AnomalyClass::JsonlNewer)),
+            "expected JSONL-newer fallback anomaly: {:?}",
+            classification.anomalies
+        );
+        assert!(
+            classification
+                .anomalies
+                .iter()
+                .any(|anomaly| matches!(anomaly, AnomalyClass::DbNewer)),
+            "expected DB-newer fallback anomaly: {:?}",
+            classification.anomalies
+        );
+
+        let local_only_checks = vec![CheckResult {
+            name: "sync.metadata".to_string(),
+            status: CheckStatus::Warn,
+            message: Some(
+                "Local changes exist but no export is recorded; consider running sync --flush-only"
+                    .to_string(),
+            ),
+            details: None,
+        }];
+        let local_only = classify_doctor_checks(&db_path, &jsonl_path, &local_only_checks);
+        assert!(
+            local_only
+                .anomalies
+                .iter()
+                .any(|anomaly| matches!(anomaly, AnomalyClass::DbNewer)),
+            "expected no-export fallback to classify DB-newer: {:?}",
+            local_only.anomalies
+        );
+        assert!(
+            !local_only
+                .anomalies
+                .iter()
+                .any(|anomaly| matches!(anomaly, AnomalyClass::JsonlNewer)),
+            "no-export fallback must not invent JSONL-newer: {:?}",
+            local_only.anomalies
         );
     }
 
@@ -16558,6 +16709,103 @@ mod tests {
                 "row 2 missing from index idx_a".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn test_check_sync_metadata_clean_export_after_import_is_not_pending_import() -> Result<()> {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let jsonl_path = temp.path().join("issues.jsonl");
+        fs::write(&jsonl_path, "{\"id\":\"bd-clean\"}\n").unwrap();
+        let jsonl_hash = crate::sync::compute_jsonl_hash(&jsonl_path)?;
+
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        storage.set_metadata("last_import_time", "2026-01-01T00:00:00Z")?;
+        storage.set_metadata("last_export_time", "2999-01-01T00:00:00Z")?;
+        storage.set_metadata("jsonl_content_hash", &jsonl_hash)?;
+        drop(storage);
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let mut checks = Vec::new();
+        check_sync_metadata(&conn, &db_path, Some(&jsonl_path), &mut checks);
+
+        let check = find_check(&checks, "sync.metadata").expect("sync metadata check");
+        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+        assert_eq!(
+            check.message.as_deref(),
+            Some("Database and JSONL are in sync"),
+            "last_export > last_import is history, not a pending import"
+        );
+        let details = check.details.as_ref().expect("sync details");
+        assert_eq!(details["dirty_issues"], 0);
+        assert_eq!(details["jsonl_newer"], false);
+        assert_eq!(details["db_newer"], false);
+        assert_eq!(details["pending_import"], false);
+        assert_eq!(details["pending_export"], false);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_check_sync_metadata_pending_import_without_local_dirty_is_ok() -> Result<()> {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let jsonl_path = temp.path().join("issues.jsonl");
+        fs::write(&jsonl_path, "{\"id\":\"bd-remote\"}\n").unwrap();
+
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        assert_eq!(storage.get_dirty_issue_count()?, 0);
+        drop(storage);
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let mut checks = Vec::new();
+        check_sync_metadata(&conn, &db_path, Some(&jsonl_path), &mut checks);
+
+        let check = find_check(&checks, "sync.metadata").expect("sync metadata check");
+        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+        assert_eq!(
+            check.message.as_deref(),
+            Some("External changes pending import"),
+            "pure JSONL-newer state is explicit import work, not a doctor failure"
+        );
+        let details = check.details.as_ref().expect("sync details");
+        assert_eq!(details["jsonl_newer"], true);
+        assert_eq!(details["db_newer"], false);
+        assert_eq!(details["pending_import"], true);
+        assert_eq!(details["pending_export"], false);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_check_sync_metadata_no_export_does_not_hide_divergence() -> Result<()> {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let jsonl_path = temp.path().join("issues.jsonl");
+        fs::write(&jsonl_path, "{\"id\":\"bd-remote\"}\n").unwrap();
+
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        storage.create_issue(&sample_issue("bd-local", "Local dirty issue"), "tester")?;
+        drop(storage);
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let mut checks = Vec::new();
+        check_sync_metadata(&conn, &db_path, Some(&jsonl_path), &mut checks);
+
+        let check = find_check(&checks, "sync.metadata").expect("sync metadata check");
+        assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
+        assert_eq!(
+            check.message.as_deref(),
+            Some("Database and JSONL have diverged (merge required)"),
+            "doctor must not suggest flush-only when JSONL is also newer"
+        );
+        let details = check.details.as_ref().expect("sync details");
+        assert_eq!(details["jsonl_newer"], true);
+        assert_eq!(details["db_newer"], true);
+        assert_eq!(details["pending_import"], true);
+        assert_eq!(details["pending_export"], true);
+
+        Ok(())
     }
 
     #[test]
