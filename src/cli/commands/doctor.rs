@@ -758,6 +758,21 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
         "write_lock",
         "fm-concurrency_primitives-orphaned-write-lock",
     ),
+    // #329: `--no-db` (JSONL-only) mode marker — enumerates DB-backed checks
+    // that were intentionally skipped.
+    (
+        "db.no_db_mode",
+        "fm-state_files-no-db-mode-db-checks-skipped",
+    ),
+    // #350: dependency-graph JSONL-audit findings.
+    (
+        "dep.dead_closed_blocking_edges",
+        "fm-dependencies-dead-closed-blocking-edges",
+    ),
+    (
+        "dep.fully_unblocked_open",
+        "fm-dependencies-fully-unblocked-open-issues",
+    ),
 ];
 
 /// Look up the canonical `fm-<subsystem>-<slug>` FM identifier for a
@@ -9950,6 +9965,22 @@ fn quote_sql_identifier(name: &str) -> String {
     quoted
 }
 
+/// Resolve the effective `no_db` flag for a doctor run the same way the
+/// storage layer does at runtime: merge the startup config layers (legacy
+/// user / user / project / env) with the CLI override layer and read the
+/// resolved `no-db` value. This honors a config-file `no-db: true` as well as
+/// the `--no-db` flag. #329
+fn resolve_doctor_no_db(beads_dir: &Path, cli: &config::CliOverrides) -> bool {
+    let startup = match config::load_startup_config(beads_dir) {
+        Ok(layer) => layer,
+        // If startup config can't be loaded, fall back to the explicit CLI
+        // override (the conservative, DB-running default is `false`).
+        Err(_) => return cli.no_db.unwrap_or(false),
+    };
+    let merged = config::ConfigLayer::merge_layers(&[startup, cli.as_layer()]);
+    config::no_db_from_layer(&merged).unwrap_or(false)
+}
+
 #[cfg(test)]
 fn collect_doctor_report(beads_dir: &Path, paths: &config::ConfigPaths) -> Result<DoctorRun> {
     collect_doctor_report_with_mode(beads_dir, paths, DoctorInspectionMode::Full)
@@ -9961,7 +9992,7 @@ fn collect_doctor_report_with_mode(
     paths: &config::ConfigPaths,
     mode: DoctorInspectionMode,
 ) -> Result<DoctorRun> {
-    collect_doctor_report_with_mode_and_db_override(beads_dir, paths, None, mode)
+    collect_doctor_report_with_mode_and_db_override(beads_dir, paths, None, mode, false)
 }
 
 fn collect_doctor_report_for_cli(
@@ -9969,11 +10000,13 @@ fn collect_doctor_report_for_cli(
     paths: &config::ConfigPaths,
     cli: &config::CliOverrides,
 ) -> Result<DoctorRun> {
+    let no_db = resolve_doctor_no_db(beads_dir, cli);
     collect_doctor_report_with_mode_and_db_override(
         beads_dir,
         paths,
         cli.db.as_ref(),
         DoctorInspectionMode::Full,
+        no_db,
     )
 }
 
@@ -9982,6 +10015,7 @@ fn collect_doctor_report_with_mode_and_db_override(
     paths: &config::ConfigPaths,
     db_override: Option<&PathBuf>,
     mode: DoctorInspectionMode,
+    no_db: bool,
 ) -> Result<DoctorRun> {
     let mut checks = Vec::new();
     check_merge_artifacts(beads_dir, &mut checks)?;
@@ -9994,7 +10028,13 @@ fn collect_doctor_report_with_mode_and_db_override(
     check_doctor_runs_creatable(repo_root, &mut checks);
     // Pass-5 cycle 30: writability of the active DB recovery dir so the
     // next --repair won't crash mid-backup.
-    check_recovery_dir_writable(&paths.db_path, beads_dir, &mut checks);
+    //
+    // #329: this is a DB-backed check (it probes the database's recovery
+    // sidecar dir). Under `--no-db` (the JSONL-only contract) we never open
+    // or recover the DB, so skip it and report it in `db.no_db_mode` below.
+    if !no_db {
+        check_recovery_dir_writable(&paths.db_path, beads_dir, &mut checks);
+    }
     // Pass-5 cycle 31: writability of `.beads/.write.lock` so we don't
     // mask EACCES failures as cryptic "could not open lock" errors.
     check_write_lock_writable(beads_dir, &mut checks);
@@ -10023,19 +10063,46 @@ fn collect_doctor_report_with_mode_and_db_override(
     check_routes_targets_resolve(beads_dir, &mut checks);
     check_startup_cache(beads_dir, db_override, &mut checks);
 
-    let (jsonl_path, jsonl_count) = inspect_doctor_jsonl(beads_dir, paths, &mut checks);
-    // Pass-5 cycle 22: db-to-selected-jsonl size ratio (VACUUM candidate).
-    check_db_bloat_vs_jsonl(&paths.db_path, jsonl_path.as_deref(), &mut checks);
-    // Pass-5 cycle 23: selected DB WAL sidecar oversized (checkpoint candidate).
-    check_wal_oversized(&paths.db_path, &mut checks);
-    inspect_doctor_database(
-        beads_dir,
-        &paths.db_path,
-        jsonl_path.as_deref(),
-        jsonl_count,
-        mode,
-        &mut checks,
-    );
+    // The JSONL-side audit always runs — it is the source of truth under the
+    // `--no-db` (JSONL-only) contract.
+    let (jsonl_path, jsonl_count) = inspect_doctor_jsonl(beads_dir, paths, mode, &mut checks);
+    if no_db {
+        // #329: under `--no-db`, `br` never opens or recovers the SQLite DB,
+        // so the DB-backed checks below would either be meaningless or would
+        // violate the JSONL-only contract by touching the database file.
+        // Skip them and emit a single Ok check that enumerates exactly which
+        // checks were skipped, so robot callers can see the scope of the
+        // reduced run rather than silently missing findings.
+        let skipped = [
+            "db.recovery_dir_writable",
+            "db.bloat_vs_jsonl",
+            "db.wal_oversized",
+            "db.inspect",
+        ];
+        push_check(
+            &mut checks,
+            "db.no_db_mode",
+            CheckStatus::Ok,
+            Some(format!(
+                "--no-db (JSONL-only): skipped {} DB-backed check(s)",
+                skipped.len()
+            )),
+            Some(serde_json::json!({ "skipped_checks": skipped })),
+        );
+    } else {
+        // Pass-5 cycle 22: db-to-selected-jsonl size ratio (VACUUM candidate).
+        check_db_bloat_vs_jsonl(&paths.db_path, jsonl_path.as_deref(), &mut checks);
+        // Pass-5 cycle 23: selected DB WAL sidecar oversized (checkpoint candidate).
+        check_wal_oversized(&paths.db_path, &mut checks);
+        inspect_doctor_database(
+            beads_dir,
+            &paths.db_path,
+            jsonl_path.as_deref(),
+            jsonl_count,
+            mode,
+            &mut checks,
+        );
+    }
 
     let classification = classify_doctor_checks(&paths.db_path, &paths.jsonl_path, &checks);
     let reliability_audit = classification.audit_record("doctor.inspect");
@@ -10059,6 +10126,7 @@ fn collect_doctor_report_with_mode_and_db_override(
 fn inspect_doctor_jsonl(
     beads_dir: &Path,
     paths: &config::ConfigPaths,
+    mode: DoctorInspectionMode,
     checks: &mut Vec<CheckResult>,
 ) -> (Option<PathBuf>, JsonlCountState) {
     let jsonl_path = select_doctor_jsonl_path(beads_dir, paths);
@@ -10103,7 +10171,213 @@ fn inspect_doctor_jsonl(
         JsonlCountState::Missing
     };
 
+    // #350: Full-mode dependency-graph audit over the JSONL source of truth.
+    // Only runs when the JSONL parsed cleanly (a malformed file is already
+    // surfaced by `jsonl.parse` above and would poison the graph).
+    if matches!(mode, DoctorInspectionMode::Full)
+        && matches!(jsonl_count, JsonlCountState::Available(_))
+        && let Some(path) = jsonl_path.as_ref()
+    {
+        check_dependency_graph_jsonl(path, checks);
+    }
+
     (jsonl_path, jsonl_count)
+}
+
+/// #350: audit the dependency graph from the JSONL source of truth and surface
+/// two actionable findings:
+///
+/// - `dep.dead_closed_blocking_edges`: open issues with a blocking dependency
+///   whose target is closed/tombstoned or entirely absent from the JSONL
+///   ("dead" edges that no longer reflect a live blocker).
+/// - `dep.fully_unblocked_open`: open issues that DO declare blocking
+///   dependencies but where EVERY blocker is now closed/tombstoned/absent —
+///   i.e. they are actually ready to work but may not be surfaced as such.
+///
+/// "Open" here means non-terminal (not `closed`/`tombstone`) and non-draft —
+/// the same work-surface notion `br ready` uses. Blocking edge types are the
+/// model's canonical blocking set (`DependencyType::is_blocking`). External
+/// targets (`external:` prefix) are not treated as dead, since `br` cannot
+/// know their state.
+fn check_dependency_graph_jsonl(path: &Path, checks: &mut Vec<CheckResult>) {
+    let issues = match read_jsonl_issues_for_graph(path) {
+        Ok(issues) => issues,
+        Err(err) => {
+            // Non-fatal: jsonl.parse already owns the hard parse error. Emit a
+            // Warn so the graph audit's absence is visible, not silent.
+            push_check(
+                checks,
+                "dep.dead_closed_blocking_edges",
+                CheckStatus::Warn,
+                Some(format!("Could not read JSONL for dependency audit: {err}")),
+                Some(serde_json::json!({ "path": path.display().to_string() })),
+            );
+            return;
+        }
+    };
+
+    // Index status by id. Terminal = closed or tombstone (a satisfied blocker).
+    let mut status_by_id: std::collections::HashMap<String, crate::model::Status> =
+        std::collections::HashMap::with_capacity(issues.len());
+    for issue in &issues {
+        status_by_id.insert(issue.id.clone(), issue.status.clone());
+    }
+
+    // A blocker is "live" (still blocking) when it exists AND is non-terminal.
+    // A blocker is "dead" when its target is terminal OR absent (and not an
+    // external ref, whose state `br` cannot resolve).
+    let blocker_is_dead = |target: &str| -> bool {
+        if target.starts_with("external:") {
+            return false;
+        }
+        match status_by_id.get(target) {
+            Some(status) => status.is_terminal(),
+            None => true,
+        }
+    };
+
+    let mut dead_edge_issues: Vec<serde_json::Value> = Vec::new();
+    let mut fully_unblocked_issues: Vec<String> = Vec::new();
+
+    for issue in &issues {
+        // Only audit open (non-terminal, non-draft) issues — the work surface.
+        if issue.status.is_terminal() || issue.status.is_draft() {
+            continue;
+        }
+
+        // Forward "blocked_by" edges only: an issue's own `depends_on_id`
+        // targets it is blocked by. Restricted to the forward blocking types
+        // (`blocks`/`conditional-blocks`/`waits-for`) — `parent-child` is
+        // INTENTIONALLY excluded because its blocking direction is reversed
+        // (the parent is blocked by the child, encoded as `issue_id=child,
+        // depends_on_id=parent`), so it is not a forward "blocked_by" edge for
+        // `issue`. This matches the ready-query forward-edge semantics.
+        let blocking_targets: Vec<&str> = issue
+            .dependencies
+            .iter()
+            .filter(|dep| {
+                matches!(
+                    dep.dep_type,
+                    crate::model::DependencyType::Blocks
+                        | crate::model::DependencyType::ConditionalBlocks
+                        | crate::model::DependencyType::WaitsFor
+                )
+            })
+            .map(|dep| dep.depends_on_id.as_str())
+            // An issue can't meaningfully block itself; ignore self-edges.
+            .filter(|target| *target != issue.id)
+            .collect();
+
+        if blocking_targets.is_empty() {
+            continue;
+        }
+
+        let dead: Vec<&str> = blocking_targets
+            .iter()
+            .copied()
+            .filter(|target| blocker_is_dead(target))
+            .collect();
+
+        if !dead.is_empty() {
+            dead_edge_issues.push(serde_json::json!({
+                "id": issue.id,
+                "dead_blockers": dead,
+            }));
+        }
+
+        // Fully unblocked: every declared blocker is dead (closed/absent), so
+        // nothing live remains to block this open issue.
+        if dead.len() == blocking_targets.len() {
+            fully_unblocked_issues.push(issue.id.clone());
+        }
+    }
+
+    emit_dead_closed_blocking_edges(&dead_edge_issues, checks);
+    emit_fully_unblocked_open(&fully_unblocked_issues, checks);
+}
+
+/// Read and parse JSONL issue records for the dependency-graph audit, skipping
+/// blank lines and ignoring records that fail to deserialize (those are
+/// already reported by `jsonl.parse`).
+fn read_jsonl_issues_for_graph(path: &Path) -> Result<Vec<crate::model::Issue>> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path)?;
+    let reader = std::io::BufReader::new(file);
+    let mut issues = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(issue) = serde_json::from_str::<crate::model::Issue>(trimmed) {
+            issues.push(issue);
+        }
+    }
+    Ok(issues)
+}
+
+fn emit_dead_closed_blocking_edges(
+    dead_edge_issues: &[serde_json::Value],
+    checks: &mut Vec<CheckResult>,
+) {
+    if dead_edge_issues.is_empty() {
+        push_check(
+            checks,
+            "dep.dead_closed_blocking_edges",
+            CheckStatus::Ok,
+            None,
+            None,
+        );
+        return;
+    }
+    let ids: Vec<&str> = dead_edge_issues
+        .iter()
+        .filter_map(|item| item.get("id").and_then(serde_json::Value::as_str))
+        .collect();
+    push_check(
+        checks,
+        "dep.dead_closed_blocking_edges",
+        CheckStatus::Warn,
+        Some(format!(
+            "{} open issue(s) have dead blocking edges (blocker closed or missing): {}",
+            dead_edge_issues.len(),
+            ids.join(", ")
+        )),
+        Some(serde_json::json!({
+            "count": dead_edge_issues.len(),
+            "issues": dead_edge_issues,
+            "remediation": "Remove or update the stale `blocks`/dependency edges (e.g. `br dep remove`) so the blocker reflects a live issue.",
+        })),
+    );
+}
+
+fn emit_fully_unblocked_open(fully_unblocked: &[String], checks: &mut Vec<CheckResult>) {
+    if fully_unblocked.is_empty() {
+        push_check(
+            checks,
+            "dep.fully_unblocked_open",
+            CheckStatus::Ok,
+            None,
+            None,
+        );
+        return;
+    }
+    push_check(
+        checks,
+        "dep.fully_unblocked_open",
+        CheckStatus::Warn,
+        Some(format!(
+            "{} open issue(s) are fully unblocked (all blockers closed) but may not be surfaced as ready: {}",
+            fully_unblocked.len(),
+            fully_unblocked.join(", ")
+        )),
+        Some(serde_json::json!({
+            "count": fully_unblocked.len(),
+            "issues": fully_unblocked,
+            "remediation": "These issues are ready to work — run `br ready` to confirm, or check status fields if they were manually set to `blocked`.",
+        })),
+    );
 }
 
 fn inspect_doctor_database(
@@ -10418,11 +10692,15 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     } else {
         DoctorInspectionMode::Full
     };
+    // #329: resolve `--no-db` (JSONL-only) the same way the storage layer does
+    // so DB-backed checks are skipped and reported via `db.no_db_mode`.
+    let no_db = resolve_doctor_no_db(&beads_dir, cli);
     let mut initial = collect_doctor_report_with_mode_and_db_override(
         &beads_dir,
         &paths,
         cli.db.as_ref(),
         inspection_mode,
+        no_db,
     )?;
 
     // WP6: --robot-triage short-circuits the flat run with a single
@@ -11472,6 +11750,135 @@ mod tests {
         .unwrap();
     }
 
+    /// #350 helper: build a JSONL issue with a `blocks` dependency on each of
+    /// `blocked_by`, set to `status`.
+    fn issue_with_blockers(id: &str, status: Status, blocked_by: &[&str]) -> Issue {
+        let mut issue = sample_issue(id, id);
+        issue.status = status;
+        issue.dependencies = blocked_by
+            .iter()
+            .map(|target| crate::model::Dependency {
+                issue_id: id.to_string(),
+                depends_on_id: (*target).to_string(),
+                dep_type: crate::model::DependencyType::Blocks,
+                created_at: Utc::now(),
+                created_by: None,
+                metadata: None,
+                thread_id: None,
+            })
+            .collect();
+        issue
+    }
+
+    fn write_issues_jsonl(path: &Path, issues: &[Issue]) {
+        let mut body = String::new();
+        for issue in issues {
+            body.push_str(&serde_json::to_string(issue).unwrap());
+            body.push('\n');
+        }
+        fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn test_dep_graph_jsonl_flags_dead_edges_and_fully_unblocked() {
+        // #350: fixture graph —
+        //  bd-a (open) blocked_by bd-closed (closed)  -> dead edge + fully unblocked
+        //  bd-b (open) blocked_by bd-open (open)       -> live, not flagged
+        //  bd-c (open) blocked_by bd-missing (absent)  -> dead edge + fully unblocked
+        //  bd-d (open) blocked_by [bd-closed, bd-open] -> 1 dead edge, NOT fully unblocked
+        //  bd-closed (closed) blocked_by ...           -> terminal, skipped
+        let temp = TempDir::new().unwrap();
+        let jsonl = temp.path().join("issues.jsonl");
+        let issues = vec![
+            issue_with_blockers("bd-a", Status::Open, &["bd-closed"]),
+            issue_with_blockers("bd-b", Status::Open, &["bd-open"]),
+            issue_with_blockers("bd-c", Status::Open, &["bd-missing"]),
+            issue_with_blockers("bd-d", Status::Open, &["bd-closed", "bd-open"]),
+            {
+                let mut closed = sample_issue("bd-closed", "bd-closed");
+                closed.status = Status::Closed;
+                closed.closed_at = Some(Utc::now());
+                closed
+            },
+            sample_issue("bd-open", "bd-open"),
+        ];
+        write_issues_jsonl(&jsonl, &issues);
+
+        let mut checks = Vec::new();
+        check_dependency_graph_jsonl(&jsonl, &mut checks);
+
+        let dead = find_check(&checks, "dep.dead_closed_blocking_edges").expect("dead-edge check");
+        assert_eq!(dead.status, CheckStatus::Warn, "{dead:?}");
+        let dead_count = dead
+            .details
+            .as_ref()
+            .and_then(|d| d.get("count"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap();
+        // bd-a, bd-c, bd-d each have >=1 dead blocking edge.
+        assert_eq!(dead_count, 3, "expected 3 issues with dead edges: {dead:?}");
+
+        let unblocked =
+            find_check(&checks, "dep.fully_unblocked_open").expect("fully-unblocked check");
+        assert_eq!(unblocked.status, CheckStatus::Warn, "{unblocked:?}");
+        let unblocked_ids: Vec<String> = unblocked
+            .details
+            .as_ref()
+            .and_then(|d| d.get("issues"))
+            .and_then(serde_json::Value::as_array)
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        // bd-a and bd-c are fully unblocked (all blockers dead). bd-d is NOT
+        // (bd-open is still live). bd-b is NOT (its only blocker is live).
+        assert!(
+            unblocked_ids.contains(&"bd-a".to_string()),
+            "{unblocked_ids:?}"
+        );
+        assert!(
+            unblocked_ids.contains(&"bd-c".to_string()),
+            "{unblocked_ids:?}"
+        );
+        assert!(
+            !unblocked_ids.contains(&"bd-d".to_string()),
+            "{unblocked_ids:?}"
+        );
+        assert!(
+            !unblocked_ids.contains(&"bd-b".to_string()),
+            "{unblocked_ids:?}"
+        );
+        assert_eq!(unblocked_ids.len(), 2, "{unblocked_ids:?}");
+    }
+
+    #[test]
+    fn test_dep_graph_jsonl_clean_graph_reports_ok() {
+        // A graph with only live blockers must produce two Ok checks.
+        let temp = TempDir::new().unwrap();
+        let jsonl = temp.path().join("issues.jsonl");
+        let issues = vec![
+            issue_with_blockers("bd-x", Status::Open, &["bd-y"]),
+            sample_issue("bd-y", "bd-y"),
+        ];
+        write_issues_jsonl(&jsonl, &issues);
+
+        let mut checks = Vec::new();
+        check_dependency_graph_jsonl(&jsonl, &mut checks);
+
+        assert_eq!(
+            find_check(&checks, "dep.dead_closed_blocking_edges")
+                .unwrap()
+                .status,
+            CheckStatus::Ok
+        );
+        assert_eq!(
+            find_check(&checks, "dep.fully_unblocked_open")
+                .unwrap()
+                .status,
+            CheckStatus::Ok
+        );
+    }
+
     fn dependency_row_count(conn: &Connection, issue_id: &str, depends_on_id: &str) -> i64 {
         let rows = conn
             .query("SELECT issue_id, depends_on_id FROM dependencies")
@@ -12363,6 +12770,99 @@ mod tests {
         let after_check =
             find_check(&report_after.report.checks, "gitignore.beads_inner").expect("status");
         assert!(matches!(after_check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn test_doctor_no_db_skips_db_backed_checks_and_reports_no_db_mode() {
+        // #329: under `--no-db` (JSONL-only), doctor must NOT run the
+        // DB-backed checks and must emit `db.no_db_mode` listing the skipped
+        // checks. The JSONL-side audit still runs.
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        // A real DB exists on disk so the DB-backed checks WOULD run if not
+        // suppressed; this proves suppression is by the flag, not by absence.
+        let _storage = SqliteStorage::open(&db_path).unwrap();
+        fs::write(
+            &jsonl_path,
+            format!(
+                "{}\n",
+                serde_json::to_string(&sample_issue("bd-test01", "Valid issue")).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let paths = config::ConfigPaths {
+            beads_dir: beads_dir.clone(),
+            db_path,
+            jsonl_path,
+            metadata: config::Metadata::default(),
+        };
+
+        // no_db = true -> DB-backed checks skipped.
+        let run = collect_doctor_report_with_mode_and_db_override(
+            &beads_dir,
+            &paths,
+            None,
+            DoctorInspectionMode::Full,
+            true,
+        )
+        .expect("doctor report");
+        let checks = &run.report.checks;
+
+        let marker = find_check(checks, "db.no_db_mode").expect("db.no_db_mode present");
+        assert_eq!(marker.status, CheckStatus::Ok);
+        let skipped: Vec<String> = marker
+            .details
+            .as_ref()
+            .and_then(|d| d.get("skipped_checks"))
+            .and_then(serde_json::Value::as_array)
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(skipped.contains(&"db.inspect".to_string()), "{skipped:?}");
+        assert!(
+            skipped.contains(&"db.bloat_vs_jsonl".to_string()),
+            "{skipped:?}"
+        );
+
+        // None of the DB-backed checks may appear.
+        for db_check in [
+            "db.exists",
+            "db.sidecars",
+            "db.recovery_artifacts",
+            "schema.tables",
+            "counts.db_vs_jsonl",
+            "permissions.recovery_dir",
+        ] {
+            assert!(
+                find_check(checks, db_check).is_none(),
+                "DB-backed check `{db_check}` must be skipped under --no-db: {:?}",
+                checks.iter().map(|c| &c.name).collect::<Vec<_>>()
+            );
+        }
+
+        // The JSONL-side audit still runs.
+        assert!(
+            find_check(checks, "jsonl.parse").is_some(),
+            "JSONL audit must still run under --no-db"
+        );
+
+        // Contrast: with no_db = false, the DB-backed checks DO run.
+        let run_db = collect_doctor_report_with_mode_and_db_override(
+            &beads_dir,
+            &paths,
+            None,
+            DoctorInspectionMode::Full,
+            false,
+        )
+        .expect("doctor report with db");
+        assert!(find_check(&run_db.report.checks, "db.no_db_mode").is_none());
+        assert!(find_check(&run_db.report.checks, "db.sidecars").is_some());
     }
 
     #[test]
