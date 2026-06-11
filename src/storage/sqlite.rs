@@ -21608,7 +21608,11 @@ mod tests {
             .unwrap();
         let values: Vec<String> = rows
             .iter()
-            .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(str::to_string))
+            .filter_map(|row| {
+                row.get(0)
+                    .and_then(SqliteValue::as_text)
+                    .map(str::to_string)
+            })
             .collect();
 
         assert_eq!(
