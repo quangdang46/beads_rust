@@ -113,7 +113,9 @@ fn main() {
                             "detail": e.to_string(),
                             "lock_path": lock_path,
                         });
-                        eprintln!(
+                        // #336: structured JSON errors go to STDOUT in json
+                        // mode so robot callers get one clean parseable stream.
+                        println!(
                             "{}",
                             serde_json::to_string_pretty(&payload)
                                 .unwrap_or_else(|_| payload.to_string())
@@ -1121,12 +1123,19 @@ fn handle_error(err: &BeadsError, json_mode: bool, color_mode: bool) -> ! {
     let exit_code = structured.code.exit_code();
 
     if json_mode {
+        // #336: In `--json` mode, route the structured JSON error envelope to
+        // STDOUT (where success JSON already goes) so robot callers read ONE
+        // clean, parseable stream. tracing/log lines stay on stderr (see
+        // `logging::init_logging`, which writes to `std::io::stderr`), so the
+        // stdout JSON is never interleaved with diagnostic noise.
         let json = structured.to_json();
-        eprintln!(
+        println!(
             "{}",
             serde_json::to_string_pretty(&json).unwrap_or_else(|_| json.to_string())
         );
     } else {
+        // Human mode: errors stay on stderr so stdout remains usable for the
+        // command's normal (non-error) output and pipelines.
         eprintln!("{}", structured.to_human(color_mode));
     }
 
