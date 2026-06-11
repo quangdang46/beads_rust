@@ -772,6 +772,10 @@ mod tests {
         init_logging();
         let filters = build_filters(&ListArgs::default()).expect("build filters");
 
+        // #349: list is COMPLETE by default — the default limit is unlimited
+        // (`0`), not a silent cap. `Some(0)` is the query layer's "no LIMIT".
+        assert_eq!(DEFAULT_LIST_LIMIT, 0, "list default must be unlimited");
+        assert_eq!(filters.limit, Some(0));
         assert_eq!(filters.limit, Some(DEFAULT_LIST_LIMIT));
         assert_eq!(filters.offset, Some(DEFAULT_LIST_OFFSET));
     }

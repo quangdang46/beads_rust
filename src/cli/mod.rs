@@ -19,8 +19,24 @@ use crate::model::{IssueType, Status};
 
 pub mod commands;
 
-pub(crate) const DEFAULT_LIST_LIMIT: usize = 50;
+/// Default cap for work-surface listings (`br list`).
+///
+/// #349: work-surface listings are COMPLETE by default — `0` means "no cap".
+/// Silently truncating an agent's view of its work surface hides issues and
+/// leads to lost work; listings now return every matching issue unless the
+/// caller passes an explicit `--limit`. The query layer treats `Some(0)` as
+/// unlimited (see `SqliteStorage` list paths, which only apply `LIMIT` when
+/// the value is `> 0`).
+pub(crate) const DEFAULT_LIST_LIMIT: usize = 0;
 pub(crate) const DEFAULT_LIST_OFFSET: usize = 0;
+
+/// Default cap for full-text SEARCH results (`br search`).
+///
+/// #349: unlike list/ready (which are complete by default), search results
+/// stay capped — a broad text query can match a huge fraction of the corpus,
+/// and a bounded, relevance-ordered result set is the right default. Callers
+/// can pass `--limit 0` for an unbounded search.
+pub(crate) const DEFAULT_SEARCH_LIMIT: usize = 50;
 
 #[derive(Clone, Copy)]
 enum IssueCompletionFilter {
@@ -1681,7 +1697,7 @@ pub struct ListArgs {
     #[arg(long, short = 'a')]
     pub all: bool,
 
-    /// Maximum number of results (0 = unlimited, default: 50)
+    /// Maximum number of results (0 = unlimited; default: unlimited — the full work surface)
     #[arg(long)]
     pub limit: Option<usize>,
 
@@ -2313,8 +2329,8 @@ pub struct UndeferArgs {
 #[derive(Args, Debug, Clone, Default)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct ReadyArgs {
-    /// Maximum number of issues to return (default: 20, 0 = unlimited)
-    #[arg(long, default_value_t = 20)]
+    /// Maximum number of issues to return (0 = unlimited; default: unlimited — the full ready set)
+    #[arg(long, default_value_t = 0)]
     pub limit: usize,
 
     /// Filter by assignee (no value = current actor)
@@ -2389,8 +2405,8 @@ pub struct ReadyArgs {
 /// Arguments for the scheduler command.
 #[derive(Args, Debug, Clone, Default)]
 pub struct SchedulerArgs {
-    /// Maximum recommendations to return (default: 20, 0 = unlimited)
-    #[arg(long, default_value_t = 20)]
+    /// Maximum recommendations to return (0 = unlimited; default: unlimited — every scored recommendation)
+    #[arg(long, default_value_t = 0)]
     pub limit: usize,
 
     /// Maximum ready candidates to score before truncating (default: 512, 0 = unlimited)

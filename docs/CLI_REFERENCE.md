@@ -305,7 +305,7 @@ br list [OPTIONS]
 **Output Options:**
 | Option | Description |
 |--------|-------------|
-| `--limit <N>` | Maximum results (0=unlimited, default: 50) |
+| `--limit <N>` | Maximum results (0=unlimited; default: unlimited — the full work surface). Pass `--limit N` to cap. |
 | `--sort <FIELD>` | Sort by: priority, created_at, updated_at, title |
 | `-r, --reverse` | Reverse sort order |
 | `--long` | Long output format |
@@ -497,7 +497,7 @@ br ready [OPTIONS]
 **Options:**
 | Option | Description |
 |--------|-------------|
-| `--limit <N>` | Maximum results (default: 20) |
+| `--limit <N>` | Maximum results (0=unlimited; default: unlimited — the full ready set). Pass `--limit N` to cap. |
 | `--assignee <NAME>` | Filter by assignee |
 | `--unassigned` | Show only unassigned |
 | `-l, --label <LABEL>` | Filter by label (AND logic) |
@@ -550,7 +550,7 @@ reservation evidence before reclaiming ownership.
 **Options:**
 | Option | Description |
 |--------|-------------|
-| `--limit <N>` | Maximum recommendations (default: 20, 0=unlimited) |
+| `--limit <N>` | Maximum recommendations (0=unlimited; default: unlimited — every scored recommendation) |
 | `--candidate-limit <N>` | Maximum ready candidates to score (default: 512, 0=unlimited) |
 | `--stale-claim-hours <N>` | Non-negative claim age threshold for stale-claim evidence (default: 2) |
 | `--format <FMT>` | Output format: text, json, toon |
@@ -653,7 +653,10 @@ Full-text search across issues.
 br search <QUERY> [OPTIONS]
 ```
 
-Supports all filter options from `list`.
+Supports all filter options from `list`. Unlike `list`/`ready` (which are
+complete by default), `search` results are **capped at 50 by default**
+(`--limit <N>`, `0`=unlimited) — a broad text query can match a large fraction
+of the corpus, so a bounded, relevance-ordered result set is the default.
 
 **Examples:**
 ```bash
