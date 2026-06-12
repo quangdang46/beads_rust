@@ -805,13 +805,13 @@ impl SqliteStorage {
                 continue;
             }
             match Self::insert_metadata_default_if_missing(conn, key, default_value) {
-                Ok(_) => {}
+                Ok(()) => {}
                 Err(e) if e.is_transient() => {
                     // BUSY — another writer is active. The default will be
                     // present once their transaction commits, or we'll seed
                     // it on the next open.
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(e),
             }
         }
         Ok(())

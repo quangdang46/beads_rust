@@ -1011,6 +1011,35 @@ fn sidecar_presence_from_check(check: &CheckResult) -> (bool, bool) {
     )
 }
 
+fn append_sync_metadata_anomalies(check: &CheckResult, anomalies: &mut Vec<AnomalyClass>) {
+    let message = check.message.as_deref().unwrap_or_default();
+    let pending_import = check
+        .details
+        .as_ref()
+        .and_then(|details| details.get("pending_import"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or_else(|| {
+            message.contains("External changes pending import")
+                || message.contains("Database and JSONL have diverged")
+        });
+    let pending_export = check
+        .details
+        .as_ref()
+        .and_then(|details| details.get("pending_export"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or_else(|| {
+            message.contains("Local changes pending export")
+                || message.contains("Local changes exist but no export is recorded")
+                || message.contains("Database and JSONL have diverged")
+        });
+    if pending_import {
+        push_anomaly(anomalies, AnomalyClass::JsonlNewer);
+    }
+    if pending_export {
+        push_anomaly(anomalies, AnomalyClass::DbNewer);
+    }
+}
+
 fn append_doctor_check_anomalies(check: &CheckResult, anomalies: &mut Vec<AnomalyClass>) {
     match check.name.as_str() {
         "db.exists" if matches!(check.status, CheckStatus::Error) => {
@@ -1055,32 +1084,7 @@ fn append_doctor_check_anomalies(check: &CheckResult, anomalies: &mut Vec<Anomal
             append_count_mismatch_anomaly(check, anomalies);
         }
         "sync.metadata" => {
-            let message = check.message.as_deref().unwrap_or_default();
-            let pending_import = check
-                .details
-                .as_ref()
-                .and_then(|details| details.get("pending_import"))
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or_else(|| {
-                    message.contains("External changes pending import")
-                        || message.contains("Database and JSONL have diverged")
-                });
-            let pending_export = check
-                .details
-                .as_ref()
-                .and_then(|details| details.get("pending_export"))
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or_else(|| {
-                    message.contains("Local changes pending export")
-                        || message.contains("Local changes exist but no export is recorded")
-                        || message.contains("Database and JSONL have diverged")
-                });
-            if pending_import {
-                push_anomaly(anomalies, AnomalyClass::JsonlNewer);
-            }
-            if pending_export {
-                push_anomaly(anomalies, AnomalyClass::DbNewer);
-            }
+            append_sync_metadata_anomalies(check, anomalies);
         }
         "db.recovery_artifacts" if matches!(check.status, CheckStatus::Warn) => {
             push_anomaly(anomalies, AnomalyClass::StaleRecoveryArtifacts);
@@ -9971,11 +9975,10 @@ fn quote_sql_identifier(name: &str) -> String {
 /// resolved `no-db` value. This honors a config-file `no-db: true` as well as
 /// the `--no-db` flag. #329
 fn resolve_doctor_no_db(beads_dir: &Path, cli: &config::CliOverrides) -> bool {
-    let startup = match config::load_startup_config(beads_dir) {
-        Ok(layer) => layer,
-        // If startup config can't be loaded, fall back to the explicit CLI
-        // override (the conservative, DB-running default is `false`).
-        Err(_) => return cli.no_db.unwrap_or(false),
+    // If startup config can't be loaded, fall back to the explicit CLI
+    // override (the conservative, DB-running default is `false`).
+    let Ok(startup) = config::load_startup_config(beads_dir) else {
+        return cli.no_db.unwrap_or(false);
     };
     let merged = config::ConfigLayer::merge_layers(&[startup, cli.as_layer()]);
     config::no_db_from_layer(&merged).unwrap_or(false)
