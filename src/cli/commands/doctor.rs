@@ -9571,17 +9571,37 @@ fn check_sync_metadata(
         }
         (true, false) => {
             // beads_rust#330: report the pending-import direction at the
-            // same advisory severity as the pending-export direction.
-            // The workspace classification already maps `jsonl_newer`
-            // to a degraded JsonlNewer anomaly via the details booleans;
-            // this keeps the per-check status consistent with it.
-            push_check(
-                checks,
-                "sync.metadata",
-                CheckStatus::Warn,
-                Some("External changes pending import".to_string()),
-                Some(details),
-            );
+            // same advisory severity as the pending-export direction so
+            // the two drift directions are consistent.
+            //
+            // Exception: a *fresh* workspace (`br init`) leaves an empty
+            // `issues.jsonl` whose mtime trails the DB's last_export, so
+            // `jsonl_newer` reads true even though there is nothing to
+            // import (the empty JSONL and an empty DB agree). Flagging
+            // that as Warn would make `br doctor` exit non-zero on a
+            // brand-new, perfectly healthy workspace. Only Warn when the
+            // JSONL actually carries importable content; the benign
+            // empty-JSONL case stays Ok with a clarifying message.
+            let jsonl_has_importable_content = jsonl_path
+                .and_then(|p| std::fs::metadata(p).ok())
+                .is_some_and(|meta| meta.len() > 0);
+            if jsonl_has_importable_content {
+                push_check(
+                    checks,
+                    "sync.metadata",
+                    CheckStatus::Warn,
+                    Some("External changes pending import".to_string()),
+                    Some(details),
+                );
+            } else {
+                push_check(
+                    checks,
+                    "sync.metadata",
+                    CheckStatus::Ok,
+                    Some("External changes pending import (empty JSONL, nothing to import)".to_string()),
+                    Some(details),
+                );
+            }
         }
         (false, true) => {
             let message = if last_export.is_none() && dirty_count > 0 {
@@ -17397,6 +17417,42 @@ mod tests {
         assert_eq!(details["db_newer"], false);
         assert_eq!(details["pending_import"], true);
         assert_eq!(details["pending_export"], false);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_check_sync_metadata_empty_jsonl_pending_import_stays_ok() -> Result<()> {
+        // beads_rust#330 regression guard: a fresh `br init` leaves an
+        // empty issues.jsonl whose mtime trails the DB, so `jsonl_newer`
+        // reads true with nothing to import. That benign state must stay
+        // Ok so `br doctor` keeps exiting 0 on a brand-new workspace.
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let jsonl_path = temp.path().join("issues.jsonl");
+        // Empty JSONL — the fresh-init shape.
+        fs::write(&jsonl_path, b"").unwrap();
+
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        assert_eq!(storage.get_dirty_issue_count()?, 0);
+        drop(storage);
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let mut checks = Vec::new();
+        check_sync_metadata(&conn, &db_path, Some(&jsonl_path), &mut checks);
+
+        let check = find_check(&checks, "sync.metadata").expect("sync metadata check");
+        assert!(
+            matches!(check.status, CheckStatus::Ok),
+            "empty-JSONL pending-import is benign (nothing to import): {check:?}"
+        );
+        assert_eq!(
+            check.message.as_deref(),
+            Some("External changes pending import (empty JSONL, nothing to import)")
+        );
+        let details = check.details.as_ref().expect("sync details");
+        assert_eq!(details["jsonl_newer"], true);
+        assert_eq!(details["pending_import"], true);
 
         Ok(())
     }

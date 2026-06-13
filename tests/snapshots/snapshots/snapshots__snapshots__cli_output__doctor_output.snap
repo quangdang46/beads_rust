@@ -34,6 +34,8 @@ OK jsonl.duplicate_ids
 OK sync_jsonl_path: JSONL path is within sync allowlist
 OK sync_conflict_markers: No merge conflict markers found
 OK jsonl.parse: Parsed 0 records
+OK dep.dead_closed_blocking_edges
+OK dep.fully_unblocked_open
 OK db_bloat
 OK wal_size
 OK db.recovery_artifacts
@@ -52,6 +54,6 @@ OK labels.orphans
 OK dependencies.orphans
 OK audit.suspect_close_reasons
 OK counts.db_vs_jsonl: Both have 0 records
-WARN sync.metadata: External changes pending import
+OK sync.metadata: External changes pending import (empty JSONL, nothing to import)
 OK db.write_probe: No issues available for ID-REDACTED write probe
 OK sqlite3.integrity_check
