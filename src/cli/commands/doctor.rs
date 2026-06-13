@@ -9598,7 +9598,10 @@ fn check_sync_metadata(
                     checks,
                     "sync.metadata",
                     CheckStatus::Ok,
-                    Some("External changes pending import (empty JSONL, nothing to import)".to_string()),
+                    Some(
+                        "External changes pending import (empty JSONL, nothing to import)"
+                            .to_string(),
+                    ),
                     Some(details),
                 );
             }
