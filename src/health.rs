@@ -491,7 +491,13 @@ pub fn classify_file_state(db_path: &Path, jsonl_path: &Path) -> Vec<AnomalyClas
     anomalies
 }
 
-fn jsonl_has_conflict_markers(path: &Path) -> bool {
+/// Returns true when any line of `path` starts with a git conflict
+/// marker (`<<<<<<<`, `=======`, `>>>>>>>`, or `|||||||`). Reads the
+/// file as raw bytes so non-UTF-8 content cannot hide markers; any
+/// open/read failure conservatively reports `false` (absence of
+/// evidence, not evidence of corruption).
+#[must_use]
+pub fn jsonl_has_conflict_markers(path: &Path) -> bool {
     use std::io::BufRead as _;
 
     let Ok(file) = std::fs::File::open(path) else {

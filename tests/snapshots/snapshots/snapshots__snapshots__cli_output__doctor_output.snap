@@ -52,6 +52,6 @@ OK labels.orphans
 OK dependencies.orphans
 OK audit.suspect_close_reasons
 OK counts.db_vs_jsonl: Both have 0 records
-OK sync.metadata: External changes pending import
+WARN sync.metadata: External changes pending import
 OK db.write_probe: No issues available for ID-REDACTED write probe
 OK sqlite3.integrity_check

@@ -6372,7 +6372,27 @@ fn integrity_check_messages(rows: &[Vec<SqliteValue>]) -> Vec<String> {
     messages
 }
 
-fn check_merge_artifacts(beads_dir: &Path, checks: &mut Vec<CheckResult>) -> Result<()> {
+/// Classify a stuck merge artifact filename for the `jsonl.merge_artifacts`
+/// details payload (beads_rust#344/#328): `.left.jsonl` / `.right.jsonl`
+/// variants are the local/remote halves of an interrupted `br sync --merge`;
+/// any other `.base.jsonl` variant (the canonical `beads.base.jsonl` anchor
+/// is excluded before this runs) is a stale base snapshot.
+fn merge_artifact_kind(name: &str) -> &'static str {
+    if name.contains(".left.jsonl") {
+        "merge-left"
+    } else if name.contains(".right.jsonl") {
+        "merge-right"
+    } else {
+        "stale-base-variant"
+    }
+}
+
+fn check_merge_artifacts(
+    beads_dir: &Path,
+    canonical_jsonl: &Path,
+    checks: &mut Vec<CheckResult>,
+) -> Result<()> {
+    let mut files = Vec::new();
     let mut artifacts = Vec::new();
     for entry in beads_dir.read_dir()? {
         let entry = entry?;
@@ -6391,7 +6411,16 @@ fn check_merge_artifacts(beads_dir: &Path, checks: &mut Vec<CheckResult>) -> Res
             || name.contains(".left.jsonl")
             || name.contains(".right.jsonl")
         {
-            artifacts.push(name.to_string());
+            // beads_rust#344/#328: carry per-file classification plus a
+            // cheap conflict-marker scan so agents can distinguish a
+            // benign leftover from a half-merged file without opening it.
+            let path = entry.path();
+            artifacts.push(serde_json::json!({
+                "path": path.display().to_string(),
+                "artifact_kind": merge_artifact_kind(name),
+                "conflict_markers_found": crate::health::jsonl_has_conflict_markers(&path),
+            }));
+            files.push(name.to_string());
         }
     }
 
@@ -6403,7 +6432,16 @@ fn check_merge_artifacts(beads_dir: &Path, checks: &mut Vec<CheckResult>) -> Res
             "jsonl.merge_artifacts",
             CheckStatus::Warn,
             Some("Merge artifacts detected in .beads/".to_string()),
-            Some(serde_json::json!({ "files": artifacts })),
+            Some(serde_json::json!({
+                // Back-compat: existing consumers key on `files`.
+                "files": files,
+                "artifacts": artifacts,
+                "canonical_jsonl": canonical_jsonl.display().to_string(),
+                "recovery": [
+                    { "kind": "quarantine", "command": "br doctor --repair" },
+                    { "kind": "undo", "command": "br doctor undo <run-id>" },
+                ],
+            })),
         );
     }
     Ok(())
@@ -9532,10 +9570,15 @@ fn check_sync_metadata(
             );
         }
         (true, false) => {
+            // beads_rust#330: report the pending-import direction at the
+            // same advisory severity as the pending-export direction.
+            // The workspace classification already maps `jsonl_newer`
+            // to a degraded JsonlNewer anomaly via the details booleans;
+            // this keeps the per-check status consistent with it.
             push_check(
                 checks,
                 "sync.metadata",
-                CheckStatus::Ok,
+                CheckStatus::Warn,
                 Some("External changes pending import".to_string()),
                 Some(details),
             );
@@ -10021,7 +10064,7 @@ fn collect_doctor_report_with_mode_and_db_override(
     no_db: bool,
 ) -> Result<DoctorRun> {
     let mut checks = Vec::new();
-    check_merge_artifacts(beads_dir, &mut checks)?;
+    check_merge_artifacts(beads_dir, &paths.jsonl_path, &mut checks)?;
     check_base_jsonl(beads_dir, &mut checks);
     // Pass-5 cycle 10: doctor's own runs dir size (operator-prunable).
     let repo_root = beads_dir.parent().unwrap_or(beads_dir);
@@ -16076,6 +16119,80 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_artifacts_warn_carries_classification_and_recovery() {
+        // beads_rust#344/#328: the warn's details must classify each
+        // flagged artifact, scan it for conflict markers, and point at the
+        // canonical JSONL plus the structured recovery actions.
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        let _storage = SqliteStorage::open(&db_path).unwrap();
+        fs::write(&jsonl_path, b"").unwrap();
+        fs::write(beads_dir.join("issues.base.jsonl"), b"").unwrap();
+        fs::write(
+            beads_dir.join("issues.left.jsonl"),
+            b"<<<<<<< HEAD\n{\"id\":\"bd-a\"}\n=======\n{\"id\":\"bd-b\"}\n>>>>>>> theirs\n",
+        )
+        .unwrap();
+        fs::write(beads_dir.join("issues.right.jsonl"), b"{\"id\":\"bd-c\"}\n").unwrap();
+        // The protected anchor must stay excluded from the details.
+        fs::write(beads_dir.join("beads.base.jsonl"), b"canonical-anchor").unwrap();
+
+        let mut checks = Vec::new();
+        check_merge_artifacts(&beads_dir, &jsonl_path, &mut checks).expect("merge artifact scan");
+        let check = find_check(&checks, "jsonl.merge_artifacts").expect("merge_artifacts check");
+        assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
+
+        let details = check.details.as_ref().expect("warn details");
+        assert_eq!(
+            details["canonical_jsonl"],
+            serde_json::json!(jsonl_path.display().to_string())
+        );
+        let recovery = details["recovery"].as_array().expect("recovery actions");
+        assert_eq!(recovery.len(), 2, "{details}");
+        assert_eq!(recovery[0]["kind"], "quarantine");
+        assert_eq!(recovery[0]["command"], "br doctor --repair");
+        assert_eq!(recovery[1]["kind"], "undo");
+        assert_eq!(recovery[1]["command"], "br doctor undo <run-id>");
+
+        let artifacts = details["artifacts"].as_array().expect("artifact entries");
+        assert_eq!(artifacts.len(), 3, "{details}");
+        let by_kind = |kind: &str| {
+            artifacts
+                .iter()
+                .find(|a| a["artifact_kind"] == kind)
+                .unwrap_or_else(|| panic!("missing {kind} entry: {details}"))
+        };
+        let left = by_kind("merge-left");
+        assert_eq!(left["conflict_markers_found"], true, "{details}");
+        assert!(
+            left["path"]
+                .as_str()
+                .is_some_and(|p| p.ends_with("issues.left.jsonl")),
+            "{details}"
+        );
+        assert_eq!(by_kind("merge-right")["conflict_markers_found"], false);
+        assert_eq!(
+            by_kind("stale-base-variant")["conflict_markers_found"],
+            false
+        );
+        assert!(
+            !artifacts.iter().any(|a| a["path"]
+                .as_str()
+                .is_some_and(|p| p.ends_with("beads.base.jsonl"))),
+            "protected anchor must not be classified as an artifact: {details}"
+        );
+
+        // Back-compat `files` list survives, and the finding_id wiring
+        // stays on the canonical FM identifier.
+        let listed = details["files"].as_array().expect("files list");
+        assert_eq!(listed.len(), 3, "{details}");
+        assert_eq!(details["finding_id"], "fm-state_files-merge-artifact-stuck");
+    }
+
+    #[test]
     fn test_fix_merge_artifacts_is_idempotent_no_op_on_second_call() {
         // The idempotence contract: a second --repair against a clean
         // workspace must find nothing to quarantine (no actions emitted).
@@ -17250,7 +17367,7 @@ mod tests {
     }
 
     #[test]
-    fn test_check_sync_metadata_pending_import_without_local_dirty_is_ok() -> Result<()> {
+    fn test_check_sync_metadata_pending_import_without_local_dirty_is_warn() -> Result<()> {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("beads.db");
         let jsonl_path = temp.path().join("issues.jsonl");
@@ -17265,7 +17382,11 @@ mod tests {
         check_sync_metadata(&conn, &db_path, Some(&jsonl_path), &mut checks);
 
         let check = find_check(&checks, "sync.metadata").expect("sync metadata check");
-        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+        assert!(
+            matches!(check.status, CheckStatus::Warn),
+            "pending-import is an advisory Warn, matching the pending-export \
+             direction (beads_rust#330): {check:?}"
+        );
         assert_eq!(
             check.message.as_deref(),
             Some("External changes pending import"),
