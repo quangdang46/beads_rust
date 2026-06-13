@@ -86,6 +86,21 @@ Each row is a workspace component; columns indicate which subsystem owns and val
 - `report.reliability_audit`: workspace classification evidence derived from `AnomalyClass`.
 - `recovery_audit`: repair action, outcome, applied local actions, quarantine artifacts, and JSONL rebuild counts.
 
+`br sync --status --json` carries the same write-gate fields (beads_rust#334):
+
+- `workspace_health`: the same `healthy`/`degraded`/`recoverable`/`unsafe`
+  vocabulary doctor emits, computed from the cheap signals available in
+  sync-status context only — the shared file-state probes
+  (`classify_file_state`: DB header, WAL/SHM/journal sidecars, JSONL
+  conflict markers, orphaned locks) plus the DB↔JSONL drift booleans
+  (`jsonl_newer` → `jsonl_newer`, `db_newer` → `db_newer`). It does NOT
+  run the full doctor checklist, so doctor-only anomaly codes (count
+  mismatches, integrity-check corruption, write-probe failures, …) never
+  appear here; absence of a code means "not evaluated", not "passed".
+- `reliability_audit`: the matching anomaly evidence record
+  (`source: "sync.status"`, `anomalies[].code/severity/message`), in the
+  same shape as `report.reliability_audit` from doctor.
+
 The same records are emitted through `tracing` with target `br::reliability` so field logs can be correlated with doctor JSON, quarantined artifacts, and replay fixtures.
 
 ## Reliability Gate Contract

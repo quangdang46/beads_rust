@@ -6,6 +6,7 @@
 use crate::cli::{DEFAULT_WITNESS_PARALLELISM, SyncArgs};
 use crate::config;
 use crate::error::{BeadsError, Result};
+use crate::health::{AnomalyClass, ReliabilityAuditRecord, WorkspaceClassification};
 use crate::output::OutputContext;
 use crate::sync::history::HistoryConfig;
 use crate::sync::witness::{
@@ -75,6 +76,68 @@ pub struct SyncStatus {
     pub jsonl_exists: bool,
     pub jsonl_newer: bool,
     pub db_newer: bool,
+    /// Workspace health classification (`healthy` / `degraded` /
+    /// `recoverable` / `unsafe`) computed from the cheap signals this
+    /// command already evaluates: file-state probes plus the
+    /// DB↔JSONL drift booleans above. Same write-gate vocabulary as
+    /// `br doctor --json` (beads_rust#334; docs/reliability/HEALTH_CONTRACT.md).
+    pub workspace_health: String,
+    /// Anomaly evidence backing `workspace_health`, in the same shape
+    /// doctor emits (`anomalies[].code` / `severity` / `message`).
+    pub reliability_audit: ReliabilityAuditRecord,
+    /// Read-only git visibility for the canonical JSONL export
+    /// (beads_rust#338). `{available:false}` when git or a repo is
+    /// absent; never fails the command.
+    pub git_export: GitExportStatus,
+}
+
+/// Read-only git visibility for the JSONL export (beads_rust#338).
+///
+/// `br sync --status` reports DB↔JSONL drift, but a dirty *tracked*
+/// `issues.jsonl` was previously invisible: the DB and the worktree
+/// file can agree while the committed copy lags behind. This block
+/// surfaces exactly what git knows about the export file. All probes
+/// are read-only (`git status --porcelain`, `git rev-parse`,
+/// `git ls-files`, `git hash-object`); any git error — git missing,
+/// not a repo, spawn failure — degrades to `{ "available": false }`
+/// rather than failing the status command.
+#[derive(Debug, Serialize)]
+pub struct GitExportStatus {
+    /// True when the JSONL sits inside a git work tree and the
+    /// read-only probes answered.
+    pub available: bool,
+    /// True when the JSONL is tracked in the git index
+    /// (`git ls-files --error-unmatch`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracked: Option<bool>,
+    /// True when the worktree copy matches the index (untracked files
+    /// report `false`: their content is invisible to git entirely).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_clean: Option<bool>,
+    /// True when the index matches HEAD for this path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_clean: Option<bool>,
+    /// Blob hash of the committed copy (`git rev-parse HEAD:<relpath>`);
+    /// `None` when the file is absent from HEAD (or no commits exist).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head_hash: Option<String>,
+    /// Blob hash of the on-disk copy (`git hash-object <jsonl>`);
+    /// `None` when the file is missing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_hash: Option<String>,
+}
+
+impl GitExportStatus {
+    fn unavailable() -> Self {
+        Self {
+            available: false,
+            tracked: None,
+            worktree_clean: None,
+            index_clean: None,
+            head_hash: None,
+            worktree_hash: None,
+        }
+    }
 }
 
 /// JSONL witness command output.
@@ -446,9 +509,13 @@ fn dispatch_sync_subcommand(
     let options = sync_dispatch_options(args, cli, ctx, open_result);
 
     match sync_operation(args) {
-        SyncOperation::Status => {
-            execute_status(&open_result.storage, path_policy, options.use_json, ctx)
-        }
+        SyncOperation::Status => execute_status(
+            &open_result.storage,
+            path_policy,
+            &options.db_path,
+            options.use_json,
+            ctx,
+        ),
         SyncOperation::Witness => execute_witness(path_policy, args, options.use_json, ctx),
         SyncOperation::Flush => execute_flush(
             &mut open_result.storage,
@@ -766,10 +833,116 @@ fn contains_git_dir(path: &Path) -> bool {
     })
 }
 
+/// Classify workspace health from the cheap signals available in
+/// sync-status context (beads_rust#334): the file-state probes shared
+/// with doctor (`classify_file_state`: DB header, sidecars, conflict
+/// markers, orphaned locks) plus the DB↔JSONL drift booleans the
+/// command already computed. This intentionally does NOT run the full
+/// doctor checklist — only anomaly codes actually evaluated here are
+/// emitted, so the audit record stays honest.
+fn classify_sync_status_workspace(
+    db_path: &Path,
+    jsonl_path: &Path,
+    jsonl_newer: bool,
+    db_newer: bool,
+) -> WorkspaceClassification {
+    let mut anomalies = crate::health::classify_file_state(db_path, jsonl_path);
+    if jsonl_newer {
+        anomalies.push(AnomalyClass::JsonlNewer);
+    }
+    if db_newer {
+        anomalies.push(AnomalyClass::DbNewer);
+    }
+    WorkspaceClassification::from_anomalies(anomalies)
+}
+
+/// Run a read-only git command in `dir`, returning trimmed stdout on
+/// success and `None` on any failure (git absent, not a repo, non-zero
+/// exit, non-UTF-8 paths). Mirrors the read-only probing pattern in
+/// `changelog.rs` / `orphans.rs` / `stats.rs` — `br` never performs
+/// git mutations.
+fn run_git_capture(dir: &Path, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Interpret `git status --porcelain -- <path>` output for a single
+/// path as `(index_clean, worktree_clean)`.
+///
+/// - empty output → both clean (or the path is unknown to git; the
+///   separate `tracked` probe disambiguates that),
+/// - `??` (untracked) → index clean (nothing staged), worktree dirty
+///   (the content is invisible to git),
+/// - otherwise the two porcelain status columns map directly: index
+///   clean when `X == ' '`, worktree clean when `Y == ' '`.
+fn porcelain_cleanliness(porcelain: &str) -> (bool, bool) {
+    let Some(line) = porcelain.lines().next() else {
+        return (true, true);
+    };
+    let mut chars = line.chars();
+    let x = chars.next().unwrap_or(' ');
+    let y = chars.next().unwrap_or(' ');
+    if x == '?' && y == '?' {
+        return (true, false);
+    }
+    (x == ' ', y == ' ')
+}
+
+/// Compute the read-only `git_export` block for `br sync --status`
+/// (beads_rust#338). Never returns an error: any git failure collapses
+/// to `GitExportStatus::unavailable()`.
+fn git_export_status(jsonl_path: &Path) -> GitExportStatus {
+    let Some(parent) = jsonl_path.parent().filter(|dir| dir.is_dir()) else {
+        return GitExportStatus::unavailable();
+    };
+    let Some(file_name) = jsonl_path.file_name().and_then(std::ffi::OsStr::to_str) else {
+        return GitExportStatus::unavailable();
+    };
+
+    if run_git_capture(parent, &["rev-parse", "--is-inside-work-tree"]).as_deref() != Some("true") {
+        return GitExportStatus::unavailable();
+    }
+    let Some(porcelain) = run_git_capture(parent, &["status", "--porcelain", "--", file_name])
+    else {
+        return GitExportStatus::unavailable();
+    };
+
+    let (index_clean, worktree_clean) = porcelain_cleanliness(&porcelain);
+    let tracked =
+        run_git_capture(parent, &["ls-files", "--error-unmatch", "--", file_name]).is_some();
+    // `HEAD:./<name>` resolves relative to the cwd we run git in, so no
+    // toplevel-relative path computation is needed.
+    let head_spec = format!("HEAD:./{file_name}");
+    let head_hash = run_git_capture(parent, &["rev-parse", "--verify", "--quiet", &head_spec])
+        .filter(|hash| !hash.is_empty());
+    let worktree_hash = if jsonl_path.is_file() {
+        run_git_capture(parent, &["hash-object", "--", file_name]).filter(|hash| !hash.is_empty())
+    } else {
+        None
+    };
+
+    GitExportStatus {
+        available: true,
+        tracked: Some(tracked),
+        worktree_clean: Some(worktree_clean),
+        index_clean: Some(index_clean),
+        head_hash,
+        worktree_hash,
+    }
+}
+
 /// Execute the --status subcommand.
 fn execute_status(
     storage: &crate::storage::SqliteStorage,
     path_policy: &SyncPathPolicy,
+    db_path: &Path,
     use_json: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
@@ -788,6 +961,22 @@ fn execute_status(
         "Computed sync status inputs"
     );
 
+    let classification = classify_sync_status_workspace(
+        db_path,
+        jsonl_path,
+        staleness.jsonl_newer,
+        staleness.db_newer,
+    );
+    let reliability_audit = classification.audit_record("sync.status");
+    reliability_audit.emit_tracing(
+        "status",
+        if classification.anomalies.is_empty() {
+            "ok"
+        } else {
+            "findings"
+        },
+    );
+
     let status = SyncStatus {
         dirty_count,
         last_export_time,
@@ -796,10 +985,14 @@ fn execute_status(
         jsonl_exists,
         jsonl_newer: staleness.jsonl_newer,
         db_newer: staleness.db_newer,
+        workspace_health: classification.health.to_string(),
+        reliability_audit,
+        git_export: git_export_status(jsonl_path),
     };
     debug!(
         jsonl_newer = staleness.jsonl_newer,
         db_newer = staleness.db_newer,
+        workspace_health = %status.workspace_health,
         "Computed sync staleness"
     );
 
@@ -2717,11 +2910,13 @@ mod tests {
     use super::{
         SyncOperation, SyncPathPolicy, auto_rebuild_semantic_conflict_field,
         auto_rebuild_semantic_flag_conflict_reason, build_base_witness_artifacts,
-        detect_prefix_from_jsonl, fresh_force_import_maintenance_gate_applies,
+        classify_sync_status_workspace, detect_prefix_from_jsonl,
+        fresh_force_import_maintenance_gate_applies, git_export_status,
         jsonl_contains_duplicate_external_refs, jsonl_contains_prefix_mismatch,
-        merge_conflict_resolution, prepare_sync_startup, should_defer_jsonl_recovery,
-        should_render_human_sync_output, sync_operation, validate_operator_requested_sync_path,
-        validate_sync_mode_args, validate_sync_paths, write_manifest_atomically,
+        merge_conflict_resolution, porcelain_cleanliness, prepare_sync_startup,
+        should_defer_jsonl_recovery, should_render_human_sync_output, sync_operation,
+        validate_operator_requested_sync_path, validate_sync_mode_args, validate_sync_paths,
+        write_manifest_atomically,
     };
     use crate::cli::SyncArgs;
     use crate::config::{self, CliOverrides};
@@ -3180,6 +3375,97 @@ mod tests {
                 .storage
                 .id_exists("bd-sync-selflock")
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_porcelain_cleanliness_maps_status_columns() {
+        // Clean (no porcelain output).
+        assert_eq!(porcelain_cleanliness(""), (true, true));
+        // Untracked: nothing staged, but the content is invisible to git.
+        assert_eq!(porcelain_cleanliness("?? issues.jsonl"), (true, false));
+        // Worktree-dirty tracked file.
+        assert_eq!(porcelain_cleanliness(" M issues.jsonl"), (true, false));
+        // Staged change, clean worktree.
+        assert_eq!(porcelain_cleanliness("M  issues.jsonl"), (false, true));
+        // Staged + worktree-dirty.
+        assert_eq!(porcelain_cleanliness("MM issues.jsonl"), (false, false));
+        // Newly added to the index.
+        assert_eq!(porcelain_cleanliness("A  issues.jsonl"), (false, true));
+    }
+
+    #[test]
+    fn test_git_export_status_unavailable_outside_git_repo() {
+        let temp = TempDir::new().unwrap();
+        let jsonl_path = temp.path().join("issues.jsonl");
+        fs::write(&jsonl_path, "{\"id\":\"bd-x\"}\n").unwrap();
+
+        let status = git_export_status(&jsonl_path);
+        assert!(!status.available, "{status:?}");
+        assert!(status.tracked.is_none(), "{status:?}");
+        assert!(status.worktree_clean.is_none(), "{status:?}");
+        assert!(status.index_clean.is_none(), "{status:?}");
+        assert!(status.head_hash.is_none(), "{status:?}");
+        assert!(status.worktree_hash.is_none(), "{status:?}");
+
+        // The unavailable shape serializes to exactly {"available": false}.
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json, serde_json::json!({ "available": false }));
+    }
+
+    #[test]
+    fn test_classify_sync_status_workspace_maps_drift_to_anomaly_codes() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let jsonl_path = temp.path().join("issues.jsonl");
+        // Valid SQLite header so file-state probes stay quiet.
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        drop(storage);
+        fs::write(&jsonl_path, "{\"id\":\"bd-x\"}\n").unwrap();
+
+        let healthy = classify_sync_status_workspace(&db_path, &jsonl_path, false, false);
+        assert_eq!(healthy.health.as_str(), "healthy", "{healthy:?}");
+        assert!(healthy.anomalies.is_empty(), "{healthy:?}");
+
+        let pending_export = classify_sync_status_workspace(&db_path, &jsonl_path, false, true);
+        assert_eq!(pending_export.health.as_str(), "degraded");
+        let audit = pending_export.audit_record("sync.status");
+        assert_eq!(audit.source, "sync.status");
+        assert_eq!(audit.anomaly_codes_csv(), "db_newer");
+
+        let diverged = classify_sync_status_workspace(&db_path, &jsonl_path, true, true);
+        assert_eq!(diverged.health.as_str(), "degraded");
+        assert_eq!(
+            diverged.audit_record("sync.status").anomaly_codes_csv(),
+            "jsonl_newer,db_newer"
+        );
+    }
+
+    #[test]
+    fn test_classify_sync_status_workspace_conflict_markers_are_unsafe() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let jsonl_path = temp.path().join("issues.jsonl");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        drop(storage);
+        fs::write(
+            &jsonl_path,
+            "<<<<<<< HEAD\n{\"id\":\"bd-a\"}\n=======\n{\"id\":\"bd-b\"}\n>>>>>>> theirs\n",
+        )
+        .unwrap();
+
+        let classification = classify_sync_status_workspace(&db_path, &jsonl_path, false, false);
+        assert_eq!(
+            classification.health.as_str(),
+            "unsafe",
+            "{classification:?}"
+        );
+        assert!(
+            classification
+                .audit_record("sync.status")
+                .anomaly_codes_csv()
+                .contains("jsonl_conflict_markers"),
+            "{classification:?}"
         );
     }
 

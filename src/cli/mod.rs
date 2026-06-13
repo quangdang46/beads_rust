@@ -2601,6 +2601,11 @@ pub struct SyncArgs {
     /// Show sync status (read-only)
     ///
     /// Displays hash comparison and freshness info without modifications.
+    /// With --json the payload also carries `workspace_health` plus a
+    /// `reliability_audit` anomaly record (same write-gate vocabulary as
+    /// `br doctor --json`) and a read-only `git_export` block reporting
+    /// whether the tracked JSONL is clean in the surrounding git repo
+    /// ({"available": false} when git or a repo is absent).
     #[arg(long)]
     pub status: bool,
 
