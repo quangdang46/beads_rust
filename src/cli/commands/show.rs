@@ -285,20 +285,28 @@ fn execute_inner(
             let inheritance_storage: Option<&SqliteStorage> = preloaded_storage
                 .or_else(|| preloaded_storage_ctx.map(|ctx| &ctx.storage))
                 .or_else(|| transient_ctx.as_ref().map(|ctx| &ctx.storage));
+            // beads_rust#351: when showing several siblings, each child's
+            // ancestor chain resolves independently, so the same epic/parent
+            // block would be re-rendered once per sibling. Dedup across the
+            // whole invocation: each inherited source is emitted exactly
+            // once, before the first child that references it.
+            let mut emitted_sources: HashSet<String> = HashSet::new();
             for (i, details) in details_list.iter().enumerate() {
                 if i > 0 {
                     println!(); // Separate multiple issues
                 }
                 if inheritance_enabled
                     && let Some(storage) = inheritance_storage
-                    && let Ok(blocks) =
+                    && let Ok(mut blocks) =
                         crate::inheritance::collect_inherited_blocks(storage, &details.issue.id)
-                    && !blocks.is_empty()
                 {
-                    let rendered = crate::inheritance::render_text(&blocks);
-                    print!("{rendered}");
-                    if !rendered.ends_with('\n') {
-                        println!();
+                    blocks.retain(|block| emitted_sources.insert(block.source_id.clone()));
+                    if !blocks.is_empty() {
+                        let rendered = crate::inheritance::render_text(&blocks);
+                        print!("{rendered}");
+                        if !rendered.ends_with('\n') {
+                            println!();
+                        }
                     }
                 }
                 if matches!(ctx.mode(), OutputMode::Rich) {
