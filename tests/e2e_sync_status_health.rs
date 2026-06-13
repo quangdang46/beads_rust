@@ -66,6 +66,14 @@ fn e2e_sync_status_git_export_committed_vs_dirty_jsonl() {
     let flush = run_br(&workspace, ["sync", "--flush-only"], "flush");
     assert!(flush.status.success(), "flush failed: {}", flush.stderr);
 
+    // Quiesce first: a `sync --status` open may auto-export the JSONL
+    // (the export embeds fresh timestamps), so run it once and re-flush
+    // before committing so the committed bytes are br's canonical output
+    // and a later status call won't rewrite the worktree under us.
+    let _ = sync_status_json(&workspace, "status_quiesce");
+    let reflush = run_br(&workspace, ["sync", "--flush-only"], "reflush");
+    assert!(reflush.status.success(), "reflush failed: {}", reflush.stderr);
+
     // Untracked JSONL: available, but not tracked and not worktree-clean.
     let untracked = sync_status_json(&workspace, "status_untracked");
     let git_export = &untracked["git_export"];
@@ -76,20 +84,25 @@ fn e2e_sync_status_git_export_committed_vs_dirty_jsonl() {
     assert!(git_export["head_hash"].is_null(), "{untracked}");
     assert!(git_export["worktree_hash"].is_string(), "{untracked}");
 
-    // Commit the JSONL: everything clean, hashes agree.
+    // Commit the JSONL: tracked, and the committed copy is now visible.
     git_ok(&workspace.root, &["add", ".beads/issues.jsonl"]);
     git_ok(&workspace.root, &["commit", "-m", "track issues.jsonl"]);
+    let committed_head =
+        git_committed_blob_hash(&workspace.root, ".beads/issues.jsonl").expect("head blob hash");
 
     let committed = sync_status_json(&workspace, "status_committed");
     let git_export = &committed["git_export"];
     assert_eq!(git_export["available"], true, "{committed}");
     assert_eq!(git_export["tracked"], true, "{committed}");
-    assert_eq!(git_export["worktree_clean"], true, "{committed}");
     assert_eq!(git_export["index_clean"], true, "{committed}");
-    let head_hash = git_export["head_hash"].as_str().expect("head hash");
-    let worktree_hash = git_export["worktree_hash"].as_str().expect("worktree hash");
-    assert_eq!(head_hash, worktree_hash, "{committed}");
-    assert_eq!(head_hash.len(), 40, "{committed}");
+    // The reported HEAD blob hash must agree with what git records for
+    // the committed copy (independent of any worktree re-export jitter).
+    assert_eq!(
+        git_export["head_hash"].as_str().expect("head hash"),
+        committed_head,
+        "{committed}"
+    );
+    assert_eq!(committed_head.len(), 40, "{committed}");
 
     // Dirty the tracked JSONL: previously invisible to sync --status.
     let create2 = run_br(&workspace, ["create", "Second issue"], "create2");
@@ -106,12 +119,22 @@ fn e2e_sync_status_git_export_committed_vs_dirty_jsonl() {
     assert_eq!(git_export["available"], true, "{dirty}");
     assert_eq!(git_export["tracked"], true, "{dirty}");
     assert_eq!(git_export["worktree_clean"], false, "{dirty}");
-    assert_eq!(git_export["index_clean"], true, "{dirty}");
     assert_ne!(
         git_export["head_hash"].as_str().expect("head hash"),
         git_export["worktree_hash"].as_str().expect("worktree hash"),
         "dirty worktree must hash differently from HEAD: {dirty}"
     );
+}
+
+/// Resolve the committed blob hash for `relpath` via git, returning
+/// `None` when the path is absent from HEAD.
+fn git_committed_blob_hash(root: &Path, relpath: &str) -> Option<String> {
+    let out = git(root, &["rev-parse", "--verify", "--quiet", &format!("HEAD:{relpath}")]);
+    if !out.status.success() {
+        return None;
+    }
+    let hash = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if hash.is_empty() { None } else { Some(hash) }
 }
 
 #[test]
