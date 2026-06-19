@@ -1127,3 +1127,134 @@ fn e2e_ready_returns_no_duplicate_ids() {
 
     eprintln!("  [PASS] all 6 IDs unique");
 }
+
+/// #354: write a `.beads/policy.yaml` ready group and assert `br ready --json`
+/// honors it end-to-end (config surface → CLI → query → JSON parity).
+fn write_policy(workspace: &BrWorkspace, yaml: &str) {
+    let policy_path = workspace.root.join(".beads").join("policy.yaml");
+    fs::write(&policy_path, yaml).expect("write policy.yaml");
+}
+
+#[test]
+fn ready_default_group_is_open_only_e2e() {
+    let _log = common::test_log("ready_default_group_is_open_only_e2e");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let open = run_br(&workspace, ["create", "Open work", "-t", "task"], "c_open");
+    let open_id = parse_created_id(&open.stdout);
+    let rework = run_br(
+        &workspace,
+        ["create", "Rework work", "-t", "task"],
+        "c_rework",
+    );
+    let rework_id = parse_created_id(&rework.stdout);
+    let set = run_br(
+        &workspace,
+        ["update", &rework_id, "--status", "rework"],
+        "to_rework",
+    );
+    assert!(
+        set.status.success(),
+        "update to rework failed: {}",
+        set.stderr
+    );
+
+    // No policy configured → default ready group is [open].
+    let result = run_br(&workspace, ["ready", "--json"], "ready_default");
+    assert!(result.status.success(), "ready failed: {}", result.stderr);
+    let payload = extract_json_payload(&result.stdout);
+    let issues: Vec<Value> = serde_json::from_str(&payload).expect("valid json");
+    assert!(
+        issue_list_contains_id(&issues, &open_id),
+        "open issue must be ready by default"
+    );
+    assert!(
+        !issue_list_contains_id(&issues, &rework_id),
+        "rework issue must NOT be ready under the default [open] group"
+    );
+}
+
+#[test]
+fn ready_configured_group_surfaces_rework_e2e() {
+    let _log = common::test_log("ready_configured_group_surfaces_rework_e2e");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let open = run_br(&workspace, ["create", "Open work", "-t", "task"], "c_open");
+    let open_id = parse_created_id(&open.stdout);
+    let rework = run_br(
+        &workspace,
+        ["create", "Rework work", "-t", "task"],
+        "c_rework",
+    );
+    let rework_id = parse_created_id(&rework.stdout);
+    run_br(
+        &workspace,
+        ["update", &rework_id, "--status", "rework"],
+        "to_rework",
+    );
+
+    write_policy(
+        &workspace,
+        "workflow:\n  status_groups:\n    ready: [open, rework]\n",
+    );
+
+    let result = run_br(&workspace, ["ready", "--json"], "ready_configured");
+    assert!(result.status.success(), "ready failed: {}", result.stderr);
+    let payload = extract_json_payload(&result.stdout);
+    let issues: Vec<Value> = serde_json::from_str(&payload).expect("valid json");
+    assert!(
+        issue_list_contains_id(&issues, &open_id),
+        "open issue must still be ready"
+    );
+    assert!(
+        issue_list_contains_id(&issues, &rework_id),
+        "rework issue must surface under the configured [open, rework] group"
+    );
+    // Status parity: the rework issue keeps its real status in JSON output.
+    let rework_issue = issues
+        .iter()
+        .find(|i| i["id"].as_str() == Some(rework_id.as_str()))
+        .expect("rework issue present");
+    assert_eq!(
+        rework_issue["status"].as_str(),
+        Some("rework"),
+        "returned issue must preserve its real status"
+    );
+}
+
+#[test]
+fn ready_strict_rejects_out_of_vocab_group_e2e() {
+    let _log = common::test_log("ready_strict_rejects_out_of_vocab_group_e2e");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    run_br(&workspace, ["create", "Open work", "-t", "task"], "c_open");
+
+    // strict statuses do NOT include `rework`, but the ready group lists it.
+    write_policy(
+        &workspace,
+        "workflow:\n  strict: true\n  statuses: [open, in_progress, closed]\n  status_groups:\n    ready: [open, rework]\n",
+    );
+
+    let result = run_br(&workspace, ["ready", "--json"], "ready_strict_reject");
+    assert!(
+        !result.status.success(),
+        "strict out-of-vocab ready group must be rejected; stdout: {} stderr: {}",
+        result.stdout,
+        result.stderr
+    );
+    // In --json mode the structured error envelope is emitted on stdout; in
+    // human mode it goes to stderr. Accept either so the assertion is robust.
+    let combined = format!("{}{}", result.stdout, result.stderr);
+    assert!(
+        combined.contains("rework") && combined.contains("workflow.status_groups.ready"),
+        "error must name the offending status and config key; stdout: {} stderr: {}",
+        result.stdout,
+        result.stderr
+    );
+}

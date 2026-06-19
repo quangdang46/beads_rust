@@ -525,6 +525,39 @@ br ready --unassigned -p 0 -p 1
 br ready --json --limit 10
 ```
 
+**Configurable ready status group (`.beads/policy.yaml`):**
+
+By default, `br ready` treats only `open` issues as actionable. Projects with a
+review workflow can widen what "ready" means — so review-returned work (e.g.
+`rework`) resurfaces through the same `br ready --json` entrypoint instead of
+forcing workflow knowledge into every agent prompt:
+
+```yaml
+workflow:
+  status_groups:
+    ready:
+      - open
+      - rework
+```
+
+Semantics:
+- **Default:** when `workflow.status_groups.ready` is absent (or empty), the
+  group is `[open]` — exactly the pre-#354 behavior (zero change for existing
+  repos).
+- **Status preserved:** returned issues keep their real status, so a `rework`
+  item still emits `{"status":"rework"}` in `--json`/`--format toon`/`--robot`.
+- **Validation:** when `workflow.strict: true` (and `workflow.statuses` is set),
+  every member of the ready group must be in `workflow.statuses`; an
+  out-of-vocabulary member is rejected with a clear error. Without `strict`, the
+  group is accepted as-is.
+- **Deferred interaction:** the `defer_until` time-gate still applies to every
+  non-`deferred` member of the group, so a configured member with a future
+  `defer_until` stays out of `br ready` until it elapses. `--include-deferred`
+  additionally surfaces `deferred` work and drops the time-gate, without
+  double-counting `deferred` if it is also listed in the group.
+- **Scope:** `br ready`, `br ready --json`, `br ready --robot`,
+  `br ready --format toon`, and `br scheduler` all use the same ready group.
+
 ---
 
 ### scheduler

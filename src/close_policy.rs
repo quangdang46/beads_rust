@@ -206,7 +206,38 @@ pub struct Workflow {
     /// block behave exactly as before layer 2.
     #[serde(default)]
     pub gates: std::collections::BTreeMap<String, GateRule>,
+    /// Named status groups (issue #354). Currently only `ready` is consumed —
+    /// it defines which statuses `br ready` (and the scheduler) treat as
+    /// actionable work. When the `status_groups:` block (or the `ready:` key
+    /// inside it) is absent, the ready group defaults to `[open]`, preserving
+    /// the pre-#354 behavior exactly.
+    ///
+    /// ```yaml
+    /// workflow:
+    ///   status_groups:
+    ///     ready: [open, rework]
+    /// ```
+    #[serde(default)]
+    pub status_groups: StatusGroups,
 }
+
+/// Named status groups under `workflow.status_groups` (issue #354).
+///
+/// The `ready` group is the set of statuses `br ready` surfaces as actionable
+/// work. An empty/absent `ready` list means "use the default" — see
+/// [`Workflow::ready_status_group`], which substitutes `[open]` so existing
+/// repos behave exactly as before this field existed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StatusGroups {
+    /// Statuses treated as "ready to work on" by `br ready`. Empty means the
+    /// default group (`[open]`).
+    #[serde(default)]
+    pub ready: Vec<String>,
+}
+
+/// The canonical default ready status group when none is configured.
+pub const DEFAULT_READY_STATUS: &str = "open";
 
 /// The set of gate conditions guarding a single `"from -> to"` transition.
 ///
@@ -556,6 +587,75 @@ impl Workflow {
     #[must_use]
     pub fn is_enforced(&self) -> bool {
         self.strict && !self.statuses.is_empty()
+    }
+
+    /// Resolve the configured ready status group (issue #354), substituting the
+    /// default `[open]` when nothing is configured. Returns lowercased,
+    /// source-order, de-duplicated status names so the query layer can build a
+    /// stable `status IN (...)` clause. The default is returned whenever
+    /// `workflow.status_groups.ready` is empty, which is the unconfigured case —
+    /// preserving pre-#354 behavior exactly.
+    #[must_use]
+    pub fn ready_status_group(&self) -> Vec<String> {
+        let configured = &self.status_groups.ready;
+        let source: Vec<String> = if configured.is_empty() {
+            vec![DEFAULT_READY_STATUS.to_string()]
+        } else {
+            configured.clone()
+        };
+        let mut out: Vec<String> = Vec::with_capacity(source.len());
+        for status in source {
+            let normalized = status.trim().to_lowercase();
+            if normalized.is_empty() {
+                continue;
+            }
+            if !out.contains(&normalized) {
+                out.push(normalized);
+            }
+        }
+        if out.is_empty() {
+            out.push(DEFAULT_READY_STATUS.to_string());
+        }
+        out
+    }
+
+    /// Validate the configured ready status group (issue #354). When
+    /// `workflow.strict` is set *and* `workflow.statuses` is non-empty, every
+    /// member of the configured ready group must appear in the allowed status
+    /// set; an out-of-vocabulary member is rejected with a clear error. When
+    /// not strict (or no `statuses` configured, or no `ready` group
+    /// configured), the group is accepted as-is.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when strict enforcement is configured and a
+    /// member of the ready group is not in `workflow.statuses`.
+    pub fn validate_ready_status_group(&self) -> Result<()> {
+        // Only validate an explicitly-configured group; the implicit `[open]`
+        // default is never rejected.
+        if self.status_groups.ready.is_empty() {
+            return Ok(());
+        }
+        if !self.is_enforced() {
+            return Ok(());
+        }
+        let unknown: Vec<String> = self
+            .ready_status_group()
+            .into_iter()
+            .filter(|status| !self.allows(status))
+            .collect();
+        if unknown.is_empty() {
+            return Ok(());
+        }
+        Err(BeadsError::validation(
+            "workflow.status_groups.ready",
+            format!(
+                "ready status group contains status(es) not permitted by the project workflow \
+                 policy (.beads/policy.yaml workflow.strict): {}. Allowed statuses: {}.",
+                unknown.join(", "),
+                self.allowed_list()
+            ),
+        ))
     }
 
     /// True when `status` (case-insensitively) is in the configured set.
@@ -1446,6 +1546,8 @@ enum PolicyNode {
     RequireTypedReferences,
     /// `workflow:` block (issue #311).
     Workflow,
+    /// `workflow.status_groups:` block (issue #354).
+    StatusGroups,
     /// Terminal scalar / list — descent stops here.
     Scalar,
 }
@@ -1487,7 +1589,9 @@ impl PolicyNode {
                 // detection (their shape is validated at parse time by the
                 // typed `GateRule`/`GateSpec` deserialisers).
                 ("gates", Self::Scalar),
+                ("status_groups", Self::StatusGroups),
             ],
+            Self::StatusGroups => &[("ready", Self::Scalar)],
             Self::Scalar => &[],
         }
     }
@@ -1533,6 +1637,101 @@ mod tests {
             close_actor: "alice",
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn ready_status_group_defaults_to_open() {
+        // #354: unconfigured workflow → ready group is [open].
+        let workflow = Workflow::default();
+        assert_eq!(workflow.ready_status_group(), vec!["open".to_string()]);
+    }
+
+    #[test]
+    fn ready_status_group_uses_configured_values_normalized() {
+        // #354: configured group is normalized (lowercased, trimmed, de-duped,
+        // source order preserved).
+        let mut workflow = Workflow::default();
+        workflow.status_groups.ready = vec![
+            "Open".to_string(),
+            "  rework ".to_string(),
+            "open".to_string(),
+        ];
+        assert_eq!(
+            workflow.ready_status_group(),
+            vec!["open".to_string(), "rework".to_string()]
+        );
+    }
+
+    #[test]
+    fn validate_ready_group_accepts_subset_when_strict() {
+        // #354: strict mode, group is a subset of statuses → ok.
+        let mut workflow = Workflow {
+            strict: true,
+            statuses: vec![
+                "open".to_string(),
+                "rework".to_string(),
+                "closed".to_string(),
+            ],
+            ..Workflow::default()
+        };
+        workflow.status_groups.ready = vec!["open".to_string(), "rework".to_string()];
+        assert!(workflow.validate_ready_status_group().is_ok());
+    }
+
+    #[test]
+    fn validate_ready_group_rejects_out_of_vocab_when_strict() {
+        // #354: strict mode, group has a status outside statuses → rejected with
+        // a clear error naming the offending value.
+        let mut workflow = Workflow {
+            strict: true,
+            statuses: vec!["open".to_string(), "closed".to_string()],
+            ..Workflow::default()
+        };
+        workflow.status_groups.ready = vec!["open".to_string(), "rework".to_string()];
+        let err = workflow
+            .validate_ready_status_group()
+            .expect_err("out-of-vocab group must be rejected under strict");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("rework"),
+            "error should name the bad status: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_ready_group_accepts_anything_when_not_strict() {
+        // #354: without strict (or without a statuses vocabulary), the group is
+        // accepted as-is.
+        let mut workflow = Workflow {
+            strict: false,
+            statuses: vec!["open".to_string()],
+            ..Workflow::default()
+        };
+        workflow.status_groups.ready = vec!["open".to_string(), "rework".to_string()];
+        assert!(workflow.validate_ready_status_group().is_ok());
+
+        // strict but empty statuses → enforcement off → accepted.
+        workflow.strict = true;
+        workflow.statuses = vec![];
+        assert!(workflow.validate_ready_status_group().is_ok());
+    }
+
+    #[test]
+    fn status_groups_parse_from_yaml_and_not_flagged_unknown() {
+        // #354: the new keys deserialize and are recognized by the
+        // unknown-field detector.
+        let raw = "workflow:\n  status_groups:\n    ready: [open, rework]\n";
+        let doc: PolicyDocument = serde_yml::from_str(raw).unwrap();
+        assert_eq!(
+            doc.workflow.status_groups.ready,
+            vec!["open".to_string(), "rework".to_string()]
+        );
+        let value: serde_yml::Value = serde_yml::from_str(raw).unwrap();
+        let unknown = detect_unknown_policy_fields(&value);
+        assert!(
+            unknown.is_empty(),
+            "status_groups.ready must not be flagged unknown: {unknown:?}"
+        );
     }
 
     #[test]

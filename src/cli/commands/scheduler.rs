@@ -211,8 +211,13 @@ fn build_scheduler_output(
 ) -> Result<SchedulerOutput> {
     let now = Utc::now();
     let candidate_limit = (args.candidate_limit > 0).then_some(args.candidate_limit);
+    // Honor the configured "ready" status group (#354) so the scheduler scores
+    // the same candidate set `br ready` surfaces. Defaults to `[open]`.
+    let workflow = crate::close_policy::load_for_beads_dir(beads_dir)?.workflow;
+    workflow.validate_ready_status_group()?;
     let mut filters = ReadyFilters {
         limit: candidate_limit,
+        ready_statuses: workflow.ready_status_group(),
         ..ReadyFilters::default()
     };
     let mut issues =

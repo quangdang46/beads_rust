@@ -126,6 +126,14 @@ fn execute_inner(
         })
         .transpose()?;
 
+    // Resolve the configured "ready" status group (#354). Defaults to `[open]`
+    // when `.beads/policy.yaml` has no `workflow.status_groups.ready`, which is
+    // a zero-behavior-change for existing repos. Strict-mode validation rejects
+    // an out-of-vocabulary group before we ever query.
+    let workflow = crate::close_policy::load_for_beads_dir(beads_dir)?.workflow;
+    workflow.validate_ready_status_group()?;
+    let ready_statuses = workflow.ready_status_group();
+
     let filters = ReadyFilters {
         assignee,
         unassigned: args.unassigned,
@@ -134,6 +142,7 @@ fn execute_inner(
         types: parse_types(&args.type_)?,
         priorities: parse_priorities(&args.priority)?,
         include_deferred: args.include_deferred,
+        ready_statuses,
         // Fetch all candidates to allow post-filtering of external blockers
         limit: None,
         parent: resolved_parent,

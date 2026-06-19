@@ -1790,7 +1790,9 @@ mod tests {
         // The parent epic, blocked by the deferred prerequisite.
         let mut parent = make_issue("bd-parent", "Parent epic");
         parent.issue_type = IssueType::Epic;
-        storage.create_issue(&parent, "tester").expect("create parent");
+        storage
+            .create_issue(&parent, "tester")
+            .expect("create parent");
         storage
             .add_dependency(
                 "bd-parent",

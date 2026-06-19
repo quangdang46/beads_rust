@@ -5015,12 +5015,39 @@ impl SqliteStorage {
             append_label_or_membership_exists(&mut sql, &mut params, &filters.labels_or);
         }
 
-        // Ready condition 1: only `open` issues are "ready" (in_progress means
-        // already claimed). Optionally include deferred issues when requested.
-        if filters.include_deferred {
-            sql.push_str(" AND status IN ('open', 'deferred')");
+        // Ready condition 1: the configured ready status group is "ready"
+        // (issue #354). The default group is `[open]`, matching pre-#354
+        // behavior (in_progress means already claimed). `--include-deferred`
+        // additionally folds in `deferred` without double-counting it if the
+        // configured group already lists it.
+        let mut ready_statuses: Vec<String> = if filters.ready_statuses.is_empty() {
+            vec!["open".to_string()]
         } else {
-            sql.push_str(" AND status = 'open'");
+            filters.ready_statuses.clone()
+        };
+        if filters.include_deferred
+            && !ready_statuses
+                .iter()
+                .any(|status| status.eq_ignore_ascii_case("deferred"))
+        {
+            ready_statuses.push("deferred".to_string());
+        }
+        // The status list is inlined as SQL string literals rather than bound
+        // `?` params. Status values are internal, validated, lowercased policy
+        // names (never raw user input reaching SQL), and the embedded fsqlite
+        // planner mishandles a bound `IN (?)` predicate when it sits alongside a
+        // correlated/grouped `id IN (SELECT ... HAVING ...)` label subquery —
+        // the same engine class of limitation documented on
+        // `ReadyFilters::parent_member_ids` (#307/#308). Inlining keeps the
+        // single-`open` case byte-identical to the pre-#354 literal and keeps
+        // widened groups index-coverable. Single quotes are still escaped
+        // defensively in case a project configures an exotic custom status.
+        {
+            let escaped: Vec<String> = ready_statuses
+                .iter()
+                .map(|status| format!("'{}'", status.replace('\'', "''")))
+                .collect();
+            let _ = write!(sql, " AND status IN ({})", escaped.join(","));
         }
 
         // Ready condition 2: blocked issues are filtered in SQL when the cache
@@ -10397,6 +10424,12 @@ pub struct ReadyFilters {
     pub types: Option<Vec<IssueType>>,
     pub priorities: Option<Vec<Priority>>,
     pub include_deferred: bool,
+    /// The status group treated as "ready" (issue #354). Each entry is a
+    /// canonical-or-custom status string (already lowercased by the caller).
+    /// Empty means "use the default `[open]` group", which preserves pre-#354
+    /// behavior exactly. The CLI layer resolves this from
+    /// `workflow.status_groups.ready` in `.beads/policy.yaml`.
+    pub ready_statuses: Vec<String>,
     pub limit: Option<usize>,
     /// Filter to children of this parent issue ID.
     pub parent: Option<String>,
@@ -19103,6 +19136,16 @@ mod tests {
             "CREATE INDEX IF NOT EXISTS idx_issues_due_at ON issues(due_at) WHERE due_at IS NOT NULL",
             "CREATE INDEX IF NOT EXISTS idx_issues_defer_until ON issues(defer_until) WHERE defer_until IS NOT NULL",
             "CREATE INDEX IF NOT EXISTS idx_issues_ready ON issues(status, priority, created_at) WHERE status = 'open' AND ephemeral = 0 AND pinned = 0 AND (is_template = 0 OR is_template IS NULL)",
+            // Issue #354: `br ready` can be configured (workflow.status_groups.ready)
+            // to surface statuses beyond `open` (e.g. `rework`). The partial
+            // `idx_issues_ready` above only covers `status = 'open'`, so a widened
+            // ready group would fall back to a scan on the status leg. The partial
+            // predicate is a static migration string and cannot be widened to a
+            // per-repo dynamic group, so we add a non-partial `(status, priority,
+            // created_at)` index to keep the widened `status IN (...) ORDER BY
+            // priority, created_at` ready query index-covered. The tighter partial
+            // index still wins for the common default `[open]` group.
+            "CREATE INDEX IF NOT EXISTS idx_issues_status_priority_created ON issues(status, priority, created_at)",
         ];
         for (i, sql) in indexes.iter().enumerate() {
             match conn.execute(sql) {
@@ -20654,6 +20697,198 @@ mod tests {
             .get_ready_issues(&filters_or_backend, ReadySortPolicy::Oldest)
             .unwrap();
         assert_eq!(res.len(), 2);
+    }
+
+    #[test]
+    fn test_ready_default_group_is_open_only() {
+        // #354: with no ready_statuses configured, the query behaves exactly as
+        // before — only `open` issues surface, `rework`/`in_progress` do not.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc::now();
+
+        storage
+            .create_issue(
+                &make_issue("bd-open", "Open", Status::Open, 2, None, t1, None),
+                "tester",
+            )
+            .unwrap();
+        storage
+            .create_issue(
+                &make_issue(
+                    "bd-rework",
+                    "Rework",
+                    Status::Custom("rework".to_string()),
+                    2,
+                    None,
+                    t1,
+                    None,
+                ),
+                "tester",
+            )
+            .unwrap();
+
+        let filters = ReadyFilters::default();
+        let res = storage
+            .get_ready_issues(&filters, ReadySortPolicy::Oldest)
+            .unwrap();
+        let ids: Vec<&str> = res.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["bd-open"], "default group must be [open] only");
+    }
+
+    #[test]
+    fn test_ready_configured_group_surfaces_rework() {
+        // #354: a configured ready group [open, rework] surfaces rework items
+        // while preserving each issue's actual status.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc::now();
+
+        storage
+            .create_issue(
+                &make_issue("bd-open", "Open", Status::Open, 2, None, t1, None),
+                "tester",
+            )
+            .unwrap();
+        storage
+            .create_issue(
+                &make_issue(
+                    "bd-rework",
+                    "Rework",
+                    Status::Custom("rework".to_string()),
+                    2,
+                    None,
+                    t1,
+                    None,
+                ),
+                "tester",
+            )
+            .unwrap();
+        storage
+            .create_issue(
+                &make_issue(
+                    "bd-inprog",
+                    "InProgress",
+                    Status::InProgress,
+                    2,
+                    None,
+                    t1,
+                    None,
+                ),
+                "tester",
+            )
+            .unwrap();
+
+        let filters = ReadyFilters {
+            ready_statuses: vec!["open".to_string(), "rework".to_string()],
+            ..Default::default()
+        };
+        let res = storage
+            .get_ready_issues(&filters, ReadySortPolicy::Oldest)
+            .unwrap();
+        let mut ids: Vec<&str> = res.iter().map(|i| i.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["bd-open", "bd-rework"]);
+        // in_progress stays out; statuses are preserved.
+        let rework = res.iter().find(|i| i.id == "bd-rework").unwrap();
+        assert_eq!(rework.status.as_str(), "rework");
+    }
+
+    #[test]
+    fn test_ready_configured_group_still_gates_defer_until() {
+        // #354: a non-deferred configured member with a future defer_until is
+        // still time-gated out unless --include-deferred is set.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc::now();
+        let future = t1 + chrono::Duration::days(7);
+
+        storage
+            .create_issue(
+                &make_issue(
+                    "bd-rework-deferred",
+                    "ReworkDeferred",
+                    Status::Custom("rework".to_string()),
+                    2,
+                    None,
+                    t1,
+                    Some(future),
+                ),
+                "tester",
+            )
+            .unwrap();
+        storage
+            .create_issue(
+                &make_issue("bd-open", "Open", Status::Open, 2, None, t1, None),
+                "tester",
+            )
+            .unwrap();
+
+        let filters = ReadyFilters {
+            ready_statuses: vec!["open".to_string(), "rework".to_string()],
+            ..Default::default()
+        };
+        let res = storage
+            .get_ready_issues(&filters, ReadySortPolicy::Oldest)
+            .unwrap();
+        let ids: Vec<&str> = res.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["bd-open"],
+            "future defer_until must gate the rework member out"
+        );
+
+        // With --include-deferred, the gate drops and the rework member returns.
+        let filters_deferred = ReadyFilters {
+            ready_statuses: vec!["open".to_string(), "rework".to_string()],
+            include_deferred: true,
+            ..Default::default()
+        };
+        let res = storage
+            .get_ready_issues(&filters_deferred, ReadySortPolicy::Oldest)
+            .unwrap();
+        let mut ids: Vec<&str> = res.iter().map(|i| i.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["bd-open", "bd-rework-deferred"]);
+    }
+
+    #[test]
+    fn test_ready_include_deferred_no_double_count_when_group_lists_deferred() {
+        // #354: --include-deferred folds in `deferred`, but must not double-count
+        // it (or error) when the configured group already lists `deferred`.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc::now();
+
+        storage
+            .create_issue(
+                &make_issue(
+                    "bd-deferred",
+                    "Deferred",
+                    Status::Deferred,
+                    2,
+                    None,
+                    t1,
+                    None,
+                ),
+                "tester",
+            )
+            .unwrap();
+        storage
+            .create_issue(
+                &make_issue("bd-open", "Open", Status::Open, 2, None, t1, None),
+                "tester",
+            )
+            .unwrap();
+
+        let filters = ReadyFilters {
+            ready_statuses: vec!["open".to_string(), "deferred".to_string()],
+            include_deferred: true,
+            ..Default::default()
+        };
+        let res = storage
+            .get_ready_issues(&filters, ReadySortPolicy::Oldest)
+            .unwrap();
+        let mut ids: Vec<&str> = res.iter().map(|i| i.id.as_str()).collect();
+        ids.sort_unstable();
+        // Exactly one row per id — no duplicate `bd-deferred`.
+        assert_eq!(ids, vec!["bd-deferred", "bd-open"]);
     }
 
     #[test]

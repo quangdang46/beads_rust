@@ -561,6 +561,33 @@ br config set defaults.priority=1
 br config edit
 ```
 
+### Workflow Policy (`.beads/policy.yaml`)
+
+Workflow behavior is configured separately in `.beads/policy.yaml`. One use is
+defining a **configurable ready status group**: which statuses `br ready` treats
+as actionable work. By default only `open` is ready, but projects with a review
+workflow can widen it so review-returned work (e.g. `rework`) resurfaces through
+the same `br ready --json` entrypoint:
+
+```yaml
+# .beads/policy.yaml
+workflow:
+  status_groups:
+    ready:
+      - open
+      - rework
+```
+
+- Default (when unset): `[open]` — no change for existing repos.
+- Returned issues keep their real status (`{"status":"rework"}` in `--json`).
+- The `defer_until` time-gate still applies to non-`deferred` members;
+  `--include-deferred` additionally surfaces `deferred` work and drops the gate.
+- Under `workflow.strict: true`, the ready group must be a subset of
+  `workflow.statuses` or `br ready` rejects it with a clear error.
+- `br ready` (text/json/toon/robot) and `br scheduler` all honor the group.
+
+See `docs/CLI_REFERENCE.md` (the `ready` command) for full details.
+
 ### Environment Variables
 
 | Variable | Description |

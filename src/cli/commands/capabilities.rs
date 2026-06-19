@@ -549,8 +549,14 @@ fn command_safety_notes(name: &str) -> &'static [&'static str] {
             "Count is read-only; grouped output is selected with `--by` or `--by-*` aliases.",
             "Use filters such as `--status`, `--priority`, `--type`, and `--assignee` to match list/search scope.",
         ],
+        "ready" => &[
+            "Ready is read-only and is the single work-discovery entrypoint; it returns unblocked, non-deferred, actionable issues.",
+            "Readiness defaults to status=open but is project-configurable via `workflow.status_groups.ready` in `.beads/policy.yaml` (e.g. `[open, rework]`); returned issues keep their real status.",
+            "`--include-deferred` additionally surfaces deferred work and drops the defer-time gate; it never double-counts a status already in the ready group.",
+        ],
         "scheduler" => &[
             "Scheduler is read-only and ranks already-ready issues; it does not claim work.",
+            "Scheduler honors the same `workflow.status_groups.ready` group as `br ready`.",
             "Use `--limit` for returned recommendations and `--candidate-limit` for the scoring window.",
         ],
         "upgrade" => {

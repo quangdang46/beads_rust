@@ -27,6 +27,16 @@ Start of session:
   br coordination status --json
   br show <id> --json
 
+Finding work:
+  br ready --json is the single work-discovery entrypoint: it returns
+  unblocked, non-deferred, actionable issues. "Ready" defaults to status=open,
+  but projects can widen it via workflow.status_groups.ready in
+  .beads/policy.yaml (e.g. [open, rework]) so review-returned work resurfaces
+  without changing the command. Don't hand-roll status filters like
+  `br list -s open -s rework`; call `br ready --json` and let project policy
+  define readiness. Returned issues keep their real status (a rework item still
+  reports {"status":"rework"}).
+
 Claiming work:
   br update <id> --claim --actor "$AGENT_NAME" --json
   If Agent Mail is down, add a comment naming the intended file scope before
