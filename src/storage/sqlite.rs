@@ -285,6 +285,17 @@ const BLOCKED_CACHE_STATE_STALE: &str = "stale";
 /// `blocked_issues_cache`; [`SqliteStorage::get_start_blockers`] filters it back
 /// out so claim/start guards ignore it (#315).
 const CHILD_OPEN_BLOCKER_SUFFIX: &str = ":child-open";
+/// Suffix marking a blocker ref produced by propagating an *already-blocked*
+/// parent down onto its children (e.g. `bd-3n73:parent-blocked`).
+///
+/// This is a **readiness/start** marker — a child of a blocked epic is not
+/// "ready" to be *started* because the epic's own prerequisites are unmet — but
+/// it is hierarchy, not a prerequisite edge from the parent to the child. It
+/// must never prevent a finished child from being *closed* (#355). The producer
+/// ([`SqliteStorage::propagate_blocked_parents`]) embeds this suffix in
+/// `blocked_issues_cache`; [`SqliteStorage::get_close_blockers`] filters it back
+/// out so the close gate ignores it.
+const PARENT_BLOCKED_SUFFIX: &str = ":parent-blocked";
 const NEEDS_FLUSH_KEY: &str = "needs_flush";
 const METADATA_EMPTY_VALUE: &str = "";
 const METADATA_FALSE_VALUE: &str = "false";
@@ -5508,6 +5519,31 @@ impl SqliteStorage {
             .filter(|blocker| !blocker.ends_with(CHILD_OPEN_BLOCKER_SUFFIX))
             .collect();
         Ok(Self::blocker_refs_to_issue_ids(&start_blocker_refs))
+    }
+
+    /// Get the blockers that prevent *closing* an issue.
+    ///
+    /// This is [`get_blockers`](Self::get_blockers) minus the
+    /// `:parent-blocked` rollup markers. Those markers encode a *readiness*
+    /// constraint propagated from an already-blocked parent epic down onto its
+    /// children — a child of a blocked epic is not "ready" to be *started* —
+    /// but `parent-child` is hierarchy, not a prerequisite edge from the parent
+    /// to the child. A finished child must be closable even while its parent
+    /// epic remains blocked or open (#355). Real prerequisite edges on the
+    /// child itself (`blocks`, `conditional-blocks`, `waits-for`) and the
+    /// `:child-open` close-ordering rollup (so an epic still can't close over
+    /// open children) are retained.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_close_blockers(&self, issue_id: &str) -> Result<Vec<String>> {
+        let close_blocker_refs: Vec<String> = self
+            .get_blocker_refs(issue_id)?
+            .into_iter()
+            .filter(|blocker| !blocker.ends_with(PARENT_BLOCKED_SUFFIX))
+            .collect();
+        Ok(Self::blocker_refs_to_issue_ids(&close_blocker_refs))
     }
 
     /// Return the raw, annotation-bearing blocker refs for an issue (e.g.
