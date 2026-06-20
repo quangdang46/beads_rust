@@ -103,6 +103,15 @@ pub const SCHEMA_SQL: &str = r"
         AND pinned = 0
         AND is_template = 0;
 
+    -- Widened ready group (issue #354): when `workflow.status_groups.ready`
+    -- surfaces statuses beyond `open` (e.g. `rework`), the partial
+    -- `idx_issues_ready` above (which only covers `status = 'open'`) cannot serve
+    -- the `status IN (...) ORDER BY priority, created_at` query, so a non-partial
+    -- composite keeps the widened path index-covered. The tighter partial index
+    -- still wins for the common default `[open]` group.
+    CREATE INDEX IF NOT EXISTS idx_issues_status_priority_created
+        ON issues(status, priority, created_at);
+
     -- Common active list path: non-terminal issues sorted by priority/created_at.
     -- Uses ASC on created_at (not DESC) to avoid frankensqlite B-tree ordering
     -- divergence with C sqlite3 integrity_check.  SQLite reverse-scans the ASC
@@ -1622,6 +1631,12 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
             AND pinned = 0
             AND is_template = 0;
 
+        -- Widened ready group (issue #354): non-partial composite so a
+        -- configured `status IN (...) ORDER BY priority, created_at` ready query
+        -- stays index-covered even on pre-existing databases.
+        CREATE INDEX IF NOT EXISTS idx_issues_status_priority_created
+            ON issues(status, priority, created_at);
+
         -- Common active list path: non-terminal issues sorted by priority/created_at
         CREATE INDEX IF NOT EXISTS idx_issues_list_active_order
             ON issues(priority, created_at)
@@ -2482,6 +2497,12 @@ mod tests {
         assert!(
             indexes.contains("idx_issues_ready"),
             "missing idx_issues_ready composite index"
+        );
+        // Widened ready group (#354): non-partial composite must exist on real DBs
+        // so a configured `status IN (...)` ready query stays index-covered.
+        assert!(
+            indexes.contains("idx_issues_status_priority_created"),
+            "missing idx_issues_status_priority_created composite index"
         );
         assert!(
             indexes.contains("idx_issues_list_active_order"),
