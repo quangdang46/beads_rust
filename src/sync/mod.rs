@@ -3094,7 +3094,6 @@ struct ExistingJsonlReplacementScan {
     exported_count: usize,
     changed: bool,
     all_replacements_seen: bool,
-    sorted_by_id: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -3106,7 +3105,6 @@ enum ExistingJsonlReplacementWrite {
         content_hash: String,
         exported_count: usize,
     },
-    Fallback,
 }
 
 struct JsonlTempOutput {
@@ -3123,12 +3121,10 @@ fn scan_existing_jsonl_replacements(
     let mut reader = BufReader::new(file);
     let mut seen_ids = HashSet::new();
     let mut seen_replacements = HashSet::with_capacity(replacement_lines.len());
-    let mut previous_id: Option<String> = None;
     let mut line_buf = String::new();
     let mut line_num = 0;
     let mut exported_count = 0;
     let mut changed = false;
-    let mut sorted_by_id = true;
 
     loop {
         line_buf.clear();
@@ -3155,14 +3151,6 @@ fn scan_existing_jsonl_replacements(
             )));
         }
 
-        if previous_id
-            .as_ref()
-            .is_some_and(|previous| previous > &partial.id)
-        {
-            sorted_by_id = false;
-        }
-        previous_id = Some(partial.id.clone());
-
         if let Some(replacement) = replacement_lines.get(&partial.id) {
             seen_replacements.insert(partial.id);
             changed |= replacement != trimmed;
@@ -3175,7 +3163,6 @@ fn scan_existing_jsonl_replacements(
         exported_count,
         changed,
         all_replacements_seen: seen_replacements.len() == replacement_lines.len(),
-        sorted_by_id,
     })
 }
 
@@ -3210,21 +3197,6 @@ fn absolute_or_current_dir_join(path: &Path) -> PathBuf {
     } else {
         path.to_path_buf()
     }
-}
-
-fn persist_jsonl_temp_output(
-    temp_output: JsonlTempOutput,
-    output_path: &Path,
-    config: &ExportConfig,
-) -> Result<()> {
-    let JsonlTempOutput {
-        temp_path,
-        temp_guard,
-        writer,
-    } = temp_output;
-
-    sync_jsonl_writer(writer)?;
-    rename_jsonl_temp_output(&temp_path, temp_guard, output_path, config)
 }
 
 fn rename_jsonl_temp_output(
@@ -3269,11 +3241,7 @@ fn try_write_existing_jsonl_replacements_atomically(
 ) -> Result<ExistingJsonlReplacementWrite> {
     let scan = scan_existing_jsonl_replacements(output_path, replacement_lines)?;
 
-    if !scan.all_replacements_seen || (scan.changed && !scan.sorted_by_id) {
-        return Ok(ExistingJsonlReplacementWrite::Fallback);
-    }
-
-    if !scan.changed {
+    if !scan.changed && scan.all_replacements_seen {
         return Ok(ExistingJsonlReplacementWrite::Unchanged {
             exported_count: scan.exported_count,
         });
@@ -3298,6 +3266,7 @@ fn write_existing_jsonl_replacements_atomically(
     let mut hasher = Sha256::new();
     let mut seen_ids = HashSet::new();
     let mut replaced_ids = HashSet::with_capacity(replacement_lines.len());
+    let mut expected_ids = Vec::new();
     let mut line_buf = String::new();
     let mut line_num = 0;
     let mut exported_count = 0;
@@ -3337,17 +3306,46 @@ fn write_existing_jsonl_replacements_atomically(
         writeln!(temp_output.writer, "{output_line}")?;
         hasher.update(output_line.as_bytes());
         hasher.update(b"\n");
+        expected_ids.push(
+            serde_json::from_str::<PartialId>(output_line)
+                .map_err(|e| {
+                    BeadsError::Config(format!(
+                        "Invalid replacement JSON while preparing incremental auto-flush: {e}"
+                    ))
+                })?
+                .id,
+        );
         exported_count += 1;
     }
 
-    if replaced_ids.len() != replacement_lines.len() {
-        return Err(BeadsError::Config(format!(
-            "JSONL changed while preparing incremental auto-flush for {} replacement(s)",
-            replacement_lines.len()
-        )));
+    let mut appended_ids = replacement_lines
+        .keys()
+        .filter(|id| !replaced_ids.contains(*id))
+        .collect::<Vec<_>>();
+    appended_ids.sort();
+
+    for issue_id in appended_ids {
+        let output_line = replacement_lines.get(issue_id).ok_or_else(|| {
+            BeadsError::Config(format!(
+                "Missing replacement JSON while preparing incremental auto-flush for {issue_id}"
+            ))
+        })?;
+        writeln!(temp_output.writer, "{output_line}")?;
+        hasher.update(output_line.as_bytes());
+        hasher.update(b"\n");
+        expected_ids.push(issue_id.clone());
+        exported_count += 1;
     }
 
-    persist_jsonl_temp_output(temp_output, output_path, config)?;
+    let JsonlTempOutput {
+        temp_path,
+        temp_guard,
+        writer,
+    } = temp_output;
+
+    sync_jsonl_writer(writer)?;
+    verify_exported_jsonl_integrity(&temp_path, &expected_ids)?;
+    rename_jsonl_temp_output(&temp_path, temp_guard, output_path, config)?;
 
     Ok((hex_encode(&hasher.finalize()), exported_count))
 }
@@ -3483,7 +3481,6 @@ fn try_existing_line_auto_flush(
                 content_hash,
             }))
         }
-        ExistingJsonlReplacementWrite::Fallback => Ok(None),
     }
 }
 
@@ -3509,7 +3506,6 @@ fn try_incremental_auto_flush(
     beads_dir: &Path,
     jsonl_path: &Path,
     allow_external_jsonl: bool,
-    history_config: HistoryConfig,
 ) -> Result<Option<AutoFlushResult>> {
     if !jsonl_path.exists() {
         return Ok(None);
@@ -3525,7 +3521,6 @@ fn try_incremental_auto_flush(
         force: false,
         beads_dir: Some(beads_dir.to_path_buf()),
         allow_external_jsonl,
-        history: history_config,
         ..Default::default()
     };
 
@@ -3602,7 +3597,6 @@ pub fn auto_flush(
     beads_dir: &Path,
     jsonl_path: &Path,
     allow_external_jsonl: bool,
-    history_config: HistoryConfig,
 ) -> Result<AutoFlushResult> {
     // Check for dirty issues or forced flush first
     let jsonl_exists = jsonl_path.exists();
@@ -3642,13 +3636,7 @@ pub fn auto_flush(
     );
 
     if !needs_flush {
-        match try_incremental_auto_flush(
-            storage,
-            beads_dir,
-            jsonl_path,
-            allow_external_jsonl,
-            history_config.clone(),
-        ) {
+        match try_incremental_auto_flush(storage, beads_dir, jsonl_path, allow_external_jsonl) {
             Ok(Some(result)) => {
                 tracing::info!(
                     flushed = result.flushed,
@@ -3676,7 +3664,6 @@ pub fn auto_flush(
         force: needs_flush,
         beads_dir: Some(beads_dir.to_path_buf()),
         allow_external_jsonl,
-        history: history_config,
         ..Default::default()
     };
 
@@ -5563,8 +5550,6 @@ mod tests {
             external_ref: None,
             source_system: None,
             source_repo: None,
-            source_repo_path: None,
-            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -5725,8 +5710,6 @@ mod tests {
             external_ref: None,
             source_system: None,
             source_repo: None,
-            source_repo_path: None,
-            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -6601,14 +6584,7 @@ mod tests {
         let issue = make_test_issue("bd-scan-error", "Dirty issue");
         storage.create_issue(&issue, "tester").unwrap();
 
-        let err = auto_flush(
-            &mut storage,
-            &beads_dir,
-            &jsonl_path,
-            false,
-            HistoryConfig::default(),
-        )
-        .unwrap_err();
+        let err = auto_flush(&mut storage, &beads_dir, &jsonl_path, false).unwrap_err();
         assert!(
             err.to_string().contains("directory")
                 || err.to_string().contains("Is a directory")
@@ -6635,14 +6611,7 @@ mod tests {
         let issue = make_test_issue("bd-auto-flush-path", "Dirty issue");
         storage.create_issue(&issue, "tester").unwrap();
 
-        let err = auto_flush(
-            &mut storage,
-            &beads_dir,
-            &outside_jsonl_path,
-            false,
-            HistoryConfig::default(),
-        )
-        .unwrap_err();
+        let err = auto_flush(&mut storage, &beads_dir, &outside_jsonl_path, false).unwrap_err();
         assert!(
             err.to_string().contains("outside the beads directory"),
             "unexpected error: {err}"
@@ -7952,14 +7921,7 @@ mod tests {
         let issue = make_test_issue("bd-noop", "No-op dirty marker");
         storage.create_issue(&issue, "test").unwrap();
 
-        let first = auto_flush(
-            &mut storage,
-            &beads_dir,
-            &output_path,
-            false,
-            HistoryConfig::default(),
-        )
-        .unwrap();
+        let first = auto_flush(&mut storage, &beads_dir, &output_path, false).unwrap();
         assert!(first.flushed);
         let before = fs::read_to_string(&output_path).unwrap();
 
@@ -7967,14 +7929,7 @@ mod tests {
             .replace_dirty_issue_marker("bd-noop", "manual-dirty-marker")
             .unwrap();
 
-        let second = auto_flush(
-            &mut storage,
-            &beads_dir,
-            &output_path,
-            false,
-            HistoryConfig::default(),
-        )
-        .unwrap();
+        let second = auto_flush(&mut storage, &beads_dir, &output_path, false).unwrap();
         assert!(
             !second.flushed,
             "byte-identical dirty markers should not rewrite JSONL"
@@ -8996,8 +8951,6 @@ mod tests {
             external_ref: None,
             source_system: None,
             source_repo: None,
-            source_repo_path: None,
-            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
