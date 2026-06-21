@@ -2586,13 +2586,11 @@ impl OpenStorageResult {
             return Ok(());
         }
 
-        let history_config = self.resolved_history_config();
         auto_flush(
             &mut self.storage,
             &self.paths.beads_dir,
             &self.paths.jsonl_path,
             self.allow_external_jsonl,
-            history_config,
         )?;
         Ok(())
     }
