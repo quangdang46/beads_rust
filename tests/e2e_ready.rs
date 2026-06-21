@@ -1258,3 +1258,69 @@ fn ready_strict_rejects_out_of_vocab_group_e2e() {
         result.stderr
     );
 }
+
+#[test]
+fn ready_cli_text_truncation_emits_showing_note() {
+    // #356: when `br ready --limit N` hides ready rows, the text surface must
+    // print a "Showing N of M" note (on stderr) instead of silently truncating
+    // — mirroring `br list` and the MCP ready surface (issue #91).
+    let _log = common::test_log("ready_cli_text_truncation_emits_showing_note");
+    let (workspace, _ids) = setup_workspace_with_issues(); // 5 ready issues
+
+    let result = run_br(&workspace, ["ready", "--limit", "2"], "ready_limit_note");
+    assert!(result.status.success(), "ready failed: {}", result.stderr);
+
+    // Exactly 2 rows shown on stdout (lines starting with "1." and "2.").
+    let shown = result
+        .stdout
+        .lines()
+        .filter(|l| l.trim_start().starts_with("1. ") || l.trim_start().starts_with("2. "))
+        .count();
+    assert_eq!(shown, 2, "expected 2 ready rows; stdout: {}", result.stdout);
+
+    assert!(
+        result
+            .stderr
+            .contains("Showing 2 of 5 ready issues. Use --limit 0 for all results."),
+        "expected truncation note on stderr; stderr: {}",
+        result.stderr
+    );
+}
+
+#[test]
+fn ready_cli_no_note_when_limit_covers_all() {
+    // No "Showing N of M" note when the limit does not actually truncate.
+    let _log = common::test_log("ready_cli_no_note_when_limit_covers_all");
+    let (workspace, _ids) = setup_workspace_with_issues(); // 5 ready issues
+
+    let result = run_br(
+        &workspace,
+        ["ready", "--limit", "10"],
+        "ready_limit_no_note",
+    );
+    assert!(result.status.success(), "ready failed: {}", result.stderr);
+    assert!(
+        !result.stderr.contains("Showing") && !result.stderr.contains("Use --limit 0"),
+        "no truncation note expected when limit >= total; stderr: {}",
+        result.stderr
+    );
+}
+
+#[test]
+fn ready_cli_quiet_suppresses_truncation_note() {
+    // `--quiet` must suppress the truncation note, matching `br list`.
+    let _log = common::test_log("ready_cli_quiet_suppresses_truncation_note");
+    let (workspace, _ids) = setup_workspace_with_issues(); // 5 ready issues
+
+    let result = run_br(
+        &workspace,
+        ["--quiet", "ready", "--limit", "2"],
+        "ready_limit_quiet",
+    );
+    assert!(result.status.success(), "ready failed: {}", result.stderr);
+    assert!(
+        !result.stderr.contains("Showing 2 of"),
+        "quiet ready should not emit truncation note; stderr: {}",
+        result.stderr
+    );
+}
