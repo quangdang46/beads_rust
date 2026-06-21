@@ -1532,6 +1532,93 @@ pub fn count_issues_in_jsonl(path: &Path) -> Result<usize> {
     Ok(analyze_jsonl(path)?.0)
 }
 
+fn verify_exported_jsonl_integrity(path: &Path, expected_ids: &[String]) -> Result<()> {
+    let file = File::open(path)?;
+    path::validate_jsonl_fd_metadata(&file, path)?;
+
+    let expected: HashSet<&str> = expected_ids.iter().map(String::as_str).collect();
+    let mut observed = HashSet::with_capacity(expected_ids.len());
+    let mut reader = BufReader::new(file);
+    let mut line_buf = String::new();
+    let mut line_num = 0;
+    let mut issue_count = 0;
+
+    loop {
+        line_buf.clear();
+        let bytes = reader.read_line(&mut line_buf)?;
+        if bytes == 0 {
+            break;
+        }
+
+        line_num += 1;
+        let trimmed = line_buf.trim_end_matches(['\n', '\r']);
+        if trimmed.trim().is_empty() {
+            continue;
+        }
+
+        let issue: Issue = serde_json::from_str(trimmed).map_err(|err| {
+            BeadsError::Config(format!(
+                "Export verification failed: invalid exported JSON at line {line_num}: {err}"
+            ))
+        })?;
+
+        if issue.id.trim().is_empty() {
+            return Err(BeadsError::Config(format!(
+                "Export verification failed: empty issue id at line {line_num}"
+            )));
+        }
+
+        if !expected.contains(issue.id.as_str()) {
+            return Err(BeadsError::Config(format!(
+                "Export verification failed: unexpected issue id '{}' at line {line_num}",
+                issue.id
+            )));
+        }
+
+        if !observed.insert(issue.id.clone()) {
+            return Err(BeadsError::Config(format!(
+                "Export verification failed: duplicate issue id '{}' at line {line_num}",
+                issue.id
+            )));
+        }
+
+        issue_count += 1;
+    }
+
+    if issue_count != expected_ids.len() {
+        return Err(BeadsError::Config(format!(
+            "Export verification failed: expected {} issues, JSONL has {} valid issue lines",
+            expected_ids.len(),
+            issue_count
+        )));
+    }
+
+    if observed.len() != expected.len() {
+        let mut missing = expected_ids
+            .iter()
+            .filter(|id| !observed.contains(id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        missing.sort();
+        let preview = missing
+            .iter()
+            .take(10)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = if missing.len() > 10 {
+            format!(" ... and {} more", missing.len() - 10)
+        } else {
+            String::new()
+        };
+        return Err(BeadsError::Config(format!(
+            "Export verification failed: JSONL is missing expected issue id(s): {preview}{more}"
+        )));
+    }
+
+    Ok(())
+}
+
 /// Get issue IDs from an existing JSONL file.
 ///
 /// # Errors
@@ -2229,14 +2316,7 @@ pub fn export_to_jsonl_with_policy(
     let content_hash = hex_encode(&hasher.finalize());
 
     // Verify staged export integrity before replacing the live JSONL.
-    let actual_count = count_issues_in_jsonl(&temp_path)?;
-    if actual_count != exported_ids.len() {
-        return Err(BeadsError::Config(format!(
-            "Export verification failed: expected {} issues, JSONL has {} lines",
-            exported_ids.len(),
-            actual_count
-        )));
-    }
+    verify_exported_jsonl_integrity(&temp_path, &exported_ids)?;
 
     if let Some(ref beads_dir) = config.beads_dir {
         require_safe_sync_overwrite_path(
@@ -3014,7 +3094,6 @@ struct ExistingJsonlReplacementScan {
     exported_count: usize,
     changed: bool,
     all_replacements_seen: bool,
-    sorted_by_id: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -3026,7 +3105,6 @@ enum ExistingJsonlReplacementWrite {
         content_hash: String,
         exported_count: usize,
     },
-    Fallback,
 }
 
 struct JsonlTempOutput {
@@ -3043,12 +3121,10 @@ fn scan_existing_jsonl_replacements(
     let mut reader = BufReader::new(file);
     let mut seen_ids = HashSet::new();
     let mut seen_replacements = HashSet::with_capacity(replacement_lines.len());
-    let mut previous_id: Option<String> = None;
     let mut line_buf = String::new();
     let mut line_num = 0;
     let mut exported_count = 0;
     let mut changed = false;
-    let mut sorted_by_id = true;
 
     loop {
         line_buf.clear();
@@ -3075,14 +3151,6 @@ fn scan_existing_jsonl_replacements(
             )));
         }
 
-        if previous_id
-            .as_ref()
-            .is_some_and(|previous| previous > &partial.id)
-        {
-            sorted_by_id = false;
-        }
-        previous_id = Some(partial.id.clone());
-
         if let Some(replacement) = replacement_lines.get(&partial.id) {
             seen_replacements.insert(partial.id);
             changed |= replacement != trimmed;
@@ -3095,7 +3163,6 @@ fn scan_existing_jsonl_replacements(
         exported_count,
         changed,
         all_replacements_seen: seen_replacements.len() == replacement_lines.len(),
-        sorted_by_id,
     })
 }
 
@@ -3130,21 +3197,6 @@ fn absolute_or_current_dir_join(path: &Path) -> PathBuf {
     } else {
         path.to_path_buf()
     }
-}
-
-fn persist_jsonl_temp_output(
-    temp_output: JsonlTempOutput,
-    output_path: &Path,
-    config: &ExportConfig,
-) -> Result<()> {
-    let JsonlTempOutput {
-        temp_path,
-        temp_guard,
-        writer,
-    } = temp_output;
-
-    sync_jsonl_writer(writer)?;
-    rename_jsonl_temp_output(&temp_path, temp_guard, output_path, config)
 }
 
 fn rename_jsonl_temp_output(
@@ -3189,11 +3241,7 @@ fn try_write_existing_jsonl_replacements_atomically(
 ) -> Result<ExistingJsonlReplacementWrite> {
     let scan = scan_existing_jsonl_replacements(output_path, replacement_lines)?;
 
-    if !scan.all_replacements_seen || (scan.changed && !scan.sorted_by_id) {
-        return Ok(ExistingJsonlReplacementWrite::Fallback);
-    }
-
-    if !scan.changed {
+    if !scan.changed && scan.all_replacements_seen {
         return Ok(ExistingJsonlReplacementWrite::Unchanged {
             exported_count: scan.exported_count,
         });
@@ -3218,6 +3266,7 @@ fn write_existing_jsonl_replacements_atomically(
     let mut hasher = Sha256::new();
     let mut seen_ids = HashSet::new();
     let mut replaced_ids = HashSet::with_capacity(replacement_lines.len());
+    let mut expected_ids = Vec::new();
     let mut line_buf = String::new();
     let mut line_num = 0;
     let mut exported_count = 0;
@@ -3257,17 +3306,46 @@ fn write_existing_jsonl_replacements_atomically(
         writeln!(temp_output.writer, "{output_line}")?;
         hasher.update(output_line.as_bytes());
         hasher.update(b"\n");
+        expected_ids.push(
+            serde_json::from_str::<PartialId>(output_line)
+                .map_err(|e| {
+                    BeadsError::Config(format!(
+                        "Invalid replacement JSON while preparing incremental auto-flush: {e}"
+                    ))
+                })?
+                .id,
+        );
         exported_count += 1;
     }
 
-    if replaced_ids.len() != replacement_lines.len() {
-        return Err(BeadsError::Config(format!(
-            "JSONL changed while preparing incremental auto-flush for {} replacement(s)",
-            replacement_lines.len()
-        )));
+    let mut appended_ids = replacement_lines
+        .keys()
+        .filter(|id| !replaced_ids.contains(*id))
+        .collect::<Vec<_>>();
+    appended_ids.sort();
+
+    for issue_id in appended_ids {
+        let output_line = replacement_lines.get(issue_id).ok_or_else(|| {
+            BeadsError::Config(format!(
+                "Missing replacement JSON while preparing incremental auto-flush for {issue_id}"
+            ))
+        })?;
+        writeln!(temp_output.writer, "{output_line}")?;
+        hasher.update(output_line.as_bytes());
+        hasher.update(b"\n");
+        expected_ids.push(issue_id.clone());
+        exported_count += 1;
     }
 
-    persist_jsonl_temp_output(temp_output, output_path, config)?;
+    let JsonlTempOutput {
+        temp_path,
+        temp_guard,
+        writer,
+    } = temp_output;
+
+    sync_jsonl_writer(writer)?;
+    verify_exported_jsonl_integrity(&temp_path, &expected_ids)?;
+    rename_jsonl_temp_output(&temp_path, temp_guard, output_path, config)?;
 
     Ok((hex_encode(&hasher.finalize()), exported_count))
 }
@@ -3293,14 +3371,8 @@ fn write_jsonl_lines_atomically(
     } = temp_output;
 
     sync_jsonl_writer(writer)?;
-    let actual_count = count_issues_in_jsonl(&temp_path)?;
-    if actual_count != lines_by_id.len() {
-        return Err(BeadsError::Config(format!(
-            "Export verification failed: expected {} issues, JSONL has {} lines",
-            lines_by_id.len(),
-            actual_count
-        )));
-    }
+    let expected_ids = lines_by_id.keys().cloned().collect::<Vec<_>>();
+    verify_exported_jsonl_integrity(&temp_path, &expected_ids)?;
 
     rename_jsonl_temp_output(&temp_path, temp_guard, output_path, config)?;
 
@@ -3409,7 +3481,6 @@ fn try_existing_line_auto_flush(
                 content_hash,
             }))
         }
-        ExistingJsonlReplacementWrite::Fallback => Ok(None),
     }
 }
 
@@ -3435,7 +3506,6 @@ fn try_incremental_auto_flush(
     beads_dir: &Path,
     jsonl_path: &Path,
     allow_external_jsonl: bool,
-    history_config: HistoryConfig,
 ) -> Result<Option<AutoFlushResult>> {
     if !jsonl_path.exists() {
         return Ok(None);
@@ -3451,7 +3521,6 @@ fn try_incremental_auto_flush(
         force: false,
         beads_dir: Some(beads_dir.to_path_buf()),
         allow_external_jsonl,
-        history: history_config,
         ..Default::default()
     };
 
@@ -3528,7 +3597,6 @@ pub fn auto_flush(
     beads_dir: &Path,
     jsonl_path: &Path,
     allow_external_jsonl: bool,
-    history_config: HistoryConfig,
 ) -> Result<AutoFlushResult> {
     // Check for dirty issues or forced flush first
     let jsonl_exists = jsonl_path.exists();
@@ -3568,13 +3636,7 @@ pub fn auto_flush(
     );
 
     if !needs_flush {
-        match try_incremental_auto_flush(
-            storage,
-            beads_dir,
-            jsonl_path,
-            allow_external_jsonl,
-            history_config.clone(),
-        ) {
+        match try_incremental_auto_flush(storage, beads_dir, jsonl_path, allow_external_jsonl) {
             Ok(Some(result)) => {
                 tracing::info!(
                     flushed = result.flushed,
@@ -3602,7 +3664,6 @@ pub fn auto_flush(
         force: needs_flush,
         beads_dir: Some(beads_dir.to_path_buf()),
         allow_external_jsonl,
-        history: history_config,
         ..Default::default()
     };
 
@@ -5489,8 +5550,6 @@ mod tests {
             external_ref: None,
             source_system: None,
             source_repo: None,
-            source_repo_path: None,
-            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -5651,8 +5710,6 @@ mod tests {
             external_ref: None,
             source_system: None,
             source_repo: None,
-            source_repo_path: None,
-            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -6121,6 +6178,91 @@ mod tests {
     }
 
     #[test]
+    fn test_verify_exported_jsonl_integrity_rejects_corruption_shapes() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("corrupt-export.jsonl");
+
+        let issue1 = make_test_issue("bd-001", "One");
+        let issue2 = make_test_issue("bd-002", "Two");
+        let json1 = serde_json::to_string(&issue1).unwrap();
+        let json2 = serde_json::to_string(&issue2).unwrap();
+
+        let cases = [
+            ("collapsed adjacent records", format!("{json1}{json2}\n")),
+            ("stray issue prefix", "{\"i{\"id\":\"bd-001\"}\n".to_string()),
+            (
+                "missing comments array closure",
+                "{\"id\":\"bd-001\",\"title\":\"Broken\",\"comments\":[{\"id\":1}\n".to_string(),
+            ),
+            (
+                "object nested in numeric field",
+                "{\"id\":\"bd-001\",\"title\":\"Broken\",\"original_size\":{\"id\":\"bd-002\"}}\n"
+                    .to_string(),
+            ),
+        ];
+
+        for (name, content) in cases {
+            fs::write(&path, content).unwrap();
+
+            let err = verify_exported_jsonl_integrity(
+                &path,
+                &["bd-001".to_string(), "bd-002".to_string()],
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("invalid exported JSON at line 1"),
+                "{name}: unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_verify_exported_jsonl_integrity_rejects_missing_expected_issue() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("missing-export.jsonl");
+
+        let issue = make_test_issue("bd-001", "One");
+        fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&issue).unwrap()),
+        )
+        .unwrap();
+
+        let err = verify_exported_jsonl_integrity(
+            &path,
+            &["bd-001".to_string(), "bd-002".to_string()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("expected 2 issues, JSONL has 1 valid issue lines"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_verify_exported_jsonl_integrity_rejects_unexpected_issue() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("unexpected-export.jsonl");
+
+        let issue = make_test_issue("bd-other", "Other");
+        fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&issue).unwrap()),
+        )
+        .unwrap();
+
+        let err = verify_exported_jsonl_integrity(&path, &["bd-001".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unexpected issue id 'bd-other' at line 1"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn test_export_excludes_ephemerals() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let temp_dir = TempDir::new().unwrap();
@@ -6442,14 +6584,7 @@ mod tests {
         let issue = make_test_issue("bd-scan-error", "Dirty issue");
         storage.create_issue(&issue, "tester").unwrap();
 
-        let err = auto_flush(
-            &mut storage,
-            &beads_dir,
-            &jsonl_path,
-            false,
-            HistoryConfig::default(),
-        )
-        .unwrap_err();
+        let err = auto_flush(&mut storage, &beads_dir, &jsonl_path, false).unwrap_err();
         assert!(
             err.to_string().contains("directory")
                 || err.to_string().contains("Is a directory")
@@ -6476,14 +6611,7 @@ mod tests {
         let issue = make_test_issue("bd-auto-flush-path", "Dirty issue");
         storage.create_issue(&issue, "tester").unwrap();
 
-        let err = auto_flush(
-            &mut storage,
-            &beads_dir,
-            &outside_jsonl_path,
-            false,
-            HistoryConfig::default(),
-        )
-        .unwrap_err();
+        let err = auto_flush(&mut storage, &beads_dir, &outside_jsonl_path, false).unwrap_err();
         assert!(
             err.to_string().contains("outside the beads directory"),
             "unexpected error: {err}"
@@ -7793,14 +7921,7 @@ mod tests {
         let issue = make_test_issue("bd-noop", "No-op dirty marker");
         storage.create_issue(&issue, "test").unwrap();
 
-        let first = auto_flush(
-            &mut storage,
-            &beads_dir,
-            &output_path,
-            false,
-            HistoryConfig::default(),
-        )
-        .unwrap();
+        let first = auto_flush(&mut storage, &beads_dir, &output_path, false).unwrap();
         assert!(first.flushed);
         let before = fs::read_to_string(&output_path).unwrap();
 
@@ -7808,14 +7929,7 @@ mod tests {
             .replace_dirty_issue_marker("bd-noop", "manual-dirty-marker")
             .unwrap();
 
-        let second = auto_flush(
-            &mut storage,
-            &beads_dir,
-            &output_path,
-            false,
-            HistoryConfig::default(),
-        )
-        .unwrap();
+        let second = auto_flush(&mut storage, &beads_dir, &output_path, false).unwrap();
         assert!(
             !second.flushed,
             "byte-identical dirty markers should not rewrite JSONL"
@@ -8837,8 +8951,6 @@ mod tests {
             external_ref: None,
             source_system: None,
             source_repo: None,
-            source_repo_path: None,
-            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
