@@ -1159,7 +1159,7 @@ pub struct UpdateArgs {
     pub title: Option<String>,
 
     /// Update description
-    #[arg(long, visible_alias = "body")]
+    #[arg(long, short = 'd', visible_alias = "body")]
     pub description: Option<String>,
 
     /// Update design notes
@@ -1225,7 +1225,7 @@ pub struct UpdateArgs {
     pub remove_label: Vec<String>,
 
     /// Set label(s) (replaces all) - repeatable like bd
-    #[arg(long, add = ArgValueCompleter::new(label_completer_delimited))]
+    #[arg(long, visible_alias = "labels", add = ArgValueCompleter::new(label_completer_delimited))]
     pub set_labels: Vec<String>,
 
     /// Reparent to new parent (empty string removes parent)
@@ -2066,7 +2066,7 @@ pub struct CommentAddArgs {
     pub author: Option<String>,
 
     /// Comment text (alternative flag)
-    #[arg(long = "message")]
+    #[arg(long = "message", short = 'm', visible_alias = "content")]
     pub message: Option<String>,
 }
 
