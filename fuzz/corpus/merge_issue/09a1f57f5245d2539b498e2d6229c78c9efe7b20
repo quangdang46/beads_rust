@@ -1,0 +1,16 @@
+{
+  "id": "bd-equalË‹–’šÝÓõ  "base": {
+    "title": "Equal timestamp base",
+    "updated_at": 1700000000
+  },
+  "local": {
+    "title": "Local equal timestamp winner",
+    "updated_at": 1700000400,
+    "labels": ["local"]
+  },
+  "external": {
+    "title": "External equal timestamp contender",
+    "updated_at": 1700000400,
+    "labels": ["external"]
+  }
+}

@@ -1,0 +1,11 @@
+---
+source: tests/snapshots/json_output.rs
+expression: normalize_json(&add_json)
+---
+[
+  {
+    "status": "added",
+    "issue_id": "ISSUE_ID",
+    "label": "backend"
+  }
+]

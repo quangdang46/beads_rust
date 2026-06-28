@@ -1,0 +1,17 @@
+---
+source: tests/snapshots/json_output.rs
+expression: normalize_json(&json)
+---
+{
+  "total": 2,
+  "groups": [
+    {
+      "group": "in_progress",
+      "count": 1
+    },
+    {
+      "group": "open",
+      "count": 1
+    }
+  ]
+}

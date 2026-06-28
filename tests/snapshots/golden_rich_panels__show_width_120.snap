@@ -1,0 +1,24 @@
+---
+source: tests/golden_rich_panels.rs
+expression: width_120
+---
+╭────────────────────────────────────────────────────── rich-ID  ──────────────────────────────────────────────────────╮
+│ rich-ID   [P1]  open  bug                                                                                            │
+│                                                                                                                      │
+│ Alpha layout regression with a medium length title                                                                   │
+│                                                                                                                      │
+│ A deterministic issue used to freeze Rich-mode show panel wrapping and field alignment.                              │
+│                                                                                                                      │
+│ ───────────────────────────────────                                                                                  │
+│ Labels:   regression, ui                                                                                             │
+│ Created:  TIMESTAMP                                                                                                  │
+│ Updated:  TIMESTAMP                                                                                                  │
+│                                                                                                                      │
+│ ───────────────────────────────────                                                                                  │
+│ Dependents:                                                                                                          │
+│   ← rich-ID  [open] Beta table row exercises dependency columns (blocks)                                             │
+│                                                                                                                      │
+│ Comments:                                                                                                            │
+│   TIMESTAMP            ubuntu: A stable comment keeps the show panel exercising comment rendering.                   │
+│                                                                                                                      │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯

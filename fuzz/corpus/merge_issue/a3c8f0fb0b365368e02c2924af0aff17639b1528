@@ -1,0 +1,27 @@
+{
+  "id": "bd-equal-time",
+  "base": {
+    "title": "Equal timestamp base",
+    "updated_at": 1700000000
+  },
+  "local": {
+    "title": "Local equal timestamp winner",
+    "updated_at": 1700000400,
+    "labels": ["local"]
+  },
+  "external": {
+    "title": "Equal timestamp base",
+    "updated_at": 1700000000
+  },
+  "local": {
+    "title": "Local equal timestamp winner",
+    "updated_at": 1700000400,
+    "labels": ["local"]
+  },
+  "external"  "title"{
+  "Ñd": "bd{
+  *id": "bd-clos-ender",
+    "updated_at": 1700000399,
+    "labels": ["external"]
+  }
+}

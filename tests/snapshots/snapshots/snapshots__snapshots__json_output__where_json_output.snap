@@ -1,0 +1,9 @@
+---
+source: tests/snapshots/json_output.rs
+expression: normalize_where_json(&json)
+---
+{
+  "database_path": "/WORKSPACE/.beads",
+  "path": "/WORKSPACE/.beads",
+  "prefix": "bd"
+}

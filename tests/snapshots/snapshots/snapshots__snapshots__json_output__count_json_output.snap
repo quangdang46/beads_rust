@@ -1,0 +1,7 @@
+---
+source: tests/snapshots/json_output.rs
+expression: normalize_json(&json)
+---
+{
+  "count": 2
+}

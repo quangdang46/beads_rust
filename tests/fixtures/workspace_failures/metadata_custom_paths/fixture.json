@@ -1,0 +1,33 @@
+{
+  "name": "metadata_custom_paths",
+  "family": "path_discovery",
+  "description": "metadata.json redirects both the database and JSONL export to non-default filenames inside .beads.",
+  "expected_classification": "usable",
+  "expected_command_outcomes": [
+    {
+      "surface": "startup/open",
+      "outcome": "success"
+    },
+    {
+      "surface": "create",
+      "outcome": "success"
+    },
+    {
+      "surface": "where",
+      "outcome": "success"
+    },
+    {
+      "surface": "info",
+      "outcome": "success"
+    },
+    {
+      "surface": "sync --status",
+      "outcome": "status_db_newer"
+    }
+  ],
+  "source_hint": "Extends the metadata override coverage already present in tests/e2e_env_overrides.rs and src/config/mod.rs.",
+  "notes": [
+    "This is the corpus entry for non-default path discovery rather than corruption.",
+    "Future non-hermetic and env-sensitive tests can layer ambient env on top of this fixture."
+  ]
+}

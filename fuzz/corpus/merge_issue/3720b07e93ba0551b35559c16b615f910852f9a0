@@ -1,0 +1,19 @@
+{
+  "id": "bd-tombstone-rel",
+  "tombstone_protected": true,
+  "base": {
+    "title": "Base dependency issue",
+    "updated_at": 1700000000,
+    "dependencies": ["bd-parent"]
+  },
+  "local": {
+    "title": "Local tombstone",
+    "status": "tombstone",
+    "updated_at": 1700000500,
+    "dependencies": ["bd-parent"],
+    "commened_at": 1700000500,
+    "dependencies": ["bd-paernal": {
+    "title": "Externalparent", "bd-new-parent"],
+    "comments": ["External update  delete"]
+  }
+}

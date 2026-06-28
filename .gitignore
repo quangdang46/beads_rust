@@ -1,0 +1,235 @@
+# Build artifacts (all target directories)
+target/
+target*/
+.rch-target/
+
+# Cargo.lock IS tracked — beads_rust is a binary CLI, so a committed
+# lockfile gives reproducible builds for `nix build`, `cargo install --git`,
+# and the flake input path used by Home Manager / NixOS configs.
+#
+# Dev-local workflow (sibling-path patching via
+# scripts/dev-local-frankensqlite.toml) rewrites Cargo.lock on every cargo
+# invocation by stripping registry source/checksum lines from patched
+# crates. To avoid accidentally committing that dev-local pollution, run
+# `scripts/activate-dev-local-patch.sh` (sets git skip-worktree on
+# Cargo.lock) before applying the patch and
+# `scripts/deactivate-dev-local-patch.sh` afterwards.
+
+# Fuzz harness lockfile — the fuzz/ workspace is opt-in tooling, not
+# part of the published binary. Keep it untracked so libfuzzer/cargo-fuzz
+# version churn doesn't show up in `git status`.
+fuzz/Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Legacy Go reference code (not part of Rust project)
+/legacy_beads/
+
+
+# Added by cargo (covered by target*/ above)
+
+# bv (beads viewer) local config and caches
+.bv/
+
+# Beads ephemeral files (runtime artifacts, not issues.jsonl)
+.beads/last-touched
+.beads/.bv.lock
+.beads/*.lock
+.beads/.br_history/
+
+# Multi-agent swarm coordination scratch state
+.swarm/
+.swarm_marching_orders.md
+
+# Coverage reports
+/coverage/
+
+# Local agent/session artifacts
+SESSION_STATUS.md
+a.out
+
+# Temp directories and crash reports
+temp_test*/
+rustc-ice-*.txt
+fuzz/artifacts/
+
+# Profiling data
+perf.data
+perf.data.old
+
+# Generated screenshots and scratch images stay ignored. The curated social
+# preview image is intentionally tracked under docs/assets/.
+*.png
+!docs/assets/gh_og_share_image.png
+
+# Claude Code temp files
+claude-upgrade-progress.json
+
+# Shell command artifacts (from malformed redirects like `> =`)
+=
+
+# Local scratch SQLite DBs (never tracked)
+storage.sqlite3
+storage.sqlite3-*
+/*.db
+/*.db-wal
+/*.db-shm
+/*.sqlite
+/*.sqlite3
+
+# Local Cargo and Rustup caches (agent workspace artifacts)
+.cargo/
+.rustup/
+
+# Ephemeral/temporary files (agent workflow artifacts)
+RESEARCH_FINDINGS.md
+TOON_INTEGRATION_BRIEF.md
+/.skill-loop-progress.md
+/CLI_SCHEMA.json
+/ROBOT_MODE_EXAMPLES.jsonl
+cov_*.out
+rustc-ice-*.txt
+*.snap.new
+sweep_*.png
+test_screenshot.png
+
+# Nix build outputs (keep flake.lock - it should be committed)
+result
+result-*
+.direnv/
+
+# Private keys and certificates
+*.pem
+
+# ACFS ephemeral patterns (auto-generated agent artifacts)
+core
+core.*
+cline.mcp.json
+codex.mcp.json
+cursor.mcp.json
+gemini.mcp.json
+opencode.json
+windsurf.mcp.json
+*.mcp.json.*.bak
+.opencode.json.*.bak
+.windsurf.mcp.json.*.bak
+.agent-mail-project-id
+.agent-mail.yaml
+*.sqlite3.bak
+*.sqlite3.corrupt*
+storage.sqlite3.corrupt-*
+storage.sqlite3-shm.corrupt-*
+storage.sqlite3-wal.corrupt-*
+.beads/*.corrupt*
+.beads/*.pre_repair_*
+.beads/*.repair_candidate_*
+.beads/*.bak-corrupt
+
+# Beads ephemeral artifacts (recovery, backup, bad/rebuild snapshots)
+.beads/*.bad_*
+.beads/*.backup_*
+.beads/*.rebuild_*
+.beads/*.reindex_test_*
+.beads/*.vacuum_test_*
+.beads/recovery*/
+
+# Malformed workspace test directories (br test artifacts)
+br_malformed_*/
+
+# SQLite WAL/SHM files in sample databases
+sample_beads_db_files/**/*.db-shm
+sample_beads_db_files/**/*.db-wal
+
+# Test database files (agent test artifacts)
+-memorytest.db
+*memorytest.db
+
+# Root-level test scratch files (agent-generated one-offs).
+# Real tests live in /tests/, which is `tests` (no underscore) and not matched.
+/test_*
+/test.lock
+/child.json
+/parent.json
+
+# One-off sed-based refactor helper scripts (see AGENTS.md — never run scripts
+# that mutate code files; these are agent-generated dev scratch and must stay
+# out of the repo).
+/fix_*.sh
+
+# Beads snapshot backups (timestamped)
+.beads.snapshot_*/
+
+# UBS scan output
+ubs.json
+ubs.txt
+ubs_output.*
+rust-bug-scan.txt
+report.json
+
+# Codex CLI ephemeral directories
+.codex-local-check/
+.codex-bench/
+.codex-tmp/
+
+# Claude Code runtime lockfile for the /schedule skill
+.claude/scheduled_tasks.lock
+
+# NTM agent pane runtime logs (also covered globally in ~/.gitignore,
+# but repeat here so they stay ignored on fresh clones or machines
+# without the global entry).
+.ntm/logs/*.log
+
+# NTM agent coordination state (human inbox spool, per-pane rate-limit
+# snapshots, spawn-state cache, robot snapshot summaries) — regenerated
+# on every orchestrator tick.
+.ntm/human_inbox/
+.ntm/rate_limits.json
+.ntm/spawn-state.json
+.ntm/summaries/
+
+# Skill workspaces — per-pass scratch trees written by /harmonize-skills-*,
+# /rust-unsafe-code-exorcist, and the rust-undefined-behavior-exorcist
+# skill. Each is regenerated on the next run.
+.harmonize_workspace/
+.ub-exorcism/
+.unsafe-audit/
+
+# Skill-loop / refactor-pass run artifacts that should NOT be tracked.
+# Each pass's directory under refactor/artifacts/ legitimately contains
+# small markdown ledgers, scoring files, and golden replay JSON which
+# are tracked. The patterns below cover the consistently-large or
+# obviously-runtime entries that don't belong in git:
+#  - ast_grep_functions.json: 9.6MB+ AST function dumps used as scan
+#    input for one pass; trivially regeneratable via ast-grep.
+#  - tests_before.txt / tests_current.txt: raw `cargo test` output
+#    captures (1.1MB+ each); the LEDGER and verify_report markdown
+#    summarize them.
+#  - golden_workspace/: a live `br` workspace (beads.db, .br_history,
+#    .sync.lock, .write.lock, last-touched) used to record golden
+#    replays, regenerated each pass.
+refactor/artifacts/*/ast_grep_functions.json
+refactor/artifacts/*/tests_before.txt
+refactor/artifacts/*/tests_current.txt
+refactor/artifacts/*/golden_workspace/
+
+# Per-run perf profiling capture tree (2GB+ of perf.data, beads.db
+# workspaces per scenario, criterion-style throughput dumps). The
+# LEDGER and bench-summary markdown files are written elsewhere by
+# the perf scripts; this tree is purely raw data.
+tests/artifacts/perf/
+tests/artifacts/perf/**/perf.data
+tests/artifacts/perf/**/*.beads/
+*.perf.data
+
+# Beads compliance audit dir (managed by /beads-compliance-and-completion-verification skill)
+/beads_compliance_audit/
+# br doctor per-run artifacts
+.doctor/

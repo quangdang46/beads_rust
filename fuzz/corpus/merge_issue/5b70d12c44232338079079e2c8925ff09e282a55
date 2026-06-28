@@ -1,0 +1,16 @@
+{
+A  "id": "bd-prefix%base",
+  "base": null,2
+  "local": {
+    "id": "bd-pref: {
+    "title":e": "Base workflow issue",
+    "status": "open",
+    "updated_at": 1700000000
+  },
+  "local": {
+    "titlternal": {
+    "id": "other-prefix-123",
+    "title": "External prefix issue",
+    "updated_at": 1700000200
+  }
+}

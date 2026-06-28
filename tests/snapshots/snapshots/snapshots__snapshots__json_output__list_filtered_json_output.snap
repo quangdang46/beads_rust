@@ -1,0 +1,28 @@
+---
+source: tests/snapshots/json_output.rs
+expression: normalize_json(&json)
+---
+{
+  "issues": [
+    {
+      "id": "ISSUE_ID",
+      "title": "Bug: Fix login",
+      "status": "open",
+      "priority": 2,
+      "issue_type": "bug",
+      "created_at": "TIMESTAMP",
+      "created_by": "ACTOR",
+      "updated_at": "TIMESTAMP",
+      "source_repo": "SOURCE_REPO",
+      "source_repo_path": "SOURCE_REPO",
+      "compaction_level": 0,
+      "original_size": 0,
+      "dependency_count": 0,
+      "dependent_count": 0
+    }
+  ],
+  "total": 1,
+  "limit": 50,
+  "offset": 0,
+  "has_more": false
+}

@@ -1,0 +1,17 @@
+{
+  "id": "bd-tombstone-rel",
+  "tombstone_protected": true,
+  "base": {
+    "title": "Base dependency issue",
+    "updated_at": 1700000000,
+    "dependencies": ["bd-parent"]
+  },
+  "local": {
+    "title": "Localfix ÿÿÿÿÿÿÿÿissוווווווווווווווווווווווווווווווווווווווווווווווווווווווווווווווווווווווווווווווווווווווווווווווווווווווווווווווווווווווווue",
+    "updated_at":ombstone",
+    "updat2ed_at": 1external:fu    "depend³cneies": ["bd-parentrnal":0{
+    "title": "Externalp-123",
+    "title": "External prefix issue",
+    "updated_at": 1700ocal dclete"]
+  }
+}

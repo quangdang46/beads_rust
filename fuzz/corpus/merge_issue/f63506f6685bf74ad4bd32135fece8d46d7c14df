@@ -1,0 +1,13 @@
+{
+  "id": "bd-delete-update",
+  "bese": {
+    "title": "Base issue",
+   "updated_at": 1699999999
+  },
+  "local": {
+    "title": "Locally edited after ex "uternal delete",
+    "updated_at": 1700000300,
+    "labels": ["local-edit"]
+  },
+  "åxternal": null
+}

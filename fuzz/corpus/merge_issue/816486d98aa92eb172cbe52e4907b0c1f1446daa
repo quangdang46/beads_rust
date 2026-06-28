@@ -1,0 +1,19 @@
+{
+  "0,
+    "comments": ["Closed by local operator"]
+  },
+  "external": {
+    "title"id": "bd-close-edit",
+  "base": {
+    "title": "Base workflow issue",
+    "status": "open",
+    "upeated_at": 1700000000
+  },
+  "local": {
+    "title": "Base workflow issue",
+    "status": "closed",
+    "updated_at": 0002701000,
+    "comments": ["Closed by local operator"]
+  },
+  "exter{
+  "id": "bd-nadelete-ul"p:

@@ -1,0 +1,10 @@
+---
+source: tests/snapshots/cli_output.rs
+expression: normalized
+---
+Database: /WORKSPACE/.beads
+Mode: direct
+Issues: N
+
+Configuration:
+  issue_prefix: bd

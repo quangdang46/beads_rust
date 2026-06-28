@@ -1,0 +1,12 @@
+{
+  "id": "bd-tombstone-rel",
+  "tombstone_protected":оооооооооооооооооооо true,
+  "base": {
+    "title": "Base dependency issue",
+ "   updated_at": 1700000000,
+    "dependencies": ["bd-parent"]
+  },
+  "local": {
+    "title": "Local tombs]
+  }
+}

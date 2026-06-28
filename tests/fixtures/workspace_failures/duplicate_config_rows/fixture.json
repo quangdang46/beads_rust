@@ -1,0 +1,37 @@
+{
+  "name": "duplicate_config_rows",
+  "family": "legacy_schema_drift",
+  "description": "The config table no longer enforces a primary key and contains duplicate rows for the same key.",
+  "expected_classification": "recoverable",
+  "expected_command_outcomes": [
+    {
+      "surface": "startup/open",
+      "outcome": "success_with_auto_recovery"
+    },
+    {
+      "surface": "create",
+      "outcome": "success_with_auto_recovery"
+    },
+    {
+      "surface": "doctor",
+      "outcome": "reports_errors"
+    },
+    {
+      "surface": "doctor --repair",
+      "outcome": "repair_applied"
+    },
+    {
+      "surface": "config get",
+      "outcome": "success_with_auto_recovery"
+    },
+    {
+      "surface": "config list",
+      "outcome": "success_with_auto_recovery"
+    }
+  ],
+  "source_hint": "Matches the duplicate-key anomaly checks in src/storage/sqlite.rs and src/cli/commands/doctor.rs.",
+  "notes": [
+    "This preserves a queryable database that still violates higher-level invariants.",
+    "It exercises legacy-schema repair without needing a fully corrupt SQLite file."
+  ]
+}

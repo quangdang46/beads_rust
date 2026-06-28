@@ -1,0 +1,17 @@
+---
+source: tests/snapshots/toon_output.rs
+expression: normalized
+---
+[1]:
+  - id: bd-ready-p0
+    title: "01 Ready Critical Unassigned"
+    status: open
+    priority: 0
+    issue_type: bug
+    created_at: "2026-02-02T00:00:00Z"
+    created_by: fixture
+    updated_at: "2026-02-02T00:00:00Z"
+    source_repo: .
+    compaction_level: 0
+    original_size: 0
+    labels[2]: agent,ops

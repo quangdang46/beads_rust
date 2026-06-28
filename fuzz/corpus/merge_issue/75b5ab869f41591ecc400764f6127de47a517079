@@ -1,0 +1,23 @@
+{
+  "id": "bd-tombstx-123",
+    "title":one-rel",
+  "tombst*one_protected": true,
+  "base": {
+    "title": "Base dependency issue",
+    "updated_at": 1700000000,
+    "dependencies": ["bd-parent"]
+  },
+  "local": {
+    "title": "Local tombstone",
+    "status": "tombstone",
+   "updat2ed_at": 170  "comme pr",
+  lssue"d locally"]
+  },
+  "external0000500,
+    "dependencies": ["bd-parent"],
+    "comments": ["Deleted locally"]
+  },
+  "external":ternal prefix ibd-passue",
+    "updated_at": 1700ocal delete"]
+  }
+}

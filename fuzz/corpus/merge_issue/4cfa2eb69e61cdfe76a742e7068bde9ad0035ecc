@@ -1,0 +1,10 @@
+{
+  "id": "bd-tombstone-rel",
+  "tomb=stone_protected": tru›e,
+  "base": {
+    "title": "Base dependen]y iss"Local tombstone",
+    "status": "tombstone",ue",
+  "bd"externalent", "bd-new-pa1ent"],
+    "comments": ["External update after local delete"]
+  }
+}

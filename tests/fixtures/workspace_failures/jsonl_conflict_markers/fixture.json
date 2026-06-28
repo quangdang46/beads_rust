@@ -1,0 +1,37 @@
+{
+  "name": "jsonl_conflict_markers",
+  "family": "malformed_jsonl",
+  "description": "The JSONL export contains git merge conflict markers wrapped around otherwise valid records.",
+  "expected_classification": "degraded",
+  "expected_command_outcomes": [
+    {
+      "surface": "startup/open",
+      "outcome": "success"
+    },
+    {
+      "surface": "create",
+      "outcome": "success"
+    },
+    {
+      "surface": "doctor",
+      "outcome": "reports_errors"
+    },
+    {
+      "surface": "doctor --repair",
+      "outcome": "fails_conflict_markers"
+    },
+    {
+      "surface": "sync --status",
+      "outcome": "status_diverged"
+    },
+    {
+      "surface": "sync --import-only",
+      "outcome": "fails_conflict_markers"
+    }
+  ],
+  "source_hint": "Derived from the conflict-marker rejection tests in tests/e2e_sync_fuzz_edge_cases.rs.",
+  "notes": [
+    "This case is syntactically broken by design and should never be treated as silently importable.",
+    "The database remains healthy so the fixture can distinguish interchange failure from primary-store failure."
+  ]
+}

@@ -1,0 +1,30 @@
+---
+source: tests/snapshots/json_output.rs
+expression: normalize_json(&json)
+---
+{
+  "root": "ISSUE_ID",
+  "nodes": [
+    {
+      "id": "ISSUE_ID",
+      "title": "Graph root",
+      "status": "open",
+      "priority": 2,
+      "depth": 0
+    },
+    {
+      "id": "ISSUE_ID",
+      "title": "Graph child",
+      "status": "open",
+      "priority": 2,
+      "depth": 1
+    }
+  ],
+  "edges": [
+    [
+      "ISSUE_ID",
+      "ISSUE_ID"
+    ]
+  ],
+  "count": 2
+}

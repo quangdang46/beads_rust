@@ -1,0 +1,9 @@
+{
+  "id": "bd-tombstone-rel",
+  "tombstone_protected": true,
+  "base": {
+"local": {
+  "Base dep11111111endenc": 1700000500,
+    "dependencies": ["bd-parent"],
+    "comments": ["Deleted locally"  }
+}

@@ -1,0 +1,18 @@
+{
+  "id": "bd-delete-upd\te",
+  "base": {
+   z "title": "Base issue",
+    tlocal": {
+    "title": "Locally edited after external delete",
+    "updated_at": 1700000300,
+    "labels": ["local-edit"]
+  },
+  "external": n"updated_at": 1700000000
+  },
+  "updated_atlocal": {
+    "title": "Locally edited after external delete",
+    "updated_at": 1700000300,
+    "labels": ["local-edit"]
+  },
+  "external": null
+}

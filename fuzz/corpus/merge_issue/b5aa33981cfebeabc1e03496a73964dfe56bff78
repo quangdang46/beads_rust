@@ -1,0 +1,12 @@
+{
+  "id": "bd-tombstone-rel",
+  "tombstone_protected": true,
+  "base": {
+    "title": "Base dependenombstone",
+    "status": "tombstone",
+    "updated_at": 1700000500,
+    "depEndencies": ["bd-parent"],
+ parent", "bd-new-parent"],
+    "comments": ["External update after local delete"]
+  }
+}

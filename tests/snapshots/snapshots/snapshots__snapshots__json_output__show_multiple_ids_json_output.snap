@@ -1,0 +1,34 @@
+---
+source: tests/snapshots/json_output.rs
+expression: normalized
+---
+[
+  {
+    "id": "ISSUE_ID",
+    "title": "First detailed issue",
+    "status": "open",
+    "priority": 2,
+    "issue_type": "task",
+    "created_at": "TIMESTAMP",
+    "created_by": "ACTOR",
+    "updated_at": "TIMESTAMP",
+    "source_repo": "SOURCE_REPO",
+    "source_repo_path": "SOURCE_REPO",
+    "compaction_level": 0,
+    "original_size": 0
+  },
+  {
+    "id": "ISSUE_ID",
+    "title": "Second detailed issue",
+    "status": "open",
+    "priority": 2,
+    "issue_type": "task",
+    "created_at": "TIMESTAMP",
+    "created_by": "ACTOR",
+    "updated_at": "TIMESTAMP",
+    "source_repo": "SOURCE_REPO",
+    "source_repo_path": "SOURCE_REPO",
+    "compaction_level": 0,
+    "original_size": 0
+  }
+]

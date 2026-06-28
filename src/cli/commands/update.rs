@@ -1,0 +1,1908 @@
+//! Update command implementation.
+
+use super::{
+    RoutedWorkspaceWriteLock, acquire_routed_workspace_write_lock,
+    auto_import_storage_ctx_if_stale, finalize_batched_blocked_cache_refresh,
+    preserve_blocked_cache_on_error, report_auto_flush_failure, resolve_issue_id,
+    resolve_issue_ids, retry_mutation_with_jsonl_recovery, update_issue_with_recovery,
+};
+use crate::cli::UpdateArgs;
+use crate::config;
+use crate::error::{BeadsError, Result};
+use crate::format::{format_status_label, format_type_label, sanitize_terminal_inline};
+use crate::model::{Issue, IssueType, Priority, Status};
+use crate::output::OutputContext;
+use crate::storage::{EventAttribution, IssueUpdate, SqliteStorage};
+use crate::util::id::{IdResolver, ResolverConfig};
+use crate::util::time::parse_flexible_timestamp;
+use crate::validation::LabelValidator;
+use chrono::{DateTime, Utc};
+use serde::Serialize;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::Path;
+
+/// JSON output structure for updated issues.
+#[derive(Debug, Serialize)]
+struct UpdatedIssueOutput {
+    id: String,
+    title: String,
+    status: String,
+    priority: i32,
+    updated_at: DateTime<Utc>,
+}
+
+impl From<&Issue> for UpdatedIssueOutput {
+    fn from(issue: &Issue) -> Self {
+        Self {
+            id: issue.id.clone(),
+            title: issue.title.clone(),
+            status: issue.status.as_str().to_string(),
+            priority: issue.priority.0,
+            updated_at: issue.updated_at,
+        }
+    }
+}
+
+/// Snapshot of which fields the caller explicitly requested to change and
+/// the post-mutation values they produced, captured directly from the
+/// validated pre-mutation `issue_before` + the `IssueUpdate` struct that was
+/// applied.
+///
+/// We deliberately do NOT derive the post-mutation values from a second
+/// `get_issue(id)` read after the write transaction commits.  Doing so has
+/// surfaced as an "unrelated bead's fields leak into the diff" bug in the
+/// wild (see issue #256): a rare, yet-to-be-fully-root-caused read-path
+/// inconsistency (e.g. fsqlite prepared-statement / pager cache edge case,
+/// or a concurrent external writer touching the JSONL between the two
+/// reads) can cause the post-update `get_issue` to return data that belongs
+/// to a different row while the on-disk write is still correct.
+///
+/// By pairing the pre-mutation snapshot (whose `id` is guarded by
+/// `get_issue_from_conn`'s post-condition check to match the requested id)
+/// with the exact `IssueUpdate` struct the user passed, the rendered diff
+/// is guaranteed to reference only the target bead and only the fields the
+/// user explicitly asked to change.  Ghost fields like `status: open →
+/// closed` can no longer appear on a `--priority 1` no-op.
+#[derive(Debug, Default, Clone)]
+struct UpdateDiff {
+    status: Option<(Status, Status)>,
+    priority: Option<(Priority, Priority)>,
+    issue_type: Option<(IssueType, IssueType)>,
+    assignee: Option<(Option<String>, Option<String>)>,
+    owner: Option<(Option<String>, Option<String>)>,
+}
+
+impl UpdateDiff {
+    fn from_before_and_update(before: &Issue, update: &IssueUpdate) -> Self {
+        let mut diff = Self::default();
+        if let Some(ref new_status) = update.status
+            && before.status != *new_status
+        {
+            diff.status = Some((before.status.clone(), new_status.clone()));
+        }
+        if let Some(new_priority) = update.priority
+            && before.priority != new_priority
+        {
+            diff.priority = Some((before.priority, new_priority));
+        }
+        if let Some(ref new_type) = update.issue_type
+            && before.issue_type != *new_type
+        {
+            diff.issue_type = Some((before.issue_type.clone(), new_type.clone()));
+        }
+        if let Some(ref new_assignee_opt) = update.assignee {
+            let before_assignee = before.assignee.clone();
+            if before_assignee != *new_assignee_opt {
+                diff.assignee = Some((before_assignee, new_assignee_opt.clone()));
+            }
+        }
+        if let Some(ref new_owner_opt) = update.owner {
+            let before_owner = before.owner.clone();
+            if before_owner != *new_owner_opt {
+                diff.owner = Some((before_owner, new_owner_opt.clone()));
+            }
+        }
+        diff
+    }
+}
+
+#[derive(Debug)]
+enum UpdateRenderItem {
+    Summary {
+        id: String,
+        title: String,
+        diff: Box<UpdateDiff>,
+    },
+    NoUpdates {
+        id: String,
+    },
+}
+
+#[derive(Debug)]
+struct UpdateRouteOutput {
+    updated_issues: Vec<UpdatedIssueOutput>,
+    render_items: Vec<UpdateRenderItem>,
+    resolved_ids: Vec<String>,
+}
+
+enum ParentUpdatePlan {
+    Unchanged,
+    Clear,
+    Set(String),
+}
+
+struct PreparedUpdateRoute {
+    storage_ctx: config::OpenStorageResult,
+    actor: String,
+    resolved_ids: Vec<String>,
+    update: IssueUpdate,
+    has_updates: bool,
+    add_labels: Vec<String>,
+    remove_labels: Vec<String>,
+    set_labels: bool,
+    valid_set_labels: Vec<String>,
+    resolved_parent: ParentUpdatePlan,
+    auto_flush_external: bool,
+    /// Tier 1 attribution (issue #312, Layer 3 capture-only) staged onto each
+    /// mutation's audit events. Recorded only — never gated or enforced on.
+    attribution: EventAttribution,
+    _routed_write_lock: RoutedWorkspaceWriteLock,
+}
+
+/// Execute the update command.
+///
+/// # Errors
+///
+/// Returns an error if database operations fail or validation errors occur.
+#[allow(clippy::too_many_lines)]
+pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
+    // Refuse terminal-state transitions before doing any I/O. `br update`
+    // is a data-only field mutator; terminal-state transitions
+    // (closed, tombstone) must go through their dedicated commands so the
+    // close-policy / delete pipelines are applied (see beads_rust#301).
+    reject_terminal_status_transition(args.status.as_deref())?;
+
+    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
+    let mut target_inputs = args.ids.clone();
+    if target_inputs.is_empty() {
+        let last_touched = crate::util::get_last_touched_id(&beads_dir);
+        if last_touched.is_empty() {
+            return Err(BeadsError::validation(
+                "ids",
+                "no issue IDs provided and no last-touched issue",
+            ));
+        }
+        target_inputs.push(last_touched);
+    }
+
+    let routed_batches = config::routing::group_issue_inputs_by_route(&target_inputs, &beads_dir)?;
+
+    let (updated_issues, render_items, ordered_resolved_ids) = if routed_batches
+        .iter()
+        .any(|batch| batch.is_external)
+    {
+        let normalized_local_beads_dir =
+            dunce::canonicalize(&beads_dir).unwrap_or_else(|_| beads_dir.clone());
+        let mut prepared_routes = Vec::new();
+        let mut routed_updated_issues = Vec::new();
+        let mut routed_render_items = Vec::new();
+        let mut routed_resolved_ids = Vec::new();
+        for batch in routed_batches {
+            let mut batch_args = args.clone();
+            batch_args.ids.clone_from(&batch.issue_inputs);
+
+            let normalized_batch_beads_dir =
+                dunce::canonicalize(&batch.beads_dir).unwrap_or_else(|_| batch.beads_dir.clone());
+            let mut batch_cli = cli.clone();
+            // Routed projects must resolve their own metadata-defined DB path
+            // instead of being forced back to the local override. Preserve the
+            // caller's explicit DB only for the local batch.
+            batch_cli.db = if normalized_batch_beads_dir == normalized_local_beads_dir {
+                cli.db.clone()
+            } else {
+                None
+            };
+            prepared_routes.push((
+                batch.issue_inputs.clone(),
+                prepare_single_route(&batch_args, &batch_cli, &batch.beads_dir, batch.is_external)?,
+            ));
+        }
+
+        let all_resolved_ids = prepared_routes
+            .iter()
+            .flat_map(|(_, route)| route.resolved_ids.iter().cloned())
+            .collect::<Vec<_>>();
+        validate_multi_issue_external_ref_update(args.external_ref.as_deref(), &all_resolved_ids)?;
+
+        let use_machine_output = update_uses_machine_output(ctx);
+        let use_human_output = update_uses_human_output(ctx);
+
+        for (issue_inputs, prepared_route) in prepared_routes {
+            let route_output = execute_prepared_route(prepared_route, ctx)?;
+
+            if use_machine_output {
+                routed_updated_issues.push((issue_inputs.clone(), route_output.updated_issues));
+            } else if use_human_output {
+                routed_render_items.push((issue_inputs.clone(), route_output.render_items));
+            }
+            routed_resolved_ids.push((issue_inputs, route_output.resolved_ids));
+        }
+
+        let updated_issues = if use_machine_output {
+            reorder_routed_items_by_requested_inputs(
+                &target_inputs,
+                routed_updated_issues,
+                "update routing",
+            )?
+        } else {
+            Vec::new()
+        };
+        let render_items = if use_human_output {
+            reorder_routed_items_by_requested_inputs(
+                &target_inputs,
+                routed_render_items,
+                "update routing",
+            )?
+        } else {
+            Vec::new()
+        };
+        let ordered_resolved_ids = reorder_routed_items_by_requested_inputs(
+            &target_inputs,
+            routed_resolved_ids,
+            "update routing",
+        )?;
+        (updated_issues, render_items, ordered_resolved_ids)
+    } else {
+        let route_output =
+            execute_prepared_route(prepare_single_route(args, cli, &beads_dir, false)?, ctx)?;
+        (
+            route_output.updated_issues,
+            route_output.render_items,
+            route_output.resolved_ids,
+        )
+    };
+
+    if let Some(last_id) = ordered_resolved_ids.last() {
+        crate::util::set_last_touched_id(&beads_dir, last_id);
+    }
+
+    if ctx.is_toon() {
+        ctx.toon(&updated_issues);
+    } else if ctx.is_json() {
+        ctx.json_pretty(&updated_issues);
+    } else if !ctx.is_quiet() {
+        print_render_items(&render_items);
+        // beads_rust#297: emit inherited governing context for any
+        // bead that just transitioned into in_progress (via --claim or
+        // --status in_progress). Done after the update summary so the
+        // child's status change is visible first, then the inherited
+        // context the agent should be operating under.
+        emit_inherited_context_for_in_progress_transitions(&beads_dir, cli, &render_items);
+    }
+
+    Ok(())
+}
+
+fn emit_inherited_context_for_in_progress_transitions(
+    beads_dir: &Path,
+    cli: &config::CliOverrides,
+    render_items: &[UpdateRenderItem],
+) {
+    if !crate::inheritance::is_enabled(beads_dir) {
+        return;
+    }
+    let claimed_ids: Vec<&str> = render_items
+        .iter()
+        .filter_map(|item| match item {
+            UpdateRenderItem::Summary { id, diff, .. }
+                if diff
+                    .status
+                    .as_ref()
+                    .is_some_and(|(_, new)| matches!(new, Status::InProgress)) =>
+            {
+                Some(id.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    if claimed_ids.is_empty() {
+        return;
+    }
+    // Open a transient read-only storage to walk ancestry. Failure
+    // here is non-fatal — the update has already succeeded and the
+    // child's status change is already printed.
+    let Ok(storage_ctx) = config::open_storage_with_cli(beads_dir, cli) else {
+        return;
+    };
+    let storage = &storage_ctx.storage;
+    for id in claimed_ids {
+        let blocks = match crate::inheritance::collect_inherited_blocks(storage, id) {
+            Ok(blocks) if !blocks.is_empty() => blocks,
+            _ => continue,
+        };
+        let rendered = crate::inheritance::render_text(&blocks);
+        println!();
+        print!("{rendered}");
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn prepare_single_route(
+    args: &UpdateArgs,
+    cli: &config::CliOverrides,
+    beads_dir: &Path,
+    auto_flush_external: bool,
+) -> Result<PreparedUpdateRoute> {
+    let routed_write_lock =
+        acquire_routed_workspace_write_lock(beads_dir, auto_flush_external, cli.lock_timeout)?;
+    let mut storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
+    auto_import_storage_ctx_if_stale(&mut storage_ctx, cli)?;
+
+    let config_layer = storage_ctx.load_config(cli)?;
+    let actor = config::resolve_actor(&config_layer);
+    let resolver = build_resolver(&config_layer, &storage_ctx.storage);
+    let resolved_ids = resolve_target_ids(args, beads_dir, &resolver, &storage_ctx.storage)?;
+
+    let claim_exclusive = config::claim_exclusive_from_layer(&config_layer);
+    let update = build_update(args, &actor, claim_exclusive)?;
+
+    // Strict status-workflow enforcement (issue #311) + transition rules
+    // (issue #312, layer 1). When the project's `.beads/policy.yaml` configures
+    // `workflow.strict: true` with a non-empty `workflow.statuses` set, a target
+    // status outside that set is rejected. When `workflow.strict: true` with a
+    // non-empty `workflow.transitions` map, a `from -> to` status change that is
+    // not an allowed transition is rejected. Absent/non-strict workflow config
+    // is a no-op, so existing repos are unaffected.
+    if let Some(new_status) = update.status.as_ref() {
+        let policy = crate::close_policy::load_for_beads_dir(beads_dir)?;
+        policy.workflow.validate_status(new_status.as_str())?;
+        let transitions_enforced = policy.workflow.transitions_enforced();
+        let gates_enforced = policy.workflow.gates_enforced();
+        if transitions_enforced || gates_enforced {
+            for id in &resolved_ids {
+                // The current status is the `from` state for the transition
+                // check. An issue that cannot be read (missing/unresolved)
+                // validates against the `initial` key (from = None), mirroring
+                // a create.
+                let current = storage_ctx
+                    .storage
+                    .get_issue(id)?
+                    .map(|issue| issue.status.as_str().to_string());
+                if transitions_enforced {
+                    policy
+                        .workflow
+                        .validate_transition(current.as_deref(), new_status.as_str())?;
+                }
+                // Workflow gate enforcement (issue #312, layer 2). A move into a
+                // gated state is rejected until every required gate passes.
+                // Only consulted when there is a `from` state (gates guard a
+                // `from -> to` transition; a create has no `from` to gate).
+                if gates_enforced && let Some(from) = current.as_deref() {
+                    enforce_gates(
+                        &storage_ctx.storage,
+                        &policy.workflow,
+                        id,
+                        from,
+                        new_status.as_str(),
+                    )?;
+                }
+            }
+        }
+    }
+    let has_updates = !update.is_empty()
+        || !args.add_label.is_empty()
+        || !args.remove_label.is_empty()
+        || !args.set_labels.is_empty()
+        || args.parent.is_some();
+
+    validate_mutable_target_issues(&storage_ctx.storage, &resolved_ids, has_updates)?;
+
+    // Validate labels before making any database changes
+    for label in &args.add_label {
+        LabelValidator::validate(label).map_err(|e| BeadsError::validation("label", e.message))?;
+    }
+    for label in &args.remove_label {
+        LabelValidator::validate(label).map_err(|e| BeadsError::validation("label", e.message))?;
+    }
+
+    let mut valid_set_labels = Vec::new();
+    if !args.set_labels.is_empty() {
+        let combined = args.set_labels.join(",");
+        for label in combined.split(',') {
+            let label = label.trim();
+            if !label.is_empty() {
+                LabelValidator::validate(label)
+                    .map_err(|e| BeadsError::validation("label", e.message))?;
+                valid_set_labels.push(label.to_string());
+            }
+        }
+    }
+
+    let resolved_parent =
+        resolve_parent_update(args.parent.as_deref(), &resolver, &storage_ctx.storage)?;
+    validate_parent_updates(&storage_ctx.storage, &resolved_ids, &resolved_parent)?;
+
+    validate_transition_to_in_progress(&storage_ctx.storage, &resolved_ids, args)?;
+    validate_route_runtime_guards(&storage_ctx.storage, &resolved_ids, &update)?;
+
+    Ok(PreparedUpdateRoute {
+        storage_ctx,
+        actor,
+        resolved_ids,
+        update,
+        has_updates,
+        add_labels: args.add_label.clone(),
+        remove_labels: args.remove_label.clone(),
+        set_labels: !args.set_labels.is_empty(),
+        valid_set_labels,
+        resolved_parent,
+        auto_flush_external,
+        attribution: EventAttribution::new(
+            args.agent_name.as_deref(),
+            args.harness.as_deref(),
+            args.model.as_deref(),
+        ),
+        _routed_write_lock: routed_write_lock,
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn execute_prepared_route(
+    mut prepared: PreparedUpdateRoute,
+    ctx: &OutputContext,
+) -> Result<UpdateRouteOutput> {
+    let mut updated_issues: Vec<UpdatedIssueOutput> = Vec::new();
+    let mut render_items = Vec::new();
+    let resolved_ids = prepared.resolved_ids.clone();
+    let use_machine_output = update_uses_machine_output(ctx);
+    let use_human_output = update_uses_human_output(ctx);
+    let mut route_has_mutated = false;
+    let mut blocked_cache_dirty = false;
+    let defer_blocked_cache_rebuild = prepared.update.status.is_some()
+        || !matches!(prepared.resolved_parent, ParentUpdatePlan::Unchanged);
+    let parent_changes_cache = !matches!(prepared.resolved_parent, ParentUpdatePlan::Unchanged);
+
+    for id in &prepared.resolved_ids {
+        // Get issue before update for change tracking
+        let issue_before_result = prepared.storage_ctx.storage.get_issue(id);
+        let issue_before = preserve_blocked_cache_on_error(
+            &mut prepared.storage_ctx.storage,
+            blocked_cache_dirty,
+            "update",
+            issue_before_result,
+        )?;
+
+        // Apply basic field updates
+        if !prepared.update.is_empty() {
+            let mut issue_update = prepared.update.clone();
+            issue_update.skip_cache_rebuild = defer_blocked_cache_rebuild;
+            // Stage Tier 1 attribution (issue #312, Layer 3 capture-only) so the
+            // update / status-change audit events record the self-reported agent
+            // identity. Recorded ONLY — never gates or alters the transition.
+            prepared
+                .storage_ctx
+                .storage
+                .set_pending_event_attribution(prepared.attribution.clone());
+            let update_result = update_issue_with_recovery(
+                &mut prepared.storage_ctx,
+                !route_has_mutated,
+                "update",
+                id,
+                &issue_update,
+                &prepared.actor,
+            );
+            preserve_blocked_cache_on_error(
+                &mut prepared.storage_ctx.storage,
+                blocked_cache_dirty,
+                "update",
+                update_result,
+            )?;
+            if prepared.update.status.is_some() {
+                blocked_cache_dirty = true;
+            }
+            route_has_mutated = true;
+        }
+
+        // Apply labels
+        for label in &prepared.add_labels {
+            let add_label_result = retry_mutation_with_jsonl_recovery(
+                &mut prepared.storage_ctx,
+                !route_has_mutated,
+                "update label add",
+                Some(id.as_str()),
+                |storage| storage.add_label(id, label, &prepared.actor),
+            );
+            preserve_blocked_cache_on_error(
+                &mut prepared.storage_ctx.storage,
+                blocked_cache_dirty,
+                "update",
+                add_label_result,
+            )?;
+            route_has_mutated = true;
+        }
+        for label in &prepared.remove_labels {
+            let remove_label_result = retry_mutation_with_jsonl_recovery(
+                &mut prepared.storage_ctx,
+                !route_has_mutated,
+                "update label remove",
+                Some(id.as_str()),
+                |storage| storage.remove_label(id, label, &prepared.actor),
+            );
+            preserve_blocked_cache_on_error(
+                &mut prepared.storage_ctx.storage,
+                blocked_cache_dirty,
+                "update",
+                remove_label_result,
+            )?;
+            route_has_mutated = true;
+        }
+        if prepared.set_labels {
+            let set_labels_result = retry_mutation_with_jsonl_recovery(
+                &mut prepared.storage_ctx,
+                !route_has_mutated,
+                "update label set",
+                Some(id.as_str()),
+                |storage| storage.set_labels(id, &prepared.valid_set_labels, &prepared.actor),
+            );
+            preserve_blocked_cache_on_error(
+                &mut prepared.storage_ctx.storage,
+                blocked_cache_dirty,
+                "update",
+                set_labels_result,
+            )?;
+            route_has_mutated = true;
+        }
+
+        // Apply parent
+        let parent_result = apply_parent_update(
+            &mut prepared.storage_ctx,
+            !route_has_mutated,
+            id,
+            &prepared.resolved_parent,
+            &prepared.actor,
+            defer_blocked_cache_rebuild,
+        );
+        preserve_blocked_cache_on_error(
+            &mut prepared.storage_ctx.storage,
+            blocked_cache_dirty,
+            "update",
+            parent_result,
+        )?;
+        if parent_changes_cache {
+            route_has_mutated = true;
+            blocked_cache_dirty = true;
+        }
+
+        // Re-read post-mutation state for JSON/TOON machine output only.
+        // For human-readable diff rendering we synthesize the diff from
+        // `(issue_before, update)` below instead of trusting a second read,
+        // to defend against the "unrelated bead's fields leak into diff"
+        // regression reported in issue #256.
+        let issue_after_result = prepared.storage_ctx.storage.get_issue(id);
+        let issue_after = preserve_blocked_cache_on_error(
+            &mut prepared.storage_ctx.storage,
+            blocked_cache_dirty,
+            "update",
+            issue_after_result,
+        )?;
+
+        if use_machine_output {
+            if let Some(ref issue) = issue_after {
+                updated_issues.push(UpdatedIssueOutput::from(issue));
+            }
+        } else if use_human_output && prepared.has_updates {
+            // Derive the rendered title and diff from the validated
+            // pre-mutation snapshot + the user's requested update.  If a
+            // title change was requested use the requested new title, else
+            // fall back to the authoritative `issue_before.title` (whose
+            // row id has been post-condition-checked to equal `id`).  Only
+            // if we have no `issue_before` at all (it was deleted / did
+            // not exist before our write, which should not happen on the
+            // `update` command path) do we fall back to the post-read.
+            let title = prepared
+                .update
+                .title
+                .clone()
+                .or_else(|| issue_before.as_ref().map(|b| b.title.clone()))
+                .or_else(|| issue_after.as_ref().map(|i| i.title.clone()))
+                .unwrap_or_default();
+            let diff = issue_before
+                .as_ref()
+                .map_or_else(UpdateDiff::default, |before| {
+                    UpdateDiff::from_before_and_update(before, &prepared.update)
+                });
+            render_items.push(UpdateRenderItem::Summary {
+                id: id.clone(),
+                title,
+                diff: Box::new(diff),
+            });
+        } else if use_human_output {
+            render_items.push(UpdateRenderItem::NoUpdates { id: id.clone() });
+        }
+    }
+
+    if defer_blocked_cache_rebuild && blocked_cache_dirty {
+        finalize_batched_blocked_cache_refresh(
+            &mut prepared.storage_ctx.storage,
+            blocked_cache_dirty,
+            "update",
+        )?;
+    }
+
+    prepared.storage_ctx.flush_no_db_if_dirty()?;
+    if prepared.auto_flush_external
+        && let Err(error) = prepared.storage_ctx.auto_flush_if_enabled()
+    {
+        report_auto_flush_failure(
+            ctx,
+            &prepared.storage_ctx.paths.beads_dir,
+            &prepared.storage_ctx.paths.jsonl_path,
+            &error,
+        );
+    }
+
+    Ok(UpdateRouteOutput {
+        updated_issues,
+        render_items,
+        resolved_ids,
+    })
+}
+
+fn update_uses_machine_output(ctx: &OutputContext) -> bool {
+    ctx.is_json() || ctx.is_toon()
+}
+
+fn update_uses_human_output(ctx: &OutputContext) -> bool {
+    !ctx.is_quiet() && !update_uses_machine_output(ctx)
+}
+
+fn validate_multi_issue_external_ref_update(
+    external_ref: Option<&str>,
+    resolved_ids: &[String],
+) -> Result<()> {
+    let Some(external_ref) = external_ref.filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+
+    let distinct_ids = resolved_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    if distinct_ids.len() > 1 {
+        return Err(BeadsError::validation(
+            "external_ref",
+            format!(
+                "cannot set external_ref '{external_ref}' on multiple issues in a single update"
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Enforce workflow gates (issue #312, layer 2) for a single `from -> to`
+/// status change on `id`. Loads the issue's labels + priority, the recorded
+/// gate results, and rejects the move with a [`BeadsError::PolicyViolation`]
+/// when any required gate is unsatisfied. A no-op when the transition is not
+/// gated.
+fn enforce_gates(
+    storage: &SqliteStorage,
+    workflow: &crate::close_policy::Workflow,
+    id: &str,
+    from: &str,
+    to: &str,
+) -> Result<()> {
+    let required = workflow.required_gates_for(from, to, &[], 0);
+    // Cheap pre-check: skip the labels/priority/results queries entirely when
+    // the bare transition has no gate rule. (required_gates_for ignores
+    // conditional gates with empty labels; we re-check below with real data.)
+    let rule = workflow.gate_rule_for(from, to);
+    if rule.is_none() && required.is_empty() {
+        return Ok(());
+    }
+    let labels = storage.get_labels(id)?;
+    let priority = storage.get_issue(id)?.map_or(0, |issue| issue.priority.0);
+    let results = storage.get_gate_results(id)?;
+    let violations =
+        crate::close_policy::evaluate_gates(workflow, id, from, to, &labels, priority, &results);
+    if violations.is_empty() {
+        return Ok(());
+    }
+    let summary = if let [single] = violations.as_slice() {
+        single.message.clone()
+    } else {
+        let lines: Vec<String> = violations
+            .iter()
+            .map(|v| format!("- {}", v.message))
+            .collect();
+        format!("{} gate(s) failed:\n{}", violations.len(), lines.join("\n"))
+    };
+    Err(BeadsError::PolicyViolation {
+        issue_id: id.to_string(),
+        summary,
+        violations,
+    })
+}
+
+fn validate_route_runtime_guards(
+    storage: &SqliteStorage,
+    resolved_ids: &[String],
+    update: &IssueUpdate,
+) -> Result<()> {
+    if update.expect_unassigned {
+        let claim_actor = update.claim_actor.as_deref().unwrap_or("");
+        for id in resolved_ids {
+            let issue = storage
+                .get_issue(id)?
+                .ok_or_else(|| BeadsError::IssueNotFound { id: id.clone() })?;
+            let trimmed = issue
+                .assignee
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+
+            match trimmed {
+                None => {}
+                Some(current) if !update.claim_exclusive && current == claim_actor => {}
+                Some(current) => {
+                    return Err(BeadsError::validation(
+                        "claim",
+                        format!("issue {id} already assigned to {current}"),
+                    ));
+                }
+            }
+        }
+    }
+
+    validate_multi_issue_external_ref_update(
+        update
+            .external_ref
+            .as_ref()
+            .and_then(|value| value.as_deref()),
+        resolved_ids,
+    )?;
+
+    if let Some(Some(external_ref)) = &update.external_ref
+        && let Some(existing_issue) = storage.find_by_external_ref(external_ref)?
+        && existing_issue.id != resolved_ids.first().map_or("", String::as_str)
+    {
+        return Err(BeadsError::Config(format!(
+            "External reference '{external_ref}' already exists on issue {}",
+            existing_issue.id
+        )));
+    }
+
+    Ok(())
+}
+
+fn validate_transition_to_in_progress(
+    storage: &SqliteStorage,
+    ids: &[String],
+    args: &UpdateArgs,
+) -> Result<()> {
+    let transitioning_to_in_progress = args.claim
+        || args
+            .status
+            .as_ref()
+            .is_some_and(|status| status.eq_ignore_ascii_case("in_progress"));
+
+    if !transitioning_to_in_progress || args.force {
+        return Ok(());
+    }
+
+    for id in ids {
+        // Use start-blockers (not `is_blocked`), so an epic that is only
+        // "blocked" by its own still-open children — a close-ordering rollup,
+        // not a real dependency — can still be claimed and worked on (#315).
+        let blockers = storage.get_start_blockers(id)?;
+        if !blockers.is_empty() {
+            return Err(BeadsError::validation(
+                "claim",
+                format!("cannot claim blocked issue: {}", blockers.join(", ")),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Print a summary of what changed for the issue.
+fn print_update_summary(id: &str, title: &str, diff: &UpdateDiff) {
+    println!("{}", updated_issue_human_line(id, title));
+
+    if let Some((old_status, new_status)) = &diff.status {
+        println!(
+            "  status: {} → {}",
+            format_status_label(old_status, false),
+            format_status_label(new_status, false)
+        );
+    }
+    if let Some((old_priority, new_priority)) = &diff.priority {
+        println!("  priority: P{} → P{}", old_priority.0, new_priority.0);
+    }
+    if let Some((old_type, new_type)) = &diff.issue_type {
+        println!(
+            "  type: {} → {}",
+            format_type_label(old_type),
+            format_type_label(new_type)
+        );
+    }
+    if let Some((old_assignee, new_assignee)) = &diff.assignee {
+        let before_assignee = old_assignee.as_deref().map_or_else(
+            || "(none)".to_string(),
+            |value| sanitize_terminal_inline(value).into_owned(),
+        );
+        let after_assignee = new_assignee.as_deref().map_or_else(
+            || "(none)".to_string(),
+            |value| sanitize_terminal_inline(value).into_owned(),
+        );
+        println!("  assignee: {before_assignee} → {after_assignee}");
+    }
+    if let Some((old_owner, new_owner)) = &diff.owner {
+        let before_owner = old_owner.as_deref().map_or_else(
+            || "(none)".to_string(),
+            |value| sanitize_terminal_inline(value).into_owned(),
+        );
+        let after_owner = new_owner.as_deref().map_or_else(
+            || "(none)".to_string(),
+            |value| sanitize_terminal_inline(value).into_owned(),
+        );
+        println!("  owner: {before_owner} → {after_owner}");
+    }
+}
+
+fn updated_issue_human_line(id: &str, title: &str) -> String {
+    format!(
+        "Updated {}: {}",
+        sanitize_terminal_inline(id),
+        sanitize_terminal_inline(title)
+    )
+}
+
+fn no_updates_human_line(id: &str) -> String {
+    format!("No updates specified for {}", sanitize_terminal_inline(id))
+}
+
+fn issue_input_text(input: &str) -> String {
+    sanitize_terminal_inline(input).into_owned()
+}
+
+fn print_render_items(render_items: &[UpdateRenderItem]) {
+    for item in render_items {
+        match item {
+            UpdateRenderItem::Summary { id, title, diff } => {
+                print_update_summary(id, title, diff.as_ref());
+            }
+            UpdateRenderItem::NoUpdates { id } => println!("{}", no_updates_human_line(id)),
+        }
+    }
+}
+
+fn reorder_routed_items_by_requested_inputs<T>(
+    requested_inputs: &[String],
+    routed_items: Vec<(Vec<String>, Vec<T>)>,
+    context: &str,
+) -> Result<Vec<T>> {
+    let mut positions_by_input: HashMap<&str, VecDeque<usize>> = HashMap::new();
+    for (index, input) in requested_inputs.iter().enumerate() {
+        positions_by_input
+            .entry(input.as_str())
+            .or_default()
+            .push_back(index);
+    }
+
+    let mut ordered_items: Vec<Option<T>> = (0..requested_inputs.len()).map(|_| None).collect();
+    for (batch_inputs, batch_items) in routed_items {
+        if batch_inputs.len() != batch_items.len() {
+            return Err(BeadsError::Config(format!(
+                "{context} produced mismatched issue/result counts"
+            )));
+        }
+
+        for (input, item) in batch_inputs.into_iter().zip(batch_items) {
+            let Some(index) = positions_by_input
+                .get_mut(input.as_str())
+                .and_then(VecDeque::pop_front)
+            else {
+                let input = issue_input_text(&input);
+                return Err(BeadsError::Config(format!(
+                    "{context} returned unexpected issue input {input}"
+                )));
+            };
+            let Some(slot) = ordered_items.get_mut(index) else {
+                let input = issue_input_text(&input);
+                return Err(BeadsError::Config(format!(
+                    "{context} returned out-of-range issue input {input}"
+                )));
+            };
+            *slot = Some(item);
+        }
+    }
+
+    ordered_items
+        .into_iter()
+        .enumerate()
+        .map(|(index, item)| {
+            item.ok_or_else(|| {
+                let input = requested_inputs
+                    .get(index)
+                    .map(|input| issue_input_text(input))
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                BeadsError::Config(format!("{context} did not produce a result for {input}"))
+            })
+        })
+        .collect()
+}
+
+fn build_resolver(config_layer: &config::ConfigLayer, _storage: &SqliteStorage) -> IdResolver {
+    let id_config = config::id_config_from_layer(config_layer);
+    IdResolver::new(ResolverConfig::with_prefix(id_config.prefix))
+}
+
+fn resolve_target_ids(
+    args: &UpdateArgs,
+    beads_dir: &std::path::Path,
+    resolver: &IdResolver,
+    storage: &SqliteStorage,
+) -> Result<Vec<String>> {
+    let mut ids = args.ids.clone();
+    if ids.is_empty() {
+        let last_touched = crate::util::get_last_touched_id(beads_dir);
+        if last_touched.is_empty() {
+            return Err(BeadsError::validation(
+                "ids",
+                "no issue IDs provided and no last-touched issue",
+            ));
+        }
+        ids.push(last_touched);
+    }
+
+    resolve_issue_ids(storage, resolver, &ids)
+}
+
+fn validate_mutable_target_issues(
+    storage: &SqliteStorage,
+    ids: &[String],
+    has_updates: bool,
+) -> Result<()> {
+    if !has_updates {
+        return Ok(());
+    }
+
+    for id in ids {
+        if storage
+            .get_issue(id)?
+            .as_ref()
+            .is_some_and(|issue| issue.status == Status::Tombstone)
+        {
+            return Err(BeadsError::validation(
+                "issue",
+                format!("cannot update tombstone issue: {id}"),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Reject `br update --status <terminal>` and direct the user at the
+/// dedicated command for that transition.
+///
+/// `br update` is a data-only field mutator. Terminal-state transitions
+/// (`closed`, `tombstone`) own their own audit / policy pipelines:
+///
+/// * `closed`    → `br close`  (close-policy gates: close-reason, AC, attribution, ...)
+/// * `tombstone` → `br delete` (tombstone metadata, dependency rewiring)
+///
+/// Allowing both paths to reach the same terminal state would give the
+/// project two different audit contracts depending on which command the
+/// operator reached for — see beads_rust#301 for the regression that
+/// motivated this gate.
+///
+/// This deliberately runs *before* any I/O (route discovery, locking,
+/// SQLite open) so a misuse fails instantly rather than after acquiring
+/// the workspace write lock.
+fn reject_terminal_status_transition(raw_status: Option<&str>) -> Result<()> {
+    let Some(raw) = raw_status else {
+        return Ok(());
+    };
+    let parsed: Status = raw.parse()?;
+    match parsed {
+        Status::Closed => Err(BeadsError::validation(
+            "status",
+            "refusing to close via `br update --status closed`: \
+             terminal-state transitions must go through `br close` so close-policy \
+             (close-reason / AC / attribution) is enforced. \
+             Use `br close <id> --reason \"...\"` instead, or `br close <id> \
+             --bypass-policy --bypass-reason \"...\"` to opt out explicitly. \
+             See https://github.com/Dicklesworthstone/beads_rust/issues/301.",
+        )),
+        Status::Tombstone => Err(BeadsError::validation(
+            "status",
+            "refusing to tombstone via `br update --status tombstone`: \
+             use `br delete <id>` instead so dependency rewiring and tombstone \
+             metadata are applied correctly.",
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn build_update(args: &UpdateArgs, actor: &str, claim_exclusive: bool) -> Result<IssueUpdate> {
+    let status = if args.claim {
+        Some(Status::InProgress)
+    } else {
+        args.status.as_ref().map(|s| s.parse()).transpose()?
+    };
+
+    let priority = args.priority.as_ref().map(|p| p.parse()).transpose()?;
+
+    let issue_type = args.type_.as_ref().map(|t| t.parse()).transpose()?;
+
+    let assignee = if args.claim {
+        Some(Some(actor.to_string()))
+    } else {
+        optional_string_field(args.assignee.as_deref())
+    };
+
+    let owner = optional_string_field(args.owner.as_deref());
+    let due_at = optional_date_field(args.due.as_deref())?;
+    let defer_until = optional_date_field(args.defer.as_deref())?;
+
+    if args.session.is_some() && !matches!(status, Some(Status::Closed)) {
+        return Err(BeadsError::validation(
+            "session",
+            "--session can only be used when closing with --status closed",
+        ));
+    }
+    let (closed_at, close_reason, closed_by_session) = match &status {
+        Some(Status::Closed) => (Some(Some(Utc::now())), None, args.session.clone().map(Some)),
+        Some(_) => (Some(None), Some(None), Some(None)),
+        None => (None, None, None),
+    };
+
+    // Build update struct
+    Ok(IssueUpdate {
+        title: args.title.clone(),
+        description: args.description.clone().map(Some),
+        design: args.design.clone().map(Some),
+        acceptance_criteria: args.acceptance_criteria.clone().map(Some),
+        notes: args.notes.clone().map(Some),
+        status,
+        priority,
+        issue_type,
+        assignee,
+        owner,
+        estimated_minutes: args.estimate.map(Some),
+        due_at,
+        defer_until,
+        external_ref: optional_string_field(args.external_ref.as_deref()),
+        source_repo: optional_string_field(args.source_repo.as_deref()),
+        source_repo_path: optional_string_field(args.source_repo_path.as_deref()),
+        agent_context: agent_context_update_from_arg(args.agent_context.as_deref())?,
+        closed_at,
+        close_reason,
+        closed_by_session,
+        deleted_at: None,
+        deleted_by: None,
+        delete_reason: None,
+        skip_cache_rebuild: false,
+        expect_unassigned: args.claim,
+        claim_exclusive: args.claim && claim_exclusive,
+        claim_actor: if args.claim {
+            Some(actor.to_string())
+        } else {
+            None
+        },
+    })
+}
+
+#[allow(clippy::option_option, clippy::single_option_map)]
+fn optional_string_field(value: Option<&str>) -> Option<Option<String>> {
+    value.map(|v| {
+        if v.is_empty() {
+            None
+        } else {
+            Some(v.to_string())
+        }
+    })
+}
+
+/// Parse the `--agent-context` argument into an `IssueUpdate::agent_context`
+/// payload. Accepts:
+///
+/// - `None` → don't touch the field (`Option<Option<String>>::None`).
+/// - `Some("")` → clear the field back to NULL (`Some(None)`).
+/// - `Some("@path")` → read the file at `path`; parse as YAML when the
+///   extension is `.yaml`/`.yml`, otherwise as JSON. Normalize to JSON
+///   so storage is opaque TEXT but always canonical-JSON-shaped.
+/// - `Some("{...}")` → parse as JSON inline.
+///
+/// Validation happens here because the storage column is opaque TEXT —
+/// without this guard we'd happily round-trip syntactically invalid
+/// JSON through SQLite and then have the emission path discover the
+/// problem at agent claim time. (beads_rust#297)
+#[allow(clippy::option_option)]
+fn agent_context_update_from_arg(value: Option<&str>) -> Result<Option<Option<String>>> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(Some(None));
+    }
+
+    let (source_label, body): (String, String) = if let Some(path_str) = raw.strip_prefix('@') {
+        let path = std::path::Path::new(path_str);
+        let contents = std::fs::read_to_string(path).map_err(|e| {
+            BeadsError::Config(format!(
+                "agent-context: cannot read {}: {e}",
+                path.display()
+            ))
+        })?;
+        let is_yaml = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("yaml") || ext.eq_ignore_ascii_case("yml"));
+        let normalized = if is_yaml {
+            let value: serde_yml::Value = serde_yml::from_str(&contents).map_err(|e| {
+                BeadsError::Config(format!(
+                    "agent-context: YAML parse failed for {}: {e}",
+                    path.display()
+                ))
+            })?;
+            serde_json::to_string(&value).map_err(|e| {
+                BeadsError::Config(format!(
+                    "agent-context: YAML to JSON conversion failed for {}: {e}",
+                    path.display()
+                ))
+            })?
+        } else {
+            let value: serde_json::Value = serde_json::from_str(&contents).map_err(|e| {
+                BeadsError::Config(format!(
+                    "agent-context: JSON parse failed for {}: {e}",
+                    path.display()
+                ))
+            })?;
+            serde_json::to_string(&value).map_err(|e| {
+                BeadsError::Config(format!(
+                    "agent-context: JSON re-serialization failed for {}: {e}",
+                    path.display()
+                ))
+            })?
+        };
+        (path.display().to_string(), normalized)
+    } else {
+        let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
+            BeadsError::Config(format!(
+                "agent-context: inline argument is not valid JSON: {e} (hint: use \
+                 `--agent-context @path/to/instructions.yaml` for a file, or pass an \
+                 empty string to clear)"
+            ))
+        })?;
+        let normalized = serde_json::to_string(&value).map_err(|e| {
+            BeadsError::Config(format!("agent-context: JSON re-serialization failed: {e}"))
+        })?;
+        ("<inline>".to_string(), normalized)
+    };
+    tracing::debug!(
+        bytes = body.len(),
+        source = %source_label,
+        "agent-context: parsed and normalized to canonical JSON"
+    );
+    Ok(Some(Some(body)))
+}
+
+#[allow(clippy::option_option)]
+fn optional_date_field(value: Option<&str>) -> Result<Option<Option<DateTime<Utc>>>> {
+    value
+        .map(|v| {
+            if v.is_empty() {
+                Ok(None)
+            } else {
+                parse_date(v).map(Some)
+            }
+        })
+        .transpose()
+}
+
+fn resolve_parent_update(
+    parent: Option<&str>,
+    resolver: &IdResolver,
+    storage: &SqliteStorage,
+) -> Result<ParentUpdatePlan> {
+    match parent {
+        None => Ok(ParentUpdatePlan::Unchanged),
+        Some("") => Ok(ParentUpdatePlan::Clear),
+        Some(parent_value) => {
+            resolve_issue_id(storage, resolver, parent_value).map(ParentUpdatePlan::Set)
+        }
+    }
+}
+
+fn apply_parent_update(
+    storage_ctx: &mut config::OpenStorageResult,
+    allow_recovery: bool,
+    issue_id: &str,
+    parent: &ParentUpdatePlan,
+    actor: &str,
+    skip_cache_rebuild: bool,
+) -> Result<()> {
+    match parent {
+        ParentUpdatePlan::Unchanged => Ok(()),
+        ParentUpdatePlan::Clear => retry_mutation_with_jsonl_recovery(
+            storage_ctx,
+            allow_recovery,
+            "update parent clear",
+            Some(issue_id),
+            |storage| storage.set_parent_with_options(issue_id, None, actor, skip_cache_rebuild),
+        ),
+        ParentUpdatePlan::Set(parent_id) => retry_mutation_with_jsonl_recovery(
+            storage_ctx,
+            allow_recovery,
+            "update parent set",
+            Some(issue_id),
+            |storage| {
+                storage.set_parent_with_options(
+                    issue_id,
+                    Some(parent_id),
+                    actor,
+                    skip_cache_rebuild,
+                )
+            },
+        ),
+    }
+}
+
+fn validate_parent_updates(
+    storage: &SqliteStorage,
+    issue_ids: &[String],
+    parent: &ParentUpdatePlan,
+) -> Result<()> {
+    let ParentUpdatePlan::Set(parent_id) = parent else {
+        return Ok(());
+    };
+
+    for issue_id in issue_ids {
+        if issue_id == parent_id {
+            return Err(BeadsError::SelfDependency {
+                id: issue_id.clone(),
+            });
+        }
+
+        if storage.would_create_cycle(issue_id, parent_id, true)? {
+            return Err(BeadsError::DependencyCycle {
+                path: format!("Setting parent of {issue_id} to {parent_id} would create a cycle"),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_date(s: &str) -> Result<DateTime<Utc>> {
+    parse_flexible_timestamp(s, "date")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::CliOverrides;
+    use crate::logging::init_test_logging;
+    use crate::model::{Issue, IssueType, Priority, Status};
+    use crate::output::{OutputContext, OutputMode};
+    use crate::storage::SqliteStorage;
+    use chrono::{Datelike, Timelike};
+    use std::fs;
+    use tempfile::TempDir;
+    use tracing::info;
+
+    #[test]
+    fn test_optional_string_field_with_value() {
+        init_test_logging();
+        info!("test_optional_string_field_with_value: starting");
+        let result = optional_string_field(Some("test"));
+        assert_eq!(result, Some(Some("test".to_string())));
+        info!("test_optional_string_field_with_value: assertions passed");
+    }
+
+    #[test]
+    fn test_optional_string_field_with_empty() {
+        init_test_logging();
+        info!("test_optional_string_field_with_empty: starting");
+        let result = optional_string_field(Some(""));
+        assert_eq!(result, Some(None));
+        info!("test_optional_string_field_with_empty: assertions passed");
+    }
+
+    #[test]
+    fn test_optional_string_field_with_none() {
+        init_test_logging();
+        info!("test_optional_string_field_with_none: starting");
+        let result = optional_string_field(None);
+        assert_eq!(result, None);
+        info!("test_optional_string_field_with_none: assertions passed");
+    }
+
+    #[test]
+    fn test_optional_date_field_with_valid() {
+        init_test_logging();
+        info!("test_optional_date_field_with_valid: starting");
+        let result = optional_date_field(Some("2024-01-15T12:00:00Z")).unwrap();
+        assert!(result.is_some());
+        let date = result.unwrap().unwrap();
+        assert_eq!(date.year(), 2024);
+        assert_eq!(date.month(), 1);
+        assert_eq!(date.day(), 15);
+        info!("test_optional_date_field_with_valid: assertions passed");
+    }
+
+    #[test]
+    fn test_optional_date_field_with_empty() {
+        init_test_logging();
+        info!("test_optional_date_field_with_empty: starting");
+        let result = optional_date_field(Some("")).unwrap();
+        assert_eq!(result, Some(None));
+        info!("test_optional_date_field_with_empty: assertions passed");
+    }
+
+    #[test]
+    fn test_optional_date_field_with_none() {
+        init_test_logging();
+        info!("test_optional_date_field_with_none: starting");
+        let result = optional_date_field(None).unwrap();
+        assert_eq!(result, None);
+        info!("test_optional_date_field_with_none: assertions passed");
+    }
+
+    #[test]
+    fn test_optional_date_field_invalid_format() {
+        init_test_logging();
+        info!("test_optional_date_field_invalid_format: starting");
+        let result = optional_date_field(Some("not-a-date"));
+        assert!(result.is_err());
+        info!("test_optional_date_field_invalid_format: assertions passed");
+    }
+
+    #[test]
+    fn test_parse_date_valid_rfc3339() {
+        init_test_logging();
+        info!("test_parse_date_valid_rfc3339: starting");
+        let result = parse_date("2024-06-15T10:30:00+00:00").unwrap();
+        assert_eq!(result.year(), 2024);
+        assert_eq!(result.month(), 6);
+        assert_eq!(result.day(), 15);
+        info!("test_parse_date_valid_rfc3339: assertions passed");
+    }
+
+    #[test]
+    fn test_parse_date_with_timezone() {
+        init_test_logging();
+        info!("test_parse_date_with_timezone: starting");
+        let result = parse_date("2024-12-25T08:00:00-05:00").unwrap();
+        // Should be converted to UTC
+        assert_eq!(result.year(), 2024);
+        assert_eq!(result.month(), 12);
+        assert_eq!(result.day(), 25);
+        assert_eq!(result.hour(), 13); // 8:00 EST = 13:00 UTC
+        info!("test_parse_date_with_timezone: assertions passed");
+    }
+
+    #[test]
+    fn test_parse_date_invalid() {
+        init_test_logging();
+        info!("test_parse_date_invalid: starting");
+        let result = parse_date("invalid");
+        assert!(result.is_err());
+        info!("test_parse_date_invalid: assertions passed");
+    }
+
+    #[test]
+    fn test_parse_date_partial_date() {
+        init_test_logging();
+        info!("test_parse_date_partial_date: starting");
+        // Partial dates without time should now succeed
+        let result = parse_date("2024-01-15");
+        assert!(result.is_ok());
+        let date = result.unwrap();
+        assert_eq!(date.year(), 2024);
+        assert_eq!(date.month(), 1);
+        assert_eq!(date.day(), 15);
+        info!("test_parse_date_partial_date: assertions passed");
+    }
+
+    #[test]
+    fn test_build_update_with_claim() {
+        init_test_logging();
+        info!("test_build_update_with_claim: starting");
+        let args = UpdateArgs {
+            claim: true,
+            ..Default::default()
+        };
+        let update = build_update(&args, "test_actor", false).unwrap();
+        assert_eq!(update.status, Some(Status::InProgress));
+        assert_eq!(update.assignee, Some(Some("test_actor".to_string())));
+        info!("test_build_update_with_claim: assertions passed");
+    }
+
+    #[test]
+    fn test_build_update_with_status() {
+        init_test_logging();
+        info!("test_build_update_with_status: starting");
+        // Non-terminal status transitions still flow through build_update.
+        // Terminal transitions (closed/tombstone) are rejected up-front by
+        // `reject_terminal_status_transition` — see beads_rust#301 and the
+        // dedicated tests below.
+        let args_blocked = UpdateArgs {
+            status: Some("blocked".to_string()),
+            ..Default::default()
+        };
+        let update_blocked = build_update(&args_blocked, "test_actor", false).unwrap();
+        assert_eq!(update_blocked.status, Some(Status::Blocked));
+        // Close metadata should be explicitly cleared for non-terminal statuses.
+        assert_eq!(update_blocked.closed_at, Some(None));
+        assert_eq!(update_blocked.close_reason, Some(None));
+        assert_eq!(update_blocked.closed_by_session, Some(None));
+
+        let args_in_progress = UpdateArgs {
+            status: Some("in_progress".to_string()),
+            ..Default::default()
+        };
+        let update_in_progress = build_update(&args_in_progress, "test_actor", false).unwrap();
+        assert_eq!(update_in_progress.status, Some(Status::InProgress));
+        info!("test_build_update_with_status: assertions passed");
+    }
+
+    /// beads_rust#301: `br update --status closed` must refuse and direct
+    /// the operator at `br close` so close-policy fires.
+    #[test]
+    fn reject_terminal_status_transition_refuses_closed() {
+        init_test_logging();
+        let err = reject_terminal_status_transition(Some("closed")).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("br close"),
+            "error must point at br close; got: {msg}"
+        );
+        assert!(
+            msg.contains("close-policy"),
+            "error must mention close-policy; got: {msg}"
+        );
+        assert!(
+            msg.contains("#301") || msg.contains("issues/301"),
+            "error must link the originating issue; got: {msg}"
+        );
+    }
+
+    /// beads_rust#301: tombstone is also a terminal state with a dedicated
+    /// command (`br delete`); refuse the update path so dependency rewiring
+    /// is not skipped.
+    #[test]
+    fn reject_terminal_status_transition_refuses_tombstone() {
+        init_test_logging();
+        let err = reject_terminal_status_transition(Some("tombstone")).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("br delete"),
+            "error must point at br delete; got: {msg}"
+        );
+    }
+
+    /// Non-terminal statuses (open/in_progress/blocked/deferred/draft) and
+    /// the absence of `--status` must keep working unchanged — the rejection
+    /// is scoped to terminal states only.
+    #[test]
+    fn reject_terminal_status_transition_allows_non_terminal_and_absent() {
+        init_test_logging();
+        reject_terminal_status_transition(None).expect("no --status must pass through");
+        for ok in &[
+            "open",
+            "in_progress",
+            "inprogress",
+            "blocked",
+            "deferred",
+            "draft",
+            "pinned",
+        ] {
+            let result = reject_terminal_status_transition(Some(ok));
+            assert!(
+                result.is_ok(),
+                "status {ok} must be accepted; got {:?}",
+                result.err()
+            );
+        }
+    }
+
+    /// Status comparison is case-insensitive and matches known aliases —
+    /// neither `CLOSED` nor `Closed` should sneak past the gate.
+    #[test]
+    fn reject_terminal_status_transition_is_case_insensitive() {
+        init_test_logging();
+        for terminal in &["Closed", "CLOSED", "Tombstone", "TOMBSTONE"] {
+            let result = reject_terminal_status_transition(Some(terminal));
+            assert!(result.is_err(), "status {terminal} must be rejected");
+            let err = result.unwrap_err();
+            assert!(!err.to_string().is_empty());
+        }
+    }
+
+    #[test]
+    fn test_build_update_rejects_session_without_closing() {
+        let args = UpdateArgs {
+            session: Some("session-123".to_string()),
+            ..Default::default()
+        };
+        let err = build_update(&args, "test_actor", false).unwrap_err();
+        assert!(err.to_string().contains("--session can only be used"));
+
+        let args_open = UpdateArgs {
+            status: Some("open".to_string()),
+            session: Some("session-123".to_string()),
+            ..Default::default()
+        };
+        let err = build_update(&args_open, "test_actor", false).unwrap_err();
+        assert!(err.to_string().contains("--session can only be used"));
+    }
+
+    #[test]
+    fn test_build_update_with_priority() {
+        init_test_logging();
+        info!("test_build_update_with_priority: starting");
+        let args = UpdateArgs {
+            priority: Some("1".to_string()),
+            ..Default::default()
+        };
+        let update = build_update(&args, "test_actor", false).unwrap();
+        assert_eq!(update.priority, Some(Priority(1)));
+        info!("test_build_update_with_priority: assertions passed");
+    }
+
+    #[test]
+    fn test_build_update_empty() {
+        init_test_logging();
+        info!("test_build_update_empty: starting");
+        let args = UpdateArgs::default();
+        let update = build_update(&args, "test_actor", false).unwrap();
+        assert!(update.is_empty());
+        info!("test_build_update_empty: assertions passed");
+    }
+
+    #[test]
+    fn test_update_output_partition_matches_previous_mode_checks() {
+        let cases = [
+            (OutputMode::Json, true, false),
+            (OutputMode::Toon, true, false),
+            (OutputMode::Quiet, false, false),
+            (OutputMode::Rich, false, true),
+            (OutputMode::Plain, false, true),
+        ];
+
+        for (mode, expected_machine, expected_human) in cases {
+            let ctx = OutputContext::with_mode(mode);
+
+            assert_eq!(update_uses_machine_output(&ctx), expected_machine);
+            assert_eq!(update_uses_human_output(&ctx), expected_human);
+        }
+    }
+
+    #[test]
+    fn update_human_lines_sanitize_issue_ids_and_titles() {
+        let updated = updated_issue_human_line("bd-1\x1b]52;c;bad\x07", "Title\x1b[2J\nnext");
+        let no_updates = no_updates_human_line("bd-2\x07");
+
+        assert!(!updated.contains('\x1b'));
+        assert!(!updated.contains('\x07'));
+        assert!(!no_updates.contains('\x07'));
+        assert_eq!(
+            updated,
+            "Updated bd-1\\u{1b}]52;c;bad\\u{7}: Title\\u{1b}[2J\\nnext"
+        );
+        assert_eq!(no_updates, "No updates specified for bd-2\\u{7}");
+    }
+
+    #[test]
+    fn reorder_routed_items_sanitizes_missing_input_error() {
+        let requested = vec!["bd-update\x1b[2J\nbad".to_string(), "bd-ok".to_string()];
+        let routed_items = vec![(vec!["bd-ok".to_string()], vec!["ok"])];
+
+        let err =
+            reorder_routed_items_by_requested_inputs(&requested, routed_items, "update routing")
+                .unwrap_err();
+
+        assert!(
+            matches!(err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        let message = err.to_string();
+        assert!(!message.chars().any(char::is_control));
+        assert!(message.contains("\\u{1b}[2J"));
+        assert!(message.contains("\\n"));
+    }
+
+    #[test]
+    fn reorder_routed_items_sanitizes_unexpected_input_error() {
+        let requested = vec!["bd-ok".to_string()];
+        let routed_items = vec![(vec!["bd-update\x1b[2J\nbad".to_string()], vec!["bad"])];
+
+        let err =
+            reorder_routed_items_by_requested_inputs(&requested, routed_items, "update routing")
+                .unwrap_err();
+
+        assert!(
+            matches!(err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        let message = err.to_string();
+        assert!(!message.chars().any(char::is_control));
+        assert!(message.contains("\\u{1b}[2J"));
+        assert!(message.contains("\\n"));
+    }
+
+    #[test]
+    fn test_validate_mutable_target_issues_rejects_tombstone() {
+        init_test_logging();
+        info!("test_validate_mutable_target_issues_rejects_tombstone: starting");
+
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let issue = Issue {
+            id: "bd-tombstone".to_string(),
+            title: "Deleted issue".to_string(),
+            status: Status::Open,
+            priority: Priority::MEDIUM,
+            issue_type: IssueType::Task,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            ..Issue::default()
+        };
+        storage.create_issue(&issue, "tester").unwrap();
+        storage
+            .delete_issue("bd-tombstone", "tester", "delete for update test", None)
+            .unwrap();
+
+        let err = validate_mutable_target_issues(&storage, &["bd-tombstone".to_string()], true)
+            .unwrap_err();
+
+        assert!(
+            matches!(err, BeadsError::Validation { .. }),
+            "unexpected error: {err:?}"
+        );
+        let BeadsError::Validation { field, reason } = err else {
+            return;
+        };
+        assert_eq!(field, "issue");
+        assert!(reason.contains("cannot update tombstone issue"));
+
+        info!("test_validate_mutable_target_issues_rejects_tombstone: assertions passed");
+    }
+
+    #[test]
+    fn test_validate_mutable_target_issues_allows_open_issue() {
+        init_test_logging();
+        info!("test_validate_mutable_target_issues_allows_open_issue: starting");
+
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let issue = Issue {
+            id: "bd-open".to_string(),
+            title: "Open issue".to_string(),
+            status: Status::Open,
+            priority: Priority::MEDIUM,
+            issue_type: IssueType::Task,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            ..Issue::default()
+        };
+        storage.create_issue(&issue, "tester").unwrap();
+
+        validate_mutable_target_issues(&storage, &["bd-open".to_string()], true).unwrap();
+
+        info!("test_validate_mutable_target_issues_allows_open_issue: assertions passed");
+    }
+
+    #[test]
+    fn test_validate_route_runtime_guards_rejects_assigned_claim_target() {
+        init_test_logging();
+        info!("test_validate_route_runtime_guards_rejects_assigned_claim_target: starting");
+
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let issue = Issue {
+            id: "bd-claimed".to_string(),
+            title: "Claimed issue".to_string(),
+            assignee: Some("bob".to_string()),
+            status: Status::InProgress,
+            priority: Priority::MEDIUM,
+            issue_type: IssueType::Task,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            ..Issue::default()
+        };
+        storage.create_issue(&issue, "tester").unwrap();
+
+        let update = IssueUpdate {
+            expect_unassigned: true,
+            claim_actor: Some("alice".to_string()),
+            assignee: Some(Some("alice".to_string())),
+            status: Some(Status::InProgress),
+            ..IssueUpdate::default()
+        };
+
+        let err = validate_route_runtime_guards(&storage, &["bd-claimed".to_string()], &update)
+            .unwrap_err();
+        assert!(err.to_string().contains("already assigned to bob"));
+
+        info!(
+            "test_validate_route_runtime_guards_rejects_assigned_claim_target: assertions passed"
+        );
+    }
+
+    #[test]
+    fn test_validate_multi_issue_external_ref_update_rejects_multiple_distinct_ids() {
+        init_test_logging();
+        info!(
+            "test_validate_multi_issue_external_ref_update_rejects_multiple_distinct_ids: starting"
+        );
+
+        let err = validate_multi_issue_external_ref_update(
+            Some("EXT-123"),
+            &["bd-1".to_string(), "bd-2".to_string()],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot set external_ref 'EXT-123'")
+        );
+
+        info!(
+            "test_validate_multi_issue_external_ref_update_rejects_multiple_distinct_ids: assertions passed"
+        );
+    }
+
+    #[test]
+    fn test_prepare_single_route_rejects_invalid_remove_label() {
+        init_test_logging();
+        info!("test_prepare_single_route_rejects_invalid_remove_label: starting");
+
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        {
+            let mut storage_ctx =
+                config::open_storage_with_cli(&beads_dir, &CliOverrides::default())
+                    .expect("storage");
+            let issue = Issue {
+                id: "bd-label".to_string(),
+                title: "Label target".to_string(),
+                status: Status::Open,
+                priority: Priority::MEDIUM,
+                issue_type: IssueType::Task,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                ..Issue::default()
+            };
+            storage_ctx
+                .storage
+                .create_issue(&issue, "tester")
+                .expect("create issue");
+        }
+
+        let args = UpdateArgs {
+            ids: vec!["bd-label".to_string()],
+            remove_label: vec!["has space".to_string()],
+            ..Default::default()
+        };
+        let result = prepare_single_route(&args, &CliOverrides::default(), &beads_dir, false);
+        assert!(result.is_err(), "invalid remove label should fail");
+        if let Err(err) = result {
+            assert!(err.to_string().contains("invalid characters"));
+        }
+        info!("test_prepare_single_route_rejects_invalid_remove_label: assertions passed");
+    }
+
+    #[test]
+    fn test_execute_prepared_route_repairs_blocked_cache_after_late_update_error() {
+        init_test_logging();
+        info!(
+            "test_execute_prepared_route_repairs_blocked_cache_after_late_update_error: starting"
+        );
+
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let mut storage_ctx =
+            config::open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("storage");
+
+        let blocker = Issue {
+            id: "bd-blocker".to_string(),
+            title: "Blocker".to_string(),
+            status: Status::Open,
+            priority: Priority::MEDIUM,
+            issue_type: IssueType::Task,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            ..Issue::default()
+        };
+        let dependent = Issue {
+            id: "bd-blocked".to_string(),
+            title: "Blocked".to_string(),
+            status: Status::Open,
+            priority: Priority::MEDIUM,
+            issue_type: IssueType::Task,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            ..Issue::default()
+        };
+
+        storage_ctx
+            .storage
+            .create_issue(&blocker, "tester")
+            .expect("create blocker");
+        storage_ctx
+            .storage
+            .create_issue(&dependent, "tester")
+            .expect("create blocked");
+        storage_ctx
+            .storage
+            .add_dependency("bd-blocked", "bd-blocker", "blocks", "tester")
+            .expect("create dependency");
+
+        assert!(
+            storage_ctx
+                .storage
+                .get_blocked_ids()
+                .expect("blocked ids before update")
+                .contains("bd-blocked")
+        );
+
+        storage_ctx
+            .storage
+            .execute_raw("DROP TABLE labels")
+            .expect("drop labels table");
+
+        let prepared = PreparedUpdateRoute {
+            storage_ctx,
+            actor: "tester".to_string(),
+            resolved_ids: vec!["bd-blocker".to_string()],
+            update: IssueUpdate {
+                status: Some(Status::Closed),
+                ..IssueUpdate::default()
+            },
+            has_updates: true,
+            add_labels: vec!["late-runtime-error".to_string()],
+            remove_labels: Vec::new(),
+            set_labels: false,
+            valid_set_labels: Vec::new(),
+            resolved_parent: ParentUpdatePlan::Unchanged,
+            auto_flush_external: false,
+            attribution: EventAttribution::default(),
+            _routed_write_lock: RoutedWorkspaceWriteLock::local(),
+        };
+
+        let ctx = OutputContext::from_flags(false, false, true);
+        let err = execute_prepared_route(prepared, &ctx).expect_err("update should fail");
+        assert!(
+            !err.to_string().contains("failed to rebuild blocked cache"),
+            "late runtime error should not be masked by blocked-cache repair: {err}"
+        );
+
+        let reopened =
+            config::open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("reopen");
+        let blocker_after = reopened
+            .storage
+            .get_issue("bd-blocker")
+            .expect("load blocker")
+            .expect("blocker should still exist");
+        assert_eq!(blocker_after.status, Status::Closed);
+        assert!(
+            !reopened
+                .storage
+                .get_blocked_ids()
+                .expect("blocked ids after repair")
+                .contains("bd-blocked"),
+            "dependent issue should be unblocked after the blocker closed despite the later error"
+        );
+
+        info!(
+            "test_execute_prepared_route_repairs_blocked_cache_after_late_update_error: assertions passed"
+        );
+    }
+}

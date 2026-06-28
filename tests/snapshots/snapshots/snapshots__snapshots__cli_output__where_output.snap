@@ -1,0 +1,7 @@
+---
+source: tests/snapshots/cli_output.rs
+expression: normalized
+---
+Beads directory: /WORKSPACE/.beads
+Prefix: bd
+Database: /WORKSPACE/.beads

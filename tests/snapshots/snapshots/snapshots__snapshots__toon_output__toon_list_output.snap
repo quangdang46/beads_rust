@@ -1,0 +1,84 @@
+---
+source: tests/snapshots/toon_output.rs
+expression: normalized
+---
+issues[5]:
+  - id: bd-blocker
+    title: "00 Blocking Root"
+    description: Unblocks dependent work
+    status: open
+    priority: 0
+    issue_type: task
+    created_at: "2026-02-01T00:00:00Z"
+    created_by: fixture
+    updated_at: "2026-02-01T00:00:00Z"
+    source_repo: .
+    compaction_level: 0
+    original_size: 0
+    labels[1]: core
+    dependency_count: 0
+    dependent_count: 1
+  - id: bd-ready-p0
+    title: "01 Ready Critical Unassigned"
+    status: open
+    priority: 0
+    issue_type: bug
+    created_at: "2026-02-02T00:00:00Z"
+    created_by: fixture
+    updated_at: "2026-02-02T00:00:00Z"
+    source_repo: .
+    compaction_level: 0
+    original_size: 0
+    labels[2]: agent,ops
+    dependency_count: 0
+    dependent_count: 0
+  - id: bd-ready-p1-assigned
+    title: "02 Ready Assigned Feature"
+    status: open
+    priority: 1
+    issue_type: feature
+    assignee: alice
+    owner: owner@example.com
+    created_at: "2026-02-03T00:00:00Z"
+    created_by: fixture
+    updated_at: "2026-02-03T00:00:00Z"
+    source_repo: .
+    compaction_level: 0
+    original_size: 0
+    labels[1]: frontend
+    dependency_count: 0
+    dependent_count: 0
+  - id: bd-blocked
+    title: "03 Blocked By Root"
+    status: open
+    priority: 1
+    issue_type: task
+    created_at: "2026-02-05T00:00:00Z"
+    created_by: fixture
+    updated_at: "2026-02-05T00:00:00Z"
+    source_repo: .
+    compaction_level: 0
+    original_size: 0
+    labels[1]: blocked
+    dependency_count: 1
+    dependent_count: 0
+  - id: bd-closed
+    title: "04 Closed Done"
+    status: closed
+    priority: 2
+    issue_type: task
+    created_at: "2026-02-08T00:00:00Z"
+    created_by: fixture
+    updated_at: "2026-02-08T00:00:00Z"
+    closed_at: "2026-02-08T01:00:00Z"
+    close_reason: done
+    source_repo: .
+    compaction_level: 0
+    original_size: 0
+    labels[1]: done
+    dependency_count: 0
+    dependent_count: 0
+total: 5
+limit: 50
+offset: 0
+has_more: false

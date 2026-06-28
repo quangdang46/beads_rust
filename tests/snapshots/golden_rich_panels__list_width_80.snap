@@ -1,0 +1,13 @@
+---
+source: tests/golden_rich_panels.rs
+expression: width_80
+---
+                                   Issues (2)
+╭────────────┬─────┬──────────┬─────────┬──────────────────────────────────────╮
+│ ID         │  P  │ Status   │ Type    │ Title                                │
+├────────────┼─────┼──────────┼─────────┼──────────────────────────────────────┤
+│ rich-ID    │ P1  │ open     │ bug     │ Alpha layout regression with a       │
+│            │     │          │         │ medium length title                  │
+│ rich-ID    │ P2  │ open     │ feature │ Beta table row exercises dependency  │
+│            │     │          │         │ columns                              │
+╰────────────┴─────┴──────────┴─────────┴──────────────────────────────────────╯

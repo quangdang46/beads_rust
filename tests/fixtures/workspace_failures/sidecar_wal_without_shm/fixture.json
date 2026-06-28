@@ -1,0 +1,33 @@
+{
+  "name": "sidecar_wal_without_shm",
+  "family": "sidecar_mismatch",
+  "description": "The workspace includes a stray WAL sidecar without a matching SHM sidecar or coordinated writer state.",
+  "expected_classification": "degraded",
+  "expected_command_outcomes": [
+    {
+      "surface": "startup/open",
+      "outcome": "success"
+    },
+    {
+      "surface": "create",
+      "outcome": "success"
+    },
+    {
+      "surface": "doctor",
+      "outcome": "reports_errors"
+    },
+    {
+      "surface": "doctor --repair",
+      "outcome": "repair_applied"
+    },
+    {
+      "surface": "sync --status",
+      "outcome": "status_in_sync"
+    }
+  ],
+  "source_hint": "Represents the stale or missing sidecar family called out in beads_rust-rsei.2.1.",
+  "notes": [
+    "The database file itself is healthy so future tests can isolate how startup reacts to sidecar mismatch.",
+    "The WAL payload is intentionally synthetic and small."
+  ]
+}

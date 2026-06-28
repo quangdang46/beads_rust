@@ -1,0 +1,15 @@
+{
+  "id": "bd-close-edit",
+  "base": {
+    "title": "Base workflow issue",
+    "status": "open",
+    "updated_at": 1700000000
+  },
+  "local": {
+    "title": "Base workflow issue",
+    "status": "closed",
+    "updated_at":  "status": "open",
+    "updated_at": 1700000300,
+    "labels": ["external-edit"]
+  }
+}

@@ -1,0 +1,40 @@
+---
+source: tests/snapshots/json_output.rs
+assertion_line: 696
+expression: normalized
+---
+[
+  {
+    "created_at": "TIMESTAMP",
+    "created_by": "ACTOR",
+    "id": "ISSUE_ID",
+    "issue_type": "task",
+    "labels": [],
+    "priority": 1,
+    "status": "open",
+    "title": "Urgent ready task",
+    "updated_at": "TIMESTAMP"
+  },
+  {
+    "created_at": "TIMESTAMP",
+    "created_by": "ACTOR",
+    "id": "ISSUE_ID",
+    "issue_type": "task",
+    "labels": [],
+    "priority": 3,
+    "status": "open",
+    "title": "Backlog ready task",
+    "updated_at": "TIMESTAMP"
+  },
+  {
+    "created_at": "TIMESTAMP",
+    "created_by": "ACTOR",
+    "id": "ISSUE_ID",
+    "issue_type": "task",
+    "labels": [],
+    "priority": 2,
+    "status": "open",
+    "title": "Normal ready task",
+    "updated_at": "TIMESTAMP"
+  }
+]

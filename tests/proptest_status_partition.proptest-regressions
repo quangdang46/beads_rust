@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d68ea2ca9ac781726cc933fac38d2ffce3985718554e20ce481b63e629fe1a67 # shrinks to statuses = [Tombstone, Open], priorities = [Priority(0), Priority(0)], types = [Task, Task]
+cc 8d9ba157719e57a2b1b3a8b3d1e8e884be6c522f41d7eed671da45db302c9115 # shrinks to statuses = [Open, Open, Open, Open, Open], priorities = [Priority(0), Priority(0)], types = [Task, Task]

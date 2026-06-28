@@ -1,0 +1,18 @@
+---
+source: tests/snapshots/cli_output.rs
+expression: normalize_output(&output.stdout)
+---
+📊 Issue Database Status
+
+Summary:
+  Total Issues:           3
+  Open:                   2
+  In Progress:            0
+  Blocked:                1
+  Closed:                 1
+  Ready to Work:          1
+
+Extended:
+  Avg Lead Time:          0.0 hours
+
+For more details, use 'br list' to see individual issues.

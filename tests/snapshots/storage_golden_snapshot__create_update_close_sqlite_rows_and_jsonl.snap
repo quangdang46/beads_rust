@@ -1,0 +1,46 @@
+---
+source: tests/storage_golden_snapshot.rs
+expression: snapshot
+---
+issue:
+  id: storage-golden-1
+  title: Golden storage lifecycle updated
+  status: closed
+  priority: 1
+  issue_type: task
+  assignee: alice
+  description: Updated description
+  close_reason: completed golden flow
+  closed_by_session: golden-session
+  created_at: 2026-04-22T12:00:00+00:00
+  updated_at: <updated_at>
+  closed_at: 2026-04-23T08:30:00+00:00
+  content_hash: 07150e7ecd2168d4336cb2258a3c36be9ce4fb12ad2d939b90909e0bfe35b530
+events:
+  - id=1 type=created actor=golden-create old= new= comment=Created issue: Golden storage lifecycle
+  - id=2 type=updated actor=golden-update old=Golden storage lifecycle new=Golden storage lifecycle updated comment=Title changed
+  - id=3 type=priority_changed actor=golden-update old=2 new=1 comment=
+  - id=4 type=status_changed actor=golden-close old=open new=closed comment=
+  - id=5 type=closed actor=golden-close old= new= comment=completed golden flow
+jsonl:
+{
+  "id": "storage-golden-1",
+  "title": "Golden storage lifecycle updated",
+  "description": "Updated description",
+  "status": "closed",
+  "priority": 1,
+  "issue_type": "task",
+  "assignee": "alice",
+  "owner": "storage-review",
+  "estimated_minutes": 30,
+  "created_at": "2026-04-22T12:00:00Z",
+  "created_by": "golden-create",
+  "updated_at": "<updated_at>",
+  "closed_at": "2026-04-23T08:30:00Z",
+  "close_reason": "completed golden flow",
+  "closed_by_session": "golden-session",
+  "external_ref": "GOLDEN-1",
+  "source_repo": ".",
+  "compaction_level": 0,
+  "original_size": 0
+}

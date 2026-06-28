@@ -1,0 +1,13 @@
+---
+source: tests/snapshots/json_output.rs
+expression: normalize_json(&json)
+---
+[
+  {
+    "id": "ISSUE_ID",
+    "title": "Issue to close",
+    "status": "closed",
+    "closed_at": "TIMESTAMP",
+    "close_reason": "Done"
+  }
+]

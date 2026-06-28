@@ -1,0 +1,5 @@
+<<<<<<< HEAD
+{"id":"bd-q3j","title":"Fixture seed issue","status":"open","priority":2,"issue_type":"task","created_at":"2026-03-12T11:37:48.464486379Z","created_by":"ubuntu","updated_at":"2026-03-12T11:37:48.464486379Z","source_repo":".","compaction_level":0,"original_size":0}
+=======
+{"id":"bd-q3j","title":"Fixture seed issue","status":"open","priority":2,"issue_type":"task","created_at":"2026-03-12T11:37:48.464486379Z","created_by":"ubuntu","updated_at":"2026-03-12T11:37:48.464486379Z","source_repo":".","compaction_level":0,"original_size":0}
+>>>>>>> fixture-branch

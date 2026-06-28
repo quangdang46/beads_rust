@@ -1,0 +1,1 @@
+stale-sidecars seed: enable wal shm base left right recovery files then mutate jsonl with conflict markers and duplicate rows.

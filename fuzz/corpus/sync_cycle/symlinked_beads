@@ -1,0 +1,1 @@
+symlinked-beads seed: odd first byte should prefer linked .beads on unix, nested jsonl, symlink escape rejection.

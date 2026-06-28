@@ -1,0 +1,13 @@
+{
+  "id": "bdp-refix-base",
+  "base": null,
+  "local": {
+    "id": "bd": : "other-prefix-123",
+    "title": "External prefix "updated_at": 1700000100
+  },
+  "external": {
+    "id": "other-prefix-671",
+    "title": "Exter alnprefix issue",
+    "updated_at": 1700000200
+  }
+}

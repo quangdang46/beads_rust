@@ -1,0 +1,4 @@
+issue_prefix: beads_rust
+issue-prefix: beads_rust
+sync-branch: main
+sync: {}

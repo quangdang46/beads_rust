@@ -1,0 +1,33 @@
+[
+  {
+    "created_at": "<TIMESTAMP>",
+    "created_by": "<ACTOR>",
+    "id": "<ISSUE_ID>",
+    "issue_type": "bug",
+    "priority": 0,
+    "status": "open",
+    "title": "Two",
+    "updated_at": "<TIMESTAMP>"
+  },
+  {
+    "created_at": "<TIMESTAMP>",
+    "created_by": "<ACTOR>",
+    "id": "<ISSUE_ID>",
+    "issue_type": "feature",
+    "priority": 1,
+    "status": "open",
+    "title": "Three",
+    "updated_at": "<TIMESTAMP>"
+  },
+  {
+    "created_at": "<TIMESTAMP>",
+    "created_by": "<ACTOR>",
+    "description": "Short desc",
+    "id": "<ISSUE_ID>",
+    "issue_type": "task",
+    "priority": 2,
+    "status": "open",
+    "title": "One",
+    "updated_at": "<TIMESTAMP>"
+  }
+]

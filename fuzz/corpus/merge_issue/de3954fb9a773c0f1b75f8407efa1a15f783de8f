@@ -1,0 +1,16 @@
+{
+  "id": "bd-prefix-base",
+  "base": null,
+  "local": {
+    "id": "bd-prefix-246",Š    "title": "Local pref"updated_at": 1700000100
+  },
+  "external": {
+    "id": "other-prefix-123",
+    "title": "External prefix "updated_at": 1700000811
+  },
+  "external": {
+    "id": "other-prefix-123",
+    "title": "External prefix issue",
+    "updated_at": 1700000200
+  }
+}

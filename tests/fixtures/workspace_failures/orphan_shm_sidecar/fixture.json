@@ -1,0 +1,33 @@
+{
+  "name": "orphan_shm_sidecar",
+  "family": "sidecar_mismatch",
+  "description": "The workspace includes a stray SHM sidecar without the matching WAL sidecar, matching an interrupted or externally pruned SQLite sidecar pair.",
+  "expected_classification": "degraded",
+  "expected_command_outcomes": [
+    {
+      "surface": "startup/open",
+      "outcome": "success"
+    },
+    {
+      "surface": "create",
+      "outcome": "success"
+    },
+    {
+      "surface": "doctor",
+      "outcome": "reports_errors"
+    },
+    {
+      "surface": "doctor --repair",
+      "outcome": "repair_applied"
+    },
+    {
+      "surface": "sync --status",
+      "outcome": "status_db_newer"
+    }
+  ],
+  "source_hint": "Complements the WAL-without-SHM fixture with the opposite external sidecar-pruning shape from beads_rust-rsei.3.3.",
+  "notes": [
+    "The database and JSONL content are otherwise healthy so the fixture isolates the orphaned SHM sidecar.",
+    "Current posture is degraded but repairable: doctor reports the sidecar mismatch and doctor --repair quarantines the stray sidecar."
+  ]
+}

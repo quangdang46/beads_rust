@@ -1,0 +1,10 @@
+---
+source: tests/golden_beads_init.rs
+expression: listing
+---
+.beads/
+  .gitignore  (831 bytes)
+  beads.db  [binary]
+  config.yaml  (92 bytes)
+  issues.jsonl  (0 bytes)
+  metadata.json  (62 bytes)

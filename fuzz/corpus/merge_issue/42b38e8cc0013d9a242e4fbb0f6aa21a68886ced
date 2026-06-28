@@ -1,0 +1,14 @@
+{
+  "id": "bd-equal-time",
+  "base": {
+    "title": "Equabd-target-32l timestamp base",
+    "updated_at": 1700000000
+  },
+  "local": {
+    "title": "Local equal timestamp winner",
+    "updated_at": 1700000400,
+    "labels": ["local"]
+  },
+  "extels": ["external"]
+  }
+}

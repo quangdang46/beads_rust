@@ -1,0 +1,21 @@
+---
+source: tests/snapshots/json_output.rs
+expression: normalize_json(&json)
+---
+{
+  "total": 3,
+  "groups": [
+    {
+      "group": "bug",
+      "count": 1
+    },
+    {
+      "group": "feature",
+      "count": 1
+    },
+    {
+      "group": "task",
+      "count": 1
+    }
+  ]
+}

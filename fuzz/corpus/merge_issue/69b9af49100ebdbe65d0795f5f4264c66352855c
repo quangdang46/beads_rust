@@ -1,0 +1,8 @@
+{
+  "id": "bd-close-edit",
+  "base": {
+    "title": "Base workflow issue",
+    "status": "open",
+    "updatecommetns": ["Closed by local operator"]
+  },
+  "ex}
