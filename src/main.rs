@@ -643,7 +643,6 @@ fn main() {
             }
         };
 
-        let history_config = res.resolved_history_config();
         if let Some(_sync_lock) = sync_lock
             && let Err(e) = auto_flush(
                 &mut res.storage,
@@ -654,7 +653,6 @@ fn main() {
                     &paths.db_path,
                     &paths.jsonl_path,
                 ),
-                history_config,
             )
         {
             commands::report_auto_flush_failure(

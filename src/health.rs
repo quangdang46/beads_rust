@@ -464,8 +464,17 @@ pub fn classify_file_state(db_path: &Path, jsonl_path: &Path) -> Vec<AnomalyClas
         anomalies.push(AnomalyClass::SidecarMismatch { has_wal, has_shm });
     }
 
+    // A WAL header shorter than 32 bytes is a partial write — except for the
+    // single value 0. A 0-byte WAL is the documented resting state after a
+    // successful `PRAGMA wal_checkpoint(TRUNCATE)` with no concurrent readers,
+    // which `SqliteStorage::Drop` runs on every mutating br invocation. Treating
+    // it as `TruncatedWal` would false-alarm a healthy store into `Recoverable`,
+    // so floor the heuristic at `> 0` — the health-path counterpart of the same
+    // `> 0` floor the recovery path's `quarantine_truncated_wal_sidecar`
+    // already carries (#291). Partial headers in `(0, 32)` still classify.
     if has_wal
         && let Ok(meta) = std::fs::metadata(&wal_path)
+        && meta.len() > 0
         && meta.len() < 32
     {
         anomalies.push(AnomalyClass::TruncatedWal);
@@ -786,6 +795,56 @@ mod tests {
                 .iter()
                 .any(|a| matches!(a, AnomalyClass::TruncatedWal)),
             "custom DB filename WAL sidecar should be detected at {wal_path:?}: {anomalies:?}"
+        );
+    }
+
+    #[test]
+    fn zero_byte_wal_is_clean_checkpoint_state_not_truncated() {
+        // #358 (health-path counterpart of #291): a 0-byte WAL is the documented
+        // resting state after `PRAGMA wal_checkpoint(TRUNCATE)` (run by
+        // `SqliteStorage::Drop` on every mutating br invocation), not corruption.
+        // Classifying it as `TruncatedWal` would false-alarm a healthy store into
+        // `Recoverable`. The `< 32` guard must carry a `> 0` floor, mirroring the
+        // recovery path's `quarantine_truncated_wal_sidecar` (#291).
+        let (_dir, db_path, jsonl_path) = setup_workspace();
+        let mut f = std::fs::File::create(&db_path).unwrap();
+        f.write_all(b"SQLite format 3\0").unwrap();
+        f.write_all(&[0u8; 100]).unwrap();
+        std::fs::write(&jsonl_path, "{\"id\":\"test-1\"}\n").unwrap();
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        std::fs::write(&wal_path, b"").unwrap(); // 0 bytes — post-wal_checkpoint(TRUNCATE)
+
+        let anomalies = classify_file_state(&db_path, &jsonl_path);
+        assert!(
+            !anomalies
+                .iter()
+                .any(|a| matches!(a, AnomalyClass::TruncatedWal)),
+            "0-byte WAL is the clean post-checkpoint state, not corruption: {anomalies:?}"
+        );
+        assert_eq!(
+            WorkspaceClassification::from_anomalies(anomalies).health,
+            WorkspaceHealth::Healthy
+        );
+    }
+
+    #[test]
+    fn one_byte_wal_still_classifies_as_truncated() {
+        // The `> 0` floor (#358) must not weaken the partial-write contract: a
+        // WAL header with 1..32 bytes is a genuine truncation and still flags.
+        let (_dir, db_path, jsonl_path) = setup_workspace();
+        let mut f = std::fs::File::create(&db_path).unwrap();
+        f.write_all(b"SQLite format 3\0").unwrap();
+        f.write_all(&[0u8; 100]).unwrap();
+        std::fs::write(&jsonl_path, "{\"id\":\"test-1\"}\n").unwrap();
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        std::fs::write(&wal_path, [0u8; 1]).unwrap(); // 1 byte — partial write
+
+        let anomalies = classify_file_state(&db_path, &jsonl_path);
+        assert!(
+            anomalies
+                .iter()
+                .any(|a| matches!(a, AnomalyClass::TruncatedWal)),
+            "a 1-byte WAL is a partial write and must still classify as truncated: {anomalies:?}"
         );
     }
 

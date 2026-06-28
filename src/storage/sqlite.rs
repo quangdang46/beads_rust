@@ -288,13 +288,16 @@ const CHILD_OPEN_BLOCKER_SUFFIX: &str = ":child-open";
 /// Suffix marking a blocker ref produced by propagating an *already-blocked*
 /// parent down onto its children (e.g. `bd-3n73:parent-blocked`).
 ///
-/// This is a **readiness/start** marker — a child of a blocked epic is not
-/// "ready" to be *started* because the epic's own prerequisites are unmet — but
-/// it is hierarchy, not a prerequisite edge from the parent to the child. It
-/// must never prevent a finished child from being *closed* (#355). The producer
+/// This is an advisory **readiness** marker used to rank a child of a blocked
+/// epic below truly-ready work in `br ready`. It is hierarchy, not a
+/// prerequisite edge from the parent to the child, so it must never act as a
+/// *hard* gate: a finished child must be *closable* (#355) and an actionable
+/// child must be *claimable / startable* (#357) even while its parent epic is
+/// blocked. The producer
 /// ([`SqliteStorage::propagate_blocked_parents`]) embeds this suffix in
-/// `blocked_issues_cache`; [`SqliteStorage::get_close_blockers`] filters it back
-/// out so the close gate ignores it.
+/// `blocked_issues_cache`; both [`SqliteStorage::get_close_blockers`] and
+/// [`SqliteStorage::get_start_blockers`] filter it back out so neither the close
+/// gate nor the start/claim gate treats it as a real blocker.
 const PARENT_BLOCKED_SUFFIX: &str = ":parent-blocked";
 const NEEDS_FLUSH_KEY: &str = "needs_flush";
 const METADATA_EMPTY_VALUE: &str = "";
@@ -5529,12 +5532,23 @@ impl SqliteStorage {
     /// Get the blockers that prevent *starting* work on an issue (claiming it or
     /// moving it to `in_progress`).
     ///
-    /// This is [`get_blockers`](Self::get_blockers) minus the `:child-open`
-    /// rollup markers. Those markers encode a *close-ordering* constraint — an
-    /// epic should not be closed while it still has open children — but they
-    /// must NOT prevent the epic from being claimed and worked on (#315). Real
-    /// start-blocking edges (`blocks`, `conditional-blocks`, `waits-for`, and a
-    /// propagated `parent-blocked` state) are retained.
+    /// This is [`get_blockers`](Self::get_blockers) minus two *rollup* markers
+    /// that are not real prerequisite edges on the issue itself:
+    ///
+    /// - `:child-open` — a *close-ordering* constraint (an epic should not be
+    ///   *closed* while it still has open children). It must NOT prevent the
+    ///   epic from being claimed and worked on (#315).
+    /// - `:parent-blocked` — propagated down onto a child from an
+    ///   *already-blocked* parent epic. `parent-child` is hierarchy, not a
+    ///   prerequisite edge from the parent to the child, so a child that has no
+    ///   real blocker of its own must remain claimable even while its parent
+    ///   epic is blocked (#357 — the start-path counterpart of #355, which
+    ///   stripped the same marker on the *close* path). The actionable children
+    ///   of a blocked epic are frequently exactly the work that unblocks it.
+    ///
+    /// Real start-blocking edges on the child itself (`blocks`,
+    /// `conditional-blocks`, `waits-for`) do not carry either suffix and are
+    /// retained — a child with a *direct* prerequisite still cannot be started.
     ///
     /// # Errors
     ///
@@ -5543,7 +5557,10 @@ impl SqliteStorage {
         let start_blocker_refs: Vec<String> = self
             .get_blocker_refs(issue_id)?
             .into_iter()
-            .filter(|blocker| !blocker.ends_with(CHILD_OPEN_BLOCKER_SUFFIX))
+            .filter(|blocker| {
+                !blocker.ends_with(CHILD_OPEN_BLOCKER_SUFFIX)
+                    && !blocker.ends_with(PARENT_BLOCKED_SUFFIX)
+            })
             .collect();
         Ok(Self::blocker_refs_to_issue_ids(&start_blocker_refs))
     }
@@ -16810,6 +16827,107 @@ mod tests {
             storage.get_start_blockers("bd-epic-blocked").unwrap(),
             vec!["bd-real-blocker".to_string()],
             "real blocks edge must still block starting; child-open filtered (#315)"
+        );
+    }
+
+    #[test]
+    fn test_get_start_blockers_ignores_inherited_parent_blocked_marker() {
+        // #357 (start-path counterpart of #355): a child whose ONLY blocker is
+        // the inherited `<parent>:parent-blocked` rollup — i.e. its parent epic
+        // is itself blocked, but the child has no real prerequisite of its own —
+        // must be claimable / startable. `parent-child` is hierarchy, not a
+        // prerequisite edge from the parent to the child, and the actionable
+        // children of a blocked epic are frequently exactly the work that
+        // unblocks the epic. A child with a DIRECT real blocker must still
+        // reject, so this strips only the propagated marker, not real edges.
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let now = Utc::now();
+
+        let mut parent = make_issue("bd-parent", "Parent epic", Status::Open, 2, None, now, None);
+        parent.issue_type = IssueType::Epic;
+        for issue in [
+            parent,
+            make_issue("bd-child", "Child task", Status::Open, 2, None, now, None),
+            make_issue(
+                "bd-child-direct",
+                "Child with its own blocker",
+                Status::Open,
+                2,
+                None,
+                now,
+                None,
+            ),
+            make_issue(
+                "bd-blocker",
+                "External blocker",
+                Status::Open,
+                2,
+                None,
+                now,
+                None,
+            ),
+            make_issue(
+                "bd-direct-blocker",
+                "Direct blocker of bd-child-direct",
+                Status::Open,
+                2,
+                None,
+                now,
+                None,
+            ),
+        ] {
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        // The parent epic is genuinely blocked by an open prerequisite.
+        storage
+            .add_dependency("bd-parent", "bd-blocker", "blocks", "tester")
+            .unwrap();
+        // Both children belong to the parent via hierarchy (parent-child).
+        storage
+            .add_dependency("bd-child", "bd-parent", "parent-child", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-child-direct", "bd-parent", "parent-child", "tester")
+            .unwrap();
+        // bd-child-direct ALSO has a real prerequisite of its own.
+        storage
+            .add_dependency("bd-child-direct", "bd-direct-blocker", "blocks", "tester")
+            .unwrap();
+
+        // The blocked parent propagates a `:parent-blocked` marker onto its
+        // children — confirm the child carries it as its only (non-direct)
+        // blocker before asserting the start gate ignores it.
+        let child_blockers = storage.get_blockers("bd-child").unwrap();
+        assert!(
+            child_blockers
+                .iter()
+                .any(|b| b == "bd-parent" || b == "bd-parent:parent-blocked"),
+            "child of a blocked epic should inherit the parent-blocked rollup: {child_blockers:?}"
+        );
+
+        // #357: a child whose only blocker is the inherited parent-blocked
+        // marker has no real start-blockers — it must be claimable / startable.
+        assert!(
+            storage.get_start_blockers("bd-child").unwrap().is_empty(),
+            "child blocked only by inherited :parent-blocked must be startable (#357)"
+        );
+
+        // A child with a DIRECT real `blocks` edge is still start-blocked; only
+        // the inherited parent-blocked marker is filtered, never the real edge.
+        assert_eq!(
+            storage.get_start_blockers("bd-child-direct").unwrap(),
+            vec!["bd-direct-blocker".to_string()],
+            "a real direct blocker must still prevent starting (#357 strips only the rollup)"
+        );
+
+        // The close path (already fixed by #355) remains correct: the child
+        // with only the inherited marker is closable too.
+        assert!(
+            storage.get_close_blockers("bd-child").unwrap().is_empty(),
+            "child blocked only by inherited :parent-blocked must be closable (#355)"
         );
     }
 

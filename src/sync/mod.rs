@@ -6189,7 +6189,10 @@ mod tests {
 
         let cases = [
             ("collapsed adjacent records", format!("{json1}{json2}\n")),
-            ("stray issue prefix", "{\"i{\"id\":\"bd-001\"}\n".to_string()),
+            (
+                "stray issue prefix",
+                "{\"i{\"id\":\"bd-001\"}\n".to_string(),
+            ),
             (
                 "missing comments array closure",
                 "{\"id\":\"bd-001\",\"title\":\"Broken\",\"comments\":[{\"id\":1}\n".to_string(),
@@ -6229,12 +6232,10 @@ mod tests {
         )
         .unwrap();
 
-        let err = verify_exported_jsonl_integrity(
-            &path,
-            &["bd-001".to_string(), "bd-002".to_string()],
-        )
-        .unwrap_err()
-        .to_string();
+        let err =
+            verify_exported_jsonl_integrity(&path, &["bd-001".to_string(), "bd-002".to_string()])
+                .unwrap_err()
+                .to_string();
         assert!(
             err.contains("expected 2 issues, JSONL has 1 valid issue lines"),
             "unexpected error: {err}"
