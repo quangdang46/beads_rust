@@ -2750,14 +2750,17 @@ pub struct ReopenArgs {
 }
 
 /// Arguments for the rename command.
+///
+/// Renames an issue ID, updating all dependency edges and text references.
 #[derive(Args, Debug, Clone, Default)]
 pub struct RenameArgs {
-    /// Issue ID to rename
+    /// Current issue ID (the ID to rename from)
     #[arg(add = ArgValueCompleter::new(issue_id_completer))]
-    pub id: String,
+    pub old_id: String,
 
-    /// New title for the issue
-    pub title: String,
+    /// New issue ID (the ID to rename to)
+    #[arg(value_name = "NEW_ID")]
+    pub new_id: String,
 }
 
 /// Sort policy for ready command.
