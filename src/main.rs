@@ -498,7 +498,7 @@ fn main() {
         Commands::Upgrade(args) => commands::upgrade::execute(&args, &output_ctx),
         Commands::Completions(args) => commands::completions::execute(&args, &output_ctx),
         Commands::Formula { command } => {
-            commands::formula::execute(command, &overrides, &output_ctx)
+            commands::formula::execute(&command, &overrides, &output_ctx)
         }
         Commands::Audit { command } => {
             commands::audit::execute(&command, cli.json, &overrides, &output_ctx)
