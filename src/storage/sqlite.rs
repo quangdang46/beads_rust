@@ -1031,6 +1031,12 @@ impl SqliteStorage {
             conn.execute(&format!("PRAGMA busy_timeout={timeout_ms}"))?;
         }
 
+        // Check for forward schema skew before any migration: if the DB
+        // version is ahead of the binary, it's unsafe to proceed.
+        // Skip check when BR_IGNORE_SCHEMA_SKEW is set.
+        let ignore_skew = std::env::var("BR_IGNORE_SCHEMA_SKEW").is_ok_and(|v| !v.is_empty());
+        crate::storage::schema::check_schema_skew(&conn, false, ignore_skew)?;
+
         if database_header_user_version(path)
             .is_some_and(|version| version >= u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0))
         {

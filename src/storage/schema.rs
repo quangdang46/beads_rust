@@ -786,6 +786,51 @@ fn current_schema_version_declared(conn: &Connection) -> bool {
         .is_some_and(|version| version >= i64::from(CURRENT_SCHEMA_VERSION))
 }
 
+/// Check for schema version skew between the database and the binary.
+///
+/// Returns `Err(BeadsError::SchemaSkewForward)` when the database version is
+/// *ahead* of the binary (forward drift — the binary is too old to safely
+/// read the database).
+///
+/// Returns `Err(BeadsError::SchemaSkewBehind)` when the database is behind and
+/// the connection is read-only (cannot migrate).
+///
+/// Both checks are skipped when the `BR_IGNORE_SCHEMA_SKEW` environment
+/// variable is set (case-insensitive, any non-empty value).
+///
+/// # Errors
+///
+/// - [`BeadsError::SchemaSkewForward`] if the database is newer than the binary
+/// - [`BeadsError::SchemaSkewBehind`] if the database is older and read-only
+pub fn check_schema_skew(conn: &Connection, is_read_only: bool, ignore_skew: bool) -> Result<()> {
+    if ignore_skew {
+        return Ok(());
+    }
+
+    let db_version = conn
+        .query_row("PRAGMA user_version")
+        .ok()
+        .and_then(|row| row.get(0).and_then(SqliteValue::as_integer))
+        .map(|v| v as i32)
+        .unwrap_or(0);
+
+    if db_version > CURRENT_SCHEMA_VERSION {
+        return Err(BeadsError::SchemaSkewForward {
+            db_version,
+            binary_version: CURRENT_SCHEMA_VERSION,
+        });
+    }
+
+    if is_read_only && db_version < CURRENT_SCHEMA_VERSION && db_version > 0 {
+        return Err(BeadsError::SchemaSkewBehind {
+            db_version,
+            binary_version: CURRENT_SCHEMA_VERSION,
+        });
+    }
+
+    Ok(())
+}
+
 fn core_runtime_tables_exist(conn: &Connection) -> bool {
     [
         "issues",
@@ -3293,5 +3338,76 @@ mod tests {
         let stmts = split_sql_statements("SELECT 42");
         assert_eq!(stmts.len(), 1);
         assert_eq!(stmts[0], "SELECT 42");
+    }
+
+    #[test]
+    fn test_check_schema_skew_forward() {
+        let conn = Connection::open(":memory:").unwrap();
+        // Set user_version to CURRENT + 1 to simulate forward skew
+        conn.execute(&format!(
+            "PRAGMA user_version = {}",
+            CURRENT_SCHEMA_VERSION + 1
+        ))
+        .unwrap();
+        let err = check_schema_skew(&conn, false, false).unwrap_err();
+        assert!(
+            matches!(&err, BeadsError::SchemaSkewForward { db_version, binary_version }
+                if *db_version == CURRENT_SCHEMA_VERSION + 1 && *binary_version == CURRENT_SCHEMA_VERSION),
+            "Expected SchemaSkewForward, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_check_schema_skew_behind_readonly() {
+        let conn = Connection::open(":memory:").unwrap();
+        // Set user_version to 1 (< CURRENT)
+        conn.execute("PRAGMA user_version = 1").unwrap();
+        let err = check_schema_skew(&conn, true, false).unwrap_err();
+        assert!(
+            matches!(&err, BeadsError::SchemaSkewBehind { db_version, binary_version }
+                if *db_version == 1 && *binary_version == CURRENT_SCHEMA_VERSION),
+            "Expected SchemaSkewBehind, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_check_schema_skew_behind_readwrite_ok() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA user_version = 1").unwrap();
+        // Read-write should NOT error on behind skew (migration will happen)
+        assert!(check_schema_skew(&conn, false, false).is_ok());
+    }
+
+    #[test]
+    fn test_check_schema_skew_current_version_ok() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
+            .unwrap();
+        assert!(check_schema_skew(&conn, false, false).is_ok());
+        assert!(check_schema_skew(&conn, true, false).is_ok());
+    }
+
+    #[test]
+    fn test_check_schema_skew_ignore_flag() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(&format!(
+            "PRAGMA user_version = {}",
+            CURRENT_SCHEMA_VERSION + 10
+        ))
+        .unwrap();
+        // Without ignore flag, should error
+        assert!(check_schema_skew(&conn, false, false).is_err());
+        // With ignore flag, should pass
+        assert!(check_schema_skew(&conn, false, true).is_ok());
+        assert!(check_schema_skew(&conn, true, true).is_ok());
+    }
+
+    #[test]
+    fn test_check_schema_skew_fresh_db_no_user_version() {
+        let conn = Connection::open(":memory:").unwrap();
+        // Fresh :memory: DB has PRAGMA user_version = 0
+        assert!(check_schema_skew(&conn, false, false).is_ok());
+        // Read-only should also pass (0 means no schema yet)
+        assert!(check_schema_skew(&conn, true, false).is_ok());
     }
 }

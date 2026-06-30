@@ -52,6 +52,8 @@ pub enum ErrorCode {
     SchemaMismatch,
     /// Database operation failed
     DatabaseError,
+    /// Schema skew detected: database version differs from binary version
+    SchemaSkew,
     /// Beads workspace not initialized
     NotInitialized,
     /// Already initialized
@@ -144,6 +146,7 @@ impl ErrorCode {
             Self::DatabaseLocked => "DATABASE_LOCKED",
             Self::SchemaMismatch => "SCHEMA_MISMATCH",
             Self::DatabaseError => "DATABASE_ERROR",
+            Self::SchemaSkew => "SCHEMA_SKEW",
             Self::NotInitialized => "NOT_INITIALIZED",
             Self::AlreadyInitialized => "ALREADY_INITIALIZED",
             // Issue
@@ -225,6 +228,7 @@ impl ErrorCode {
             | Self::DatabaseLocked
             | Self::SchemaMismatch
             | Self::DatabaseError
+            | Self::SchemaSkew
             | Self::NotInitialized
             | Self::AlreadyInitialized => 2,
             // Issue / Operational (3)
@@ -674,6 +678,14 @@ impl StructuredError {
             BeadsError::Io(_) => (ErrorCode::IoError, None),
             BeadsError::Json(_) => (ErrorCode::JsonError, None),
             BeadsError::Yaml(_) => (ErrorCode::YamlError, None),
+            BeadsError::SchemaSkewForward { db_version, binary_version } => (
+                ErrorCode::SchemaSkew,
+                Some(json!({"db_version": db_version, "binary_version": binary_version, "direction": "forward"})),
+            ),
+            BeadsError::SchemaSkewBehind { db_version, binary_version } => (
+                ErrorCode::SchemaSkew,
+                Some(json!({"db_version": db_version, "binary_version": binary_version, "direction": "behind"})),
+            ),
             BeadsError::WithContext { context, source } => {
                 if let Some(source_err) = source.downcast_ref::<BeadsError>() {
                     let (code, inner_context) = Self::extract_code_and_context(source_err);
