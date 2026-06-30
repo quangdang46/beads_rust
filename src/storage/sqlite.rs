@@ -3860,7 +3860,7 @@ impl SqliteStorage {
         }
 
         let mut sql = String::from(
-            "SELECT id, title, description, status, issue_type, created_at, updated_at
+            "SELECT id, title, description, acceptance_criteria, status, issue_type, created_at, updated_at
              FROM issues WHERE 1=1",
         );
         let mut params = Vec::new();
@@ -10109,17 +10109,17 @@ impl SqliteStorage {
             title: get_str(1),
             description: get_non_empty_str(2),
             design: None,
-            acceptance_criteria: None,
+            acceptance_criteria: get_non_empty_str(3),
             notes: None,
-            status: parse_status(row.get(3).and_then(SqliteValue::as_text)),
+            status: parse_status(row.get(4).and_then(SqliteValue::as_text)),
             priority: Priority::default(),
-            issue_type: parse_issue_type(row.get(4).and_then(SqliteValue::as_text)),
+            issue_type: parse_issue_type(row.get(5).and_then(SqliteValue::as_text)),
             assignee: None,
             owner: None,
             estimated_minutes: None,
-            created_at: parse_datetime_value(row.get(5))?,
+            created_at: parse_datetime_value(row.get(6))?,
             created_by: None,
-            updated_at: parse_datetime_value(row.get(6))?,
+            updated_at: parse_datetime_value(row.get(7))?,
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
