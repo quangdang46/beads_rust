@@ -1040,8 +1040,53 @@ EXAMPLES:
     /// Show version information
     Version(VersionArgs),
 
+    /// Manage git worktrees
+    #[command(subcommand)]
+    Worktree(WorktreeCommand),
+
     /// Show the active .beads directory
     Where,
+}
+
+/// Worktree subcommands.
+#[derive(Subcommand, Debug, Clone)]
+pub enum WorktreeCommand {
+    /// List all git worktrees (with bead state info)
+    List,
+    /// Show detailed info about the current worktree
+    Info,
+    /// Create a new worktree
+    Create(WorktreeCreateArgs),
+    /// Remove a worktree
+    Remove(WorktreeRemoveArgs),
+}
+
+/// Arguments for `worktree create`.
+#[derive(Args, Debug, Clone)]
+pub struct WorktreeCreateArgs {
+    /// Path for the new worktree
+    #[arg()]
+    pub path: String,
+
+    /// Branch to check out in the new worktree (defaults to basename of path)
+    #[arg(long)]
+    pub branch: Option<String>,
+
+    /// Force creation (skip safety checks)
+    #[arg(long)]
+    pub force: bool,
+}
+
+/// Arguments for `worktree remove`.
+#[derive(Args, Debug, Clone)]
+pub struct WorktreeRemoveArgs {
+    /// Worktree name or path to remove
+    #[arg()]
+    pub name: String,
+
+    /// Force removal (skip safety checks)
+    #[arg(long)]
+    pub force: bool,
 }
 
 /// Arguments for the completions command.

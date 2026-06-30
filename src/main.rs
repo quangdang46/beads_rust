@@ -490,6 +490,12 @@ fn main() {
         Commands::Import(args) => commands::import::execute(&args, &overrides, &output_ctx),
         Commands::Schema(args) => commands::schema::execute(&args, &overrides, &output_ctx),
         Commands::Where => commands::r#where::execute(&overrides, &output_ctx),
+        Commands::Worktree(command) => {
+            let result = commands::worktree::execute(&command, &output_ctx);
+            result.map_err(|e| beads_rust::error::BeadsError::Internal {
+                message: e.to_string(),
+            })
+        },
         Commands::Version(args) => commands::version::execute(&args, &output_ctx),
 
         #[cfg(feature = "mcp")]
@@ -1022,7 +1028,8 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Admin { .. }
         | Commands::Import(_)
         | Commands::Formula { .. }
-        | Commands::Recipes { .. } => false,
+        | Commands::Recipes { .. }
+        | Commands::Worktree(_) => false,
 
         #[cfg(feature = "mcp")]
         Commands::Serve(_) => false,

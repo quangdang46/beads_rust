@@ -43,6 +43,7 @@ pub mod storage;
 pub mod sync;
 pub mod util;
 pub mod validation;
+pub mod worktree;
 pub mod write_combining;
 pub mod formula;
 pub mod query;
