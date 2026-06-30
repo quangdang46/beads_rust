@@ -893,6 +893,12 @@ pub enum Commands {
     /// List ready issues (open, unblocked, not deferred)
     Ready(ReadyArgs),
 
+    /// Install or list AI tool recipes for beads workflow integration
+    Recipes {
+        #[command(subcommand)]
+        command: RecipesCommands,
+    },
+
     /// Rename an issue (alias for `br update <id> --title <new-title>`)
     Rename(RenameArgs),
 
@@ -1594,6 +1600,33 @@ pub struct CapabilitiesArgs {
     /// Show token savings stats when using TOON output
     #[arg(long)]
     pub stats: bool,
+}
+
+/// Subcommands for AI tool recipe management.
+#[derive(Subcommand, Debug, Clone)]
+pub enum RecipesCommands {
+    /// List all available AI tool recipes
+    List(RecipesListArgs),
+    /// Install a recipe for a specific AI tool
+    Install(RecipesInstallArgs),
+}
+
+/// Arguments for `br recipes list`.
+#[derive(Args, Debug, Default, Clone)]
+pub struct RecipesListArgs {
+    /// Show detailed information for each recipe (type, path)
+    #[arg(long)]
+    pub details: bool,
+}
+
+/// Arguments for `br recipes install`.
+#[derive(Args, Debug, Clone)]
+pub struct RecipesInstallArgs {
+    /// Recipe name (e.g., "cursor", "claude", "aider")
+    pub recipe: String,
+    /// Project directory (defaults to current working directory)
+    #[arg(long)]
+    pub project_dir: Option<String>,
 }
 
 /// Subcommands for robot-oriented in-tool documentation.

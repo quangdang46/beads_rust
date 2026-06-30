@@ -43,6 +43,7 @@ pub mod q;
 pub mod query;
 pub mod quickstart;
 pub mod ready;
+pub mod recipes;
 pub mod rename;
 pub mod reopen;
 pub mod robot_docs;

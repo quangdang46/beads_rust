@@ -1630,6 +1630,33 @@ Prints a comprehensive quick start guide showing common workflows. No arguments 
 
 ---
 
+### recipes
+
+Manage AI tool integration recipes for beads workflow.
+
+```bash
+br recipes <COMMAND>
+```
+
+**Subcommands:**
+
+| Command | Description |
+|---------|-------------|
+| `list` | List all available AI tool recipes |
+| `install` | Install a recipe for a specific tool |
+
+**Examples:**
+
+```bash
+br recipes list                           # List all recipes
+br recipes list --verbose                 # Show with type info
+br recipes install cursor                 # Install Cursor rules
+br recipes install aider                  # Install Aider files
+br recipes install claude --project-dir . # Install Claude hooks
+```
+
+---
+
 ### rename
 
 Rename an issue (alias for `br update <id> --title <new-title>`).
