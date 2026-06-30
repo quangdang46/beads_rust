@@ -15,11 +15,11 @@
 pub mod events;
 pub mod schema;
 pub mod sqlite;
+pub mod trait_;
 
-pub(crate) use sqlite::ChangelogIssueRow;
 pub mod hooks;
 
 pub use sqlite::{
-    CloseMetadataRow, EventAttribution, IssueUpdate, ListFilters, ReadyFilters, ReadySortPolicy,
-    SqliteStorage, StatsIssueRow,
+    ChangelogIssueRow, CloseMetadataRow, EventAttribution, IssueUpdate, ListFilters,
+    ReadyFilters, ReadySortPolicy, SqliteStorage, StatsIssueRow,
 };
