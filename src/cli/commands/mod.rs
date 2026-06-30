@@ -34,6 +34,7 @@ pub mod graph;
 pub mod history;
 pub mod info;
 pub mod init;
+pub mod import;
 pub mod label;
 pub mod lint;
 pub mod list;

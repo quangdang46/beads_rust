@@ -1192,6 +1192,40 @@ br sync --flush-only -v
 
 ---
 
+### import
+
+Import issues from external files into the database.
+
+```bash
+br import [OPTIONS] [--format <FMT>] [--input <PATH>]
+```
+
+**Supported formats:** `jsonl`, `json`, `csv`, `obsidian` (markdown).
+By default, detects format from file extension. Uses `.beads/issues.jsonl` if
+no `--input` is given.
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--format <FMT>` | Input format: jsonl, json, csv, obsidian (default: jsonl) |
+| `--input <PATH>` | Input file path |
+| `--rename-prefix <PREFIX>` | Rewrite issue IDs to a different project prefix |
+| `--force` | Force overwrite existing issues |
+
+**Examples:**
+```bash
+# Import from default JSONL
+br import
+
+# Import from CSV
+br import --format csv --input issues.csv
+
+# Import from markdown with prefix rewrite
+br import --format obsidian --input tasks.md --rename-prefix proj
+```
+
+---
+
 ### config
 
 Configuration management.
