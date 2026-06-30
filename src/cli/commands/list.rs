@@ -14,13 +14,16 @@ use crate::format::{
     IssueWithCounts, ListPage, TextFormatOptions, format_issue_line_with, format_issue_long_with,
     format_issue_pretty_with, terminal_width,
 };
-use crate::model::{IssueType, Priority, Status};
+use crate::model::{IssueType, MolType, Priority, Status};
 use crate::output::{IssueTable, IssueTableColumns, JsonArrayPageMeta, OutputContext, OutputMode};
 use crate::storage::ListFilters;
 use crate::storage::sqlite::ListRelationMetadata;
-use chrono::Utc;
+use crate::query::{parse_and_evaluate};
+use crate::util::time::parse_duration_shorthand;
+use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
+use std::str::FromStr;
 
 // Large default-visible structured pages are faster through the existing full
 // scan/relation path; smaller pages keep the medium-page relation queries.
@@ -434,6 +437,64 @@ fn issue_with_batched_relation_metadata(
     }
 }
 
+/// Parse a time filter CLI value into an optional DateTime.
+///
+/// Accepts either:
+/// - A duration shorthand (e.g., "7d", "24h", "2w", "1mo", "1y")
+/// - An RFC3339 timestamp (e.g., "2025-01-15T12:00:00Z")
+///
+/// Returns `None` if the input is `None` or empty.
+/// Returns an error if the value can't be parsed.
+fn parse_time_filter(value: Option<&str>) -> Result<Option<DateTime<Utc>>> {
+    let Some(s) = value else {
+        return Ok(None);
+    };
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok(None);
+    }
+
+    // Try duration shorthand first (digits + suffix, no +/- prefix)
+    if let Some(ts) = parse_duration_shorthand(s) {
+        return Ok(Some(ts));
+    }
+
+    // Otherwise try as RFC3339 timestamp
+    match s.parse::<DateTime<Utc>>() {
+        Ok(ts) => Ok(Some(ts)),
+        Err(_) => Err(BeadsError::validation(
+            "time filter",
+            format!(
+                "invalid time format: '{s}'. Use a duration shorthand (7d, 24h, 2w, 1mo, 1y) \
+                 or an RFC3339 timestamp (2025-01-15T12:00:00Z)",
+            ),
+        )),
+    }
+}
+
+/// Parse metadata filter strings ("key=value") into (key, value) pairs.
+pub(crate) fn parse_metadata_filters(filters: &[String]) -> Result<Vec<(String, String)>> {
+    let mut result = Vec::with_capacity(filters.len());
+    for filter in filters {
+        let Some(eq_pos) = filter.find('=') else {
+            return Err(BeadsError::validation(
+                "metadata",
+                format!("invalid metadata filter '{filter}': expected KEY=VALUE format"),
+            ));
+        };
+        let key = filter[..eq_pos].trim().to_string();
+        let value = filter[eq_pos + 1..].trim().to_string();
+        if key.is_empty() {
+            return Err(BeadsError::validation(
+                "metadata",
+                format!("invalid metadata filter '{filter}': key cannot be empty"),
+            ));
+        }
+        result.push((key, value));
+    }
+    Ok(result)
+}
+
 /// Convert CLI args to storage filter.
 fn build_filters(args: &ListArgs) -> Result<ListFilters> {
     // Parse status strings to Status enums
@@ -486,7 +547,7 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
             .as_ref()
             .is_some_and(|parsed| parsed.contains(&Status::Deferred));
 
-    Ok(ListFilters {
+    let mut filters = ListFilters {
         statuses,
         types,
         priorities,
@@ -510,9 +571,50 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
         } else {
             Some(args.label_any.clone())
         },
-        updated_before: None,
-        updated_after: None,
-    })
+        updated_before: parse_time_filter(args.updated_before.as_deref())?,
+        updated_after: parse_time_filter(args.updated_after.as_deref())?,
+        created_before: parse_time_filter(args.created_before.as_deref())?,
+        created_after: parse_time_filter(args.created_after.as_deref())?,
+        metadata_filters: {
+            let parsed = parse_metadata_filters(&args.metadata)?;
+            if parsed.is_empty() {
+                None
+            } else {
+                Some(parsed.into_iter().map(|(k, v)| format!("{k}={v}")).collect())
+            }
+        },
+        ids: Some(args.id.clone()),
+        owner: args.owner.clone(),
+        pinned: args.pinned.then_some(true),
+        mol_type: args.mol_type.as_ref().and_then(|m| MolType::from_str(m).ok()),
+    };
+
+    // Apply query DSL filter (--filter) on top of explicit CLI filters
+    if let Some(filter_expr) = &args.filter {
+        let query_result = parse_and_evaluate(filter_expr).map_err(|e| {
+            BeadsError::Validation { field: "filter".into(), reason: e.to_string() }
+        })?;
+        // Merge query filters into the base filters
+        let qf = query_result.filters;
+        if let Some(s) = qf.statuses { filters.statuses = Some(s); }
+        if let Some(s) = qf.types { filters.types = Some(s); }
+        if let Some(p) = qf.priorities { filters.priorities = Some(p); }
+        if let Some(a) = qf.assignee { filters.assignee = Some(a); }
+        if qf.unassigned { filters.unassigned = true; }
+        if let Some(t) = qf.title_contains { filters.title_contains = Some(t); }
+        if let Some(l) = qf.labels { filters.labels = Some(l); }
+        if let Some(o) = qf.owner { filters.owner = Some(o); }
+        if let Some(p) = qf.pinned { filters.pinned = Some(p); }
+        if let Some(m) = qf.mol_type { filters.mol_type = Some(m); }
+        if let Some(ids) = qf.ids { filters.ids = Some(ids); }
+        if let Some(mf) = qf.metadata_filters { filters.metadata_filters = Some(mf); }
+        filters.updated_before = filters.updated_before.or(qf.updated_before);
+        filters.updated_after = filters.updated_after.or(qf.updated_after);
+        filters.created_before = filters.created_before.or(qf.created_before);
+        filters.created_after = filters.created_after.or(qf.created_after);
+    }
+
+    Ok(filters)
 }
 
 /// Validate `list`-compatible CLI filters without executing the query.

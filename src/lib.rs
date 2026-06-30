@@ -43,6 +43,7 @@ pub mod util;
 pub mod validation;
 pub mod write_combining;
 pub mod formula;
+pub mod query;
 
 #[cfg(feature = "mcp")]
 pub mod mcp;

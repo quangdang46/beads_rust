@@ -141,6 +141,16 @@ impl SavedFilters {
             format: None,
             stats: false,
             fields: None,
+            // Filter fields — use defaults
+            owner: None,
+            pinned: false,
+            mol_type: None,
+            metadata: Vec::new(),
+            created_before: None,
+            created_after: None,
+            updated_before: None,
+            updated_after: None,
+            filter: None,
         }
     }
 
@@ -210,6 +220,20 @@ impl SavedFilters {
             format: cli.format,
             stats: cli.stats,
             fields: cli.fields.clone(),
+            // Extended filter fields — CLI overrides if present
+            owner: cli.owner.clone().or(base.owner),
+            pinned: cli.pinned || base.pinned,
+            mol_type: cli.mol_type.clone().or(base.mol_type),
+            metadata: if cli.metadata.is_empty() {
+                base.metadata.clone()
+            } else {
+                cli.metadata.clone()
+            },
+            created_before: cli.created_before.clone().or(base.created_before),
+            created_after: cli.created_after.clone().or(base.created_after),
+            updated_before: cli.updated_before.clone().or(base.updated_before),
+            updated_after: cli.updated_after.clone().or(base.updated_after),
+            filter: cli.filter.clone().or(base.filter),
         }
     }
 }

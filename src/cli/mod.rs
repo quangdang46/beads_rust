@@ -1920,6 +1920,10 @@ pub struct ListArgs {
     /// Default: id, title, status, priority, `issue_type`, assignee, `created_at`, `updated_at`
     #[arg(long, value_name = "FIELDS", add = ArgValueCompleter::new(csv_fields_completer))]
     pub fields: Option<String>,
+
+    /// Query DSL filter expression (e.g. "status=open AND priority>1")
+    #[arg(long, short = 'F')]
+    pub filter: Option<String>,
 }
 
 /// Arguments for the search command.
