@@ -522,6 +522,7 @@ fn main() {
             commands::config::execute(&command, cli.json, &overrides, &output_ctx)
         }
         Commands::History(args) => commands::history::execute(args, &overrides, &output_ctx),
+        Commands::Hooks(command) => commands::hooks::execute(&command, &output_ctx),
         Commands::Defer(args) => {
             commands::defer::execute_defer(&args, cli.json || args.robot, &overrides, &output_ctx)
         }
@@ -1012,6 +1013,7 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Orphans(_)
         | Commands::Config { .. }
         | Commands::History(_)
+        | Commands::Hooks(_)
         | Commands::Wisp { .. }
         | Commands::CustomStatus { .. }
         | Commands::CustomType { .. }

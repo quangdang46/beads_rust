@@ -31,6 +31,7 @@ pub mod coordination;
 pub mod error;
 pub mod format;
 pub mod health;
+pub mod hooks;
 pub mod inheritance;
 pub mod logging;
 pub mod model;
