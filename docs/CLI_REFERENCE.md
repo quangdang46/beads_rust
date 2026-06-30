@@ -32,6 +32,7 @@ Comprehensive reference for all `br` (beads_rust) commands.
   - [comments](#comments)
 - [Workflow Commands](#workflow-commands)
   - [defer / undefer](#defer--undefer)
+  - [wisp](#wisp)
   - [orphans](#orphans)
   - [query (saved queries)](#query-saved-queries)
   - [gate](#gate)
@@ -923,6 +924,46 @@ br undefer <IDS>... [OPTIONS]
 |--------|-------------|
 | `--until <DATE>` | Defer until date |
 | `--robot` | Machine-readable output |
+
+---
+
+### wisp
+
+Manage wisps (ephemeral issues excluded from JSONL sync). Wisps are issues
+with `ephemeral=true` and a `wsp-` ID prefix.
+
+Subcommands: `list`, `create`, `close`, `gc`.
+
+```bash
+br wisp list [OPTIONS]
+br wisp create <TITLE>... [OPTIONS]
+br wisp close <IDS>... [OPTIONS]
+br wisp gc [OPTIONS]
+```
+
+**Options (list):**
+| Option | Description |
+|--------|-------------|
+| `--all` | Include closed wisps |
+| `--json` | JSON output |
+
+**Options (create):**
+| Option | Description |
+|--------|-------------|
+| `-p, --priority <PRIORITY>` | Priority (0-4, P0-P4) |
+| `-t, --type <TYPE>` | Issue type |
+| `-a, --assignee <NAME>` | Assignee |
+
+**Options (close):**
+| Option | Description |
+|--------|-------------|
+| `--reason <TEXT>` | Close reason (default: Completed) |
+
+**Options (gc):**
+| Option | Description |
+|--------|-------------|
+| `--max-age-hours <HOURS>` | Delete wisps older than this (default: 24) |
+| `--dry-run` | Show what would be deleted without deleting |
 
 ---
 

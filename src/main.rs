@@ -527,6 +527,9 @@ fn main() {
         Commands::Undefer(args) => {
             commands::defer::execute_undefer(&args, cli.json || args.robot, &overrides, &output_ctx)
         }
+        Commands::Wisp { command } => {
+            commands::wisp::execute(&command, &overrides, &output_ctx)
+        }
         Commands::Orphans(args) if !args.fix => {
             if let (Some(res), Some(beads_dir)) = (storage_result.as_ref(), ctx.beads_dir.as_ref())
             {
@@ -838,6 +841,12 @@ const fn is_mutating_command(cmd: &Commands) -> bool {
         | Commands::Q(_)
         | Commands::Defer(_)
         | Commands::Undefer(_) => true,
+        Commands::Wisp { command } => matches!(
+            command,
+            commands::wisp::WispCommands::Create(_)
+                | commands::wisp::WispCommands::Close(_)
+                | commands::wisp::WispCommands::Gc(_)
+        ),
         Commands::Dep { command } => matches!(
             command,
             beads_rust::cli::DepCommands::Add(_) | beads_rust::cli::DepCommands::Remove(_)
@@ -981,6 +990,7 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Orphans(_)
         | Commands::Config { .. }
         | Commands::History(_)
+        | Commands::Wisp { .. }
         | Commands::Agents(_)
         | Commands::Quickstart(_)
         | Commands::Admin { .. }
