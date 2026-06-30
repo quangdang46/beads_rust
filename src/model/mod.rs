@@ -764,6 +764,28 @@ pub struct CustomType {
     pub name: String,
 }
 
+/// Repository file mtime tracking entry (Issue #39).
+///
+/// Records the latest observed modification time and content hash for each
+/// JSONL file tracked by the sync engine, enabling incremental re-sync
+/// without re-reading files whose mtime hasn't changed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct RepoMtime {
+    /// Absolute or canonical path to the repository root.
+    pub repo_path: String,
+    /// Path to the JSONL file within the repo (relative or absolute).
+    pub jsonl_path: String,
+    /// Modification time in nanoseconds since Unix epoch.
+    pub mtime_ns: i64,
+    /// Timestamp of the last sync check against this file.
+    #[serde(default = "default_last_checked")]
+    pub last_checked: DateTime<Utc>,
+}
+
+fn default_last_checked() -> DateTime<Utc> {
+    Utc::now()
+}
+
 /// BondRef tracks compound molecule lineage.
 /// When protos or molecules are bonded together, BondRefs record
 /// which sources were combined and how they were attached.

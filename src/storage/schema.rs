@@ -8,7 +8,7 @@ use crate::error::{BeadsError, Result};
 use crate::model::{IssueType, Priority, Status};
 use crate::util::content_hash_from_parts;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 14;
+pub const CURRENT_SCHEMA_VERSION: i32 = 15;
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 
 /// The complete SQL schema for the beads database.
@@ -297,6 +297,15 @@ pub const SCHEMA_SQL: &str = r"
     CREATE TABLE IF NOT EXISTS custom_types (
         name VARCHAR(64) PRIMARY KEY
     );
+
+    -- Repository file mtime tracking for efficient re-sync (Issue #39)
+    CREATE TABLE IF NOT EXISTS repo_mtimes (
+        repo_path TEXT PRIMARY KEY,
+        jsonl_path TEXT NOT NULL,
+        mtime_ns BIGINT NOT NULL,
+        last_checked DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_repo_mtimes_checked ON repo_mtimes(last_checked);
 ";
 
 /// Split a SQL script into individual statements, respecting string literals,
@@ -1729,6 +1738,26 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
             )?;
             tracing::info!("Backfilled built-in types into custom_types");
         }
+    }
+
+    // Migration v14 -> v15 (Issue #39): add repo_mtimes table for file mtime tracking.
+    // Pure additive — new table, no existing-row rewrite.
+    if user_version < 15 {
+        tracing::info!(
+            "Migrating database to schema version 15 (repo_mtimes table - Issue #39)"
+        );
+        execute_batch(
+            conn,
+            r"
+            CREATE TABLE IF NOT EXISTS repo_mtimes (
+                repo_path TEXT PRIMARY KEY,
+                jsonl_path TEXT NOT NULL,
+                mtime_ns BIGINT NOT NULL,
+                last_checked DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_repo_mtimes_checked ON repo_mtimes(last_checked);
+        ",
+        )?;
     }
 
     // Migration: Add missing indexes for bd parity
