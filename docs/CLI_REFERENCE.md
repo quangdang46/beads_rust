@@ -1574,6 +1574,26 @@ br history <COMMAND>
 
 ---
 
+### hooks
+
+Install, uninstall, list, and run git hooks for beads auto-import/export integration.
+
+```bash
+br hooks <COMMAND>
+```
+
+**Subcommands:**
+| Command | Description |
+|---------|-------------|
+| `install` | Install git hooks (pre-commit, post-merge, pre-push, post-checkout) |
+| `uninstall` | Remove beads section from git hooks |
+| `list` | Show installation status of managed hooks |
+| `run` | Execute a hook's synchronisation logic directly |
+
+**Installed hook scripts** invoke `br sync --flush-only` (pre-commit), `br sync --import-only` (post-merge), or check beads state (pre-push, post-checkout). Hook files use section markers (`BEGIN BEADS INTEGRATION` / `END BEADS INTEGRATION`) to preserve user content on reinstall.
+
+---
+
 ### changelog
 
 Generate changelog from closed issues.

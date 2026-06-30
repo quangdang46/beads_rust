@@ -32,6 +32,7 @@ pub mod epic;
 pub mod gate;
 pub mod graph;
 pub mod history;
+pub mod hooks;
 pub mod info;
 pub mod init;
 pub mod import;

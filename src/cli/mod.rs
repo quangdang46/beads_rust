@@ -841,6 +841,10 @@ pub enum Commands {
     /// Manage local history backups
     History(HistoryArgs),
 
+    /// Install/uninstall/list/run git hooks for beads auto-import/export
+    #[command(subcommand)]
+    Hooks(HooksCommand),
+
     /// Import issues from a file (JSONL, CSV, markdown)
     Import(ImportArgs),
 
@@ -1487,6 +1491,51 @@ pub struct ImportArgs {
     /// Force import even on conflict
     #[arg(short = 'F', long)]
     pub force: bool,
+}
+
+/// Git hooks management commands.
+#[derive(Debug, Clone, clap::Subcommand)]
+pub enum HooksCommand {
+    /// Install git hooks
+    Install(HooksInstallArgs),
+    /// Uninstall git hooks (remove beads section)
+    Uninstall(HooksUninstallArgs),
+    /// List installed hooks status
+    List,
+    /// Run a hook's synchronisation logic (for debugging)
+    Run(HooksRunArgs),
+}
+
+/// Arguments for `hooks install`.
+#[derive(Args, Debug, Clone, Default)]
+pub struct HooksInstallArgs {
+    /// Specific hook to install (default: install all)
+    #[arg()]
+    pub hook: Option<String>,
+
+    /// Install all managed hooks
+    #[arg(long)]
+    pub all: bool,
+}
+
+/// Arguments for `hooks uninstall`.
+#[derive(Args, Debug, Clone, Default)]
+pub struct HooksUninstallArgs {
+    /// Specific hook to uninstall
+    #[arg()]
+    pub hook: Option<String>,
+
+    /// Uninstall all managed hooks
+    #[arg(long)]
+    pub all: bool,
+}
+
+/// Arguments for `hooks run`.
+#[derive(Args, Debug, Clone, Default)]
+pub struct HooksRunArgs {
+    /// Hook name to run (pre-commit, post-merge, etc.)
+    #[arg()]
+    pub hook: String,
 }
 
 /// Arguments for the schema command.
