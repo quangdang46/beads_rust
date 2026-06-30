@@ -1539,6 +1539,66 @@ Beads-aware: `list` and `info` detect the `.beads/` state — none, local, share
 
 ---
 
+### merge-slot
+
+Acquire exclusive access to the merge slot for serialized conflict resolution. The merge slot is a special-purpose bead that prevents concurrent merge attempts.
+
+```bash
+br merge-slot <COMMAND>
+```
+
+**Subcommands:**
+
+| Command | Description |
+|---------|-------------|
+| `create` | Create the merge slot bead for the current project (idempotent) |
+| `check` | Show current slot status (available / held by whom / waiters) |
+| `acquire` | Attempt to acquire the slot; add to waiters queue if held |
+| `wait` | Poll until the slot is acquired |
+| `release` | Release the slot (clears holder, promotes first waiter) |
+
+**Options (acquire):**
+
+| Option | Description |
+|--------|-------------|
+| `--wait` | If the slot is held, join the waiters queue instead of failing |
+
+**Options (wait):**
+
+| Option | Description |
+|--------|-------------|
+| `--poll <SECONDS>` | Polling interval in seconds (default: 2) |
+
+**Options (all):**
+
+| Option | Description |
+|--------|-------------|
+| `--json` | JSON output |
+
+**Actor:** Resolved from `BR_ACTOR` env var, then `USER`, then `"merge-slot"`.
+
+**JSON output (acquire):**
+
+```json
+{
+  "slot_id": "br-merge-slot",
+  "acquired": true,
+  "waiting": false,
+  "holder": "alice",
+  "position": null
+}
+```
+
+**Metadata schema** (stored in the slot bead's `metadata` field):
+
+```json
+{"holder": "alice", "waiters": ["bob", "carol"]}
+```
+
+The slot bead uses `id = <issue_prefix>-merge-slot`, `status = open` (available) or `in_progress` (held), and label `gt:slot` for tooling discovery.
+
+---
+
 ### audit
 
 Record and label agent interactions.

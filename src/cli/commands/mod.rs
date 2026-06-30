@@ -58,6 +58,7 @@ pub mod stats;
 pub mod sync;
 pub mod update;
 pub mod version;
+pub mod merge_slot;
 pub mod worktree;
 pub mod r#where;
 pub mod formula;

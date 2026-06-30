@@ -495,7 +495,13 @@ fn main() {
             result.map_err(|e| beads_rust::error::BeadsError::Internal {
                 message: e.to_string(),
             })
-        },
+        }
+        Commands::MergeSlot(command) => {
+            let result = commands::merge_slot::execute(&command, &output_ctx);
+            result.map_err(|e| beads_rust::error::BeadsError::Internal {
+                message: e.to_string(),
+            })
+        }
         Commands::Version(args) => commands::version::execute(&args, &output_ctx),
 
         #[cfg(feature = "mcp")]
@@ -1029,7 +1035,8 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Import(_)
         | Commands::Formula { .. }
         | Commands::Recipes { .. }
-        | Commands::Worktree(_) => false,
+        | Commands::Worktree(_)
+        | Commands::MergeSlot(_) => false,
 
         #[cfg(feature = "mcp")]
         Commands::Serve(_) => false,

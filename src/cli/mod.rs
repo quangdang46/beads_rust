@@ -1044,6 +1044,10 @@ EXAMPLES:
     #[command(subcommand)]
     Worktree(WorktreeCommand),
 
+    /// Manage the merge slot for exclusive conflict resolution access
+    #[command(subcommand)]
+    MergeSlot(MergeSlotCommand),
+
     /// Show the active .beads directory
     Where,
 }
@@ -1087,6 +1091,37 @@ pub struct WorktreeRemoveArgs {
     /// Force removal (skip safety checks)
     #[arg(long)]
     pub force: bool,
+}
+
+/// Merge slot subcommands.
+#[derive(Subcommand, Debug, Clone)]
+pub enum MergeSlotCommand {
+    /// Create the merge slot issue for the current project
+    Create,
+    /// Check whether the merge slot is available or held
+    Check,
+    /// Acquire the merge slot (with optional --wait to queue)
+    Acquire(MergeSlotAcquireArgs),
+    /// Acquire the merge slot and block until acquired (polling mode)
+    Wait(MergeSlotWaitArgs),
+    /// Release the merge slot
+    Release,
+}
+
+/// Arguments for `merge-slot acquire`.
+#[derive(Args, Debug, Clone)]
+pub struct MergeSlotAcquireArgs {
+    /// If the slot is held, join the wait queue instead of failing
+    #[arg(long)]
+    pub wait: bool,
+}
+
+/// Arguments for `merge-slot wait`.
+#[derive(Args, Debug, Clone)]
+pub struct MergeSlotWaitArgs {
+    /// Poll interval in seconds (default: 2, min: 1)
+    #[arg(long)]
+    pub poll: Option<u64>,
 }
 
 /// Arguments for the completions command.
