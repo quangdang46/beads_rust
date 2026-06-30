@@ -253,6 +253,36 @@ fn append_issue_id_membership_filter(
     sql.push(')');
 }
 
+/// Append WHERE clauses for metadata key=value filtering using LIKE on the
+/// JSON text column. Each entry in `filters` is either:
+/// - `"key=value"` — match metadata that contains the key with the given value
+/// - Bare key — match metadata that contains the key (presence check)
+///
+/// Uses LIKE instead of json_extract because SQLite's JSON1 extension is not
+/// available in all builds. Both `"key":"value"` and `"key": "value"` JSON
+/// whitespace formats are handled.
+fn append_metadata_filter(
+    sql: &mut String,
+    params: &mut Vec<SqliteValue>,
+    filters: &[String],
+) {
+    for filter in filters {
+        if let Some(eq_pos) = filter.find('=') {
+            let key = escape_like_pattern(&filter[..eq_pos]);
+            let value = escape_like_pattern(&filter[eq_pos + 1..]);
+            // Match both "key":"value" and "key": "value" formats
+            sql.push_str(" AND (metadata LIKE ? ESCAPE '\\' OR metadata LIKE ? ESCAPE '\\')");
+            params.push(SqliteValue::from(format!("%\"{key}\":\"{value}\"%")));
+            params.push(SqliteValue::from(format!("%\"{key}\": \"{value}\"%")));
+        } else {
+            // Bare key: presence check — match `"key":` anywhere in the JSON
+            let key = escape_like_pattern(filter);
+            sql.push_str(" AND metadata LIKE ? ESCAPE '\\'");
+            params.push(SqliteValue::from(format!("%\"{key}\":%")));
+        }
+    }
+}
+
 fn append_label_or_membership_exists(
     sql: &mut String,
     params: &mut Vec<SqliteValue>,
@@ -506,7 +536,7 @@ impl ReadyIssueProjection {
                          due_at, defer_until, external_ref, source_system, source_repo,
                          deleted_at, deleted_by, delete_reason, original_type,
                          compaction_level, compacted_at, compacted_at_commit, original_size,
-                         sender, ephemeral, pinned, is_template, source_repo_path, agent_context"
+                         sender, ephemeral, pinned, is_template, source_repo_path, agent_context, metadata"
             }
             Self::Command => {
                 r"SELECT id, title, description, acceptance_criteria, notes, status, priority,
@@ -538,7 +568,7 @@ impl SearchIssueProjection {
                          due_at, defer_until, external_ref, source_system, source_repo,
                          deleted_at, deleted_by, delete_reason, original_type,
                          compaction_level, compacted_at, compacted_at_commit, original_size,
-                         sender, ephemeral, pinned, is_template, source_repo_path, agent_context
+                         sender, ephemeral, pinned, is_template, source_repo_path, agent_context, metadata
                   FROM issues
                   WHERE 1=1"
             }
@@ -570,6 +600,7 @@ impl BlockedIssueProjection {
                      i.deleted_at, i.deleted_by, i.delete_reason, i.original_type, i.compaction_level,
                      i.compacted_at, i.compacted_at_commit, i.original_size, i.sender, i.ephemeral,
                      i.pinned, i.is_template, i.source_repo_path, i.agent_context,
+                     i.metadata,
                      bc.blocked_by"
             }
             Self::Command => {
@@ -588,7 +619,7 @@ impl BlockedIssueProjection {
                      due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                      compacted_at, compacted_at_commit, original_size, sender, ephemeral,
-                     pinned, is_template, source_repo_path, agent_context"
+                     pinned, is_template, source_repo_path, agent_context, metadata"
             }
             Self::Command => {
                 r"SELECT id, title, description, status, priority, issue_type,
@@ -601,9 +632,10 @@ impl BlockedIssueProjection {
         match self {
             // Bumped from 37 → 38 after `agent_context` was appended
             // to the Full SELECT at position 37 (beads_rust#297).
-            // Source_repo_path is at 36, agent_context is at 37, so
-            // bc.blocked_by lands at 38 in the joined projection.
-            Self::Full => 38,
+            // Then 38→39 after `metadata` was appended (beads_rust#16).
+            // Source_repo_path is at 36, agent_context at 37, metadata at 38, so
+            // bc.blocked_by lands at 39 in the joined projection.
+            Self::Full => 39,
             Self::Command => 9,
         }
     }
@@ -2280,8 +2312,8 @@ impl SqliteStorage {
                     closed_by_session, due_at, defer_until, external_ref, source_system,
                     source_repo, source_repo_path, deleted_at, deleted_by, delete_reason, original_type,
                     compaction_level, compacted_at, compacted_at_commit, original_size,
-                    sender, ephemeral, pinned, is_template, agent_context
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38)",
+                    sender, ephemeral, pinned, is_template, agent_context, metadata
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39)",
                 &[
                     SqliteValue::from(issue.id.as_str()),
                     SqliteValue::from(content_hash.as_str()),
@@ -2321,6 +2353,7 @@ impl SqliteStorage {
                     SqliteValue::from(i64::from(i32::from(issue.pinned))),
                     SqliteValue::from(i64::from(i32::from(issue.is_template))),
                     issue.agent_context.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+                    issue.metadata.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
                 ],
             )?;
 
@@ -3176,7 +3209,7 @@ impl SqliteStorage {
                    due_at, defer_until, external_ref, source_system, source_repo,
                    deleted_at, deleted_by, delete_reason, original_type,
                    compaction_level, compacted_at, compacted_at_commit, original_size,
-                   sender, ephemeral, pinned, is_template, source_repo_path, agent_context
+                   sender, ephemeral, pinned, is_template, source_repo_path, agent_context, metadata
             FROM issues
             WHERE id = ?
         ";
@@ -3216,7 +3249,7 @@ impl SqliteStorage {
                          due_at, defer_until, external_ref, source_system, source_repo,
                          deleted_at, deleted_by, delete_reason, original_type,
                          compaction_level, compacted_at, compacted_at_commit, original_size,
-                         sender, ephemeral, pinned, is_template, source_repo_path, agent_context
+                         sender, ephemeral, pinned, is_template, source_repo_path, agent_context, metadata
                   FROM issues WHERE id IN ({})",
                 placeholders.join(",")
             );
@@ -3352,7 +3385,7 @@ impl SqliteStorage {
                      due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type,
                      compaction_level, compacted_at, compacted_at_commit, original_size,
-                     sender, ephemeral, pinned, is_template, source_repo_path, agent_context",
+                     sender, ephemeral, pinned, is_template, source_repo_path, agent_context, metadata",
         );
 
         let mut params: Vec<SqliteValue> = Vec::new();
@@ -3445,6 +3478,12 @@ impl SqliteStorage {
             && !ids.is_empty()
         {
             append_issue_id_membership_filter(&mut sql, &mut params, ids);
+        }
+
+        if let Some(ref mf) = filters.metadata_filters
+            && !mf.is_empty()
+        {
+            append_metadata_filter(&mut sql, &mut params, mf);
         }
 
         if let Some(ts) = filters.updated_before {
@@ -3547,7 +3586,7 @@ impl SqliteStorage {
                          due_at, defer_until, external_ref, source_system, source_repo,
                          deleted_at, deleted_by, delete_reason, original_type,
                          compaction_level, compacted_at, compacted_at_commit, original_size,
-                         sender, ephemeral, pinned, is_template, source_repo_path, agent_context
+                         sender, ephemeral, pinned, is_template, source_repo_path, agent_context, metadata
                   FROM issues
                   WHERE {status_filter}
                     AND (is_template = 0 OR is_template IS NULL)
@@ -4164,6 +4203,12 @@ impl SqliteStorage {
             append_issue_id_membership_filter(&mut sql, &mut params, ids);
         }
 
+        if let Some(ref mf) = filters.metadata_filters
+            && !mf.is_empty()
+        {
+            append_metadata_filter(&mut sql, &mut params, mf);
+        }
+
         if let Some(ts) = filters.updated_before {
             sql.push_str(" AND updated_at <= ?");
             params.push(SqliteValue::from(ts.to_rfc3339()));
@@ -4529,6 +4574,12 @@ impl SqliteStorage {
             append_issue_id_membership_filter(&mut sql, &mut params, ids);
         }
 
+        if let Some(ref mf) = filters.metadata_filters
+            && !mf.is_empty()
+        {
+            append_metadata_filter(&mut sql, &mut params, mf);
+        }
+
         if let Some(ts) = filters.updated_before {
             sql.push_str(" AND updated_at <= ?");
             params.push(SqliteValue::from(ts.to_rfc3339()));
@@ -4696,6 +4747,12 @@ impl SqliteStorage {
             && !ids.is_empty()
         {
             append_issue_id_membership_filter(&mut sql, &mut params, ids);
+        }
+
+        if let Some(ref mf) = filters.metadata_filters
+            && !mf.is_empty()
+        {
+            append_metadata_filter(&mut sql, &mut params, mf);
         }
 
         if let Some(ts) = filters.updated_before {
@@ -9128,7 +9185,7 @@ impl SqliteStorage {
                            due_at, defer_until, external_ref, source_system, source_repo,
                            deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                            compacted_at, compacted_at_commit, original_size, sender, ephemeral,
-                           pinned, is_template, source_repo_path, agent_context
+                           pinned, is_template, source_repo_path, agent_context, metadata
                     FROM issues
                     WHERE (ephemeral = 0 OR ephemeral IS NULL)
                       AND id NOT LIKE '%-wisp-%'
@@ -9823,6 +9880,7 @@ impl SqliteStorage {
             // accessor still finds the right column.
             source_repo_path: get_non_empty_str(36),
             agent_context: get_non_empty_str(37),
+            metadata: get_non_empty_str(38),
             labels: vec![],
             dependencies: vec![],
             comments: vec![],
@@ -9877,6 +9935,7 @@ impl SqliteStorage {
             source_repo: None,
             source_repo_path: None,
             agent_context: None,
+            metadata: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -9943,6 +10002,7 @@ impl SqliteStorage {
             source_repo: None,
             source_repo_path: None,
             agent_context: None,
+            metadata: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -10009,6 +10069,7 @@ impl SqliteStorage {
             source_repo: None,
             source_repo_path: None,
             agent_context: None,
+            metadata: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -10069,6 +10130,7 @@ impl SqliteStorage {
             source_repo: None,
             source_repo_path: None,
             agent_context: None,
+            metadata: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -10135,6 +10197,7 @@ impl SqliteStorage {
             source_repo: None,
             source_repo_path: None,
             agent_context: None,
+            metadata: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -10195,6 +10258,7 @@ impl SqliteStorage {
             source_repo: None,
             source_repo_path: None,
             agent_context: None,
+            metadata: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -11773,7 +11837,7 @@ impl SqliteStorage {
                      due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                      compacted_at, compacted_at_commit, original_size, sender, ephemeral,
-                     pinned, is_template, source_repo_path, agent_context
+                     pinned, is_template, source_repo_path, agent_context, metadata
                FROM issues WHERE external_ref = ?",
             &[SqliteValue::from(external_ref)],
         ) {
@@ -11796,7 +11860,7 @@ impl SqliteStorage {
                      due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                      compacted_at, compacted_at_commit, original_size, sender, ephemeral,
-                     pinned, is_template, source_repo_path, agent_context
+                     pinned, is_template, source_repo_path, agent_context, metadata
                FROM issues WHERE content_hash = ?",
             &[SqliteValue::from(content_hash)],
         ) {
@@ -13238,6 +13302,7 @@ mod tests {
             source_repo: None,
             source_repo_path: None,
             agent_context: None,
+            metadata: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -13554,6 +13619,7 @@ mod tests {
             source_repo: None,
             source_repo_path: None,
             agent_context: None,
+            metadata: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -16297,6 +16363,7 @@ mod tests {
             source_repo: None,
             source_repo_path: None,
             agent_context: None,
+            metadata: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -16379,6 +16446,7 @@ mod tests {
             source_repo: None,
             source_repo_path: None,
             agent_context: None,
+            metadata: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -16455,6 +16523,7 @@ mod tests {
             source_repo: None,
             source_repo_path: None,
             agent_context: None,
+            metadata: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -16588,6 +16657,7 @@ mod tests {
             source_repo: None,
             source_repo_path: None,
             agent_context: None,
+            metadata: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -17095,6 +17165,7 @@ mod tests {
             source_repo: None,
             source_repo_path: None,
             agent_context: None,
+            metadata: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -24272,5 +24343,71 @@ mod tests {
         };
         let results2 = storage.list_issues(&filters2).unwrap();
         assert_eq!(results2.len(), 0, "non-matching wildcard should return nothing");
+    }
+
+    #[test]
+    fn metadata_filter_key_value() {
+        use crate::storage::ListFilters;
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        let mut issue = make_issue("br-md1", "Metadata test", Status::Open, 2, None, now, None);
+        issue.metadata = Some(serde_json::json!({"env": "prod", "region": "us-east-1"}).to_string());
+        storage.create_issue(&issue, "tester").unwrap();
+        let mut issue2 = make_issue("br-md2", "Metadata test 2", Status::Open, 2, None, now, None);
+        issue2.metadata = Some(serde_json::json!({"env": "staging", "region": "eu-west-1"}).to_string());
+        storage.create_issue(&issue2, "tester").unwrap();
+
+        // Filter by env=prod
+        let filters = ListFilters {
+            metadata_filters: Some(vec!["env=prod".to_string()]),
+            ..Default::default()
+        };
+        let results = storage.list_issues(&filters).unwrap();
+        assert_eq!(results.len(), 1, "should match env=prod");
+        assert_eq!(results[0].id, "br-md1");
+    }
+
+    #[test]
+    fn metadata_filter_presence() {
+        use crate::storage::ListFilters;
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        let mut issue = make_issue("br-mp1", "Has team", Status::Open, 2, None, now, None);
+        issue.metadata = Some(serde_json::json!({"team": "backend", "env": "prod"}).to_string());
+        storage.create_issue(&issue, "tester").unwrap();
+        let mut issue2 = make_issue("br-mp2", "No team", Status::Open, 2, None, now, None);
+        issue2.metadata = Some(serde_json::json!({"env": "prod"}).to_string());
+        storage.create_issue(&issue2, "tester").unwrap();
+
+        // Filter by presence of team key
+        let filters = ListFilters {
+            metadata_filters: Some(vec!["team".to_string()]),
+            ..Default::default()
+        };
+        let results = storage.list_issues(&filters).unwrap();
+        assert_eq!(results.len(), 1, "should match issues with team key");
+        assert_eq!(results[0].id, "br-mp1");
+    }
+
+    #[test]
+    fn metadata_filter_multi() {
+        use crate::storage::ListFilters;
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        let mut issue = make_issue("br-mm1", "Match both", Status::Open, 2, None, now, None);
+        issue.metadata = Some(serde_json::json!({"env": "prod", "tier": "gold"}).to_string());
+        storage.create_issue(&issue, "tester").unwrap();
+        let mut issue2 = make_issue("br-mm2", "Match one", Status::Open, 2, None, now, None);
+        issue2.metadata = Some(serde_json::json!({"env": "prod"}).to_string());
+        storage.create_issue(&issue2, "tester").unwrap();
+
+        // Multiple filters = AND
+        let filters = ListFilters {
+            metadata_filters: Some(vec!["env=prod".to_string(), "tier=gold".to_string()]),
+            ..Default::default()
+        };
+        let results = storage.list_issues(&filters).unwrap();
+        assert_eq!(results.len(), 1, "should match both env=prod AND tier=gold");
+        assert_eq!(results[0].id, "br-mm1");
     }
 }
