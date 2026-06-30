@@ -333,7 +333,9 @@ fn main() {
         Commands::Reopen(args) => {
             commands::reopen::execute(&args, cli.json || args.robot, &overrides, &output_ctx)
         }
+        Commands::Rename(args) => commands::rename::execute(&args, &overrides, &output_ctx),
         Commands::Q(args) => commands::q::execute(args, &overrides, &output_ctx),
+        Commands::Quickstart(_) => commands::quickstart::execute(&output_ctx),
         Commands::Dep { command } => {
             if let (Some(res), Some(beads_dir)) = (storage_result.as_ref(), ctx.beads_dir.as_ref())
             {
@@ -483,6 +485,7 @@ fn main() {
             write_lock.is_some(),
         ),
         Commands::Doctor(args) => commands::doctor::execute(&args, &overrides, &output_ctx),
+        Commands::Admin { command } => commands::admin::execute(&command, &overrides, &output_ctx),
         Commands::Info(args) => commands::info::execute(&args, &overrides, &output_ctx),
         Commands::Schema(args) => commands::schema::execute(&args, &overrides, &output_ctx),
         Commands::Where => commands::r#where::execute(&overrides, &output_ctx),
@@ -494,6 +497,9 @@ fn main() {
         #[cfg(feature = "self_update")]
         Commands::Upgrade(args) => commands::upgrade::execute(&args, &output_ctx),
         Commands::Completions(args) => commands::completions::execute(&args, &output_ctx),
+        Commands::Formula { command } => {
+            commands::formula::execute(command, &overrides, &output_ctx)
+        }
         Commands::Audit { command } => {
             commands::audit::execute(&command, cli.json, &overrides, &output_ctx)
         }
@@ -593,6 +599,26 @@ fn main() {
                 force: args.force,
             };
             commands::agents::execute(&agents_args, &output_ctx)
+        }
+        Commands::Template { command } => {
+            if let (Some(res), Some(beads_dir)) = (storage_result.as_ref(), ctx.beads_dir.as_ref())
+            {
+                match commands::template::execute_with_storage_ctx(
+                    &command,
+                    cli.json,
+                    &overrides,
+                    &output_ctx,
+                    res,
+                ) {
+                    Ok(true) => Ok(()),
+                    Ok(false) => {
+                        commands::template::execute(&command, cli.json, &overrides, &output_ctx)
+                    }
+                    Err(err) => Err(err),
+                }
+            } else {
+                commands::template::execute(&command, cli.json, &overrides, &output_ctx)
+            }
         }
     };
 
@@ -805,6 +831,7 @@ const fn is_mutating_command(cmd: &Commands) -> bool {
     match cmd {
         Commands::Create(_)
         | Commands::Update(_)
+        | Commands::Rename(_)
         | Commands::Delete(_)
         | Commands::Close(_)
         | Commands::Reopen(_)
@@ -820,6 +847,11 @@ const fn is_mutating_command(cmd: &Commands) -> bool {
             beads_rust::cli::LabelCommands::Add(_)
                 | beads_rust::cli::LabelCommands::Remove(_)
                 | beads_rust::cli::LabelCommands::Rename(_)
+        ),
+        Commands::Template { command } => matches!(
+            command,
+            beads_rust::cli::TemplateCommands::Create(_)
+                | beads_rust::cli::TemplateCommands::Delete(_)
         ),
         Commands::Comments(args) => matches!(
             args.command.as_ref(),
@@ -877,14 +909,16 @@ const fn needs_write_lock(cmd: &Commands) -> bool {
         | Commands::Dep { .. }
         | Commands::Label { .. }
         | Commands::Epic { .. }
-        | Commands::Query { .. }
-        | Commands::Orphans(_)
-        | Commands::Audit { .. }
-        | Commands::Info(_)
-        | Commands::Where
-        | Commands::Sync(_)
-        | Commands::Init { .. }
-        | Commands::Doctor(_) => true,
+ | Commands::Query { .. }
+ | Commands::Orphans(_)
+ | Commands::Audit { .. }
+ | Commands::Info(_)
+ | Commands::Where
+ | Commands::Sync(_)
+ | Commands::Init { .. }
+ | Commands::Doctor(_)
+ | Commands::Template { .. }
+ | Commands::Admin { .. } => true,
         Commands::Config { command } => !matches!(
             command,
             beads_rust::cli::ConfigCommands::Path | beads_rust::cli::ConfigCommands::Edit
@@ -924,12 +958,14 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Q(_)
         | Commands::Defer(_)
         | Commands::Undefer(_)
+        | Commands::Rename(_)
         | Commands::Comments(_)
         | Commands::Dep { .. }
         | Commands::Label { .. }
         | Commands::Epic { .. }
         | Commands::Gate { .. }
-        | Commands::Query { .. } => true,
+        | Commands::Query { .. }
+        | Commands::Template { .. } => true,
 
         Commands::Init { .. }
         | Commands::Sync(_)
@@ -945,7 +981,10 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Orphans(_)
         | Commands::Config { .. }
         | Commands::History(_)
-        | Commands::Agents(_) => false,
+        | Commands::Agents(_)
+        | Commands::Quickstart(_)
+        | Commands::Admin { .. }
+        | Commands::Formula { .. } => false,
 
         #[cfg(feature = "mcp")]
         Commands::Serve(_) => false,
@@ -980,6 +1019,11 @@ const fn supports_read_only_fast_open(cmd: &Commands) -> bool {
         | Commands::Epic {
             command: beads_rust::cli::EpicCommands::Status(_),
         } => true,
+        Commands::Template {
+            command:
+                beads_rust::cli::TemplateCommands::List(_)
+                | beads_rust::cli::TemplateCommands::Show(_),
+        } => true,
         Commands::Dep { command } => is_read_only_dep_command(command),
         Commands::Label { command } => is_read_only_label_listing(command),
         Commands::Query { command } => is_read_only_query_command(command),
@@ -1007,6 +1051,11 @@ const fn supports_auto_import_read_only_probe(cmd: &Commands) -> bool {
         })
         | Commands::Epic {
             command: beads_rust::cli::EpicCommands::Status(_),
+        } => true,
+        Commands::Template {
+            command:
+                beads_rust::cli::TemplateCommands::List(_)
+                | beads_rust::cli::TemplateCommands::Show(_),
         } => true,
         Commands::Lint(args) => args.ids.is_empty(),
         Commands::Label { command } => is_read_only_label_listing(command),

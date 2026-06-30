@@ -19,6 +19,8 @@ use crate::model::{IssueType, Status};
 
 pub mod commands;
 
+pub use commands::formula::FormulaCommands;
+
 /// Default cap for work-surface listings (`br list`).
 ///
 /// #349: work-surface listings are COMPLETE by default — `0` means "no cap".
@@ -767,6 +769,12 @@ pub enum Commands {
     /// Close an issue
     Close(CloseArgs),
 
+    /// Formula Language: workflow-as-code engine
+    Formula {
+        #[command(subcommand)]
+            command: FormulaCommands,
+    },
+
     /// Manage comments
     #[command(alias = "comment")]
     Comments(CommentsArgs),
@@ -808,6 +816,12 @@ pub enum Commands {
 
     /// Run diagnostics and optionally repair issues
     Doctor(DoctorArgs),
+
+    /// Administrative commands for database maintenance
+    Admin {
+        #[command(subcommand)]
+        command: AdminCommands,
+    },
 
     /// Epic management commands
     Epic {
@@ -863,6 +877,10 @@ pub enum Commands {
     /// Quick capture (create issue, print ID only)
     Q(QuickArgs),
 
+    /// Quick start guide with examples (for new users)
+    #[command(name = "quickstart", alias = "onboard")]
+    Quickstart(QuickstartArgs),
+
     /// Manage saved queries
     Query {
         #[command(subcommand)]
@@ -871,6 +889,9 @@ pub enum Commands {
 
     /// List ready issues (open, unblocked, not deferred)
     Ready(ReadyArgs),
+
+    /// Rename an issue (alias for `br update <id> --title <new-title>`)
+    Rename(RenameArgs),
 
     /// Reopen an issue
     Reopen(ReopenArgs),
@@ -964,6 +985,12 @@ EXAMPLES:
 
     /// Undefer issues (make ready again)
     Undefer(UndeferArgs),
+
+    /// Issue tracking template commands
+    Template {
+        #[command(subcommand)]
+        command: TemplateCommands,
+    },
 
     /// Update an issue
     Update(UpdateArgs),
@@ -1145,6 +1172,92 @@ pub struct QuickArgs {
     /// Time estimate in minutes
     #[arg(long, short = 'e')]
     pub estimate: Option<i32>,
+}
+
+/// Quick start guide with examples (for new users)
+#[derive(Args, Debug)]
+pub struct QuickstartArgs {
+    /// No arguments needed — just prints the quick start guide.
+    #[arg(skip)]
+    pub _marker: bool,
+}
+
+/// Subcommands for the template command.
+#[derive(Subcommand, Debug)]
+pub enum TemplateCommands {
+    /// Create a new issue template
+    Create(TemplateCreateArgs),
+    /// List all issue templates
+    List(TemplateListArgs),
+    /// Show a template's details
+    Show(TemplateShowArgs),
+    /// Delete (tombstone) a template
+    Delete(TemplateDeleteArgs),
+}
+
+/// Arguments for template create.
+#[derive(Args, Debug, Clone)]
+pub struct TemplateCreateArgs {
+    /// Template title
+    pub title: String,
+
+    /// Template description
+    #[arg(long)]
+    pub description: Option<String>,
+
+    /// Issue type (task, bug, feature, etc.)
+    #[arg(long, default_value = "task")]
+    pub type_: Option<String>,
+
+    /// Priority (0-4)
+    #[arg(long, short = 'p')]
+    pub priority: Option<String>,
+
+    /// Labels
+    #[arg(long)]
+    pub labels: Vec<String>,
+
+    /// Assignee
+    #[arg(long)]
+    pub assignee: Option<String>,
+
+    /// Owner
+    #[arg(long)]
+    pub owner: Option<String>,
+}
+
+/// Arguments for template list.
+#[derive(Args, Debug, Clone)]
+pub struct TemplateListArgs {
+    /// JSON output
+    #[arg(long, short = 'j')]
+    pub json: bool,
+
+    /// Limit results
+    #[arg(long)]
+    pub limit: Option<usize>,
+
+    /// Offset results
+    #[arg(long)]
+    pub offset: Option<usize>,
+}
+
+/// Arguments for template show.
+#[derive(Args, Debug, Clone)]
+pub struct TemplateShowArgs {
+    /// Template ID
+    pub id: String,
+}
+
+/// Arguments for template delete.
+#[derive(Args, Debug, Clone)]
+pub struct TemplateDeleteArgs {
+    /// Template ID
+    pub id: String,
+
+    /// Delete reason
+    #[arg(long)]
+    pub reason: Option<String>,
 }
 
 #[derive(Args, Debug, Clone, Default)]
@@ -1460,6 +1573,31 @@ pub struct RobotDocsGuideArgs {
     pub stats: bool,
 }
 
+/// Format for export/import commands (JSONL, JSON, CSV).
+#[derive(ValueEnum, Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum ExportFormat {
+    /// JSONL format (one JSON object per line) — default
+    #[default]
+    Jsonl,
+    /// JSON array format
+    Json,
+    /// CSV format
+    Csv,
+}
+
+impl std::str::FromStr for ExportFormat {
+    type Err = ();
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "jsonl" => Ok(Self::Jsonl),
+            "json" => Ok(Self::Json),
+            "csv" => Ok(Self::Csv),
+            _ => Err(()),
+        }
+    }
+}
+
 /// Output format for list command.
 #[derive(ValueEnum, Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub enum OutputFormat {
@@ -1657,6 +1795,18 @@ pub struct ListArgs {
     #[arg(long)]
     pub unassigned: bool,
 
+    /// Filter by owner
+    #[arg(long, add = ArgValueCompleter::new(owner_completer))]
+    pub owner: Option<String>,
+
+    /// Filter for pinned issues only
+    #[arg(long)]
+    pub pinned: bool,
+
+    /// Filter by molecule type (swarm, patrol, work)
+    #[arg(long = "mol-type", value_name = "TYPE")]
+    pub mol_type: Option<String>,
+
     /// Filter by specific IDs (can be repeated)
     #[arg(long, add = ArgValueCompleter::new(issue_id_completer))]
     pub id: Vec<String>,
@@ -1740,6 +1890,26 @@ pub struct ListArgs {
     /// Show token savings stats when using TOON output
     #[arg(long)]
     pub stats: bool,
+
+    /// Filter by metadata key=value (can be repeated, AND logic)
+    #[arg(long, value_name = "KEY=VALUE")]
+    pub metadata: Vec<String>,
+
+    /// Filter by `created_at` <= timestamp (or duration shorthand like "7d", "24h", "2w", "1mo", "1y")
+    #[arg(long)]
+    pub created_before: Option<String>,
+
+    /// Filter by `created_at` >= timestamp (or duration shorthand like "7d", "24h", "2w", "1mo", "1y")
+    #[arg(long)]
+    pub created_after: Option<String>,
+
+    /// Filter by `updated_at` <= timestamp (or duration shorthand like "7d", "24h", "2w", "1mo", "1y")
+    #[arg(long)]
+    pub updated_before: Option<String>,
+
+    /// Filter by `updated_at` >= timestamp (or duration shorthand like "7d", "24h", "2w", "1mo", "1y")
+    #[arg(long)]
+    pub updated_after: Option<String>,
 
     /// CSV fields to include (comma-separated)
     ///
@@ -2557,6 +2727,17 @@ pub struct ReopenArgs {
     pub model: Option<String>,
 }
 
+/// Arguments for the rename command.
+#[derive(Args, Debug, Clone, Default)]
+pub struct RenameArgs {
+    /// Issue ID to rename
+    #[arg(add = ArgValueCompleter::new(issue_id_completer))]
+    pub id: String,
+
+    /// New title for the issue
+    pub title: String,
+}
+
 /// Sort policy for ready command.
 #[derive(ValueEnum, Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub enum SortPolicy {
@@ -3029,6 +3210,33 @@ pub struct DoctorExplainArgs {
     #[arg(long)]
     pub json: bool,
 }
+
+/// Subcommands for `br admin`.
+#[derive(Subcommand, Debug, Clone)]
+pub enum AdminCommands {
+    /// Run health checks (alias for `br doctor`)
+    Doctor(AdminDoctorArgs),
+    /// VACUUM the SQLite database to reclaim space
+    Vacuum(AdminVacuumArgs),
+    /// Print database statistics (issue count by status, etc.)
+    Stats(AdminStatsArgs),
+}
+
+/// Arguments for `br admin doctor`.
+#[derive(Args, Debug, Clone, Default)]
+pub struct AdminDoctorArgs {}
+
+/// Arguments for `br admin vacuum`.
+#[derive(Args, Debug, Clone, Default)]
+pub struct AdminVacuumArgs {
+    /// The path to the database file (default: auto-discovered)
+    #[arg(long)]
+    pub db: Option<String>,
+}
+
+/// Arguments for `br admin stats`.
+#[derive(Args, Debug, Clone, Default)]
+pub struct AdminStatsArgs {}
 
 /// Arguments for the upgrade command.
 #[cfg(feature = "self_update")]

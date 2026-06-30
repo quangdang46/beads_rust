@@ -99,6 +99,7 @@ regex = "1.12"
 shell-words = "1.1.1"
 similar = "3.1.1"
 tempfile = "3.25"
+toml = "0.8"
 unicode-width = "0.2.2"
 
 # Versioning

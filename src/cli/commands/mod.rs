@@ -11,6 +11,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 
 pub mod agents;
+pub mod admin;
 pub mod audit;
 pub mod blocked;
 pub mod capabilities;
@@ -39,7 +40,9 @@ pub mod list;
 pub mod orphans;
 pub mod q;
 pub mod query;
+pub mod quickstart;
 pub mod ready;
+pub mod rename;
 pub mod reopen;
 pub mod robot_docs;
 pub mod scheduler;
@@ -47,11 +50,13 @@ pub mod schema;
 pub mod search;
 pub mod show;
 pub mod stale;
+pub mod template;
 pub mod stats;
 pub mod sync;
 pub mod update;
 pub mod version;
 pub mod r#where;
+pub mod formula;
 
 #[cfg(feature = "self_update")]
 pub mod upgrade;
