@@ -17,6 +17,8 @@ pub mod schema;
 pub mod sqlite;
 
 pub(crate) use sqlite::ChangelogIssueRow;
+pub mod hooks;
+
 pub use sqlite::{
     CloseMetadataRow, EventAttribution, IssueUpdate, ListFilters, ReadyFilters, ReadySortPolicy,
     SqliteStorage, StatsIssueRow,
