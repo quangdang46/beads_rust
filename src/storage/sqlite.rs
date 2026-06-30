@@ -2898,6 +2898,15 @@ impl SqliteStorage {
                     SqliteValue::from(val.as_deref().unwrap_or("")),
                 );
             }
+            // Raw metadata field
+            if let Some(ref val) = updates.metadata {
+                issue.metadata.clone_from(val);
+                add_update(
+                    "metadata",
+                    val.as_ref()
+                        .map_or(SqliteValue::Null, |s| SqliteValue::from(s.as_str())),
+                );
+            }
 
             // Date fields
             if let Some(ref val) = updates.due_at {
@@ -10815,6 +10824,9 @@ pub struct IssueUpdate {
     pub claim_actor: Option<String>,
     /// Template flag to make/unmake an issue as a template.
     pub is_template: Option<bool>,
+    /// Raw JSON metadata string to store verbatim.
+    /// Use `Some(Some(json_str))` to write; `Some(None)` to clear; `None` to leave unchanged.
+    pub metadata: Option<Option<String>>,
 }
 
 impl IssueUpdate {
@@ -10844,6 +10856,7 @@ impl IssueUpdate {
             && self.deleted_by.is_none()
             && self.delete_reason.is_none()
             && !self.expect_unassigned
+            && self.metadata.is_none()
     }
 }
 
