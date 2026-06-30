@@ -9,6 +9,8 @@
 //! - Progress indicators (for long-running operations)
 
 mod hash;
+pub mod circuit_breaker;
+pub mod credentials;
 pub mod id;
 pub mod markdown_import;
 pub mod progress;
