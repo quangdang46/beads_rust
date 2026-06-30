@@ -226,15 +226,28 @@ fn append_issue_id_membership_filter(
     params: &mut Vec<SqliteValue>,
     issue_ids: &[String],
 ) {
+    let has_wild = issue_ids.iter().any(|id| id.contains('*'));
+
     sql.push_str(" AND (");
-    for (index, chunk) in issue_ids.chunks(SQLITE_VAR_LIMIT).enumerate() {
-        if index > 0 {
-            sql.push_str(" OR ");
+    if has_wild {
+        for (index, id) in issue_ids.iter().enumerate() {
+            if index > 0 {
+                sql.push_str(" OR ");
+            }
+            let like_pattern = escape_like_pattern(id).replace('*', "%");
+            sql.push_str("id LIKE ? ESCAPE '\\'");
+            params.push(SqliteValue::from(like_pattern.as_str()));
         }
-        let placeholders: Vec<String> = chunk.iter().map(|_| "?".to_string()).collect();
-        let _ = write!(sql, "id IN ({})", placeholders.join(","));
-        for issue_id in chunk {
-            params.push(SqliteValue::from(issue_id.as_str()));
+    } else {
+        for (index, chunk) in issue_ids.chunks(SQLITE_VAR_LIMIT).enumerate() {
+            if index > 0 {
+                sql.push_str(" OR ");
+            }
+            let placeholders: Vec<String> = chunk.iter().map(|_| "?".to_string()).collect();
+            let _ = write!(sql, "id IN ({})", placeholders.join(","));
+            for issue_id in chunk {
+                params.push(SqliteValue::from(issue_id.as_str()));
+            }
         }
     }
     sql.push(')');
@@ -3428,6 +3441,12 @@ impl SqliteStorage {
             params.push(SqliteValue::from(format!("%{escaped}%")));
         }
 
+        if let Some(ref ids) = filters.ids
+            && !ids.is_empty()
+        {
+            append_issue_id_membership_filter(&mut sql, &mut params, ids);
+        }
+
         if let Some(ts) = filters.updated_before {
             sql.push_str(" AND updated_at <= ?");
             params.push(SqliteValue::from(ts.to_rfc3339()));
@@ -4139,6 +4158,12 @@ impl SqliteStorage {
             params.push(SqliteValue::from(format!("%{escaped}%")));
         }
 
+        if let Some(ref ids) = filters.ids
+            && !ids.is_empty()
+        {
+            append_issue_id_membership_filter(&mut sql, &mut params, ids);
+        }
+
         if let Some(ts) = filters.updated_before {
             sql.push_str(" AND updated_at <= ?");
             params.push(SqliteValue::from(ts.to_rfc3339()));
@@ -4498,6 +4523,12 @@ impl SqliteStorage {
             params.push(SqliteValue::from(format!("%{escaped}%")));
         }
 
+        if let Some(ref ids) = filters.ids
+            && !ids.is_empty()
+        {
+            append_issue_id_membership_filter(&mut sql, &mut params, ids);
+        }
+
         if let Some(ts) = filters.updated_before {
             sql.push_str(" AND updated_at <= ?");
             params.push(SqliteValue::from(ts.to_rfc3339()));
@@ -4659,6 +4690,12 @@ impl SqliteStorage {
             sql.push_str(" AND title LIKE ? ESCAPE '\\'");
             let escaped = escape_like_pattern(title_contains);
             params.push(SqliteValue::from(format!("%{escaped}%")));
+        }
+
+        if let Some(ref ids) = filters.ids
+            && !ids.is_empty()
+        {
+            append_issue_id_membership_filter(&mut sql, &mut params, ids);
         }
 
         if let Some(ts) = filters.updated_before {
@@ -24178,5 +24215,62 @@ mod tests {
         storage.delete_federation_peer("del-peer").unwrap();
         let got = storage.get_federation_peer("del-peer").unwrap();
         assert!(got.is_none());
+    }
+
+    // ---- Wildcard ID matching tests (Issue #19) ------------------------
+
+    #[test]
+    fn wildcard_id_matches_prefix() {
+        use crate::storage::ListFilters;
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        let issue = make_issue("br-abc123", "Prefix test", Status::Open, 2, None, now, None);
+        storage.create_issue(&issue, "tester").unwrap();
+        let filters = ListFilters {
+            ids: Some(vec!["br-*".to_string()]),
+            ..Default::default()
+        };
+        let results = storage.list_issues(&filters).unwrap();
+        assert_eq!(results.len(), 1, "should match id=br-*");
+        assert_eq!(results[0].id, "br-abc123");
+    }
+
+    #[test]
+    fn wildcard_id_matches_suffix() {
+        use crate::storage::ListFilters;
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        let issue = make_issue("br-abc123", "Suffix test", Status::Open, 2, None, now, None);
+        storage.create_issue(&issue, "tester").unwrap();
+        let filters = ListFilters {
+            ids: Some(vec!["*-abc123".to_string()]),
+            ..Default::default()
+        };
+        let results = storage.list_issues(&filters).unwrap();
+        assert_eq!(results.len(), 1, "should match id=*-abc123");
+        assert_eq!(results[0].id, "br-abc123");
+    }
+
+    #[test]
+    fn wildcard_id_does_not_match_exact_missing() {
+        use crate::storage::ListFilters;
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        let issue = make_issue("br-abc123", "No match", Status::Open, 2, None, now, None);
+        storage.create_issue(&issue, "tester").unwrap();
+        // No wildcard — exact match should still work.
+        let filters = ListFilters {
+            ids: Some(vec!["br-abc123".to_string()]),
+            ..Default::default()
+        };
+        let results = storage.list_issues(&filters).unwrap();
+        assert_eq!(results.len(), 1, "exact match should work");
+        // Unknown prefix with wildcard — should return nothing.
+        let filters2 = ListFilters {
+            ids: Some(vec!["nope-*".to_string()]),
+            ..Default::default()
+        };
+        let results2 = storage.list_issues(&filters2).unwrap();
+        assert_eq!(results2.len(), 0, "non-matching wildcard should return nothing");
     }
 }

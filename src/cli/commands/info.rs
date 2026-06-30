@@ -942,6 +942,7 @@ mod tests {
             "child_counters".to_string(),
             "close_metadata".to_string(),
             "comments".to_string(),
+            "compaction_snapshots".to_string(),
             "config".to_string(),
             "custom_statuses".to_string(),
             "custom_types".to_string(),
@@ -949,10 +950,16 @@ mod tests {
             "dirty_issues".to_string(),
             "events".to_string(),
             "export_hashes".to_string(),
+            "federation_peers".to_string(),
             "gate_results".to_string(),
+            "interactions".to_string(),
+            "issue_counter".to_string(),
+            "issue_snapshots".to_string(),
             "issues".to_string(),
             "labels".to_string(),
             "metadata".to_string(),
+            "repo_mtimes".to_string(),
+            "routes".to_string(),
         ];
         assert_eq!(
             output
