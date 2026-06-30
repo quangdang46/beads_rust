@@ -8,7 +8,7 @@ use crate::error::{BeadsError, Result};
 use crate::model::{IssueType, Priority, Status};
 use crate::util::content_hash_from_parts;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 15;
+pub const CURRENT_SCHEMA_VERSION: i32 = 16;
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 
 /// The complete SQL schema for the beads database.
@@ -306,6 +306,30 @@ pub const SCHEMA_SQL: &str = r"
         last_checked DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
     CREATE INDEX IF NOT EXISTS idx_repo_mtimes_checked ON repo_mtimes(last_checked);
+
+    -- Issue snapshots for compaction recovery (Issue #38)
+    CREATE TABLE IF NOT EXISTS issue_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        issue_id TEXT NOT NULL,
+        snapshot_time TEXT NOT NULL,
+        compaction_level INTEGER NOT NULL DEFAULT 0,
+        original_size INTEGER NOT NULL DEFAULT 0,
+        compressed_size INTEGER NOT NULL DEFAULT 0,
+        original_content TEXT NOT NULL DEFAULT '',
+        archived_events TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_issue_snapshots_issue ON issue_snapshots(issue_id);
+    CREATE INDEX IF NOT EXISTS idx_issue_snapshots_level ON issue_snapshots(compaction_level);
+
+    -- Compaction snapshots for BLOB-based compaction recovery (Issue #38)
+    CREATE TABLE IF NOT EXISTS compaction_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        issue_id TEXT NOT NULL,
+        compaction_level INTEGER NOT NULL DEFAULT 0,
+        snapshot_json BLOB NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_comp_snapshot_issue ON compaction_snapshots(issue_id, compaction_level, created_at);
 ";
 
 /// Split a SQL script into individual statements, respecting string literals,
@@ -1756,6 +1780,40 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
                 last_checked DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE INDEX IF NOT EXISTS idx_repo_mtimes_checked ON repo_mtimes(last_checked);
+        ",
+        )?;
+    }
+
+    // Migration v15 -> v16 (Issue #38): add issue_snapshots and compaction_snapshots tables.
+    // Pure additive — new tables, no existing-row rewrite.
+    if user_version < 16 {
+        tracing::info!(
+            "Migrating database to schema version 16 (snapshot tables - Issue #38)"
+        );
+        execute_batch(
+            conn,
+            r"
+            CREATE TABLE IF NOT EXISTS issue_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                issue_id TEXT NOT NULL,
+                snapshot_time TEXT NOT NULL,
+                compaction_level INTEGER NOT NULL DEFAULT 0,
+                original_size INTEGER NOT NULL DEFAULT 0,
+                compressed_size INTEGER NOT NULL DEFAULT 0,
+                original_content TEXT NOT NULL DEFAULT '',
+                archived_events TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_issue_snapshots_issue ON issue_snapshots(issue_id);
+            CREATE INDEX IF NOT EXISTS idx_issue_snapshots_level ON issue_snapshots(compaction_level);
+
+            CREATE TABLE IF NOT EXISTS compaction_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                issue_id TEXT NOT NULL,
+                compaction_level INTEGER NOT NULL DEFAULT 0,
+                snapshot_json BLOB NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_comp_snapshot_issue ON compaction_snapshots(issue_id, compaction_level, created_at);
         ",
         )?;
     }

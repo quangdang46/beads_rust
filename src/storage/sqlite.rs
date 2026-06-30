@@ -3,8 +3,8 @@
 use crate::error::{BeadsError, Result};
 use crate::format::{IssueDetails, IssueWithDependencyMetadata};
 use crate::model::{
-    Comment, Dependency, DependencyType, Event, EventType, Issue, IssueType, MolType, Priority,
-    RepoMtime, Status,
+    Comment, CompactionSnapshot, Dependency, DependencyType, Event, EventType, Issue,
+    IssueSnapshot, IssueType, MolType, Priority, RepoMtime, Status,
 };
 use crate::storage::events::get_events;
 use crate::storage::schema::CURRENT_SCHEMA_VERSION;
@@ -11848,6 +11848,207 @@ impl SqliteStorage {
         Ok(count > 0)
     }
 
+    // ---- Issue Snapshot CRUD (Issue #38) -----------------------------------
+
+    /// Create a new issue snapshot.
+    pub fn create_issue_snapshot(&self, snapshot: &IssueSnapshot) -> Result<i64> {
+        self.conn.execute_with_params(
+            "INSERT INTO issue_snapshots \
+             (issue_id, snapshot_time, compaction_level, original_size, \
+              compressed_size, original_content, archived_events) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            &[
+                SqliteValue::from(snapshot.issue_id.as_str()),
+                SqliteValue::from(snapshot.snapshot_time.to_rfc3339()),
+                SqliteValue::from(i64::from(snapshot.compaction_level)),
+                SqliteValue::from(i64::from(snapshot.original_size)),
+                SqliteValue::from(i64::from(snapshot.compressed_size)),
+                SqliteValue::from(snapshot.original_content.as_str()),
+                snapshot
+                    .archived_events
+                    .as_deref()
+                    .map_or(SqliteValue::Null, SqliteValue::from),
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Retrieve a single issue snapshot by ID.
+    pub fn get_issue_snapshot(&self, id: i64) -> Result<Option<IssueSnapshot>> {
+        match self.conn.query_row_with_params(
+            "SELECT id, issue_id, snapshot_time, compaction_level, \
+             original_size, compressed_size, original_content, archived_events \
+             FROM issue_snapshots WHERE id = ?",
+            &[SqliteValue::from(id)],
+        ) {
+            Ok(row) => {
+                let parsed = chrono::DateTime::parse_from_rfc3339(
+                    row.get(2).and_then(SqliteValue::as_text).unwrap_or(""),
+                )
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|_| Utc::now());
+
+                Ok(Some(IssueSnapshot {
+                    id: row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0),
+                    issue_id: row
+                        .get(1)
+                        .and_then(SqliteValue::as_text)
+                        .unwrap_or("")
+                        .to_string(),
+                    snapshot_time: parsed,
+                    compaction_level: row
+                        .get(3)
+                        .and_then(SqliteValue::as_integer)
+                        .map(|v| v as i32)
+                        .unwrap_or(0),
+                    original_size: row
+                        .get(4)
+                        .and_then(SqliteValue::as_integer)
+                        .map(|v| v as i32)
+                        .unwrap_or(0),
+                    compressed_size: row
+                        .get(5)
+                        .and_then(SqliteValue::as_integer)
+                        .map(|v| v as i32)
+                        .unwrap_or(0),
+                    original_content: row
+                        .get(6)
+                        .and_then(SqliteValue::as_text)
+                        .unwrap_or("")
+                        .to_string(),
+                    archived_events: row.get(7).and_then(SqliteValue::as_text).map(String::from),
+                }))
+            }
+            Err(FrankenError::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// List issue snapshots for a given issue, newest first.
+    pub fn list_issue_snapshots(&self, issue_id: &str) -> Result<Vec<IssueSnapshot>> {
+        let rows = self.conn.query_with_params(
+            "SELECT id, issue_id, snapshot_time, compaction_level, \
+             original_size, compressed_size, original_content, archived_events \
+             FROM issue_snapshots WHERE issue_id = ? \
+             ORDER BY snapshot_time DESC",
+            &[SqliteValue::from(issue_id)],
+        )?;
+        let mut result = Vec::new();
+        for row in &rows {
+            let parsed = chrono::DateTime::parse_from_rfc3339(
+                row.get(2).and_then(SqliteValue::as_text).unwrap_or(""),
+            )
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .unwrap_or_else(|_| Utc::now());
+            result.push(IssueSnapshot {
+                id: row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0),
+                issue_id: row
+                    .get(1)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or("")
+                    .to_string(),
+                snapshot_time: parsed,
+                compaction_level: row
+                    .get(3)
+                    .and_then(SqliteValue::as_integer)
+                    .map(|v| v as i32)
+                    .unwrap_or(0),
+                original_size: row
+                    .get(4)
+                    .and_then(SqliteValue::as_integer)
+                    .map(|v| v as i32)
+                    .unwrap_or(0),
+                compressed_size: row
+                    .get(5)
+                    .and_then(SqliteValue::as_integer)
+                    .map(|v| v as i32)
+                    .unwrap_or(0),
+                original_content: row
+                    .get(6)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or("")
+                    .to_string(),
+                archived_events: row.get(7).and_then(SqliteValue::as_text).map(String::from),
+            });
+        }
+        Ok(result)
+    }
+
+    /// Delete an issue snapshot by ID.
+    pub fn delete_issue_snapshot(&self, id: i64) -> Result<()> {
+        self.conn.execute_with_params(
+            "DELETE FROM issue_snapshots WHERE id = ?",
+            &[SqliteValue::from(id)],
+        )?;
+        Ok(())
+    }
+
+    // ---- Compaction Snapshot CRUD (Issue #38) ------------------------------
+
+    /// Create a new compaction snapshot.
+    pub fn create_compaction_snapshot(&self, snap: &CompactionSnapshot) -> Result<i64> {
+        self.conn.execute_with_params(
+            "INSERT INTO compaction_snapshots \
+             (issue_id, compaction_level, snapshot_json, created_at) \
+             VALUES (?, ?, ?, ?)",
+            &[
+                SqliteValue::from(snap.issue_id.as_str()),
+                SqliteValue::from(i64::from(snap.compaction_level)),
+                SqliteValue::from(&snap.snapshot_json[..]),
+                SqliteValue::from(snap.created_at.to_rfc3339()),
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Retrieve a compaction snapshot by ID.
+    pub fn get_compaction_snapshot(&self, id: i64) -> Result<Option<CompactionSnapshot>> {
+        match self.conn.query_row_with_params(
+            "SELECT id, issue_id, compaction_level, snapshot_json, created_at \
+             FROM compaction_snapshots WHERE id = ?",
+            &[SqliteValue::from(id)],
+        ) {
+            Ok(row) => {
+                let parsed = chrono::DateTime::parse_from_rfc3339(
+                    row.get(4).and_then(SqliteValue::as_text).unwrap_or(""),
+                )
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|_| Utc::now());
+
+                Ok(Some(CompactionSnapshot {
+                    id: row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0),
+                    issue_id: row
+                        .get(1)
+                        .and_then(SqliteValue::as_text)
+                        .unwrap_or("")
+                        .to_string(),
+                    compaction_level: row
+                        .get(2)
+                        .and_then(SqliteValue::as_integer)
+                        .map(|v| v as i32)
+                        .unwrap_or(0),
+                    snapshot_json: row
+                        .get(3)
+                        .and_then(SqliteValue::as_blob)
+                        .unwrap_or_default()
+                        .to_vec(),
+                    created_at: parsed,
+                }))
+            }
+            Err(FrankenError::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Delete a compaction snapshot by ID.
+    pub fn delete_compaction_snapshot(&self, id: i64) -> Result<()> {
+        self.conn.execute_with_params(
+            "DELETE FROM compaction_snapshots WHERE id = ?",
+            &[SqliteValue::from(id)],
+        )?;
+        Ok(())
+    }
+
     /// Check if an issue is a tombstone (deleted).
     ///
     /// # Errors
@@ -23273,5 +23474,143 @@ mod tests {
     fn repo_mtime_missing_row_has_false() {
         let storage = SqliteStorage::open_memory().unwrap();
         assert!(!storage.has_repo_mtime("/does/not/exist").unwrap());
+    }
+
+    // ---- Issue Snapshot tests (Issue #38) ---------------------------------
+
+    #[test]
+    fn issue_snapshot_create_and_get() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        let snap = IssueSnapshot {
+            id: 0,
+            issue_id: "test-issue-1".to_string(),
+            snapshot_time: now,
+            compaction_level: 1,
+            original_size: 1000,
+            compressed_size: 500,
+            original_content: "original content".to_string(),
+            archived_events: None,
+        };
+        let id = storage.create_issue_snapshot(&snap).unwrap();
+        assert!(id > 0, "should return a positive rowid");
+
+        let got = storage.get_issue_snapshot(id).unwrap().expect("should exist");
+        assert_eq!(got.issue_id, "test-issue-1");
+        assert_eq!(got.compaction_level, 1);
+        assert_eq!(got.original_size, 1000);
+        assert_eq!(got.compressed_size, 500);
+        assert_eq!(got.original_content, "original content");
+        assert!(got.archived_events.is_none());
+    }
+
+    #[test]
+    fn issue_snapshot_get_nonexistent_returns_none() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        let got = storage.get_issue_snapshot(9999).unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn issue_snapshot_list_filters_by_issue() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc::now();
+        let t2 = Utc::now();
+
+        let snap_a = IssueSnapshot {
+            id: 0,
+            issue_id: "issue-a".to_string(),
+            snapshot_time: t1,
+            compaction_level: 0,
+            original_size: 10,
+            compressed_size: 5,
+            original_content: "a1".to_string(),
+            archived_events: None,
+        };
+        let snap_b = IssueSnapshot {
+            id: 0,
+            issue_id: "issue-b".to_string(),
+            snapshot_time: t2,
+            compaction_level: 0,
+            original_size: 20,
+            compressed_size: 10,
+            original_content: "b1".to_string(),
+            archived_events: Some("events".to_string()),
+        };
+
+        storage.create_issue_snapshot(&snap_a).unwrap();
+        storage.create_issue_snapshot(&snap_b).unwrap();
+
+        let list_a = storage.list_issue_snapshots("issue-a").unwrap();
+        assert_eq!(list_a.len(), 1);
+        assert_eq!(list_a[0].issue_id, "issue-a");
+
+        let list_b = storage.list_issue_snapshots("issue-b").unwrap();
+        assert_eq!(list_b.len(), 1);
+        assert_eq!(list_b[0].issue_id, "issue-b");
+        assert_eq!(list_b[0].archived_events.as_deref(), Some("events"));
+    }
+
+    #[test]
+    fn issue_snapshot_delete_removes_row() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        let snap = IssueSnapshot {
+            id: 0,
+            issue_id: "del-test".to_string(),
+            snapshot_time: Utc::now(),
+            compaction_level: 0,
+            original_size: 0,
+            compressed_size: 0,
+            original_content: "".to_string(),
+            archived_events: None,
+        };
+        let id = storage.create_issue_snapshot(&snap).unwrap();
+        storage.delete_issue_snapshot(id).unwrap();
+        let got = storage.get_issue_snapshot(id).unwrap();
+        assert!(got.is_none());
+    }
+
+    // ---- Compaction Snapshot tests (Issue #38) ----------------------------
+
+    #[test]
+    fn compaction_snapshot_create_and_get() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        let snap = CompactionSnapshot {
+            id: 0,
+            issue_id: "comp-test".to_string(),
+            compaction_level: 2,
+            snapshot_json: b"{\"key\":\"value\"}".to_vec(),
+            created_at: Utc::now(),
+        };
+        let id = storage.create_compaction_snapshot(&snap).unwrap();
+        assert!(id > 0);
+
+        let got = storage.get_compaction_snapshot(id).unwrap().expect("exists");
+        assert_eq!(got.issue_id, "comp-test");
+        assert_eq!(got.compaction_level, 2);
+        assert_eq!(got.snapshot_json, b"{\"key\":\"value\"}");
+    }
+
+    #[test]
+    fn compaction_snapshot_get_nonexistent_returns_none() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        let got = storage.get_compaction_snapshot(8888).unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn compaction_snapshot_delete_removes_row() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        let snap = CompactionSnapshot {
+            id: 0,
+            issue_id: "del-comp".to_string(),
+            compaction_level: 0,
+            snapshot_json: vec![],
+            created_at: Utc::now(),
+        };
+        let id = storage.create_compaction_snapshot(&snap).unwrap();
+        storage.delete_compaction_snapshot(id).unwrap();
+        let got = storage.get_compaction_snapshot(id).unwrap();
+        assert!(got.is_none());
     }
 }

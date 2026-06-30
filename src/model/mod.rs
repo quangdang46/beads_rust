@@ -764,7 +764,46 @@ pub struct CustomType {
     pub name: String,
 }
 
-/// Repository file mtime tracking entry (Issue #39).
+/// A point-in-time snapshot of an issue's full state (Issue #38).
+///
+/// Captured before compaction so the original state can be recovered.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct IssueSnapshot {
+    /// Auto-increment primary key.
+    pub id: i64,
+    /// The issue that was snapshotted.
+    pub issue_id: String,
+    /// When the snapshot was taken.
+    pub snapshot_time: DateTime<Utc>,
+    /// Compaction level at snapshot time.
+    pub compaction_level: i32,
+    /// Size of the issue content before compression.
+    pub original_size: i32,
+    /// Size of the issue content after compression.
+    pub compressed_size: i32,
+    /// The uncompressed issue content (titles, description, etc.).
+    pub original_content: String,
+    /// Archived events as JSON, or None.
+    pub archived_events: Option<String>,
+}
+
+/// A BLOB-based compaction snapshot for recovery (Issue #38).
+///
+/// Stores the entire compacted state as a JSON blob for bulk recovery.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CompactionSnapshot {
+    /// Auto-increment primary key.
+    pub id: i64,
+    /// The issue that was compacted.
+    pub issue_id: String,
+    /// Compaction level when this was created.
+    pub compaction_level: i32,
+    /// Full JSON state blob.
+    pub snapshot_json: Vec<u8>,
+    /// When the snapshot was created.
+    pub created_at: DateTime<Utc>,
+}
+
 ///
 /// Records the latest observed modification time and content hash for each
 /// JSONL file tracked by the sync engine, enabling incremental re-sync
