@@ -986,6 +986,12 @@ EXAMPLES:
     /// Undefer issues (make ready again)
     Undefer(UndeferArgs),
 
+    /// Manage wisps (ephemeral, JSONL-excluded issues)
+    Wisp {
+        #[command(subcommand)]
+        command: commands::wisp::WispCommands,
+    },
+
     /// Issue tracking template commands
     Template {
         #[command(subcommand)]

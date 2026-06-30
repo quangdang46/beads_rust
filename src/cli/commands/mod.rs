@@ -57,6 +57,7 @@ pub mod update;
 pub mod version;
 pub mod r#where;
 pub mod formula;
+pub mod wisp;
 
 #[cfg(feature = "self_update")]
 pub mod upgrade;
