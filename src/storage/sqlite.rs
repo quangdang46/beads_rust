@@ -3131,6 +3131,179 @@ impl SqliteStorage {
         })
     }
 
+    /// Rename an issue's ID, updating all references.
+    ///
+    /// Updates:
+    /// - The issue's primary ID
+    /// - All dependency edges (issue_id and depends_on_id columns)
+    /// - All text fields (title, description, design, notes, acceptance_criteria)
+    ///   in every other issue that references the old ID as a word-bounded token
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the old issue doesn't exist, the new ID already exists,
+    /// or any database update fails.
+    pub fn update_issue_id(
+        &mut self,
+        old_id: &str,
+        new_id: &str,
+        actor: &str,
+    ) -> Result<Issue> {
+        self.mutate("update_issue_id", actor, |conn, ctx| {
+            // Fetch the existing issue
+            let issue = Self::get_issue_from_conn(conn, old_id)?
+                .ok_or_else(|| BeadsError::IssueNotFound { id: old_id.to_string() })?;
+
+            // Verify the new ID doesn't already exist
+            if Self::get_issue_from_conn(conn, new_id)?.is_some() {
+                return Err(BeadsError::Validation {
+                    field: "new_id".to_string(),
+                    reason: format!("issue {new_id} already exists"),
+                });
+            }
+
+            // Validate new ID format: prefix-suffix (e.g. bd-dolt, gt-auth)
+            if !regex::Regex::new(r"^[a-z]+-[a-zA-Z0-9._-]+$")
+                .unwrap()
+                .is_match(new_id)
+            {
+                return Err(BeadsError::validation(
+                    "new_id",
+                    "must be prefix-suffix format (e.g., bd-dolt, gt-auth)",
+                ));
+            }
+
+            let now = Utc::now();
+
+            // Update the issue's own ID
+            conn.execute_with_params(
+                "UPDATE issues SET id = ?1, updated_at = ?2 WHERE id = ?3",
+                &[
+                    SqliteValue::from(new_id),
+                    SqliteValue::from(now.to_rfc3339()),
+                    SqliteValue::from(old_id),
+                ],
+            )?;
+
+            // Update dependency edges: issue_id column
+            conn.execute_with_params(
+                "UPDATE dependencies SET issue_id = ?1 WHERE issue_id = ?2",
+                &[SqliteValue::from(new_id), SqliteValue::from(old_id)],
+            )?;
+
+            // Update dependency edges: depends_on_id column
+            conn.execute_with_params(
+                "UPDATE dependencies SET depends_on_id = ?1 WHERE depends_on_id = ?2",
+                &[SqliteValue::from(new_id), SqliteValue::from(old_id)],
+            )?;
+
+            // Update text references in all other issues (word-bounded replacement)
+            let pattern = regex::Regex::new(&format!(r"\b{}\b", regex::escape(old_id))).unwrap();
+            Self::update_text_references_in_all_issues(conn, &pattern, new_id)?;
+
+            ctx.invalidate_cache();
+            ctx.force_flush = true;
+
+            // Return the updated issue
+            Self::get_issue_from_conn(conn, new_id)?
+                .ok_or_else(|| BeadsError::IssueNotFound { id: new_id.to_string() })
+        })
+    }
+
+    /// Replace all occurrences of `pattern` (matching word-bounded old_id) in text
+    /// fields of every non-renamed issue.
+    fn update_text_references_in_all_issues(
+        conn: &Connection,
+        pattern: &regex::Regex,
+        new_id: &str,
+    ) -> Result<()> {
+        // We need to read all issues, check each text field, and update those that match.
+        // Use the Limited SELECT to avoid hydrating the full issue.
+        let mut stmt = conn.prepare(
+            "SELECT id, title, description, design, notes, acceptance_criteria
+             FROM issues WHERE 1=1",
+        )?;
+
+        let rows = stmt.query_with_params(&[])?;
+        let mut ids_to_update = Vec::new();
+        let mut title_updates = Vec::new();
+        let mut desc_updates = Vec::new();
+        let mut design_updates = Vec::new();
+        let mut notes_updates = Vec::new();
+        let mut ac_updates = Vec::new();
+
+        for row in rows {
+            let get_text = |idx: usize| -> Option<String> {
+                row.get(idx)
+                    .and_then(SqliteValue::as_text)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+            };
+
+            let id: String = row.get(0).and_then(SqliteValue::as_text).unwrap_or("").to_string();
+            let title = get_text(1);
+            let description = get_text(2);
+            let design = get_text(3);
+            let notes = get_text(4);
+            let acceptance_criteria = get_text(5);
+
+            let mut any_updated = false;
+            let mut new_title = title.clone();
+            let mut new_desc = description.clone();
+            let mut new_design = design.clone();
+            let mut new_notes = notes.clone();
+            let mut new_ac = acceptance_criteria.clone();
+
+            if title.as_ref().is_some_and(|t| pattern.is_match(t)) {
+                new_title = Some(pattern.replace_all(title.as_deref().unwrap(), new_id).to_string());
+                any_updated = true;
+            }
+            if description.as_ref().is_some_and(|d| pattern.is_match(d)) {
+                new_desc = Some(pattern.replace_all(description.as_deref().unwrap(), new_id).to_string());
+                any_updated = true;
+            }
+            if design.as_ref().is_some_and(|d| pattern.is_match(d)) {
+                new_design = Some(pattern.replace_all(design.as_deref().unwrap(), new_id).to_string());
+                any_updated = true;
+            }
+            if notes.as_ref().is_some_and(|n| pattern.is_match(n)) {
+                new_notes = Some(pattern.replace_all(notes.as_deref().unwrap(), new_id).to_string());
+                any_updated = true;
+            }
+            if acceptance_criteria.as_ref().is_some_and(|a| pattern.is_match(a)) {
+                new_ac = Some(pattern.replace_all(acceptance_criteria.as_deref().unwrap(), new_id).to_string());
+                any_updated = true;
+            }
+
+            if any_updated {
+                ids_to_update.push(id.clone());
+                title_updates.push(new_title);
+                desc_updates.push(new_desc);
+                design_updates.push(new_design);
+                notes_updates.push(new_notes);
+                ac_updates.push(new_ac);
+            }
+        }
+
+        // Batch update in a transaction
+        for i in 0..ids_to_update.len() {
+            conn.execute_with_params(
+                "UPDATE issues SET title = ?1, description = ?2, design = ?3,
+                 notes = ?4, acceptance_criteria = ?5 WHERE id = ?6",
+                &[
+                    SqliteValue::from(title_updates[i].clone()),
+                    SqliteValue::from(desc_updates[i].clone()),
+                    SqliteValue::from(design_updates[i].clone()),
+                    SqliteValue::from(notes_updates[i].clone()),
+                    SqliteValue::from(ac_updates[i].clone()),
+                    SqliteValue::from(ids_to_update[i].clone()),
+                ],
+            )?;
+        }
+
+        Ok(())
+    }
+
     /// Get an issue by ID.
     ///
     /// # Errors
