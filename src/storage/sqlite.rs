@@ -53,7 +53,7 @@ pub(crate) struct ListRelationMetadata {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ChangelogIssueRow {
+pub struct ChangelogIssueRow {
     pub(crate) id: String,
     pub(crate) title: String,
     pub(crate) priority: Priority,
