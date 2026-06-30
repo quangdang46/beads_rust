@@ -89,6 +89,32 @@ const EPIC_SECTIONS: [RequiredSection; 1] = [RequiredSection {
     hint: "Define high-level success criteria",
 }];
 
+const DECISION_SECTIONS: [RequiredSection; 3] = [
+    RequiredSection {
+        heading: "## Decision",
+        hint: "Summarize what was decided",
+    },
+    RequiredSection {
+        heading: "## Rationale",
+        hint: "Explain why this option was chosen",
+    },
+    RequiredSection {
+        heading: "## Alternatives Considered",
+        hint: "List alternatives and why they were rejected",
+    },
+];
+
+const SPIKE_SECTIONS: [RequiredSection; 2] = [
+    RequiredSection {
+        heading: "## Goal",
+        hint: "What question does this spike answer?",
+    },
+    RequiredSection {
+        heading: "## Findings",
+        hint: "What was learned? (fill in when complete)",
+    },
+];
+
 /// Execute the lint command.
 ///
 /// # Errors
@@ -423,8 +449,33 @@ fn lint_issue(issue: &Issue) -> Option<LintResult> {
         return None;
     }
 
+    // Build combined text from description and acceptance_criteria (Go parity)
     let description = issue.description.as_deref().unwrap_or("");
-    let missing = missing_sections(description, required);
+    let acceptance = issue.acceptance_criteria.as_deref().unwrap_or("");
+    let combined = if acceptance.is_empty() {
+        description.to_string()
+    } else {
+        format!("{description}\n{acceptance}")
+    };
+
+    let missing = missing_sections(&combined, required);
+
+    // A non-empty acceptance_criteria satisfies "Acceptance Criteria" /
+    // "Success Criteria" even without the heading text (Go parity).
+    let missing: Vec<RequiredSection> = if acceptance.is_empty() {
+        missing
+    } else {
+        missing
+            .into_iter()
+            .filter(|section| {
+                !matches!(
+                    strip_heading_prefix(section.heading).to_lowercase().as_str(),
+                    "acceptance criteria" | "success criteria"
+                )
+            })
+            .collect()
+    };
+
     if missing.is_empty() {
         return None;
     }
@@ -456,6 +507,8 @@ const fn required_sections(issue_type: &IssueType) -> &'static [RequiredSection]
         IssueType::Bug => &BUG_SECTIONS,
         IssueType::Task | IssueType::Feature => &TASK_SECTIONS,
         IssueType::Epic => &EPIC_SECTIONS,
+        IssueType::Decision => &DECISION_SECTIONS,
+        IssueType::Spike => &SPIKE_SECTIONS,
         _ => &[],
     }
 }
@@ -532,6 +585,7 @@ mod tests {
             labels: vec![],
             dependencies: vec![],
             comments: vec![],
+            ..Default::default()
         }
     }
 
@@ -604,7 +658,7 @@ mod tests {
             .find(|issue| issue.id == "bd-lint-missing")
             .unwrap();
         assert!(projected_issue.design.is_none());
-        assert!(projected_issue.acceptance_criteria.is_none());
+        assert!(projected_issue.acceptance_criteria.is_some());
         assert!(projected_issue.notes.is_none());
         assert!(projected_issue.owner.is_none());
         assert!(projected_issue.sender.is_none());
