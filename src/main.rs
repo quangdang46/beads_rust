@@ -610,6 +610,9 @@ fn main() {
             };
             commands::agents::execute(&agents_args, &output_ctx)
         }
+        Commands::Recipes { command } => {
+            commands::recipes::execute(&command, cli.json, &overrides, &output_ctx)
+        }
         Commands::Template { command } => {
             if let (Some(res), Some(beads_dir)) = (storage_result.as_ref(), ctx.beads_dir.as_ref())
             {
@@ -1016,7 +1019,8 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Quickstart(_)
         | Commands::Admin { .. }
         | Commands::Import(_)
-        | Commands::Formula { .. } => false,
+        | Commands::Formula { .. }
+        | Commands::Recipes { .. } => false,
 
         #[cfg(feature = "mcp")]
         Commands::Serve(_) => false,
