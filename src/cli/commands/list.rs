@@ -8,6 +8,7 @@ use crate::cli::{
     resolve_output_format_with_outer_mode,
 };
 use crate::config;
+use regex::Regex;
 use crate::error::{BeadsError, Result};
 use crate::format::csv;
 use crate::format::{
@@ -682,6 +683,8 @@ fn apply_client_filters(
     issues: Vec<crate::model::Issue>,
     args: &ListArgs,
 ) -> Result<Vec<crate::model::Issue>> {
+    // Issue #19: support `*` glob in `--id` values.
+    let has_wild = args.id.iter().any(|id| id.contains('*'));
     let id_filter: Option<HashSet<&str>> = if args.id.is_empty() {
         None
     } else {
@@ -707,10 +710,22 @@ fn apply_client_filters(
     validate_priority_bounds(args.priority_min, args.priority_max)?;
 
     for issue in issues {
-        if let Some(ids) = &id_filter
-            && !ids.contains(issue.id.as_str())
-        {
-            continue;
+        if let Some(ids) = &id_filter {
+            if has_wild {
+                let matched = ids.iter().any(|pattern| {
+                    // Convert `*` to regex `.*` for glob matching.
+                    let escaped = regex::escape(pattern);
+                    let regex_str = escaped.replace(r"\*", ".*");
+                    Regex::new(&format!("^{}$", regex_str))
+                        .map(|re| re.is_match(issue.id.as_str()))
+                        .unwrap_or(false)
+                });
+                if !matched {
+                    continue;
+                }
+            } else if !ids.contains(issue.id.as_str()) {
+                continue;
+            }
         }
 
         if let Some(min) = min_priority
