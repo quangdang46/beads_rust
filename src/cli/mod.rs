@@ -1601,6 +1601,8 @@ pub enum ExportFormat {
     Json,
     /// CSV format
     Csv,
+    /// Obsidian Markdown format (Tasks plugin compatible)
+    Obsidian,
 }
 
 impl std::str::FromStr for ExportFormat {
@@ -1611,6 +1613,7 @@ impl std::str::FromStr for ExportFormat {
             "jsonl" => Ok(Self::Jsonl),
             "json" => Ok(Self::Json),
             "csv" => Ok(Self::Csv),
+            "obsidian" | "md" | "markdown" => Ok(Self::Obsidian),
             _ => Err(()),
         }
     }
