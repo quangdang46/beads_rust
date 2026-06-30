@@ -33,6 +33,8 @@ Comprehensive reference for all `br` (beads_rust) commands.
 - [Workflow Commands](#workflow-commands)
   - [defer / undefer](#defer--undefer)
   - [wisp](#wisp)
+  - [custom-status](#custom-status)
+  - [custom-type](#custom-type)
   - [orphans](#orphans)
   - [query (saved queries)](#query-saved-queries)
   - [gate](#gate)
@@ -964,6 +966,52 @@ br wisp gc [OPTIONS]
 |--------|-------------|
 | `--max-age-hours <HOURS>` | Delete wisps older than this (default: 24) |
 | `--dry-run` | Show what would be deleted without deleting |
+
+---
+
+### custom-status
+
+Manage custom statuses registered in the database-backed workflow configuration.
+Statuses define the available workflow states for issues with associated
+behavior categories (`active`, `wip`, `done`, `frozen`, `unspecified`).
+
+Subcommands: `list`, `add`, `remove`.
+
+```bash
+br custom-status list [OPTIONS]
+br custom-status add <NAME> [--category <CATEGORY>]
+br custom-status remove <NAME>
+```
+
+**Options (list):**
+| Option | Description |
+|--------|-------------|
+| `--json` | JSON output |
+
+**Options (add):**
+| Option | Description |
+|--------|-------------|
+| `--category <CATEGORY>` | Behavior category (default: unspecified) |
+
+---
+
+### custom-type
+
+Manage custom types registered in the database-backed workflow configuration.
+Types define the available issue categories beyond the built-in set.
+
+Subcommands: `list`, `add`, `remove`.
+
+```bash
+br custom-type list [OPTIONS]
+br custom-type add <NAME>
+br custom-type remove <NAME>
+```
+
+**Options (list):**
+| Option | Description |
+|--------|-------------|
+| `--json` | JSON output |
 
 ---
 

@@ -200,6 +200,14 @@ pub enum IssueType {
     Chore,
     Docs,
     Question,
+    Decision,
+    Message,
+    Molecule,
+    Gate,
+    Spike,
+    Story,
+    Milestone,
+    Event,
     #[serde(untagged)]
     Custom(String),
 }
@@ -224,6 +232,14 @@ impl IssueType {
             "chore" => Self::Chore,
             "docs" => Self::Docs,
             "question" => Self::Question,
+            "decision" => Self::Decision,
+            "message" => Self::Message,
+            "molecule" => Self::Molecule,
+            "gate" => Self::Gate,
+            "spike" => Self::Spike,
+            "story" => Self::Story,
+            "milestone" => Self::Milestone,
+            "event" => Self::Event,
             _ => return None,
         })
     }
@@ -238,15 +254,46 @@ impl IssueType {
             Self::Chore => "chore",
             Self::Docs => "docs",
             Self::Question => "question",
+            Self::Decision => "decision",
+            Self::Message => "message",
+            Self::Molecule => "molecule",
+            Self::Gate => "gate",
+            Self::Spike => "spike",
+            Self::Story => "story",
+            Self::Milestone => "milestone",
+            Self::Event => "event",
             Self::Custom(value) => value,
         }
     }
 
     /// Returns true if this is a standard (non-custom) issue type.
-    /// Used for bd conformance validation in CLI commands.
     #[must_use]
     pub const fn is_standard(&self) -> bool {
         !matches!(self, Self::Custom(_))
+    }
+
+    /// Returns true if this is a built-in type (core + system-internal).
+    /// System-internal types like Event are accepted without extra config.
+    #[must_use]
+    pub const fn is_built_in(&self) -> bool {
+        matches!(
+            self,
+            Self::Task
+                | Self::Bug
+                | Self::Feature
+                | Self::Epic
+                | Self::Chore
+                | Self::Docs
+                | Self::Question
+                | Self::Decision
+                | Self::Message
+                | Self::Molecule
+                | Self::Gate
+                | Self::Spike
+                | Self::Story
+                | Self::Milestone
+                | Self::Event
+        )
     }
 }
 
@@ -268,17 +315,44 @@ impl FromStr for IssueType {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum DependencyType {
+    /// A blocks B (B cannot proceed until A is closed).
     Blocks,
+    /// A is a parent of B (B cannot be closed until A is closed).
     ParentChild,
+    /// B runs only if A fails.
     ConditionalBlocks,
+    /// Fanout gate: wait for dynamic children.
     WaitsFor,
+    /// A is related to B (informational).
     Related,
+    /// B was discovered from A (tracing).
     DiscoveredFrom,
+    /// B is a reply to A (conversation threading).
     RepliesTo,
+    /// B relates to A (loose knowledge graph edge).
     RelatesTo,
+    /// B duplicates A (deduplication link).
     Duplicates,
+    /// B supersedes A (version chain link).
     Supersedes,
+    /// A is authored by B (creator relationship).
+    AuthoredBy,
+    /// A is assigned to B (assignment relationship).
+    AssignedTo,
+    /// A is approved by B (approval relationship).
+    ApprovedBy,
+    /// A attests that B has a given skill/attribute.
+    Attests,
+    /// A tracks B (convoy → issue tracking, non-blocking).
+    Tracks,
+    /// A is active until B closes (e.g., muted until issue resolved).
+    Until,
+    /// A is caused by B (triggered by target, audit trail).
     CausedBy,
+    /// A validates B (approval/validation relationship).
+    Validates,
+    /// A is delegated from B (work handoff).
+    DelegatedFrom,
     #[serde(untagged)]
     Custom(String),
 }
@@ -298,6 +372,14 @@ impl<'de> Deserialize<'de> for DependencyType {
             "duplicates" => Self::Duplicates,
             "supersedes" => Self::Supersedes,
             "caused-by" => Self::CausedBy,
+            "authored-by" => Self::AuthoredBy,
+            "assigned-to" => Self::AssignedTo,
+            "approved-by" => Self::ApprovedBy,
+            "attests" => Self::Attests,
+            "tracks" => Self::Tracks,
+            "until" => Self::Until,
+            "validates" => Self::Validates,
+            "delegated-from" => Self::DelegatedFrom,
             _ => Self::Custom(value),
         })
     }
@@ -318,6 +400,14 @@ impl DependencyType {
             Self::Duplicates => "duplicates",
             Self::Supersedes => "supersedes",
             Self::CausedBy => "caused-by",
+            Self::AuthoredBy => "authored-by",
+            Self::AssignedTo => "assigned-to",
+            Self::ApprovedBy => "approved-by",
+            Self::Attests => "attests",
+            Self::Tracks => "tracks",
+            Self::Until => "until",
+            Self::Validates => "validates",
+            Self::DelegatedFrom => "delegated-from",
             Self::Custom(value) => value,
         }
     }
@@ -361,6 +451,14 @@ impl FromStr for DependencyType {
             "duplicates" => Ok(Self::Duplicates),
             "supersedes" => Ok(Self::Supersedes),
             "caused-by" => Ok(Self::CausedBy),
+            "authored-by" => Ok(Self::AuthoredBy),
+            "assigned-to" => Ok(Self::AssignedTo),
+            "approved-by" => Ok(Self::ApprovedBy),
+            "attests" => Ok(Self::Attests),
+            "tracks" => Ok(Self::Tracks),
+            "until" => Ok(Self::Until),
+            "validates" => Ok(Self::Validates),
+            "delegated-from" => Ok(Self::DelegatedFrom),
             other => Ok(Self::Custom(other.to_string())),
         }
     }
@@ -453,8 +551,235 @@ impl JsonSchema for EventType {
     }
 }
 
-/// The primary issue entity.
+/// WispType categorizes ephemeral wisps for TTL-based compaction.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WispType {
+    #[default]
+    /// Default (no specific wisp type).
+    None,
+    /// Liveness pings (TTL: 6h).
+    Heartbeat,
+    /// Health check ACKs (TTL: 6h).
+    Ping,
+    /// Patrol cycle reports (TTL: 24h).
+    Patrol,
+    /// Garbage collection reports (TTL: 24h).
+    GcReport,
+    /// Force-kill, recovery actions (TTL: 7d).
+    Recovery,
+    /// Error reports (TTL: 7d).
+    Error,
+    /// Human escalations (TTL: 7d).
+    Escalation,
+    /// User-defined wisp type.
+    #[serde(untagged)]
+    Custom(String),
+}
+
+impl WispType {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::None => "none",
+            Self::Heartbeat => "heartbeat",
+            Self::Ping => "ping",
+            Self::Patrol => "patrol",
+            Self::GcReport => "gc_report",
+            Self::Recovery => "recovery",
+            Self::Error => "error",
+            Self::Escalation => "escalation",
+            Self::Custom(value) => value,
+        }
+    }
+
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        matches!(
+            self,
+            Self::None
+                | Self::Heartbeat
+                | Self::Ping
+                | Self::Patrol
+                | Self::GcReport
+                | Self::Recovery
+                | Self::Error
+                | Self::Escalation
+        )
+    }
+}
+
+impl fmt::Display for WispType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// MolType categorizes molecule types for swarm coordination.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MolType {
+    #[default]
+    /// Regular assigned work (default).
+    Work,
+    /// Swarm molecule: coordinated multi-worker work.
+    Swarm,
+    /// Patrol molecule: recurring operational work.
+    Patrol,
+    /// User-defined mol type.
+    #[serde(untagged)]
+    Custom(String),
+}
+
+impl MolType {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Work => "work",
+            Self::Swarm => "swarm",
+            Self::Patrol => "patrol",
+            Self::Custom(value) => value,
+        }
+    }
+
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        matches!(self, Self::Work | Self::Swarm | Self::Patrol)
+    }
+}
+
+impl fmt::Display for MolType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl std::str::FromStr for MolType {
+    type Err = crate::error::BeadsError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "work" => Ok(Self::Work),
+            "swarm" => Ok(Self::Swarm),
+            "patrol" => Ok(Self::Patrol),
+            _ => Ok(Self::Custom(s.to_string())),
+        }
+    }
+}
+
+/// WorkType categorizes how work assignment operates for a bead.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkType {
+    #[default]
+    /// One worker, exclusive assignment (default).
+    Mutex,
+    /// Many submit, buyer picks.
+    OpenCompetition,
+    /// User-defined work type.
+    #[serde(untagged)]
+    Custom(String),
+}
+
+impl WorkType {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Mutex => "mutex",
+            Self::OpenCompetition => "open_competition",
+            Self::Custom(value) => value,
+        }
+    }
+
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        matches!(self, Self::Mutex | Self::OpenCompetition)
+    }
+}
+
+impl fmt::Display for WorkType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// StatusCategory defines how a custom status behaves in views and commands.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusCategory {
+    /// Appears in ready and default list.
+    #[default]
+    Active,
+    /// Excluded from ready, visible in default list.
+    Wip,
+    /// Excluded from ready and default list (completed).
+    Done,
+    /// Excluded from ready and default list (frozen).
+    Frozen,
+    /// No category assigned (backward compat).
+    Unspecified,
+    /// User-defined category.
+    #[serde(untagged)]
+    Custom(String),
+}
+
+impl StatusCategory {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Active => "active",
+            Self::Wip => "wip",
+            Self::Done => "done",
+            Self::Frozen => "frozen",
+            Self::Unspecified => "unspecified",
+            Self::Custom(value) => value,
+        }
+    }
+
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        matches!(
+            self,
+            Self::Active | Self::Wip | Self::Done | Self::Frozen | Self::Unspecified
+        )
+    }
+}
+
+impl fmt::Display for StatusCategory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// A custom status registered in the database-backed workflow config (Issue #5).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+pub struct CustomStatus {
+    pub name: String,
+    pub category: String,
+}
+
+/// A custom type registered in the database-backed workflow config (Issue #5).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+pub struct CustomType {
+    pub name: String,
+}
+
+/// BondRef tracks compound molecule lineage.
+/// When protos or molecules are bonded together, BondRefs record
+/// which sources were combined and how they were attached.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct BondRef {
+    /// Source proto or molecule ID.
+    pub source_id: String,
+    /// Type of bond: sequential, parallel, conditional.
+    pub bond_type: String,
+    /// Attachment site (issue ID or empty for root).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bond_point: Option<String>,
+}
+
+/// The primary issue entity.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct Issue {
     /// Unique ID (e.g., "bd-abc123").
     pub id: String,
@@ -610,11 +935,96 @@ pub struct Issue {
     #[serde(default, skip_serializing_if = "is_false")]
     pub ephemeral: bool,
 
+    // Messaging
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub no_history: bool,
+
     // Context
     #[serde(default, skip_serializing_if = "is_false")]
     pub pinned: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub is_template: bool,
+
+    // Molecule type (swarm coordination)
+    #[serde(default)]
+    pub mol_type: MolType,
+
+    // Work type (assignment model)
+    #[serde(default)]
+    pub work_type: WorkType,
+
+    // Wisp type (TTL-based compaction)
+    #[serde(default)]
+    pub wisp_type: WispType,
+
+    // SpecId (project/component identifier)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_id: Option<String>,
+
+    // StartedAt (when work actually started)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+
+    // Metadata (arbitrary JSON blob)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<String>,
+
+    // Source formula tracing
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_formula: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_location: Option<String>,
+
+    // Gate fields (async coordination)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub await_type: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub await_id: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<i64>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_bead: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_bead: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_state: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_type: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rig: Option<String>,
+
+    // Event fields
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_kind: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<String>,
+
+    // Quality score
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality_score: Option<f64>,
+
+    // Crystallizes flag
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub crystallizes: bool,
+
+    // BondedFrom (compound molecule lineage)
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub bonded_from: Vec<BondRef>,
 
     // Relations (for export/display, not always in DB table directly)
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -664,8 +1074,32 @@ impl Default for Issue {
             original_size: None,
             sender: None,
             ephemeral: false,
+            no_history: false,
             pinned: false,
             is_template: false,
+            mol_type: MolType::default(),
+            work_type: WorkType::default(),
+            wisp_type: WispType::default(),
+            spec_id: None,
+            started_at: None,
+            metadata: None,
+            source_formula: None,
+            source_location: None,
+            await_type: None,
+            await_id: None,
+            timeout_seconds: None,
+            holder: None,
+            hook_bead: None,
+            role_bead: None,
+            agent_state: None,
+            role_type: None,
+            rig: None,
+            event_kind: None,
+            target: None,
+            payload: None,
+            quality_score: None,
+            crystallizes: false,
+            bonded_from: Vec::new(),
             labels: Vec::new(),
             dependencies: Vec::new(),
             comments: Vec::new(),
@@ -836,7 +1270,7 @@ impl Issue {
 }
 
 /// Epic completion status with child counts.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct EpicStatus {
     pub epic: Issue,
     pub total_children: usize,
@@ -1007,9 +1441,7 @@ mod tests {
             ephemeral: false,
             pinned: false,
             is_template: false,
-            labels: vec![],
-            dependencies: vec![],
-            comments: vec![],
+            ..Default::default()
         };
 
         let json = serde_json::to_string(&issue).unwrap();
@@ -1470,9 +1902,7 @@ mod tests {
             ephemeral: false,
             pinned: false,
             is_template: false,
-            labels: vec![],
-            dependencies: vec![],
-            comments: vec![],
+            ..Default::default()
         }
     }
 

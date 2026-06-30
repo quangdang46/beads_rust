@@ -8,7 +8,7 @@ use crate::error::{BeadsError, Result};
 use crate::model::{IssueType, Priority, Status};
 use crate::util::content_hash_from_parts;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 13;
+pub const CURRENT_SCHEMA_VERSION: i32 = 14;
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 
 /// The complete SQL schema for the beads database.
@@ -286,6 +286,17 @@ pub const SCHEMA_SQL: &str = r"
         FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_gate_results_issue ON gate_results(issue_id);
+
+    -- Custom statuses for runtime-enumerable workflow configuration (Issue #5)
+    CREATE TABLE IF NOT EXISTS custom_statuses (
+        name VARCHAR(64) PRIMARY KEY,
+        category VARCHAR(32) NOT NULL DEFAULT 'unspecified'
+    );
+
+    -- Custom types for runtime-enumerable workflow configuration (Issue #5)
+    CREATE TABLE IF NOT EXISTS custom_types (
+        name VARCHAR(64) PRIMARY KEY
+    );
 ";
 
 /// Split a SQL script into individual statements, respecting string literals,
@@ -1605,6 +1616,76 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
         ensure_columns(conn, "events", EVENT_COLUMNS)?;
     }
 
+    // Migration v13 -> v14 (beads_rust#5): add custom_statuses and custom_types
+    // tables for runtime-enumerable workflow configuration. Pure additive — new
+    // tables, no existing-row rewrite. Idempotent via CREATE TABLE IF NOT EXISTS
+    // and SCHEMA_SQL already includes them for fresh databases.
+    if user_version < 14 {
+        tracing::info!(
+            "Migrating database to schema version 14 (custom_statuses and custom_types tables - beads_rust#5)"
+        );
+        execute_batch(
+            conn,
+            r"
+            CREATE TABLE IF NOT EXISTS custom_statuses (
+                name VARCHAR(64) PRIMARY KEY,
+                category VARCHAR(32) NOT NULL DEFAULT 'unspecified'
+            );
+            CREATE TABLE IF NOT EXISTS custom_types (
+                name VARCHAR(64) PRIMARY KEY
+            );
+        ",
+        )?;
+        // Backfill built-in statuses as custom entries for parity
+        let existing_status_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM custom_statuses")?
+            .get(0)
+            .and_then(SqliteValue::as_integer)
+            .unwrap_or(0);
+        if existing_status_count == 0 {
+            execute_batch(
+                conn,
+                r#"
+                INSERT OR IGNORE INTO custom_statuses (name, category) VALUES ('open', 'active');
+                INSERT OR IGNORE INTO custom_statuses (name, category) VALUES ('in_progress', 'wip');
+                INSERT OR IGNORE INTO custom_statuses (name, category) VALUES ('closed', 'done');
+                INSERT OR IGNORE INTO custom_statuses (name, category) VALUES ('deferred', 'frozen');
+                INSERT OR IGNORE INTO custom_statuses (name, category) VALUES ('tombstone', 'done');
+                INSERT OR IGNORE INTO custom_statuses (name, category) VALUES ('blocked', 'active');
+                "#,
+            )?;
+            tracing::info!("Backfilled built-in statuses into custom_statuses");
+        }
+
+        let existing_type_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM custom_types")?
+            .get(0)
+            .and_then(SqliteValue::as_integer)
+            .unwrap_or(0);
+        if existing_type_count == 0 {
+            execute_batch(
+                conn,
+                r#"
+                INSERT OR IGNORE INTO custom_types (name) VALUES ('task');
+                INSERT OR IGNORE INTO custom_types (name) VALUES ('bug');
+                INSERT OR IGNORE INTO custom_types (name) VALUES ('feature');
+                INSERT OR IGNORE INTO custom_types (name) VALUES ('epic');
+                INSERT OR IGNORE INTO custom_types (name) VALUES ('question');
+                INSERT OR IGNORE INTO custom_types (name) VALUES ('docs');
+                INSERT OR IGNORE INTO custom_types (name) VALUES ('decision');
+                INSERT OR IGNORE INTO custom_types (name) VALUES ('message');
+                INSERT OR IGNORE INTO custom_types (name) VALUES ('molecule');
+                INSERT OR IGNORE INTO custom_types (name) VALUES ('gate');
+                INSERT OR IGNORE INTO custom_types (name) VALUES ('spike');
+                INSERT OR IGNORE INTO custom_types (name) VALUES ('story');
+                INSERT OR IGNORE INTO custom_types (name) VALUES ('milestone');
+                INSERT OR IGNORE INTO custom_types (name) VALUES ('event');
+                "#,
+            )?;
+            tracing::info!("Backfilled built-in types into custom_types");
+        }
+    }
+
     // Migration: Add missing indexes for bd parity
     // These use IF NOT EXISTS so they're safe to run multiple times
     execute_batch(
@@ -1832,18 +1913,18 @@ fn rebuild_content_hashes_for_go_parity(conn: &Connection) -> Result<usize> {
             );
 
             conn.execute_with_params(
-                "UPDATE issues SET content_hash = ? WHERE id = ?",
+                "UPDATE issues SET content_hash = ?1 WHERE id = ?2",
                 &[
                     SqliteValue::from(content_hash.as_str()),
                     SqliteValue::from(id.as_str()),
                 ],
             )?;
             conn.execute_with_params(
-                "DELETE FROM dirty_issues WHERE issue_id = ?",
+                "DELETE FROM dirty_issues WHERE issue_id = ?1",
                 &[SqliteValue::from(id.as_str())],
             )?;
             conn.execute_with_params(
-                "INSERT INTO dirty_issues (issue_id, marked_at) VALUES (?, ?)",
+                "INSERT INTO dirty_issues (issue_id, marked_at) VALUES (?1, ?2)",
                 &[
                     SqliteValue::from(id.as_str()),
                     SqliteValue::from(now_str.as_str()),
@@ -3032,7 +3113,7 @@ mod tests {
         // Migration should preserve existing values.
         let config_latest = conn
             .query_row_with_params(
-                "SELECT value FROM config WHERE key = ?",
+                "SELECT value FROM config WHERE key = ?1",
                 &[SqliteValue::from("issue_prefix")],
             )
             .unwrap();
@@ -3043,7 +3124,7 @@ mod tests {
 
         let metadata_latest = conn
             .query_row_with_params(
-                "SELECT value FROM metadata WHERE key = ?",
+                "SELECT value FROM metadata WHERE key = ?1",
                 &[SqliteValue::from("project")],
             )
             .unwrap();

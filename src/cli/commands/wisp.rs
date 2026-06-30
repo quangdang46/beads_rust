@@ -20,7 +20,7 @@ use crate::Result;
 use chrono::{DateTime, Utc};
 use clap::{Args, Subcommand};
 use std::str::FromStr;
-use tracing::{info, warn};
+use tracing::info;
 
 // ---------------------------------------------------------------------------
 // CLI arg types
