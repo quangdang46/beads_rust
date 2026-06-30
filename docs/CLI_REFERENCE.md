@@ -1505,6 +1505,40 @@ br version
 
 ---
 
+### worktree
+
+List, inspect, create, and remove git worktrees with beads state awareness.
+
+```bash
+br worktree <COMMAND>
+```
+
+**Subcommands:**
+
+| Command | Description |
+|---------|-------------|
+| `list` | List all git worktrees with bead state info |
+| `info` | Show detailed info about the current worktree |
+| `create <PATH>` | Create a new git worktree on `<PATH>` checked out to a branch |
+| `remove <NAME>` | Remove a worktree by name or path |
+
+**Options (create):**
+
+| Option | Description |
+|--------|-------------|
+| `--branch <BRANCH>` | Branch for the new worktree (defaults to basename of PATH) |
+| `--force` | Skip safety checks |
+
+**Options (remove):**
+
+| Option | Description |
+|--------|-------------|
+| `--force` | Skip safety checks (uncommitted/unpushed) |
+
+Beads-aware: `list` and `info` detect the `.beads/` state — none, local, shared (same as main repo), or redirect (a `.beads/redirect` file points to another beads dir).
+
+---
+
 ### audit
 
 Record and label agent interactions.
