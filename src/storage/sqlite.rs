@@ -3,7 +3,8 @@
 use crate::error::{BeadsError, Result};
 use crate::format::{IssueDetails, IssueWithDependencyMetadata};
 use crate::model::{
-    Comment, Dependency, DependencyType, Event, EventType, Issue, IssueType, Priority, Status,
+    Comment, Dependency, DependencyType, Event, EventType, Issue, IssueType, MolType, Priority,
+    Status,
 };
 use crate::storage::events::get_events;
 use crate::storage::schema::CURRENT_SCHEMA_VERSION;
@@ -763,7 +764,7 @@ impl SqliteStorage {
 
     fn metadata_key_exists(conn: &Connection, key: &str) -> Result<bool> {
         let rows = conn.query_with_params(
-            "SELECT 1 FROM metadata WHERE key = ? LIMIT 1",
+            "SELECT 1 FROM metadata WHERE key = ?1 LIMIT 1",
             &[SqliteValue::from(key)],
         )?;
         Ok(!rows.is_empty())
@@ -771,7 +772,7 @@ impl SqliteStorage {
 
     fn upsert_metadata_key_in_tx(conn: &Connection, key: &str, value: &str) -> Result<()> {
         let updated = conn.execute_with_params(
-            "UPDATE metadata SET value = ? WHERE key = ? AND value != ?",
+            "UPDATE metadata SET value = ?1 WHERE key = ?2 AND value != ?3",
             &[
                 SqliteValue::from(value),
                 SqliteValue::from(key),
@@ -780,7 +781,7 @@ impl SqliteStorage {
         )?;
         if updated == 0 && !Self::metadata_key_exists(conn, key)? {
             conn.execute_with_params(
-                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                "INSERT INTO metadata (key, value) VALUES (?1, ?2)",
                 &[SqliteValue::from(key), SqliteValue::from(value)],
             )?;
         }
@@ -794,9 +795,9 @@ impl SqliteStorage {
     ) -> Result<()> {
         conn.execute_with_params(
             "INSERT INTO metadata (key, value)
-             SELECT ?, ?
+             SELECT ?1, ?2
              WHERE NOT EXISTS (
-                 SELECT 1 FROM metadata WHERE key = ? LIMIT 1
+                 SELECT 1 FROM metadata WHERE key = ?3 LIMIT 1
              )",
             &[
                 SqliteValue::from(key),
@@ -833,7 +834,7 @@ impl SqliteStorage {
 
     fn metadata_equals(conn: &Connection, key: &str, expected: &str) -> Result<bool> {
         match conn.query_row_with_params(
-            "SELECT value FROM metadata WHERE key = ? ORDER BY rowid DESC LIMIT 1",
+            "SELECT value FROM metadata WHERE key = ?1 ORDER BY rowid DESC LIMIT 1",
             &[SqliteValue::from(key)],
         ) {
             Ok(row) => Ok(row.get(0).and_then(SqliteValue::as_text) == Some(expected)),
@@ -1374,7 +1375,7 @@ impl SqliteStorage {
         self.conn.execute("BEGIN IMMEDIATE")?;
 
         let probe_result = self.conn.execute_with_params(
-            "UPDATE issues SET priority = priority, status = status WHERE id = ?",
+            "UPDATE issues SET priority = priority, status = status WHERE id = ?1",
             &[SqliteValue::from(issue_id)],
         );
         let rollback_result = self.conn.execute("ROLLBACK");
@@ -1512,7 +1513,7 @@ impl SqliteStorage {
             // Delete existing entries row-by-row to avoid fsqlite IN-clause bugs
             for (id, _) in chunk {
                 self.conn.execute_with_params(
-                    "DELETE FROM export_hashes WHERE issue_id = ?",
+                    "DELETE FROM export_hashes WHERE issue_id = ?1",
                     &[SqliteValue::from(id.as_str())],
                 )?;
             }
@@ -1522,7 +1523,7 @@ impl SqliteStorage {
             // insert isolated after the chunk delete.
             for (issue_id, content_hash) in chunk {
                 self.conn.execute_with_params(
-                    "INSERT INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?, ?, ?)",
+                    "INSERT INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?1, ?2, ?3)",
                     &[
                         SqliteValue::from(issue_id.as_str()),
                         SqliteValue::from(content_hash.as_str()),
@@ -1558,7 +1559,7 @@ impl SqliteStorage {
 
         for (issue_id, content_hash) in &unique_exports {
             self.conn.execute_with_params(
-                "INSERT OR REPLACE INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?, ?, ?)",
+                "INSERT OR REPLACE INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?1, ?2, ?3)",
                 &[
                     SqliteValue::from(issue_id.as_str()),
                     SqliteValue::from(content_hash.as_str()),
@@ -1602,11 +1603,11 @@ impl SqliteStorage {
             }
 
             self.conn.execute_with_params(
-                "DELETE FROM export_hashes WHERE issue_id = ?",
+                "DELETE FROM export_hashes WHERE issue_id = ?1",
                 &[SqliteValue::from(issue_id.as_str())],
             )?;
             self.conn.execute_with_params(
-                "INSERT INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?, ?, ?)",
+                "INSERT INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?1, ?2, ?3)",
                 &[
                     SqliteValue::from(issue_id.as_str()),
                     SqliteValue::from(content_hash.as_str()),
@@ -1691,7 +1692,7 @@ impl SqliteStorage {
             let mut chunk_deleted = 0;
             for id in chunk {
                 let deleted = self.conn.execute_with_params(
-                    "DELETE FROM export_hashes WHERE issue_id = ?",
+                    "DELETE FROM export_hashes WHERE issue_id = ?1",
                     &[SqliteValue::from(id.as_str())],
                 )?;
                 chunk_deleted += deleted;
@@ -1860,7 +1861,7 @@ impl SqliteStorage {
                 bypass_reason,
                 policy_gates_fired,
                 recorded_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, CURRENT_TIMESTAMP)",
             &[
                 SqliteValue::from(issue_id),
                 attribution
@@ -1897,7 +1898,7 @@ impl SqliteStorage {
         let rows = self.conn.query_with_params(
             "SELECT closed_by_agent_name, closed_by_harness, closed_by_model, \
                     bypassed_policy, bypass_reason, policy_gates_fired, recorded_at \
-             FROM close_metadata WHERE issue_id = ?",
+             FROM close_metadata WHERE issue_id = ?1",
             &[SqliteValue::from(issue_id)],
         )?;
         let Some(row) = rows.first() else {
@@ -1958,7 +1959,7 @@ impl SqliteStorage {
         self.conn.execute_with_params(
             "INSERT OR REPLACE INTO gate_results (
                 issue_id, gate, provider, passed, note, recorded_by, recorded_at
-            ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, CURRENT_TIMESTAMP)",
             &[
                 SqliteValue::from(issue_id),
                 SqliteValue::from(gate),
@@ -1985,7 +1986,7 @@ impl SqliteStorage {
         }
         let rows = self.conn.query_with_params(
             "SELECT gate, provider, passed, note FROM gate_results \
-             WHERE issue_id = ? ORDER BY gate, provider",
+             WHERE issue_id = ?1 ORDER BY gate, provider",
             &[SqliteValue::from(issue_id)],
         )?;
         Ok(rows
@@ -2131,7 +2132,7 @@ impl SqliteStorage {
                         // Delete existing entries row-by-row to avoid fsqlite IN-clause bugs
                         for id in insert_chunk {
                             storage.conn.execute_with_params(
-                                "DELETE FROM dirty_issues WHERE issue_id = ?",
+                                "DELETE FROM dirty_issues WHERE issue_id = ?1",
                                 &[SqliteValue::from(id.as_str())],
                             )?;
                         }
@@ -2139,7 +2140,7 @@ impl SqliteStorage {
                         // Now insert fresh rows one by one
                         for id in insert_chunk {
                             storage.conn.execute_with_params(
-                                "INSERT INTO dirty_issues (issue_id, marked_at) VALUES (?, ?)",
+                                "INSERT INTO dirty_issues (issue_id, marked_at) VALUES (?1, ?2)",
                                 &[
                                     SqliteValue::from(id.as_str()),
                                     SqliteValue::from(now_str.as_str()),
@@ -2210,7 +2211,7 @@ impl SqliteStorage {
             // Explicit duplicate check since fsqlite does not enforce
             // UNIQUE constraints on non-rowid columns.
             match conn.query_row_with_params(
-                "SELECT 1 FROM issues WHERE id = ? LIMIT 1",
+                "SELECT 1 FROM issues WHERE id = ?1 LIMIT 1",
                 &[SqliteValue::from(issue.id.as_str())],
             ) {
                 Ok(_) => {
@@ -2225,7 +2226,7 @@ impl SqliteStorage {
             // Check for external_ref collision
             if let Some(ref ext_ref) = issue.external_ref {
                 let existing_ext = conn.query_with_params(
-                    "SELECT id FROM issues WHERE external_ref = ? LIMIT 1",
+                    "SELECT id FROM issues WHERE external_ref = ?1 LIMIT 1",
                     &[SqliteValue::from(ext_ref.as_str())],
                 )?;
                 if let Some(existing_row) = existing_ext.first() {
@@ -2260,7 +2261,7 @@ impl SqliteStorage {
                     source_repo, source_repo_path, deleted_at, deleted_by, delete_reason, original_type,
                     compaction_level, compacted_at, compacted_at_commit, original_size,
                     sender, ephemeral, pinned, is_template, agent_context
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38)",
                 &[
                     SqliteValue::from(issue.id.as_str()),
                     SqliteValue::from(content_hash.as_str()),
@@ -2319,7 +2320,7 @@ impl SqliteStorage {
                     continue;
                 }
                 conn.execute_with_params(
-                    "INSERT INTO labels (issue_id, label) VALUES (?, ?)",
+                    "INSERT INTO labels (issue_id, label) VALUES (?1, ?2)",
                     &[SqliteValue::from(issue.id.as_str()), SqliteValue::from(label.as_str())],
                 )?;
                 ctx.record_event(
@@ -2356,7 +2357,7 @@ impl SqliteStorage {
 
                 conn.execute_with_params(
                     "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
-                     VALUES (?, ?, ?, ?, ?)",
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
                     &[
                         SqliteValue::from(issue.id.as_str()),
                         SqliteValue::from(dep.depends_on_id.as_str()),
@@ -2380,7 +2381,7 @@ impl SqliteStorage {
             // Insert Comments
             for comment in &issue.comments {
                 conn.execute_with_params(
-                    "INSERT INTO comments (issue_id, author, text, created_at) VALUES (?, ?, ?, ?)",
+                    "INSERT INTO comments (issue_id, author, text, created_at) VALUES (?1, ?2, ?3, ?4)",
                     &[
                         SqliteValue::from(issue.id.as_str()),
                         SqliteValue::from(comment.author.as_str()),
@@ -2536,7 +2537,7 @@ impl SqliteStorage {
             // to prevent TOCTOU races where two agents both see "unassigned".
             if updates.expect_unassigned {
                 let current_assignee = match conn.query_row_with_params(
-                    "SELECT assignee FROM issues WHERE id = ?",
+                    "SELECT assignee FROM issues WHERE id = ?1",
                     &[SqliteValue::from(id)],
                 ) {
                     Ok(row) => row.get(0).and_then(SqliteValue::as_text).map(String::from),
@@ -2673,7 +2674,7 @@ impl SqliteStorage {
                     if was_terminal && !status.is_terminal() {
                         ctx.record_event(EventType::Reopened, id, None);
                         conn.execute_with_params(
-                            "DELETE FROM close_metadata WHERE issue_id = ?",
+                            "DELETE FROM close_metadata WHERE issue_id = ?1",
                             &[SqliteValue::from(id)],
                         )?;
                     }
@@ -2762,7 +2763,7 @@ impl SqliteStorage {
                 // Explicit uniqueness check for fsqlite
                 if let Some(ext_ref) = val {
                     let existing_ext = conn.query_with_params(
-                        "SELECT id FROM issues WHERE external_ref = ? AND id != ? LIMIT 1",
+                        "SELECT id FROM issues WHERE external_ref = ?1 AND id != ?2 LIMIT 1",
                         &[SqliteValue::from(ext_ref.as_str()), SqliteValue::from(id)],
                     )?;
                     if let Some(existing_row) = existing_ext.first() {
@@ -2913,7 +2914,7 @@ impl SqliteStorage {
             if updated_rows == 0 {
                 if updates.expect_unassigned {
                     let current_assignee = match conn.query_row_with_params(
-                        "SELECT assignee FROM issues WHERE id = ?",
+                        "SELECT assignee FROM issues WHERE id = ?1",
                         &[SqliteValue::from(id)],
                     ) {
                         Ok(row) => row
@@ -2977,14 +2978,14 @@ impl SqliteStorage {
         self.mutate("delete_issue", actor, |conn, ctx| {
             conn.execute_with_params(
                 "UPDATE issues SET
-                    content_hash = ?,
+                    content_hash = ?1,
                     status = 'tombstone',
-                    deleted_at = ?,
-                    deleted_by = ?,
-                    delete_reason = ?,
-                    original_type = ?,
-                    updated_at = ?
-                 WHERE id = ?",
+                    deleted_at = ?2,
+                    deleted_by = ?3,
+                    delete_reason = ?4,
+                    original_type = ?5,
+                    updated_at = ?6
+                 WHERE id = ?7",
                 &[
                     SqliteValue::from(tombstone_hash.as_str()),
                     SqliteValue::from(timestamp.to_rfc3339()),
@@ -2996,7 +2997,7 @@ impl SqliteStorage {
                 ],
             )?;
             conn.execute_with_params(
-                "DELETE FROM close_metadata WHERE issue_id = ?",
+                "DELETE FROM close_metadata WHERE issue_id = ?1",
                 &[SqliteValue::from(id)],
             )?;
 
@@ -3033,42 +3034,42 @@ impl SqliteStorage {
 
         self.mutate("purge_issue", actor, |conn, ctx| {
             conn.execute_with_params(
-                "DELETE FROM comments WHERE issue_id = ?",
+                "DELETE FROM comments WHERE issue_id = ?1",
                 &[SqliteValue::from(id)],
             )?;
             conn.execute_with_params(
-                "DELETE FROM labels WHERE issue_id = ?",
+                "DELETE FROM labels WHERE issue_id = ?1",
                 &[SqliteValue::from(id)],
             )?;
             conn.execute_with_params(
-                "DELETE FROM dependencies WHERE issue_id = ?",
+                "DELETE FROM dependencies WHERE issue_id = ?1",
                 &[SqliteValue::from(id)],
             )?;
             conn.execute_with_params(
-                "DELETE FROM dependencies WHERE depends_on_id = ?",
+                "DELETE FROM dependencies WHERE depends_on_id = ?1",
                 &[SqliteValue::from(id)],
             )?;
             conn.execute_with_params(
-                "DELETE FROM events WHERE issue_id = ?",
+                "DELETE FROM events WHERE issue_id = ?1",
                 &[SqliteValue::from(id)],
             )?;
             conn.execute_with_params(
-                "DELETE FROM dirty_issues WHERE issue_id = ?",
+                "DELETE FROM dirty_issues WHERE issue_id = ?1",
                 &[SqliteValue::from(id)],
             )?;
             conn.execute_with_params(
-                "DELETE FROM export_hashes WHERE issue_id = ?",
+                "DELETE FROM export_hashes WHERE issue_id = ?1",
                 &[SqliteValue::from(id)],
             )?;
             conn.execute_with_params(
-                "DELETE FROM blocked_issues_cache WHERE issue_id = ?",
+                "DELETE FROM blocked_issues_cache WHERE issue_id = ?1",
                 &[SqliteValue::from(id)],
             )?;
             conn.execute_with_params(
-                "DELETE FROM child_counters WHERE parent_id = ?",
+                "DELETE FROM child_counters WHERE parent_id = ?1",
                 &[SqliteValue::from(id)],
             )?;
-            conn.execute_with_params("DELETE FROM issues WHERE id = ?", &[SqliteValue::from(id)])?;
+            conn.execute_with_params("DELETE FROM issues WHERE id = ?1", &[SqliteValue::from(id)])?;
 
             ctx.invalidate_cache();
             ctx.force_flush = true;
@@ -3135,7 +3136,7 @@ impl SqliteStorage {
     /// Returns an error if the query fails.
     pub fn get_issue_ids_by_status(&self, status: &Status) -> Result<Vec<String>> {
         let rows = self.conn.query_with_params(
-            "SELECT id FROM issues WHERE status = ? ORDER BY id",
+            "SELECT id FROM issues WHERE status = ?1 ORDER BY id",
             &[SqliteValue::from(status.as_str())],
         )?;
 
@@ -3636,9 +3637,9 @@ impl SqliteStorage {
                  FROM issues INDEXED BY idx_issues_list_active_order
                  WHERE status NOT IN ('closed', 'tombstone')
                    AND (is_template = 0 OR is_template IS NULL)
-                   AND priority = ?
+                   AND priority = ?1
                  ORDER BY created_at DESC, id ASC
-                 LIMIT ?",
+                 LIMIT ?2",
                 &[
                     SqliteValue::from(i64::from(priority)),
                     SqliteValue::from(i64::try_from(query_limit).unwrap_or(i64::MAX)),
@@ -4179,7 +4180,7 @@ impl SqliteStorage {
         }
 
         let label_rows = self.conn.query_with_params(
-            "SELECT issue_id FROM labels WHERE label = ?",
+            "SELECT issue_id FROM labels WHERE label = ?1",
             &[SqliteValue::from(label)],
         )?;
         Ok(label_rows
@@ -5502,7 +5503,7 @@ impl SqliteStorage {
             return Ok(blocked_ids.contains(issue_id));
         }
         let rows = match self.conn.query_with_params(
-            "SELECT 1 FROM blocked_issues_cache WHERE issue_id = ? LIMIT 1",
+            "SELECT 1 FROM blocked_issues_cache WHERE issue_id = ?1 LIMIT 1",
             &[SqliteValue::from(issue_id)],
         ) {
             Ok(rows) => rows,
@@ -5608,7 +5609,7 @@ impl SqliteStorage {
                 .map_or_else(Vec::new, Clone::clone));
         }
         let rows = match self.conn.query_with_params(
-            "SELECT blocked_by FROM blocked_issues_cache WHERE issue_id = ?",
+            "SELECT blocked_by FROM blocked_issues_cache WHERE issue_id = ?1",
             &[SqliteValue::from(issue_id)],
         ) {
             Ok(rows) => rows,
@@ -5745,11 +5746,11 @@ impl SqliteStorage {
             // Explicit DELETE + INSERT instead of INSERT OR REPLACE because
             // fsqlite does not reliably support UNIQUE constraint upserts.
             conn.execute_with_params(
-                "DELETE FROM child_counters WHERE parent_id = ?",
+                "DELETE FROM child_counters WHERE parent_id = ?1",
                 &[SqliteValue::from(parent_id.as_str())],
             )?;
             conn.execute_with_params(
-                "INSERT INTO child_counters (parent_id, last_child) VALUES (?, ?)",
+                "INSERT INTO child_counters (parent_id, last_child) VALUES (?1, ?2)",
                 &[
                     SqliteValue::from(parent_id.as_str()),
                     SqliteValue::from(i64::from(last_child)),
@@ -6102,11 +6103,11 @@ impl SqliteStorage {
             // Explicit DELETE + INSERT instead of INSERT OR REPLACE because
             // fsqlite does not reliably support UNIQUE constraint upserts.
             conn.execute_with_params(
-                "DELETE FROM blocked_issues_cache WHERE issue_id = ?",
+                "DELETE FROM blocked_issues_cache WHERE issue_id = ?1",
                 &[SqliteValue::from(issue_id.as_str())],
             )?;
             conn.execute_with_params(
-                "INSERT INTO blocked_issues_cache (issue_id, blocked_by, blocked_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+                "INSERT INTO blocked_issues_cache (issue_id, blocked_by, blocked_at) VALUES (?1, ?2, CURRENT_TIMESTAMP)",
                 &[
                     SqliteValue::from(issue_id.as_str()),
                     SqliteValue::from(blockers_json.as_str()),
@@ -6869,7 +6870,7 @@ impl SqliteStorage {
     /// Returns an error if the database query fails.
     pub fn find_ids_by_exact_title(&self, title: &str) -> Result<Vec<String>> {
         let rows = self.conn.query_with_params(
-            "SELECT id FROM issues WHERE title = ? ORDER BY created_at ASC, id ASC",
+            "SELECT id FROM issues WHERE title = ?1 ORDER BY created_at ASC, id ASC",
             &[SqliteValue::from(title.trim())],
         )?;
         Ok(rows
@@ -6958,7 +6959,7 @@ impl SqliteStorage {
     ) -> Result<bool> {
         let existing_parent = conn
             .query_with_params(
-                "SELECT depends_on_id FROM dependencies WHERE issue_id = ? AND type COLLATE NOCASE = 'parent-child' ORDER BY rowid ASC LIMIT 1",
+                "SELECT depends_on_id FROM dependencies WHERE issue_id = ?1 AND type COLLATE NOCASE = 'parent-child' ORDER BY rowid ASC LIMIT 1",
                 &[SqliteValue::from(issue_id)],
             )?
             .first()
@@ -7076,8 +7077,8 @@ impl SqliteStorage {
             "SELECT i.id FROM issues i \
              WHERE i.status IN ('open', 'in_progress') \
                AND (i.is_template = 0 OR i.is_template IS NULL) \
-               AND i.id LIKE ? ESCAPE '\\' \
-               AND i.id NOT LIKE ? ESCAPE '\\'",
+               AND i.id LIKE ?1 ESCAPE '\\' \
+               AND i.id NOT LIKE ?2 ESCAPE '\\'",
             &[
                 SqliteValue::from(direct_prefix.as_str()),
                 SqliteValue::from(grandchild_prefix.as_str()),
@@ -7188,7 +7189,7 @@ impl SqliteStorage {
             }
 
             let existing = conn.query_with_params(
-                "SELECT 1 FROM dependencies WHERE issue_id = ? AND depends_on_id = ? LIMIT 1",
+                "SELECT 1 FROM dependencies WHERE issue_id = ?1 AND depends_on_id = ?2 LIMIT 1",
                 &[
                     SqliteValue::from(issue_id),
                     SqliteValue::from(depends_on_id),
@@ -7200,7 +7201,7 @@ impl SqliteStorage {
 
             let inserted = conn.execute_with_params(
                 "INSERT OR IGNORE INTO dependencies (issue_id, depends_on_id, type, created_at, created_by, metadata)
-                 VALUES (?, ?, ?, ?, ?, ?)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 &[
                     SqliteValue::from(issue_id),
                     SqliteValue::from(depends_on_id),
@@ -7216,7 +7217,7 @@ impl SqliteStorage {
             }
 
             conn.execute_with_params(
-                "UPDATE issues SET updated_at = ? WHERE id = ?",
+                "UPDATE issues SET updated_at = ?1 WHERE id = ?2",
                 &[
                     SqliteValue::from(Utc::now().to_rfc3339()),
                     SqliteValue::from(issue_id),
@@ -7255,7 +7256,7 @@ impl SqliteStorage {
             Self::ensure_issue_mutable_in_tx(conn, issue_id, "remove dependency from")?;
 
             let rows = conn.execute_with_params(
-                "DELETE FROM dependencies WHERE issue_id = ? AND depends_on_id = ?",
+                "DELETE FROM dependencies WHERE issue_id = ?1 AND depends_on_id = ?2",
                 &[
                     SqliteValue::from(issue_id),
                     SqliteValue::from(depends_on_id),
@@ -7264,7 +7265,7 @@ impl SqliteStorage {
 
             if rows > 0 {
                 conn.execute_with_params(
-                    "UPDATE issues SET updated_at = ? WHERE id = ?",
+                    "UPDATE issues SET updated_at = ?1 WHERE id = ?2",
                     &[
                         SqliteValue::from(Utc::now().to_rfc3339()),
                         SqliteValue::from(issue_id),
@@ -7293,7 +7294,7 @@ impl SqliteStorage {
     pub fn remove_all_dependencies(&mut self, issue_id: &str, actor: &str) -> Result<usize> {
         self.mutate("remove_all_dependencies", actor, |conn, ctx| {
             let affected_rows = conn.query_with_params(
-                "SELECT DISTINCT issue_id FROM dependencies WHERE depends_on_id = ?",
+                "SELECT DISTINCT issue_id FROM dependencies WHERE depends_on_id = ?1",
                 &[SqliteValue::from(issue_id)],
             )?;
             let affected: Vec<String> = affected_rows
@@ -7302,11 +7303,11 @@ impl SqliteStorage {
                 .collect();
 
             let outgoing = conn.execute_with_params(
-                "DELETE FROM dependencies WHERE issue_id = ?",
+                "DELETE FROM dependencies WHERE issue_id = ?1",
                 &[SqliteValue::from(issue_id)],
             )?;
             let incoming = conn.execute_with_params(
-                "DELETE FROM dependencies WHERE depends_on_id = ?",
+                "DELETE FROM dependencies WHERE depends_on_id = ?1",
                 &[SqliteValue::from(issue_id)],
             )?;
             let total = outgoing + incoming;
@@ -7315,14 +7316,14 @@ impl SqliteStorage {
                 let now = Utc::now().to_rfc3339();
 
                 conn.execute_with_params(
-                    "UPDATE issues SET updated_at = ? WHERE id = ?",
+                    "UPDATE issues SET updated_at = ?1 WHERE id = ?2",
                     &[SqliteValue::from(now.as_str()), SqliteValue::from(issue_id)],
                 )?;
 
                 for chunk in affected.chunks(400) {
                     for id in chunk {
                         conn.execute_with_params(
-                            "UPDATE issues SET updated_at = ? WHERE id = ?",
+                            "UPDATE issues SET updated_at = ?1 WHERE id = ?2",
                             &[
                                 SqliteValue::from(now.as_str()),
                                 SqliteValue::from(id.as_str()),
@@ -7360,7 +7361,7 @@ impl SqliteStorage {
             Self::ensure_issue_mutable_in_tx(conn, issue_id, "clear parent from")?;
 
             let previous_parent_rows = conn.query_with_params(
-                "SELECT depends_on_id FROM dependencies WHERE issue_id = ? AND type = 'parent-child' ORDER BY rowid ASC",
+                "SELECT depends_on_id FROM dependencies WHERE issue_id = ?1 AND type = 'parent-child' ORDER BY rowid ASC",
                 &[SqliteValue::from(issue_id)],
             )?;
             let previous_parents = previous_parent_rows
@@ -7369,13 +7370,13 @@ impl SqliteStorage {
                 .collect::<Vec<_>>();
 
             let rows = conn.execute_with_params(
-                "DELETE FROM dependencies WHERE issue_id = ? AND type = 'parent-child'",
+                "DELETE FROM dependencies WHERE issue_id = ?1 AND type = 'parent-child'",
                 &[SqliteValue::from(issue_id)],
             )?;
 
             if rows > 0 {
                 conn.execute_with_params(
-                    "UPDATE issues SET updated_at = ? WHERE id = ?",
+                    "UPDATE issues SET updated_at = ?1 WHERE id = ?2",
                     &[
                         SqliteValue::from(Utc::now().to_rfc3339()),
                         SqliteValue::from(issue_id),
@@ -7437,7 +7438,7 @@ impl SqliteStorage {
             Self::ensure_issue_mutable_in_tx(conn, issue_id, action)?;
 
             let previous_parent_rows = conn.query_with_params(
-                "SELECT depends_on_id FROM dependencies WHERE issue_id = ? AND type = 'parent-child' ORDER BY rowid ASC",
+                "SELECT depends_on_id FROM dependencies WHERE issue_id = ?1 AND type = 'parent-child' ORDER BY rowid ASC",
                 &[SqliteValue::from(issue_id)],
             )?;
             let previous_parents = previous_parent_rows
@@ -7453,7 +7454,7 @@ impl SqliteStorage {
 
             // Remove existing parent
             conn.execute_with_params(
-                "DELETE FROM dependencies WHERE issue_id = ? AND type = 'parent-child'",
+                "DELETE FROM dependencies WHERE issue_id = ?1 AND type = 'parent-child'",
                 &[SqliteValue::from(issue_id)],
             )?;
 
@@ -7475,7 +7476,7 @@ impl SqliteStorage {
 
                 conn.execute_with_params(
                     "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
-                     VALUES (?, ?, 'parent-child', ?, ?)",
+                     VALUES (?1, ?2, 'parent-child', ?3, ?4)",
                     &[
                         SqliteValue::from(issue_id),
                         SqliteValue::from(pid),
@@ -7498,7 +7499,7 @@ impl SqliteStorage {
             }
 
             conn.execute_with_params(
-                "UPDATE issues SET updated_at = ? WHERE id = ?",
+                "UPDATE issues SET updated_at = ?1 WHERE id = ?2",
                 &[
                     SqliteValue::from(Utc::now().to_rfc3339()),
                     SqliteValue::from(issue_id),
@@ -7552,7 +7553,7 @@ impl SqliteStorage {
             }
 
             let row = conn.query_row_with_params(
-                "SELECT count(*) FROM labels WHERE issue_id = ? AND label = ?",
+                "SELECT count(*) FROM labels WHERE issue_id = ?1 AND label = ?2",
                 &[SqliteValue::from(issue_id), SqliteValue::from(label)],
             )?;
             let exists = row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0);
@@ -7562,7 +7563,7 @@ impl SqliteStorage {
             }
 
             let row = conn.query_row_with_params(
-                "SELECT count(*) FROM labels WHERE issue_id = ?",
+                "SELECT count(*) FROM labels WHERE issue_id = ?1",
                 &[SqliteValue::from(issue_id)],
             )?;
             let label_count = row
@@ -7575,7 +7576,7 @@ impl SqliteStorage {
             }
 
             conn.execute_with_params(
-                "INSERT INTO labels (issue_id, label) VALUES (?, ?)",
+                "INSERT INTO labels (issue_id, label) VALUES (?1, ?2)",
                 &[SqliteValue::from(issue_id), SqliteValue::from(label)],
             )?;
 
@@ -7587,7 +7588,7 @@ impl SqliteStorage {
             ctx.mark_dirty(issue_id);
 
             conn.execute_with_params(
-                "UPDATE issues SET updated_at = ? WHERE id = ?",
+                "UPDATE issues SET updated_at = ?1 WHERE id = ?2",
                 &[
                     SqliteValue::from(Utc::now().to_rfc3339()),
                     SqliteValue::from(issue_id),
@@ -7623,13 +7624,13 @@ impl SqliteStorage {
             }
 
             let rows = conn.execute_with_params(
-                "DELETE FROM labels WHERE issue_id = ? AND label = ?",
+                "DELETE FROM labels WHERE issue_id = ?1 AND label = ?2",
                 &[SqliteValue::from(issue_id), SqliteValue::from(label)],
             )?;
 
             if rows > 0 {
                 conn.execute_with_params(
-                    "UPDATE issues SET updated_at = ? WHERE id = ?",
+                    "UPDATE issues SET updated_at = ?1 WHERE id = ?2",
                     &[
                         SqliteValue::from(Utc::now().to_rfc3339()),
                         SqliteValue::from(issue_id),
@@ -7658,13 +7659,13 @@ impl SqliteStorage {
             Self::ensure_issue_mutable_in_tx(conn, issue_id, "remove labels from")?;
 
             let rows = conn.execute_with_params(
-                "DELETE FROM labels WHERE issue_id = ?",
+                "DELETE FROM labels WHERE issue_id = ?1",
                 &[SqliteValue::from(issue_id)],
             )?;
 
             if rows > 0 {
                 conn.execute_with_params(
-                    "UPDATE issues SET updated_at = ? WHERE id = ?",
+                    "UPDATE issues SET updated_at = ?1 WHERE id = ?2",
                     &[
                         SqliteValue::from(Utc::now().to_rfc3339()),
                         SqliteValue::from(issue_id),
@@ -7683,6 +7684,93 @@ impl SqliteStorage {
         })
     }
 
+    // ------------------------------------------------------------------
+    // Custom status / type management (Issue #5)
+    // ------------------------------------------------------------------
+
+    /// List all registered custom statuses.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn list_custom_statuses(&self) -> Result<Vec<crate::model::CustomStatus>> {
+        let rows = self.conn.query("SELECT name, category FROM custom_statuses ORDER BY name")?;
+        let mut statuses = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let name = row.get(0).and_then(SqliteValue::as_text).unwrap_or_default().to_string();
+            let category = row.get(1).and_then(SqliteValue::as_text).unwrap_or_default().to_string();
+            statuses.push(crate::model::CustomStatus { name, category });
+        }
+        Ok(statuses)
+    }
+
+    /// Add a custom status.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the status already exists or the database update fails.
+    pub fn add_custom_status(&self, name: &str, category: &str) -> Result<bool> {
+        let rows = self.conn.execute_with_params(
+            "INSERT OR IGNORE INTO custom_statuses (name, category) VALUES (?1, ?2)",
+            &[SqliteValue::from(name), SqliteValue::from(category)],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Remove a custom status.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the status doesn't exist or the database update fails.
+    pub fn remove_custom_status(&self, name: &str) -> Result<bool> {
+        let rows = self.conn.execute_with_params(
+            "DELETE FROM custom_statuses WHERE name = ?1",
+            &[SqliteValue::from(name)],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// List all registered custom types.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn list_custom_types(&self) -> Result<Vec<crate::model::CustomType>> {
+        let rows = self.conn.query("SELECT name FROM custom_types ORDER BY name")?;
+        let mut types = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let name = row.get(0).and_then(SqliteValue::as_text).unwrap_or_default().to_string();
+            types.push(crate::model::CustomType { name });
+        }
+        Ok(types)
+    }
+
+    /// Add a custom type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the type already exists or the database update fails.
+    pub fn add_custom_type(&self, name: &str) -> Result<bool> {
+        let rows = self.conn.execute_with_params(
+            "INSERT OR IGNORE INTO custom_types (name) VALUES (?1)",
+            &[SqliteValue::from(name)],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Remove a custom type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the type doesn't exist or the database update fails.
+    pub fn remove_custom_type(&self, name: &str) -> Result<bool> {
+        let rows = self.conn.execute_with_params(
+            "DELETE FROM custom_types WHERE name = ?1",
+            &[SqliteValue::from(name)],
+        )?;
+        Ok(rows > 0)
+    }
+
     /// Set all labels for an issue (replace existing).
     ///
     /// # Errors
@@ -7693,7 +7781,7 @@ impl SqliteStorage {
             Self::ensure_issue_mutable_in_tx(conn, issue_id, "set labels on")?;
 
             let old_rows = conn.query_with_params(
-                "SELECT label FROM labels WHERE issue_id = ?",
+                "SELECT label FROM labels WHERE issue_id = ?1",
                 &[SqliteValue::from(issue_id)],
             )?;
             let old_labels_raw: Vec<String> = old_rows
@@ -7715,7 +7803,7 @@ impl SqliteStorage {
             }
 
             conn.execute_with_params(
-                "DELETE FROM labels WHERE issue_id = ?",
+                "DELETE FROM labels WHERE issue_id = ?1",
                 &[SqliteValue::from(issue_id)],
             )?;
 
@@ -7725,7 +7813,7 @@ impl SqliteStorage {
                     continue;
                 }
                 conn.execute_with_params(
-                    "INSERT INTO labels (issue_id, label) VALUES (?, ?)",
+                    "INSERT INTO labels (issue_id, label) VALUES (?1, ?2)",
                     &[
                         SqliteValue::from(issue_id),
                         SqliteValue::from(label.as_str()),
@@ -7776,7 +7864,7 @@ impl SqliteStorage {
                 ctx.mark_dirty(issue_id);
 
                 conn.execute_with_params(
-                    "UPDATE issues SET updated_at = ? WHERE id = ?",
+                    "UPDATE issues SET updated_at = ?1 WHERE id = ?2",
                     &[
                         SqliteValue::from(Utc::now().to_rfc3339()),
                         SqliteValue::from(issue_id),
@@ -7795,7 +7883,7 @@ impl SqliteStorage {
     /// Returns an error if the database query fails.
     pub fn get_labels(&self, issue_id: &str) -> Result<Vec<String>> {
         let rows = self.conn.query_with_params(
-            "SELECT label FROM labels WHERE issue_id = ? ORDER BY label",
+            "SELECT label FROM labels WHERE issue_id = ?1 ORDER BY label",
             &[SqliteValue::from(issue_id)],
         )?;
         Ok(rows
@@ -8064,7 +8152,7 @@ impl SqliteStorage {
                 "SELECT l.issue_id
                  FROM labels l
                  JOIN issues i ON l.issue_id = i.id
-                 WHERE l.label = ? AND i.status != 'tombstone'",
+                 WHERE l.label = ?1 AND i.status != 'tombstone'",
                 &[SqliteValue::from(old_name)],
             )?;
             let issue_ids: Vec<String> = id_rows
@@ -8076,9 +8164,9 @@ impl SqliteStorage {
                 "SELECT l.issue_id
                  FROM labels l
                  JOIN issues i ON l.issue_id = i.id
-                 WHERE l.label = ?
+                 WHERE l.label = ?1
                    AND i.status != 'tombstone'
-                   AND l.issue_id IN (SELECT issue_id FROM labels WHERE label = ?)",
+                   AND l.issue_id IN (SELECT issue_id FROM labels WHERE label = ?2)",
                 &[SqliteValue::from(new_name), SqliteValue::from(old_name)],
             )?;
             let conflicts: Vec<String> = conflict_rows
@@ -8088,7 +8176,7 @@ impl SqliteStorage {
 
             for conflict_id in &conflicts {
                 conn.execute_with_params(
-                    "DELETE FROM labels WHERE issue_id = ? AND label = ?",
+                    "DELETE FROM labels WHERE issue_id = ?1 AND label = ?2",
                     &[
                         SqliteValue::from(conflict_id.as_str()),
                         SqliteValue::from(old_name),
@@ -8099,8 +8187,8 @@ impl SqliteStorage {
 
             let renamed = conn.execute_with_params(
                 "UPDATE labels
-                 SET label = ?
-                 WHERE label = ?
+                 SET label = ?1
+                 WHERE label = ?2
                    AND issue_id IN (SELECT id FROM issues WHERE status != 'tombstone')",
                 &[SqliteValue::from(new_name), SqliteValue::from(old_name)],
             )?;
@@ -8115,7 +8203,7 @@ impl SqliteStorage {
                 ctx.mark_dirty(issue_id);
 
                 conn.execute_with_params(
-                    "UPDATE issues SET updated_at = ? WHERE id = ?",
+                    "UPDATE issues SET updated_at = ?1 WHERE id = ?2",
                     &[
                         SqliteValue::from(now.as_str()),
                         SqliteValue::from(issue_id.as_str()),
@@ -8136,7 +8224,7 @@ impl SqliteStorage {
         let rows = self.conn.query_with_params(
             "SELECT id, issue_id, author, text, created_at
              FROM comments
-             WHERE issue_id = ?
+             WHERE issue_id = ?1
              ORDER BY created_at ASC, id ASC",
             &[SqliteValue::from(issue_id)],
         )?;
@@ -8258,7 +8346,7 @@ impl SqliteStorage {
         let count = self
             .conn
             .query_row_with_params(
-                "SELECT count(*) FROM events WHERE issue_id = ?",
+                "SELECT count(*) FROM events WHERE issue_id = ?1",
                 &[SqliteValue::from(issue_id)],
             )?
             .get(0)
@@ -8281,7 +8369,7 @@ impl SqliteStorage {
             let comment_id = insert_comment_row(conn, issue_id, author, text)?;
 
             conn.execute_with_params(
-                "UPDATE issues SET updated_at = ? WHERE id = ?",
+                "UPDATE issues SET updated_at = ?1 WHERE id = ?2",
                 &[
                     SqliteValue::from(Utc::now().to_rfc3339()),
                     SqliteValue::from(issue_id),
@@ -8308,7 +8396,7 @@ impl SqliteStorage {
             "SELECT d.depends_on_id, i.title, i.status, i.priority, d.type, i.created_at
              FROM dependencies d
              LEFT JOIN issues i ON d.depends_on_id = i.id
-             WHERE d.issue_id = ?
+             WHERE d.issue_id = ?1
             ORDER BY COALESCE(i.priority, 2) ASC, i.created_at DESC, d.depends_on_id ASC",
             &[SqliteValue::from(issue_id)],
         )?;
@@ -8331,7 +8419,7 @@ impl SqliteStorage {
             "SELECT d.issue_id, i.title, i.status, i.priority, d.type, i.created_at
              FROM dependencies d
              LEFT JOIN issues i ON d.issue_id = i.id
-             WHERE d.depends_on_id = ?
+             WHERE d.depends_on_id = ?1
             ORDER BY COALESCE(i.priority, 2) ASC, i.created_at DESC, d.issue_id ASC",
             &[SqliteValue::from(issue_id)],
         )?;
@@ -8403,7 +8491,7 @@ impl SqliteStorage {
     /// Returns an error if the database query fails.
     pub fn get_parent_id(&self, issue_id: &str) -> Result<Option<String>> {
         match self.conn.query_row_with_params(
-            "SELECT depends_on_id FROM dependencies WHERE issue_id = ? AND type = 'parent-child' ORDER BY rowid DESC LIMIT 1",
+            "SELECT depends_on_id FROM dependencies WHERE issue_id = ?1 AND type = 'parent-child' ORDER BY rowid DESC LIMIT 1",
             &[SqliteValue::from(issue_id)],
         ) {
             Ok(row) => Ok(row.get(0).and_then(SqliteValue::as_text).map(String::from)),
@@ -8419,7 +8507,7 @@ impl SqliteStorage {
     /// Returns an error if the database query fails.
     pub fn get_dependents(&self, issue_id: &str) -> Result<Vec<String>> {
         let rows = self.conn.query_with_params(
-            "SELECT issue_id FROM dependencies WHERE depends_on_id = ?",
+            "SELECT issue_id FROM dependencies WHERE depends_on_id = ?1",
             &[SqliteValue::from(issue_id)],
         )?;
         Ok(rows
@@ -8481,7 +8569,7 @@ impl SqliteStorage {
     /// Returns an error if the database query fails.
     pub fn get_dependencies(&self, issue_id: &str) -> Result<Vec<String>> {
         let rows = self.conn.query_with_params(
-            "SELECT depends_on_id FROM dependencies WHERE issue_id = ?",
+            "SELECT depends_on_id FROM dependencies WHERE issue_id = ?1",
             &[SqliteValue::from(issue_id)],
         )?;
         Ok(rows
@@ -8498,7 +8586,7 @@ impl SqliteStorage {
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     pub fn count_dependencies(&self, issue_id: &str) -> Result<usize> {
         let row = self.conn.query_row_with_params(
-            "SELECT count(*) FROM dependencies WHERE issue_id = ?",
+            "SELECT count(*) FROM dependencies WHERE issue_id = ?1",
             &[SqliteValue::from(issue_id)],
         )?;
         let count = row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0);
@@ -8513,7 +8601,7 @@ impl SqliteStorage {
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     pub fn count_dependents(&self, issue_id: &str) -> Result<usize> {
         let row = self.conn.query_row_with_params(
-            "SELECT count(*) FROM dependencies WHERE depends_on_id = ?",
+            "SELECT count(*) FROM dependencies WHERE depends_on_id = ?1",
             &[SqliteValue::from(issue_id)],
         )?;
         let count = row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0);
@@ -8531,7 +8619,7 @@ impl SqliteStorage {
     pub fn next_child_number(&self, parent_id: &str) -> Result<u32> {
         // First, check the child_counters table (source of truth)
         match self.conn.query_row_with_params(
-            "SELECT last_child FROM child_counters WHERE parent_id = ?",
+            "SELECT last_child FROM child_counters WHERE parent_id = ?1",
             &[SqliteValue::from(parent_id)],
         ) {
             Ok(row) => {
@@ -8549,7 +8637,7 @@ impl SqliteStorage {
         let escaped_parent = escape_like_pattern(parent_id);
         let pattern = format!("{escaped_parent}.%");
         let ids_rows = self.conn.query_with_params(
-            "SELECT id FROM issues WHERE id LIKE ? ESCAPE '\\'",
+            "SELECT id FROM issues WHERE id LIKE ?1 ESCAPE '\\'",
             &[SqliteValue::from(pattern.as_str())],
         )?;
         let ids: Vec<String> = ids_rows
@@ -8585,7 +8673,7 @@ impl SqliteStorage {
     ) -> Result<()> {
         // Check current value
         let current_max = match conn.query_row_with_params(
-            "SELECT last_child FROM child_counters WHERE parent_id = ?",
+            "SELECT last_child FROM child_counters WHERE parent_id = ?1",
             &[SqliteValue::from(parent_id)],
         ) {
             Ok(row) => row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0),
@@ -8598,11 +8686,11 @@ impl SqliteStorage {
             // FK enforcement is disabled by the caller's transaction wrapper
             // to avoid false FK violations from fsqlite (#215).
             conn.execute_with_params(
-                "DELETE FROM child_counters WHERE parent_id = ?",
+                "DELETE FROM child_counters WHERE parent_id = ?1",
                 &[SqliteValue::from(parent_id)],
             )?;
             conn.execute_with_params(
-                "INSERT INTO child_counters (parent_id, last_child) VALUES (?, ?)",
+                "INSERT INTO child_counters (parent_id, last_child) VALUES (?1, ?2)",
                 &[
                     SqliteValue::from(parent_id),
                     SqliteValue::from(i64::from(child_number)),
@@ -8901,7 +8989,7 @@ impl SqliteStorage {
     /// Returns an error if the database query fails.
     pub fn get_config(&self, key: &str) -> Result<Option<String>> {
         match self.conn.query_row_with_params(
-            "SELECT value FROM config WHERE key = ?",
+            "SELECT value FROM config WHERE key = ?1",
             &[SqliteValue::from(key)],
         ) {
             Ok(row) => Ok(row.get(0).and_then(SqliteValue::as_text).map(String::from)),
@@ -8948,11 +9036,11 @@ impl SqliteStorage {
         };
         self.with_write_transaction(|storage| {
             storage.conn.execute_with_params(
-                "DELETE FROM config WHERE key = ?",
+                "DELETE FROM config WHERE key = ?1",
                 &[SqliteValue::from(key)],
             )?;
             storage.conn.execute_with_params(
-                "INSERT INTO config (key, value) VALUES (?, ?)",
+                "INSERT INTO config (key, value) VALUES (?1, ?2)",
                 &[
                     SqliteValue::from(key),
                     SqliteValue::from(stored_value.as_str()),
@@ -8971,7 +9059,7 @@ impl SqliteStorage {
     /// Returns an error if the database delete fails.
     pub fn delete_config(&mut self, key: &str) -> Result<bool> {
         let deleted = self.conn.execute_with_params(
-            "DELETE FROM config WHERE key = ?",
+            "DELETE FROM config WHERE key = ?1",
             &[SqliteValue::from(key)],
         )?;
         Ok(deleted > 0)
@@ -9225,7 +9313,7 @@ impl SqliteStorage {
         let mut total_deleted = 0;
         for (id, marked_at) in metadata {
             let count = self.conn.execute_with_params(
-                "DELETE FROM dirty_issues WHERE issue_id = ? AND marked_at = ?",
+                "DELETE FROM dirty_issues WHERE issue_id = ?1 AND marked_at = ?2",
                 &[
                     SqliteValue::from(id.as_str()),
                     SqliteValue::from(marked_at.as_str()),
@@ -9254,7 +9342,7 @@ impl SqliteStorage {
             let mut chunk_deleted = 0;
             for id in chunk {
                 let deleted = self.conn.execute_with_params(
-                    "DELETE FROM dirty_issues WHERE issue_id = ?",
+                    "DELETE FROM dirty_issues WHERE issue_id = ?1",
                     &[SqliteValue::from(id.as_str())],
                 )?;
                 chunk_deleted += deleted;
@@ -9288,7 +9376,7 @@ impl SqliteStorage {
     /// Returns an error if the database query fails.
     pub fn get_export_hash(&self, issue_id: &str) -> Result<Option<(String, String)>> {
         match self.conn.query_row_with_params(
-            "SELECT content_hash, exported_at FROM export_hashes WHERE issue_id = ?",
+            "SELECT content_hash, exported_at FROM export_hashes WHERE issue_id = ?1",
             &[SqliteValue::from(issue_id)],
         ) {
             Ok(row) => {
@@ -9318,11 +9406,11 @@ impl SqliteStorage {
         let now = Utc::now().to_rfc3339();
         self.with_write_transaction(|storage| {
             storage.conn.execute_with_params(
-                "DELETE FROM export_hashes WHERE issue_id = ?",
+                "DELETE FROM export_hashes WHERE issue_id = ?1",
                 &[SqliteValue::from(issue_id)],
             )?;
             storage.conn.execute_with_params(
-                "INSERT INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?, ?, ?)",
+                "INSERT INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?1, ?2, ?3)",
                 &[
                     SqliteValue::from(issue_id),
                     SqliteValue::from(content_hash),
@@ -9412,7 +9500,7 @@ impl SqliteStorage {
     /// Returns an error if the database query fails.
     pub fn get_metadata(&self, key: &str) -> Result<Option<String>> {
         match self.conn.query_row_with_params(
-            "SELECT value FROM metadata WHERE key = ? ORDER BY rowid DESC LIMIT 1",
+            "SELECT value FROM metadata WHERE key = ?1 ORDER BY rowid DESC LIMIT 1",
             &[SqliteValue::from(key)],
         ) {
             Ok(row) => Ok(row
@@ -9437,6 +9525,30 @@ impl SqliteStorage {
         })
     }
 
+    /// Set or clear the `is_template` flag on an issue.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the issue does not exist or the database update fails.
+    pub fn set_issue_template_flag(&mut self, issue_id: &str, is_template: bool) -> Result<()> {
+        self.with_write_transaction(|storage| {
+            let rows = storage.conn.execute_with_params(
+                "UPDATE issues SET is_template = ?1, updated_at = ?2 WHERE id = ?3",
+                &[
+                    SqliteValue::from(if is_template { 1_i32 } else { 0_i32 }),
+                    SqliteValue::from(Utc::now().to_rfc3339().as_str()),
+                    SqliteValue::from(issue_id),
+                ],
+            )?;
+            if rows == 0 {
+                return Err(BeadsError::IssueNotFound {
+                    id: issue_id.to_string(),
+                });
+            }
+            Ok(())
+        })
+    }
+
     /// Set a metadata value using an internal write transaction.
     ///
     /// # Errors
@@ -9456,7 +9568,7 @@ impl SqliteStorage {
     /// Returns an error if the database update fails.
     pub fn delete_metadata(&mut self, key: &str) -> Result<bool> {
         let count = self.conn.execute_with_params(
-            "DELETE FROM metadata WHERE key = ?",
+            "DELETE FROM metadata WHERE key = ?1",
             &[SqliteValue::from(key)],
         )?;
         Ok(count > 0)
@@ -9567,12 +9679,12 @@ impl SqliteStorage {
     fn issue_detail_relation_presence(&self, id: &str) -> Result<IssueDetailRelationPresence> {
         let row = self.conn.query_row_with_params(
             "SELECT
-                 EXISTS(SELECT 1 FROM labels WHERE issue_id = ?),
-                 EXISTS(SELECT 1 FROM dependencies WHERE issue_id = ?),
-                 EXISTS(SELECT 1 FROM dependencies WHERE depends_on_id = ?),
-                 EXISTS(SELECT 1 FROM comments WHERE issue_id = ?),
+                 EXISTS(SELECT 1 FROM labels WHERE issue_id = ?1),
+                 EXISTS(SELECT 1 FROM dependencies WHERE issue_id = ?2),
+                 EXISTS(SELECT 1 FROM dependencies WHERE depends_on_id = ?3),
+                 EXISTS(SELECT 1 FROM comments WHERE issue_id = ?4),
                  (SELECT depends_on_id FROM dependencies
-                  WHERE issue_id = ? AND type = 'parent-child'
+                  WHERE issue_id = ?5 AND type = 'parent-child'
                   ORDER BY rowid DESC LIMIT 1)",
             &[
                 SqliteValue::from(id),
@@ -9670,6 +9782,7 @@ impl SqliteStorage {
             labels: vec![],
             dependencies: vec![],
             comments: vec![],
+            ..Default::default()
         })
     }
 
@@ -9735,6 +9848,7 @@ impl SqliteStorage {
             labels: vec![],
             dependencies: vec![],
             comments: vec![],
+            ..Default::default()
         })
     }
 
@@ -9800,6 +9914,7 @@ impl SqliteStorage {
             labels: vec![],
             dependencies: vec![],
             comments: vec![],
+            ..Default::default()
         })
     }
 
@@ -9865,6 +9980,7 @@ impl SqliteStorage {
             labels: vec![],
             dependencies: vec![],
             comments: vec![],
+            ..Default::default()
         })
     }
 
@@ -9924,6 +10040,7 @@ impl SqliteStorage {
             labels: vec![],
             dependencies: vec![],
             comments: vec![],
+            ..Default::default()
         })
     }
 
@@ -9989,6 +10106,7 @@ impl SqliteStorage {
             labels: vec![],
             dependencies: vec![],
             comments: vec![],
+            ..Default::default()
         })
     }
 
@@ -10048,6 +10166,7 @@ impl SqliteStorage {
             labels: vec![],
             dependencies: vec![],
             comments: vec![],
+            ..Default::default()
         })
     }
 
@@ -10316,6 +10435,20 @@ pub struct ListFilters {
     pub updated_before: Option<DateTime<Utc>>,
     /// Filter by `updated_at` >= timestamp
     pub updated_after: Option<DateTime<Utc>>,
+    /// Filter by specific issue IDs (wildcard matching with GLOB).
+    pub ids: Option<Vec<String>>,
+    /// Filter by `created_at` >= timestamp
+    pub created_after: Option<DateTime<Utc>>,
+    /// Filter by `created_at` <= timestamp
+    pub created_before: Option<DateTime<Utc>>,
+    /// Filter by metadata key=value pairs (JSON object match).
+    pub metadata_filters: Option<Vec<String>>,
+    /// Filter by assigned owner.
+    pub owner: Option<String>,
+    /// Include only pinned issues.
+    pub pinned: Option<bool>,
+    /// Filter by molecular type.
+    pub mol_type: Option<MolType>,
 }
 
 /// Closure-time policy metadata row (issue #274 Phase 1).
@@ -10399,6 +10532,8 @@ pub struct IssueUpdate {
     pub claim_exclusive: bool,
     /// The actor performing the claim (used for idempotent same-actor check).
     pub claim_actor: Option<String>,
+    /// Template flag to make/unmake an issue as a template.
+    pub is_template: Option<bool>,
 }
 
 impl IssueUpdate {
@@ -11264,7 +11399,7 @@ impl SqliteStorage {
             let mut chunk_deleted = 0;
             for id in chunk {
                 let deleted = self.conn.execute_with_params(
-                    "DELETE FROM dirty_issues WHERE issue_id = ?",
+                    "DELETE FROM dirty_issues WHERE issue_id = ?1",
                     &[SqliteValue::from(id.as_str())],
                 )?;
                 chunk_deleted += deleted;
@@ -11313,7 +11448,7 @@ impl SqliteStorage {
         let count = self
             .conn
             .query_row_with_params(
-                "SELECT COUNT(*) FROM dependencies WHERE issue_id = ? AND depends_on_id = ?",
+                "SELECT COUNT(*) FROM dependencies WHERE issue_id = ?1 AND depends_on_id = ?2",
                 &[
                     SqliteValue::from(issue_id),
                     SqliteValue::from(depends_on_id),
@@ -11810,7 +11945,7 @@ impl SqliteStorage {
         // if the id is present. If it's malformed we still want to
         // overwrite it.
         let issue_exists = match self.conn.query_row_with_params(
-            "SELECT 1 FROM issues WHERE id = ? LIMIT 1",
+            "SELECT 1 FROM issues WHERE id = ?1 LIMIT 1",
             &[SqliteValue::from(issue.id.as_str())],
         ) {
             Ok(_) => true,
@@ -11845,9 +11980,9 @@ impl SqliteStorage {
     pub(crate) fn has_owned_relation_rows_for_import(&self, issue_id: &str) -> Result<bool> {
         let row = self.conn.query_row_with_params(
             "SELECT
-                 EXISTS(SELECT 1 FROM labels WHERE issue_id = ?)
-                 OR EXISTS(SELECT 1 FROM dependencies WHERE issue_id = ?)
-                 OR EXISTS(SELECT 1 FROM comments WHERE issue_id = ?)",
+                 EXISTS(SELECT 1 FROM labels WHERE issue_id = ?1)
+                 OR EXISTS(SELECT 1 FROM dependencies WHERE issue_id = ?2)
+                 OR EXISTS(SELECT 1 FROM comments WHERE issue_id = ?3)",
             &[
                 SqliteValue::from(issue_id),
                 SqliteValue::from(issue_id),
@@ -11865,11 +12000,11 @@ impl SqliteStorage {
     /// Returns an error if the marker cannot be updated.
     pub(crate) fn replace_dirty_issue_marker(&self, issue_id: &str, marked_at: &str) -> Result<()> {
         self.conn.execute_with_params(
-            "DELETE FROM dirty_issues WHERE issue_id = ?",
+            "DELETE FROM dirty_issues WHERE issue_id = ?1",
             &[SqliteValue::from(issue_id)],
         )?;
         self.conn.execute_with_params(
-            "INSERT INTO dirty_issues (issue_id, marked_at) VALUES (?, ?)",
+            "INSERT INTO dirty_issues (issue_id, marked_at) VALUES (?1, ?2)",
             &[SqliteValue::from(issue_id), SqliteValue::from(marked_at)],
         )?;
         Ok(())
@@ -11887,7 +12022,7 @@ impl SqliteStorage {
 
         // Remove existing labels
         self.conn.execute_with_params(
-            "DELETE FROM labels WHERE issue_id = ?",
+            "DELETE FROM labels WHERE issue_id = ?1",
             &[SqliteValue::from(issue_id)],
         )?;
 
@@ -11914,7 +12049,7 @@ impl SqliteStorage {
         // inserts with repeated issue_id bindings on this primary key.
         for label in unique_labels {
             self.conn.execute_with_params(
-                "INSERT OR IGNORE INTO labels (issue_id, label) VALUES (?, ?)",
+                "INSERT OR IGNORE INTO labels (issue_id, label) VALUES (?1, ?2)",
                 &[
                     SqliteValue::from(issue_id),
                     SqliteValue::from(label.as_str()),
@@ -11939,7 +12074,7 @@ impl SqliteStorage {
 
         // Remove existing dependencies where this issue is the dependent
         self.conn.execute_with_params(
-            "DELETE FROM dependencies WHERE issue_id = ?",
+            "DELETE FROM dependencies WHERE issue_id = ?1",
             &[SqliteValue::from(issue_id)],
         )?;
 
@@ -12027,7 +12162,12 @@ impl SqliteStorage {
         for chunk in unique_deps.chunks(IMPORT_DEPENDENCY_CHUNK_SIZE) {
             let placeholders: Vec<String> = chunk
                 .iter()
-                .map(|_| "(?, ?, ?, ?, ?, ?, ?)".to_string())
+                .enumerate()
+                .map(|(i, _)| {
+                    let base = i * 7 + 1;
+                    format!("(?{base}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{})",
+                        base + 1, base + 2, base + 3, base + 4, base + 5, base + 6)
+                })
                 .collect();
             let sql = format!(
                 "INSERT OR IGNORE INTO dependencies (issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id) VALUES {}",
@@ -12067,7 +12207,7 @@ impl SqliteStorage {
 
         // Remove existing comments
         self.conn.execute_with_params(
-            "DELETE FROM comments WHERE issue_id = ?",
+            "DELETE FROM comments WHERE issue_id = ?1",
             &[SqliteValue::from(issue_id)],
         )?;
 
@@ -12143,7 +12283,7 @@ impl SqliteStorage {
         created_at: &str,
     ) -> Result<()> {
         self.conn.execute_with_params(
-            "INSERT INTO comments (issue_id, author, text, created_at) VALUES (?, ?, ?, ?)",
+            "INSERT INTO comments (issue_id, author, text, created_at) VALUES (?1, ?2, ?3, ?4)",
             &[
                 SqliteValue::from(issue_id),
                 SqliteValue::from(comment.author.as_str()),
@@ -12161,7 +12301,7 @@ impl SqliteStorage {
         created_at: &str,
     ) -> Result<()> {
         self.conn.execute_with_params(
-            "INSERT INTO comments (id, issue_id, author, text, created_at) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO comments (id, issue_id, author, text, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             &[
                 SqliteValue::from(comment.id),
                 SqliteValue::from(issue_id),
@@ -12177,7 +12317,7 @@ impl SqliteStorage {
         Ok(self
             .conn
             .query_with_params(
-                "SELECT issue_id FROM comments WHERE id = ? LIMIT 1",
+                "SELECT issue_id FROM comments WHERE id = ?1 LIMIT 1",
                 &[SqliteValue::from(comment_id)],
             )?
             .into_iter()
@@ -12282,7 +12422,7 @@ fn validate_import_comments_for_issue(issue_id: &str, comments: &[Comment]) -> R
 fn insert_comment_row(conn: &Connection, issue_id: &str, author: &str, text: &str) -> Result<i64> {
     conn.execute_with_params(
         "INSERT INTO comments (issue_id, author, text, created_at)
-         VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+         VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP)",
         &[
             SqliteValue::from(issue_id),
             SqliteValue::from(author),
@@ -12306,7 +12446,7 @@ fn insert_comment_row(conn: &Connection, issue_id: &str, author: &str, text: &st
 
 fn fetch_comment(conn: &Connection, comment_id: i64) -> Result<Comment> {
     let row = match conn.query_row_with_params(
-        "SELECT id, issue_id, author, text, created_at FROM comments WHERE id = ?",
+        "SELECT id, issue_id, author, text, created_at FROM comments WHERE id = ?1",
         &[SqliteValue::from(comment_id)],
     ) {
         Ok(row) => row,
@@ -12505,6 +12645,7 @@ mod tests {
             labels: vec![],
             dependencies: vec![],
             comments: vec![],
+            ..Default::default()
         }
     }
 
@@ -12661,7 +12802,7 @@ mod tests {
             .conn
             .execute_with_params(
                 "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
-                 VALUES (?, ?, 'parent-child', ?, ?)",
+                 VALUES (?1, ?2, 'parent-child', ?3, ?4)",
                 &[
                     SqliteValue::from(external_child),
                     SqliteValue::from(parent_id),
@@ -12683,7 +12824,7 @@ mod tests {
             .conn
             .execute_with_params(
                 "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
-                 VALUES (?, ?, 'parent-child', ?, ?)",
+                 VALUES (?1, ?2, 'parent-child', ?3, ?4)",
                 &[
                     SqliteValue::from(child_id),
                     SqliteValue::from(parent_id),
@@ -12820,6 +12961,7 @@ mod tests {
             labels: vec![],
             dependencies: vec![],
             comments: vec![],
+            ..Default::default()
         };
 
         storage.create_issue(&issue, "tester").unwrap();
@@ -12828,7 +12970,7 @@ mod tests {
         let count = storage
             .conn
             .query_row_with_params(
-                "SELECT count(*) FROM issues WHERE id = ?",
+                "SELECT count(*) FROM issues WHERE id = ?1",
                 &[SqliteValue::from("bd-1")],
             )
             .unwrap()
@@ -12852,7 +12994,7 @@ mod tests {
         let event_count = storage
             .conn
             .query_row_with_params(
-                "SELECT count(*) FROM events WHERE issue_id = ?",
+                "SELECT count(*) FROM events WHERE issue_id = ?1",
                 &[SqliteValue::from("bd-1")],
             )
             .unwrap()
@@ -12865,7 +13007,7 @@ mod tests {
         let dirty_count = storage
             .conn
             .query_row_with_params(
-                "SELECT count(*) FROM dirty_issues WHERE issue_id = ?",
+                "SELECT count(*) FROM dirty_issues WHERE issue_id = ?1",
                 &[SqliteValue::from("bd-1")],
             )
             .unwrap()
@@ -13693,7 +13835,7 @@ mod tests {
             storage
                 .conn
                 .execute_with_params(
-                    "UPDATE issues SET description = ?, updated_at = ? WHERE id = ?",
+                    "UPDATE issues SET description = ?1, updated_at = ?2 WHERE id = ?3",
                     &[
                         SqliteValue::from("Thread description"),
                         SqliteValue::from(Utc::now().to_rfc3339()),
@@ -15057,7 +15199,7 @@ mod tests {
         let parent_rows = storage
             .conn
             .query_with_params(
-                "SELECT depends_on_id FROM dependencies WHERE issue_id = ? AND type = 'parent-child' ORDER BY depends_on_id",
+                "SELECT depends_on_id FROM dependencies WHERE issue_id = ?1 AND type = 'parent-child' ORDER BY depends_on_id",
                 &[SqliteValue::from("bd-parent-cleanup-child")],
             )
             .unwrap();
@@ -15302,7 +15444,7 @@ mod tests {
         storage
             .conn
             .execute_with_params(
-                "UPDATE dependencies SET created_at = ? WHERE issue_id = ? AND depends_on_id = ?",
+                "UPDATE dependencies SET created_at = ?1 WHERE issue_id = ?2 AND depends_on_id = ?3",
                 &[
                     SqliteValue::Integer(1_776_651_488_000_000),
                     SqliteValue::from("bd-a1"),
@@ -15562,13 +15704,14 @@ mod tests {
             labels: vec![],
             dependencies: vec![],
             comments: vec![],
+            ..Default::default()
         };
         storage.create_issue(&issue, "tester").unwrap();
 
         storage
             .conn
             .execute_with_params(
-                "INSERT INTO comments (issue_id, author, text, created_at) VALUES (?, ?, ?, ?)",
+                "INSERT INTO comments (issue_id, author, text, created_at) VALUES (?1, ?2, ?3, ?4)",
                 &[
                     SqliteValue::from("bd-c1"),
                     SqliteValue::from("alice"),
@@ -15580,7 +15723,7 @@ mod tests {
         storage
             .conn
             .execute_with_params(
-                "INSERT INTO comments (issue_id, author, text, created_at) VALUES (?, ?, ?, ?)",
+                "INSERT INTO comments (issue_id, author, text, created_at) VALUES (?1, ?2, ?3, ?4)",
                 &[
                     SqliteValue::from("bd-c1"),
                     SqliteValue::from("bob"),
@@ -15643,13 +15786,14 @@ mod tests {
             labels: vec![],
             dependencies: vec![],
             comments: vec![],
+            ..Default::default()
         };
         storage.create_issue(&issue, "tester").unwrap();
 
         storage
             .conn
             .execute_with_params(
-                "INSERT INTO comments (issue_id, author, text, created_at) VALUES (?, ?, ?, ?)",
+                "INSERT INTO comments (issue_id, author, text, created_at) VALUES (?1, ?2, ?3, ?4)",
                 &[
                     SqliteValue::from("bd-c-invalid"),
                     SqliteValue::from("alice"),
@@ -15718,12 +15862,13 @@ mod tests {
             labels: vec![],
             dependencies: vec![],
             comments: vec![],
+            ..Default::default()
         };
         storage.create_issue(&issue, "tester").unwrap();
         storage
             .conn
             .execute_with_params(
-                "INSERT INTO comments (issue_id, author, text, created_at) VALUES (?, ?, ?, ?)",
+                "INSERT INTO comments (issue_id, author, text, created_at) VALUES (?1, ?2, ?3, ?4)",
                 &[
                     SqliteValue::from("bd-c-numeric-time"),
                     SqliteValue::from("alice"),
@@ -15767,7 +15912,7 @@ mod tests {
             storage
                 .conn
                 .execute_with_params(
-                    "INSERT INTO comments (issue_id, author, text, created_at) VALUES (?, ?, ?, ?)",
+                    "INSERT INTO comments (issue_id, author, text, created_at) VALUES (?1, ?2, ?3, ?4)",
                     &[
                         SqliteValue::from(issue_id),
                         SqliteValue::from("tester"),
@@ -15850,6 +15995,7 @@ mod tests {
             labels: vec![],
             dependencies: vec![],
             comments: vec![],
+            ..Default::default()
         };
         storage.create_issue(&issue, "tester").unwrap();
 
@@ -16272,7 +16418,7 @@ mod tests {
         storage
             .conn
             .execute_with_params(
-                "INSERT INTO labels (issue_id, label) VALUES (?, ?)",
+                "INSERT INTO labels (issue_id, label) VALUES (?1, ?2)",
                 &[
                     SqliteValue::from("bd-cap-tombstone"),
                     SqliteValue::from("provides:deleted-cap"),
@@ -16356,6 +16502,7 @@ mod tests {
             labels: vec![],
             dependencies: vec![],
             comments: vec![],
+            ..Default::default()
         };
         storage.create_issue(&issue, "tester").unwrap();
 
@@ -16366,7 +16513,7 @@ mod tests {
         let dirty_count = storage
             .conn
             .query_row_with_params(
-                "SELECT count(*) FROM dirty_issues WHERE issue_id = ?",
+                "SELECT count(*) FROM dirty_issues WHERE issue_id = ?1",
                 &[SqliteValue::from("bd-c3")],
             )
             .unwrap()
@@ -16394,7 +16541,7 @@ mod tests {
         let created_at: String = storage
             .conn
             .query_row_with_params(
-                "SELECT created_at FROM events WHERE issue_id = ?",
+                "SELECT created_at FROM events WHERE issue_id = ?1",
                 &[SqliteValue::from("bd-e1")],
             )
             .unwrap()
@@ -16441,7 +16588,7 @@ mod tests {
         storage
             .conn
             .execute_with_params(
-                "INSERT INTO blocked_issues_cache (issue_id, blocked_by) VALUES (?, ?)",
+                "INSERT INTO blocked_issues_cache (issue_id, blocked_by) VALUES (?1, ?2)",
                 &[
                     SqliteValue::from("bd-c1"),
                     SqliteValue::from(r#"["bd-b1"]"#),
@@ -16453,7 +16600,7 @@ mod tests {
         let count = storage
             .conn
             .query_row_with_params(
-                "SELECT count(*) FROM blocked_issues_cache WHERE issue_id = ?",
+                "SELECT count(*) FROM blocked_issues_cache WHERE issue_id = ?1",
                 &[SqliteValue::from("bd-c1")],
             )
             .unwrap()
@@ -16492,7 +16639,7 @@ mod tests {
         let count = storage
             .conn
             .query_row_with_params(
-                "SELECT count(*) FROM blocked_issues_cache WHERE issue_id = ?",
+                "SELECT count(*) FROM blocked_issues_cache WHERE issue_id = ?1",
                 &[SqliteValue::from("bd-c1")],
             )
             .unwrap()
@@ -16717,7 +16864,7 @@ mod tests {
         storage
             .conn
             .execute_with_params(
-                "DELETE FROM dependencies WHERE issue_id = ? AND depends_on_id = ?",
+                "DELETE FROM dependencies WHERE issue_id = ?1 AND depends_on_id = ?2",
                 &[
                     SqliteValue::from("bd-parent"),
                     SqliteValue::from("bd-blocker"),
@@ -16954,7 +17101,7 @@ mod tests {
         storage
             .conn
             .execute_with_params(
-                "INSERT INTO blocked_issues_cache (issue_id, blocked_by, blocked_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+                "INSERT INTO blocked_issues_cache (issue_id, blocked_by, blocked_at) VALUES (?1, ?2, CURRENT_TIMESTAMP)",
                 &[
                     SqliteValue::from(blocked.id.as_str()),
                     SqliteValue::from("[\"bd-old:open\"]"),
@@ -18018,7 +18165,7 @@ mod tests {
         storage
             .conn
             .execute_with_params(
-                "UPDATE blocked_issues_cache SET blocked_by = ? WHERE issue_id = ?",
+                "UPDATE blocked_issues_cache SET blocked_by = ?1 WHERE issue_id = ?2",
                 &[SqliteValue::from("not-json"), SqliteValue::from("bd-c1")],
             )
             .unwrap();
@@ -18051,7 +18198,7 @@ mod tests {
         storage
             .conn
             .execute_with_params(
-                "UPDATE blocked_issues_cache SET blocked_by = ? WHERE issue_id = ?",
+                "UPDATE blocked_issues_cache SET blocked_by = ?1 WHERE issue_id = ?2",
                 &[SqliteValue::from("not-json"), SqliteValue::from("bd-c1")],
             )
             .unwrap();
@@ -18262,7 +18409,7 @@ mod tests {
             storage
                 .conn
                 .execute_with_params(
-                    "DELETE FROM metadata WHERE key = ?",
+                    "DELETE FROM metadata WHERE key = ?1",
                     &[SqliteValue::from(METADATA_JSONL_CONTENT_HASH)],
                 )
                 .unwrap();
@@ -18274,7 +18421,7 @@ mod tests {
         let rows = storage
             .conn
             .query_with_params(
-                "SELECT 1 FROM metadata WHERE key = ? LIMIT 1",
+                "SELECT 1 FROM metadata WHERE key = ?1 LIMIT 1",
                 &[SqliteValue::from(METADATA_JSONL_CONTENT_HASH)],
             )
             .unwrap();
@@ -18604,7 +18751,7 @@ mod tests {
         storage
             .conn
             .execute_with_params(
-                "UPDATE issues SET status = ? WHERE id = ?",
+                "UPDATE issues SET status = ?1 WHERE id = ?2",
                 &[
                     SqliteValue::from("not-a-status"),
                     SqliteValue::from(issue.id.as_str()),
@@ -19081,7 +19228,7 @@ mod tests {
         let conn = fsqlite::Connection::open(":memory:".to_string()).unwrap();
         conn.execute("CREATE TABLE t (k TEXT, v TEXT)").unwrap();
         conn.execute_with_params(
-            "INSERT INTO t VALUES (?, ?)",
+            "INSERT INTO t VALUES (?1, ?2)",
             &[SqliteValue::from("a"), SqliteValue::from("b")],
         )
         .unwrap();
@@ -19116,7 +19263,7 @@ mod tests {
         }
         let r3 = conn
             .query_with_params(
-                "SELECT count(*) FROM t WHERE k = ?",
+                "SELECT count(*) FROM t WHERE k = ?1",
                 &[SqliteValue::from("a")],
             )
             .unwrap();
@@ -19138,7 +19285,7 @@ mod tests {
 
         // 4: select with bind WHERE (no aggregate)
         let r4 = conn
-            .query_with_params("SELECT k FROM t WHERE k = ?", &[SqliteValue::from("a")])
+            .query_with_params("SELECT k FROM t WHERE k = ?1", &[SqliteValue::from("a")])
             .unwrap();
         eprintln!(
             "[DIAG] 4. select k bind WHERE: {:?}",
@@ -19148,7 +19295,7 @@ mod tests {
         // 5: count(k) with bind WHERE
         let r5 = conn
             .query_with_params(
-                "SELECT count(k) FROM t WHERE k = ?",
+                "SELECT count(k) FROM t WHERE k = ?1",
                 &[SqliteValue::from("a")],
             )
             .unwrap();
@@ -19160,7 +19307,7 @@ mod tests {
         // 6: count with bind WHERE but no match
         let r6 = conn
             .query_with_params(
-                "SELECT count(*) FROM t WHERE k = ?",
+                "SELECT count(*) FROM t WHERE k = ?1",
                 &[SqliteValue::from("nonexistent")],
             )
             .unwrap();
@@ -19373,7 +19520,7 @@ mod tests {
             conn3.execute("BEGIN IMMEDIATE").unwrap();
             conn3
                 .execute_with_params(
-                    "INSERT INTO ev (msg) VALUES (?)",
+                    "INSERT INTO ev (msg) VALUES (?1)",
                     &[SqliteValue::from(format!("msg{i}"))],
                 )
                 .unwrap();
@@ -19414,7 +19561,7 @@ mod tests {
         for i in 0..5 {
             conn4
                 .execute_with_params(
-                    "INSERT INTO ev2 (msg) VALUES (?)",
+                    "INSERT INTO ev2 (msg) VALUES (?1)",
                     &[SqliteValue::from(format!("msg{i}"))],
                 )
                 .unwrap();
@@ -21319,7 +21466,7 @@ mod tests {
                 INSERT INTO issues (
                     id, title, status, priority, issue_type, created_at, updated_at,
                     ephemeral, pinned, is_template
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, NULL)
                 ",
                 &[
                     SqliteValue::from("bd-legacy-ready"),
@@ -21602,7 +21749,7 @@ mod tests {
                 INSERT INTO issues (
                     id, title, status, priority, issue_type, created_at, updated_at,
                     ephemeral, pinned, is_template
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                 ",
                 &[
                     SqliteValue::from("bd-orphan.6"),
@@ -21966,14 +22113,14 @@ mod tests {
         storage
             .conn
             .execute_with_params(
-                "DELETE FROM metadata WHERE key = ?",
+                "DELETE FROM metadata WHERE key = ?1",
                 &[SqliteValue::from(METADATA_JSONL_SIZE)],
             )
             .unwrap();
         storage
             .conn
             .execute_with_params(
-                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                "INSERT INTO metadata (key, value) VALUES (?1, ?2)",
                 &[
                     SqliteValue::from(METADATA_JSONL_SIZE),
                     SqliteValue::from("racing-writer"),
@@ -21991,7 +22138,7 @@ mod tests {
         let rows = storage
             .conn
             .query_with_params(
-                "SELECT value FROM metadata WHERE key = ? ORDER BY rowid ASC",
+                "SELECT value FROM metadata WHERE key = ?1 ORDER BY rowid ASC",
                 &[SqliteValue::from(METADATA_JSONL_SIZE)],
             )
             .unwrap();
@@ -22025,7 +22172,7 @@ mod tests {
         let needs_flush_count = storage
             .conn
             .query_row_with_params(
-                "SELECT count(*) FROM metadata WHERE key = ?",
+                "SELECT count(*) FROM metadata WHERE key = ?1",
                 &[SqliteValue::from(NEEDS_FLUSH_KEY)],
             )
             .unwrap()
@@ -22037,7 +22184,7 @@ mod tests {
         let blocked_cache_count = storage
             .conn
             .query_row_with_params(
-                "SELECT count(*) FROM metadata WHERE key = ?",
+                "SELECT count(*) FROM metadata WHERE key = ?1",
                 &[SqliteValue::from(BLOCKED_CACHE_STATE_KEY)],
             )
             .unwrap()
@@ -22062,7 +22209,7 @@ mod tests {
         storage
             .conn
             .execute_with_params(
-                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                "INSERT INTO metadata (key, value) VALUES (?1, ?2)",
                 &[
                     SqliteValue::from(METADATA_JSONL_CONTENT_HASH),
                     SqliteValue::from("stale-hash"),
@@ -22072,7 +22219,7 @@ mod tests {
         storage
             .conn
             .execute_with_params(
-                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                "INSERT INTO metadata (key, value) VALUES (?1, ?2)",
                 &[
                     SqliteValue::from(METADATA_JSONL_CONTENT_HASH),
                     SqliteValue::from("latest-hash"),
@@ -22093,7 +22240,7 @@ mod tests {
         let rows = storage
             .conn
             .query_with_params(
-                "SELECT value FROM metadata WHERE key = ? ORDER BY rowid ASC",
+                "SELECT value FROM metadata WHERE key = ?1 ORDER BY rowid ASC",
                 &[SqliteValue::from(METADATA_JSONL_CONTENT_HASH)],
             )
             .unwrap();
@@ -22129,7 +22276,7 @@ mod tests {
         storage
             .conn
             .execute_with_params(
-                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                "INSERT INTO metadata (key, value) VALUES (?1, ?2)",
                 &[
                     SqliteValue::from(BLOCKED_CACHE_STATE_KEY),
                     SqliteValue::from(BLOCKED_CACHE_STATE_STALE),
@@ -22139,7 +22286,7 @@ mod tests {
         storage
             .conn
             .execute_with_params(
-                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                "INSERT INTO metadata (key, value) VALUES (?1, ?2)",
                 &[
                     SqliteValue::from(BLOCKED_CACHE_STATE_KEY),
                     SqliteValue::from(METADATA_EMPTY_VALUE),

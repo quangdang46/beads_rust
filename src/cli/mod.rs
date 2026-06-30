@@ -992,6 +992,18 @@ EXAMPLES:
         command: commands::wisp::WispCommands,
     },
 
+    /// Manage custom statuses (Issue #5)
+    CustomStatus {
+        #[command(subcommand)]
+        command: commands::custom_status::StatusCommands,
+    },
+
+    /// Manage custom types (Issue #5)
+    CustomType {
+        #[command(subcommand)]
+        command: commands::custom_status::TypeCommands,
+    },
+
     /// Issue tracking template commands
     Template {
         #[command(subcommand)]

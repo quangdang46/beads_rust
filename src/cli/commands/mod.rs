@@ -58,6 +58,7 @@ pub mod version;
 pub mod r#where;
 pub mod formula;
 pub mod wisp;
+pub mod custom_status;
 
 #[cfg(feature = "self_update")]
 pub mod upgrade;

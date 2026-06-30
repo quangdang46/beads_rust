@@ -530,6 +530,12 @@ fn main() {
         Commands::Wisp { command } => {
             commands::wisp::execute(&command, &overrides, &output_ctx)
         }
+        Commands::CustomStatus { command } => {
+            commands::custom_status::execute_status(&command, cli.json, &overrides, &output_ctx)
+        }
+        Commands::CustomType { command } => {
+            commands::custom_status::execute_type(&command, cli.json, &overrides, &output_ctx)
+        }
         Commands::Orphans(args) if !args.fix => {
             if let (Some(res), Some(beads_dir)) = (storage_result.as_ref(), ctx.beads_dir.as_ref())
             {
@@ -847,6 +853,16 @@ const fn is_mutating_command(cmd: &Commands) -> bool {
                 | commands::wisp::WispCommands::Close(_)
                 | commands::wisp::WispCommands::Gc(_)
         ),
+        Commands::CustomStatus { command } => matches!(
+            command,
+            commands::custom_status::StatusCommands::Add(_)
+                | commands::custom_status::StatusCommands::Remove(_)
+        ),
+        Commands::CustomType { command } => matches!(
+            command,
+            commands::custom_status::TypeCommands::Add(_)
+                | commands::custom_status::TypeCommands::Remove(_)
+        ),
         Commands::Dep { command } => matches!(
             command,
             beads_rust::cli::DepCommands::Add(_) | beads_rust::cli::DepCommands::Remove(_)
@@ -991,6 +1007,8 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Config { .. }
         | Commands::History(_)
         | Commands::Wisp { .. }
+        | Commands::CustomStatus { .. }
+        | Commands::CustomType { .. }
         | Commands::Agents(_)
         | Commands::Quickstart(_)
         | Commands::Admin { .. }
