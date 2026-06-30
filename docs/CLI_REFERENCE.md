@@ -1467,6 +1467,82 @@ br changelog [OPTIONS]
 
 ---
 
+### admin
+
+Administrative commands for database maintenance.
+
+```bash
+br admin <SUBCOMMAND>
+```
+
+**Subcommands:**
+
+| Subcommand | Description |
+|------------|-------------|
+| `doctor` | Run health checks (alias for `br doctor`) |
+| `stats` | Print database statistics (issue count by status, etc.) |
+| `vacuum` | VACUUM the SQLite database to reclaim space |
+
+**Example:**
+
+```bash
+# Print database stats
+br admin stats
+
+# Vacuum the database
+br admin vacuum
+```
+
+---
+
+### quickstart
+
+Quick start guide with examples (for new users).
+
+```bash
+br quickstart
+```
+
+Prints a comprehensive quick start guide showing common workflows. No arguments needed.
+
+---
+
+### rename
+
+Rename an issue (alias for `br update <id> --title <new-title>`).
+
+```bash
+br rename <ID> <NEW-TITLE>
+```
+
+**Arguments:**
+
+| Argument | Description |
+|----------|-------------|
+| `ID` | Issue ID to rename |
+| `NEW-TITLE` | New title for the issue |
+
+---
+
+### template
+
+Manage issue templates.
+
+```bash
+br template <SUBCOMMAND>
+```
+
+**Subcommands:**
+
+| Subcommand | Description |
+|------------|-------------|
+| `create` | Create a new issue template |
+| `list` | List all issue templates |
+| `show` | Show a template's details |
+| `delete` | Delete (tombstone) a template |
+
+---
+
 ### lint
 
 Check issues for missing template sections.
@@ -1510,6 +1586,35 @@ br completions <SHELL>
 # Add to ~/.bashrc
 br completions bash >> ~/.bashrc
 source ~/.bashrc
+```
+
+### formula
+
+Formula Language: workflow-as-code engine.
+
+```bash
+br formula <COMMAND> [OPTIONS]
+```
+
+**Commands:**
+- `validate <file>` — Validate a .formula.json or .formula.toml file
+- `expand <file>` — Preview what issues would be created
+
+**Options:**
+- `--json`, `-j` — Output raw JSON
+- `--robot` — Output machine-readable JSON
+- `--var <KEY=VALUE>`, `-v <KEY=VALUE>` — Variable overrides (expand only)
+
+**Example:**
+```bash
+# Validate a formula file
+br formula validate workflow.formula.json
+
+# Preview rendered issues
+br formula expand workflow.formula.json --var component=auth
+
+# Machine-readable JSON output
+br formula expand workflow.formula.json --robot
 ```
 
 ---

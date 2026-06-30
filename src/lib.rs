@@ -42,6 +42,7 @@ pub mod sync;
 pub mod util;
 pub mod validation;
 pub mod write_combining;
+pub mod formula;
 
 #[cfg(feature = "mcp")]
 pub mod mcp;
