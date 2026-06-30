@@ -8,7 +8,7 @@ use crate::error::{BeadsError, Result};
 use crate::model::{IssueType, Priority, Status};
 use crate::util::content_hash_from_parts;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 17;
+pub const CURRENT_SCHEMA_VERSION: i32 = 18;
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 
 /// The complete SQL schema for the beads database.
@@ -67,6 +67,8 @@ pub const SCHEMA_SQL: &str = r"
         -- column itself stays a TEXT bag. NULL means no inherited context;
         -- emission for descendants silently skips ancestors with NULL.
         agent_context TEXT,
+        -- metadata JSON blob for key=value filtering (br list --metadata).
+        metadata TEXT DEFAULT '{}',
         CHECK (
             (status = 'closed' AND closed_at IS NOT NULL) OR
             (status = 'tombstone') OR
@@ -810,6 +812,8 @@ const ISSUE_COLUMNS: &[(&str, &str)] = &[
     // Append-at-end keeps EXPECTED_ISSUE_COLUMN_ORDER aligned for fresh
     // and migrated databases.
     ("agent_context", "TEXT"),
+    // beads_rust#16: per-issue JSON metadata (key=value filtering).
+    ("metadata", "TEXT DEFAULT '{}'"),
 ];
 
 const DEPENDENCY_COLUMNS: &[(&str, &str)] = &[
@@ -974,6 +978,7 @@ const EXPECTED_ISSUE_COLUMN_ORDER: &[&str] = &[
     "is_template",
     "source_repo_path",
     "agent_context",
+    "metadata",
 ];
 
 /// Check whether the issues table has columns in the expected order.
@@ -1237,6 +1242,7 @@ fn backfill_storage_null_in_default_columns(conn: &Connection) {
         ("issues", "ephemeral", "0"),
         ("issues", "pinned", "0"),
         ("issues", "is_template", "0"),
+        ("issues", "metadata", "'{}'"),
         // dependencies
         ("dependencies", "type", "'blocks'"),
         ("dependencies", "created_by", "''"),
