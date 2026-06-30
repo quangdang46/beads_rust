@@ -839,6 +839,55 @@ pub struct BondRef {
     pub bond_point: Option<String>,
 }
 
+/// Route prefix → path mapping (Issue #36).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct Route {
+    pub prefix: String,
+    pub path: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Prefix-based sequential ID counter (Issue #36).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct IssueCounter {
+    pub prefix: String,
+    pub last_id: i64,
+}
+
+/// Agent session interaction record (Issue #36).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct Interaction {
+    pub id: String,
+    pub kind: String,
+    pub created_at: String,
+    pub actor: Option<String>,
+    pub issue_id: Option<String>,
+    pub model: Option<String>,
+    pub prompt: Option<String>,
+    pub response: Option<String>,
+    pub error: Option<String>,
+    pub tool_name: Option<String>,
+    pub exit_code: Option<i32>,
+    pub parent_id: Option<String>,
+    pub label: Option<String>,
+    pub reason: Option<String>,
+    pub extra: Option<String>,
+}
+
+/// Federation peer configuration (Issue #36).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FederationPeer {
+    pub name: String,
+    pub remote_url: String,
+    pub username: Option<String>,
+    pub password_encrypted: Option<Vec<u8>>,
+    pub sovereignty: String,
+    pub last_sync: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 /// The primary issue entity.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct Issue {

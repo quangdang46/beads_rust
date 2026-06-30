@@ -3,8 +3,9 @@
 use crate::error::{BeadsError, Result};
 use crate::format::{IssueDetails, IssueWithDependencyMetadata};
 use crate::model::{
-    Comment, CompactionSnapshot, Dependency, DependencyType, Event, EventType, Issue,
-    IssueSnapshot, IssueType, MolType, Priority, RepoMtime, Status,
+    Comment, CompactionSnapshot, Dependency, DependencyType, Event, EventType, FederationPeer,
+    Interaction, Issue, IssueCounter, IssueSnapshot, IssueType, MolType, Priority, RepoMtime,
+    Route, Status,
 };
 use crate::storage::events::get_events;
 use crate::storage::schema::CURRENT_SCHEMA_VERSION;
@@ -12049,6 +12050,289 @@ impl SqliteStorage {
         Ok(())
     }
 
+    // ---- Route CRUD (Issue #36) ------------------------------------------
+
+    pub fn create_route(&self, route: &Route) -> Result<()> {
+        self.conn.execute_with_params(
+            "INSERT OR REPLACE INTO routes (prefix, path, created_at, updated_at) VALUES (?1, ?2, ?3, ?4)",
+            &[
+                SqliteValue::from(route.prefix.as_str()),
+                SqliteValue::from(route.path.as_str()),
+                SqliteValue::from(route.created_at.as_str()),
+                SqliteValue::from(route.updated_at.as_str()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_route(&self, prefix: &str) -> Result<Option<Route>> {
+        let result = self.conn.query_row_with_params(
+            "SELECT prefix, path, created_at, updated_at FROM routes WHERE prefix = ?1",
+            &[SqliteValue::from(prefix)],
+        );
+        match result {
+            Ok(row) => Ok(Some(Route {
+                prefix: row.get(0).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
+                path: row.get(1).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
+                created_at: row.get(2).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
+                updated_at: row.get(3).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
+            })),
+            Err(FrankenError::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn list_routes(&self) -> Result<Vec<Route>> {
+        let rows = self.conn.query("SELECT prefix, path, created_at, updated_at FROM routes ORDER BY prefix")?;
+        let mut routes = Vec::new();
+        for row in &rows {
+            routes.push(Route {
+                prefix: row.get(0).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
+                path: row.get(1).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
+                created_at: row.get(2).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
+                updated_at: row.get(3).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
+            });
+        }
+        Ok(routes)
+    }
+
+    pub fn delete_route(&self, prefix: &str) -> Result<()> {
+        self.conn.execute_with_params(
+            "DELETE FROM routes WHERE prefix = ?1",
+            &[SqliteValue::from(prefix)],
+        )?;
+        Ok(())
+    }
+
+    // ---- IssueCounter CRUD (Issue #36) -----------------------------------
+
+    pub fn get_issue_counter(&self, prefix: &str) -> Result<Option<IssueCounter>> {
+        let result = self.conn.query_row_with_params(
+            "SELECT prefix, last_id FROM issue_counter WHERE prefix = ?1",
+            &[SqliteValue::from(prefix)],
+        );
+        match result {
+            Ok(row) => Ok(Some(IssueCounter {
+                prefix: row.get(0).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
+                last_id: row.get(1).and_then(SqliteValue::as_integer).unwrap_or(0) as i64,
+            })),
+            Err(FrankenError::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn set_issue_counter(&self, prefix: &str, last_id: i64) -> Result<()> {
+        self.conn.execute_with_params(
+            "INSERT OR REPLACE INTO issue_counter (prefix, last_id) VALUES (?1, ?2)",
+            &[SqliteValue::from(prefix), SqliteValue::from(last_id)],
+        )?;
+        Ok(())
+    }
+
+    pub fn increment_issue_counter(&self, prefix: &str) -> Result<i64> {
+        self.conn.execute_with_params(
+            "INSERT INTO issue_counter (prefix, last_id) VALUES (?1, 1)
+             ON CONFLICT(prefix) DO UPDATE SET last_id = last_id + 1",
+            &[SqliteValue::from(prefix)],
+        )?;
+        let counter = self.get_issue_counter(prefix)?;
+        Ok(counter.map_or(1, |c| c.last_id))
+    }
+
+    // ---- Interaction CRUD (Issue #36) ------------------------------------
+
+    pub fn create_interaction(&self, interaction: &Interaction) -> Result<()> {
+        self.conn.execute_with_params(
+            "INSERT OR REPLACE INTO interactions (id, kind, created_at, actor, issue_id, model, prompt, response, error, tool_name, exit_code, parent_id, label, reason, extra) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            &[
+                SqliteValue::from(interaction.id.as_str()),
+                SqliteValue::from(interaction.kind.as_str()),
+                SqliteValue::from(interaction.created_at.as_str()),
+                interaction.actor.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+                interaction.issue_id.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+                interaction.model.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+                interaction.prompt.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+                interaction.response.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+                interaction.error.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+                interaction.tool_name.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+                interaction.exit_code.map_or(SqliteValue::Null, |v| SqliteValue::from(i64::from(v))),
+                interaction.parent_id.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+                interaction.label.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+                interaction.reason.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+                interaction.extra.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_interaction(&self, id: &str) -> Result<Option<Interaction>> {
+        let result = self.conn.query_row_with_params(
+            "SELECT id, kind, created_at, actor, issue_id, model, prompt, response, error, tool_name, exit_code, parent_id, label, reason, extra FROM interactions WHERE id = ?1",
+            &[SqliteValue::from(id)],
+        );
+        match result {
+            Ok(row) => Ok(Some(Interaction {
+                id: row.get(0).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
+                kind: row.get(1).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
+                created_at: row.get(2).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
+                actor: row.get(3).and_then(SqliteValue::as_text).map(String::from),
+                issue_id: row.get(4).and_then(SqliteValue::as_text).map(String::from),
+                model: row.get(5).and_then(SqliteValue::as_text).map(String::from),
+                prompt: row.get(6).and_then(SqliteValue::as_text).map(String::from),
+                response: row.get(7).and_then(SqliteValue::as_text).map(String::from),
+                error: row.get(8).and_then(SqliteValue::as_text).map(String::from),
+                tool_name: row.get(9).and_then(SqliteValue::as_text).map(String::from),
+                exit_code: row.get(10).and_then(SqliteValue::as_integer).map(|v| v as i32),
+                parent_id: row.get(11).and_then(SqliteValue::as_text).map(String::from),
+                label: row.get(12).and_then(SqliteValue::as_text).map(String::from),
+                reason: row.get(13).and_then(SqliteValue::as_text).map(String::from),
+                extra: row.get(14).and_then(SqliteValue::as_text).map(String::from),
+            })),
+            Err(FrankenError::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn list_interactions_by_issue(&self, issue_id: &str) -> Result<Vec<Interaction>> {
+        let rows = self.conn.query_with_params(
+            "SELECT id, kind, created_at, actor, issue_id, model, prompt, response, error, tool_name, exit_code, parent_id, label, reason, extra FROM interactions WHERE issue_id = ?1 ORDER BY created_at DESC",
+            &[SqliteValue::from(issue_id)],
+        )?;
+        let mut interactions = Vec::new();
+        for row in &rows {
+            interactions.push(Interaction {
+                id: row.get(0).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
+                kind: row.get(1).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
+                created_at: row.get(2).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
+                actor: row.get(3).and_then(SqliteValue::as_text).map(String::from),
+                issue_id: row.get(4).and_then(SqliteValue::as_text).map(String::from),
+                model: row.get(5).and_then(SqliteValue::as_text).map(String::from),
+                prompt: row.get(6).and_then(SqliteValue::as_text).map(String::from),
+                response: row.get(7).and_then(SqliteValue::as_text).map(String::from),
+                error: row.get(8).and_then(SqliteValue::as_text).map(String::from),
+                tool_name: row.get(9).and_then(SqliteValue::as_text).map(String::from),
+                exit_code: row.get(10).and_then(SqliteValue::as_integer).map(|v| v as i32),
+                parent_id: row.get(11).and_then(SqliteValue::as_text).map(String::from),
+                label: row.get(12).and_then(SqliteValue::as_text).map(String::from),
+                reason: row.get(13).and_then(SqliteValue::as_text).map(String::from),
+                extra: row.get(14).and_then(SqliteValue::as_text).map(String::from),
+            });
+        }
+        Ok(interactions)
+    }
+
+    pub fn list_interactions_by_kind(&self, kind: &str) -> Result<Vec<Interaction>> {
+        let rows = self.conn.query_with_params(
+            "SELECT id, kind, created_at, actor, issue_id, model, prompt, response, error, tool_name, exit_code, parent_id, label, reason, extra FROM interactions WHERE kind = ?1 ORDER BY created_at DESC LIMIT 100",
+            &[SqliteValue::from(kind)],
+        )?;
+        let mut interactions = Vec::new();
+        for row in &rows {
+            interactions.push(Interaction {
+                id: row.get(0).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
+                kind: row.get(1).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
+                created_at: row.get(2).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
+                actor: row.get(3).and_then(SqliteValue::as_text).map(String::from),
+                issue_id: row.get(4).and_then(SqliteValue::as_text).map(String::from),
+                model: row.get(5).and_then(SqliteValue::as_text).map(String::from),
+                prompt: row.get(6).and_then(SqliteValue::as_text).map(String::from),
+                response: row.get(7).and_then(SqliteValue::as_text).map(String::from),
+                error: row.get(8).and_then(SqliteValue::as_text).map(String::from),
+                tool_name: row.get(9).and_then(SqliteValue::as_text).map(String::from),
+                exit_code: row.get(10).and_then(SqliteValue::as_integer).map(|v| v as i32),
+                parent_id: row.get(11).and_then(SqliteValue::as_text).map(String::from),
+                label: row.get(12).and_then(SqliteValue::as_text).map(String::from),
+                reason: row.get(13).and_then(SqliteValue::as_text).map(String::from),
+                extra: row.get(14).and_then(SqliteValue::as_text).map(String::from),
+            });
+        }
+        Ok(interactions)
+    }
+
+    pub fn delete_interaction(&self, id: &str) -> Result<()> {
+        self.conn.execute_with_params(
+            "DELETE FROM interactions WHERE id = ?1",
+            &[SqliteValue::from(id)],
+        )?;
+        Ok(())
+    }
+
+    // ---- FederationPeer CRUD (Issue #36) ---------------------------------
+
+    pub fn create_federation_peer(&self, peer: &FederationPeer) -> Result<()> {
+        self.conn.execute_with_params(
+            "INSERT OR REPLACE INTO federation_peers (name, remote_url, username, password_encrypted, sovereignty, last_sync, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            &[
+                SqliteValue::from(peer.name.as_str()),
+                SqliteValue::from(peer.remote_url.as_str()),
+                peer.username.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+                peer.password_encrypted.as_deref().map(|b| SqliteValue::from(b.to_vec())).unwrap_or(SqliteValue::Null),
+                SqliteValue::from(peer.sovereignty.as_str()),
+                peer.last_sync.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+                SqliteValue::from(peer.created_at.as_str()),
+                SqliteValue::from(peer.updated_at.as_str()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_federation_peer(&self, name: &str) -> Result<Option<FederationPeer>> {
+        let result = self.conn.query_row_with_params(
+            "SELECT name, remote_url, username, password_encrypted, sovereignty, last_sync, created_at, updated_at FROM federation_peers WHERE name = ?1",
+            &[SqliteValue::from(name)],
+        );
+        match result {
+            Ok(row) => Ok(Some(FederationPeer {
+                name: row.get(0).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
+                remote_url: row.get(1).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
+                username: row.get(2).and_then(SqliteValue::as_text).map(String::from),
+                password_encrypted: row.get(3).and_then(SqliteValue::as_blob).map(|b| b.to_vec()),
+                sovereignty: row.get(4).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
+                last_sync: row.get(5).and_then(SqliteValue::as_text).map(String::from),
+                created_at: row.get(6).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
+                updated_at: row.get(7).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
+            })),
+            Err(FrankenError::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn list_federation_peers(&self) -> Result<Vec<FederationPeer>> {
+        let rows = self.conn.query(
+            "SELECT name, remote_url, username, password_encrypted, sovereignty, last_sync, created_at, updated_at FROM federation_peers ORDER BY name",
+        )?;
+        let mut peers = Vec::new();
+        for row in &rows {
+            peers.push(FederationPeer {
+                name: row.get(0).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
+                remote_url: row.get(1).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
+                username: row.get(2).and_then(SqliteValue::as_text).map(String::from),
+                password_encrypted: row.get(3).and_then(SqliteValue::as_blob).map(|b| b.to_vec()),
+                sovereignty: row.get(4).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
+                last_sync: row.get(5).and_then(SqliteValue::as_text).map(String::from),
+                created_at: row.get(6).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
+                updated_at: row.get(7).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
+            });
+        }
+        Ok(peers)
+    }
+
+    pub fn delete_federation_peer(&self, name: &str) -> Result<()> {
+        self.conn.execute_with_params(
+            "DELETE FROM federation_peers WHERE name = ?1",
+            &[SqliteValue::from(name)],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_federation_peer_last_sync(&self, name: &str, last_sync: &str) -> Result<()> {
+        self.conn.execute_with_params(
+            "UPDATE federation_peers SET last_sync = ?1, updated_at = datetime('now') WHERE name = ?2",
+            &[SqliteValue::from(last_sync), SqliteValue::from(name)],
+        )?;
+        Ok(())
+    }
+
     /// Check if an issue is a tombstone (deleted).
     ///
     /// # Errors
@@ -23611,6 +23895,288 @@ mod tests {
         let id = storage.create_compaction_snapshot(&snap).unwrap();
         storage.delete_compaction_snapshot(id).unwrap();
         let got = storage.get_compaction_snapshot(id).unwrap();
+        assert!(got.is_none());
+    }
+
+    // ---- Route tests (Issue #36) ----------------------------------------
+
+    #[test]
+    fn route_create_get() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        let route = Route {
+            prefix: "test".to_string(),
+            path: "/tmp/test".to_string(),
+            created_at: "2026-06-30T12:00:00Z".to_string(),
+            updated_at: "2026-06-30T12:00:00Z".to_string(),
+        };
+        storage.create_route(&route).unwrap();
+        let got = storage.get_route("test").unwrap();
+        assert!(got.is_some());
+        assert_eq!(got.as_ref().unwrap().path, "/tmp/test");
+        assert_eq!(got.as_ref().unwrap().prefix, "test");
+    }
+
+    #[test]
+    fn route_get_nonexistent() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        let got = storage.get_route("nonexistent").unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn route_list() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        for i in 0..3 {
+            storage.create_route(&Route {
+                prefix: format!("r{i}"),
+                path: format!("/path/{i}"),
+                created_at: "2026-06-30T12:00:00Z".to_string(),
+                updated_at: "2026-06-30T12:00:00Z".to_string(),
+            }).unwrap();
+        }
+        let routes = storage.list_routes().unwrap();
+        assert_eq!(routes.len(), 3);
+    }
+
+    #[test]
+    fn route_delete() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        storage.create_route(&Route {
+            prefix: "del".to_string(),
+            path: "/del".to_string(),
+            created_at: "2026-06-30T12:00:00Z".to_string(),
+            updated_at: "2026-06-30T12:00:00Z".to_string(),
+        }).unwrap();
+        storage.delete_route("del").unwrap();
+        let got = storage.get_route("del").unwrap();
+        assert!(got.is_none());
+    }
+
+    // ---- IssueCounter tests (Issue #36) ---------------------------------
+
+    #[test]
+    fn issue_counter_get_nonexistent() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        let got = storage.get_issue_counter("proj").unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn issue_counter_set_and_get() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        storage.set_issue_counter("proj", 42).unwrap();
+        let got = storage.get_issue_counter("proj").unwrap();
+        assert!(got.is_some());
+        assert_eq!(got.unwrap().last_id, 42);
+    }
+
+    #[test]
+    fn issue_counter_increment() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        let first = storage.increment_issue_counter("proj").unwrap();
+        assert_eq!(first, 1);
+        let second = storage.increment_issue_counter("proj").unwrap();
+        assert_eq!(second, 2);
+        let third = storage.increment_issue_counter("proj").unwrap();
+        assert_eq!(third, 3);
+    }
+
+    #[test]
+    fn issue_counter_independent_prefixes() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        let a1 = storage.increment_issue_counter("a").unwrap();
+        let b1 = storage.increment_issue_counter("b").unwrap();
+        let a2 = storage.increment_issue_counter("a").unwrap();
+        assert_eq!(a1, 1);
+        assert_eq!(b1, 1);
+        assert_eq!(a2, 2);
+    }
+
+    // ---- Interaction tests (Issue #36) ----------------------------------
+
+    #[test]
+    fn interaction_create_get() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        let interaction = Interaction {
+            id: "int-001".to_string(),
+            kind: "llm_call".to_string(),
+            created_at: "2026-06-30T12:00:00Z".to_string(),
+            actor: Some("agent1".to_string()),
+            issue_id: Some("proj-001".to_string()),
+            model: Some("gpt-4".to_string()),
+            prompt: Some("Hello".to_string()),
+            response: Some("Hi".to_string()),
+            error: None,
+            tool_name: None,
+            exit_code: None,
+            parent_id: None,
+            label: None,
+            reason: None,
+            extra: None,
+        };
+        storage.create_interaction(&interaction).unwrap();
+        let got = storage.get_interaction("int-001").unwrap();
+        assert!(got.is_some());
+        let g = got.unwrap();
+        assert_eq!(g.kind, "llm_call");
+        assert_eq!(g.actor.unwrap(), "agent1");
+        assert_eq!(g.issue_id.unwrap(), "proj-001");
+    }
+
+    #[test]
+    fn interaction_get_nonexistent() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        let got = storage.get_interaction("nope").unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn interaction_list_by_issue() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        for i in 0..3 {
+            storage.create_interaction(&Interaction {
+                id: format!("int-{i}"),
+                kind: "test".to_string(),
+                created_at: format!("2026-06-30T12:00:0{i}Z"),
+                actor: None,
+                issue_id: Some("proj-X".to_string()),
+                model: None,
+                prompt: None,
+                response: None,
+                error: None,
+                tool_name: None,
+                exit_code: None,
+                parent_id: None,
+                label: None,
+                reason: None,
+                extra: None,
+            }).unwrap();
+        }
+        let list = storage.list_interactions_by_issue("proj-X").unwrap();
+        assert_eq!(list.len(), 3);
+    }
+
+    #[test]
+    fn interaction_list_by_kind() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        storage.create_interaction(&Interaction {
+            id: "int-a".to_string(),
+            kind: "query".to_string(),
+            created_at: "2026-06-30T12:00:00Z".to_string(),
+            actor: None, issue_id: None, model: None, prompt: None,
+            response: None, error: None, tool_name: None, exit_code: None,
+            parent_id: None, label: None, reason: None, extra: None,
+        }).unwrap();
+        storage.create_interaction(&Interaction {
+            id: "int-b".to_string(),
+            kind: "command".to_string(),
+            created_at: "2026-06-30T12:00:01Z".to_string(),
+            actor: None, issue_id: None, model: None, prompt: None,
+            response: None, error: None, tool_name: None, exit_code: None,
+            parent_id: None, label: None, reason: None, extra: None,
+        }).unwrap();
+        let queries = storage.list_interactions_by_kind("query").unwrap();
+        assert_eq!(queries.len(), 1);
+        let commands = storage.list_interactions_by_kind("command").unwrap();
+        assert_eq!(commands.len(), 1);
+    }
+
+    #[test]
+    fn interaction_delete() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        storage.create_interaction(&Interaction {
+            id: "int-del".to_string(),
+            kind: "test".to_string(),
+            created_at: "2026-06-30T12:00:00Z".to_string(),
+            actor: None, issue_id: None, model: None, prompt: None,
+            response: None, error: None, tool_name: None, exit_code: None,
+            parent_id: None, label: None, reason: None, extra: None,
+        }).unwrap();
+        storage.delete_interaction("int-del").unwrap();
+        let got = storage.get_interaction("int-del").unwrap();
+        assert!(got.is_none());
+    }
+
+    // ---- FederationPeer tests (Issue #36) --------------------------------
+
+    #[test]
+    fn federation_peer_create_get() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        let peer = FederationPeer {
+            name: "peer1".to_string(),
+            remote_url: "https://example.com/beads".to_string(),
+            username: Some("admin".to_string()),
+            password_encrypted: Some(vec![1, 2, 3]),
+            sovereignty: "read".to_string(),
+            last_sync: None,
+            created_at: "2026-06-30T12:00:00Z".to_string(),
+            updated_at: "2026-06-30T12:00:00Z".to_string(),
+        };
+        storage.create_federation_peer(&peer).unwrap();
+        let got = storage.get_federation_peer("peer1").unwrap();
+        assert!(got.is_some());
+        let g = got.unwrap();
+        assert_eq!(g.remote_url, "https://example.com/beads");
+        assert_eq!(g.username.unwrap(), "admin");
+        assert_eq!(g.password_encrypted.unwrap(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn federation_peer_get_nonexistent() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        let got = storage.get_federation_peer("nope").unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn federation_peer_list() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        for i in 0..3 {
+            storage.create_federation_peer(&FederationPeer {
+                name: format!("p{i}"),
+                remote_url: format!("https://peer{i}.example.com"),
+                username: None, password_encrypted: None,
+                sovereignty: "full".to_string(),
+                last_sync: None,
+                created_at: "2026-06-30T12:00:00Z".to_string(),
+                updated_at: "2026-06-30T12:00:00Z".to_string(),
+            }).unwrap();
+        }
+        let peers = storage.list_federation_peers().unwrap();
+        assert_eq!(peers.len(), 3);
+    }
+
+    #[test]
+    fn federation_peer_update_last_sync() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        storage.create_federation_peer(&FederationPeer {
+            name: "sync-test".to_string(),
+            remote_url: "https://sync.example.com".to_string(),
+            username: None, password_encrypted: None,
+            sovereignty: "full".to_string(),
+            last_sync: None,
+            created_at: "2026-06-30T12:00:00Z".to_string(),
+            updated_at: "2026-06-30T12:00:00Z".to_string(),
+        }).unwrap();
+        storage.update_federation_peer_last_sync("sync-test", "2026-07-01T00:00:00Z").unwrap();
+        let got = storage.get_federation_peer("sync-test").unwrap().unwrap();
+        assert_eq!(got.last_sync.unwrap(), "2026-07-01T00:00:00Z");
+    }
+
+    #[test]
+    fn federation_peer_delete() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        storage.create_federation_peer(&FederationPeer {
+            name: "del-peer".to_string(),
+            remote_url: "https://del.example.com".to_string(),
+            username: None, password_encrypted: None,
+            sovereignty: "full".to_string(),
+            last_sync: None,
+            created_at: "2026-06-30T12:00:00Z".to_string(),
+            updated_at: "2026-06-30T12:00:00Z".to_string(),
+        }).unwrap();
+        storage.delete_federation_peer("del-peer").unwrap();
+        let got = storage.get_federation_peer("del-peer").unwrap();
         assert!(got.is_none());
     }
 }

@@ -8,7 +8,7 @@ use crate::error::{BeadsError, Result};
 use crate::model::{IssueType, Priority, Status};
 use crate::util::content_hash_from_parts;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 16;
+pub const CURRENT_SCHEMA_VERSION: i32 = 17;
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 
 /// The complete SQL schema for the beads database.
@@ -330,6 +330,56 @@ pub const SCHEMA_SQL: &str = r"
         created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
     CREATE INDEX IF NOT EXISTS idx_comp_snapshot_issue ON compaction_snapshots(issue_id, compaction_level, created_at);
+
+    -- Routes table (Issue #36)
+    CREATE TABLE IF NOT EXISTS routes (
+        prefix TEXT PRIMARY KEY,
+        path TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    -- Issue counter table (Issue #36)
+    CREATE TABLE IF NOT EXISTS issue_counter (
+        prefix TEXT PRIMARY KEY,
+        last_id INTEGER NOT NULL DEFAULT 0
+    );
+
+    -- Interactions table (Issue #36)
+    CREATE TABLE IF NOT EXISTS interactions (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        actor TEXT,
+        issue_id TEXT,
+        model TEXT,
+        prompt TEXT,
+        response TEXT,
+        error TEXT,
+        tool_name TEXT,
+        exit_code INTEGER,
+        parent_id TEXT,
+        label TEXT,
+        reason TEXT,
+        extra TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_interactions_kind ON interactions(kind);
+    CREATE INDEX IF NOT EXISTS idx_interactions_created_at ON interactions(created_at);
+    CREATE INDEX IF NOT EXISTS idx_interactions_issue_id ON interactions(issue_id);
+    CREATE INDEX IF NOT EXISTS idx_interactions_parent_id ON interactions(parent_id);
+
+    -- Federation peers table (Issue #36)
+    CREATE TABLE IF NOT EXISTS federation_peers (
+        name TEXT PRIMARY KEY,
+        remote_url TEXT NOT NULL,
+        username TEXT,
+        password_encrypted BLOB,
+        sovereignty TEXT NOT NULL DEFAULT '',
+        last_sync TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_fed_peers_sovereignty ON federation_peers(sovereignty);
 ";
 
 /// Split a SQL script into individual statements, respecting string literals,
@@ -1815,6 +1865,63 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
             );
             CREATE INDEX IF NOT EXISTS idx_comp_snapshot_issue ON compaction_snapshots(issue_id, compaction_level, created_at);
         ",
+        )?;
+    }
+
+    // Migration v16 -> v17 (Issue #36): add routes, issue_counter, interactions, federation_peers tables.
+    if user_version < 17 {
+        tracing::info!(
+            "Migrating database to schema version 17 (remaining missing tables - Issue #36)"
+        );
+        execute_batch(
+            conn,
+            r#"
+            CREATE TABLE IF NOT EXISTS routes (
+                prefix TEXT PRIMARY KEY,
+                path TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS issue_counter (
+                prefix TEXT PRIMARY KEY,
+                last_id INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS interactions (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                actor TEXT,
+                issue_id TEXT,
+                model TEXT,
+                prompt TEXT,
+                response TEXT,
+                error TEXT,
+                tool_name TEXT,
+                exit_code INTEGER,
+                parent_id TEXT,
+                label TEXT,
+                reason TEXT,
+                extra TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_interactions_kind ON interactions(kind);
+            CREATE INDEX IF NOT EXISTS idx_interactions_created_at ON interactions(created_at);
+            CREATE INDEX IF NOT EXISTS idx_interactions_issue_id ON interactions(issue_id);
+            CREATE INDEX IF NOT EXISTS idx_interactions_parent_id ON interactions(parent_id);
+
+            CREATE TABLE IF NOT EXISTS federation_peers (
+                name TEXT PRIMARY KEY,
+                remote_url TEXT NOT NULL,
+                username TEXT,
+                password_encrypted BLOB,
+                sovereignty TEXT NOT NULL DEFAULT '',
+                last_sync TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_fed_peers_sovereignty ON federation_peers(sovereignty);
+        "#,
         )?;
     }
 
