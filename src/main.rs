@@ -487,6 +487,7 @@ fn main() {
         Commands::Doctor(args) => commands::doctor::execute(&args, &overrides, &output_ctx),
         Commands::Admin { command } => commands::admin::execute(&command, &overrides, &output_ctx),
         Commands::Info(args) => commands::info::execute(&args, &overrides, &output_ctx),
+        Commands::Import(args) => commands::import::execute(&args, &overrides, &output_ctx),
         Commands::Schema(args) => commands::schema::execute(&args, &overrides, &output_ctx),
         Commands::Where => commands::r#where::execute(&overrides, &output_ctx),
         Commands::Version(args) => commands::version::execute(&args, &output_ctx),
@@ -846,7 +847,8 @@ const fn is_mutating_command(cmd: &Commands) -> bool {
         | Commands::Reopen(_)
         | Commands::Q(_)
         | Commands::Defer(_)
-        | Commands::Undefer(_) => true,
+        | Commands::Undefer(_)
+        | Commands::Import(_) => true,
         Commands::Wisp { command } => matches!(
             command,
             commands::wisp::WispCommands::Create(_)
@@ -938,6 +940,7 @@ const fn needs_write_lock(cmd: &Commands) -> bool {
  | Commands::Orphans(_)
  | Commands::Audit { .. }
  | Commands::Info(_)
+ | Commands::Import(_)
  | Commands::Where
  | Commands::Sync(_)
  | Commands::Init { .. }
@@ -1012,6 +1015,7 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Agents(_)
         | Commands::Quickstart(_)
         | Commands::Admin { .. }
+        | Commands::Import(_)
         | Commands::Formula { .. } => false,
 
         #[cfg(feature = "mcp")]

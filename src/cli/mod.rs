@@ -841,6 +841,9 @@ pub enum Commands {
     /// Manage local history backups
     History(HistoryArgs),
 
+    /// Import issues from a file (JSONL, CSV, markdown)
+    Import(ImportArgs),
+
     /// Show diagnostic metadata about the workspace
     Info(InfoArgs),
 
@@ -1457,6 +1460,27 @@ pub struct InfoArgs {
     /// Show acknowledgements and exit
     #[arg(long, conflicts_with = "whats_new")]
     pub thanks: bool,
+}
+
+/// Arguments for the import command.
+#[derive(Args, Debug, Clone, Default)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct ImportArgs {
+    /// Input file path (default: .beads/issues.jsonl)
+    #[arg(long, short = 'i')]
+    pub input: Option<PathBuf>,
+
+    /// Input format: jsonl (default), json, csv, markdown
+    #[arg(long, short = 'f', default_value = "jsonl")]
+    pub format: String,
+
+    /// Rename mismatched issue IDs to the expected prefix
+    #[arg(long)]
+    pub rename_prefix: Option<String>,
+
+    /// Force import even on conflict
+    #[arg(short = 'F', long)]
+    pub force: bool,
 }
 
 /// Arguments for the schema command.
