@@ -4,7 +4,7 @@ use crate::error::{BeadsError, Result};
 use crate::format::{IssueDetails, IssueWithDependencyMetadata};
 use crate::model::{
     Comment, Dependency, DependencyType, Event, EventType, Issue, IssueType, MolType, Priority,
-    Status,
+    RepoMtime, Status,
 };
 use crate::storage::events::get_events;
 use crate::storage::schema::CURRENT_SCHEMA_VERSION;
@@ -11768,6 +11768,86 @@ impl SqliteStorage {
         }
     }
 
+    /// Retrieve a `RepoMtime` entry for a repository path.
+    pub fn get_repo_mtime(&self, repo_path: &str) -> Result<Option<RepoMtime>> {
+        match self.conn.query_row_with_params(
+            "SELECT repo_path, jsonl_path, mtime_ns, last_checked FROM repo_mtimes WHERE repo_path = ?",
+            &[SqliteValue::from(repo_path)],
+        ) {
+            Ok(row) => {
+                let last_checked: &str = row.get(3).and_then(SqliteValue::as_text).unwrap_or("");
+                Ok(Some(RepoMtime {
+                    repo_path: row.get(0).and_then(SqliteValue::as_text).unwrap_or("").to_string(),
+                    jsonl_path: row.get(1).and_then(SqliteValue::as_text).unwrap_or("").to_string(),
+                    mtime_ns: row.get(2).and_then(SqliteValue::as_integer).unwrap_or(0),
+                    last_checked: chrono::DateTime::parse_from_rfc3339(last_checked)
+                        .map(|dt| dt.with_timezone(&chrono::Utc))
+                        .unwrap_or_else(|_| Utc::now()),
+                }))
+            }
+            Err(FrankenError::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Upsert a `RepoMtime` entry: insert or replace on repo_path.
+    pub fn upsert_repo_mtime(&mut self, mtime: &RepoMtime) -> Result<()> {
+        self.conn.execute_with_params(
+            "INSERT OR REPLACE INTO repo_mtimes (repo_path, jsonl_path, mtime_ns, last_checked) VALUES (?1, ?2, ?3, ?4)",
+            &[
+                SqliteValue::from(mtime.repo_path.as_str()),
+                SqliteValue::from(mtime.jsonl_path.as_str()),
+                SqliteValue::from(mtime.mtime_ns),
+                SqliteValue::from(mtime.last_checked.to_rfc3339()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a `RepoMtime` entry by repository path.
+    pub fn delete_repo_mtime(&mut self, repo_path: &str) -> Result<()> {
+        self.conn.execute_with_params(
+            "DELETE FROM repo_mtimes WHERE repo_path = ?1",
+            &[SqliteValue::from(repo_path)],
+        )?;
+        Ok(())
+    }
+
+    /// List all tracked `RepoMtime` entries, ordered by last_checked descending.
+    pub fn list_repo_mtimes(&self) -> Result<Vec<RepoMtime>> {
+        let stmt = self.conn.prepare(
+            "SELECT repo_path, jsonl_path, mtime_ns, last_checked FROM repo_mtimes ORDER BY last_checked DESC",
+        )?;
+        let rows = stmt.query_with_params(&[])?;
+        let mut result = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let last_checked: &str = row.get(3).and_then(SqliteValue::as_text).unwrap_or("");
+            result.push(RepoMtime {
+                repo_path: row.get(0).and_then(SqliteValue::as_text).unwrap_or("").to_string(),
+                jsonl_path: row.get(1).and_then(SqliteValue::as_text).unwrap_or("").to_string(),
+                mtime_ns: row.get(2).and_then(SqliteValue::as_integer).unwrap_or(0),
+                last_checked: chrono::DateTime::parse_from_rfc3339(last_checked)
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .unwrap_or_else(|_| Utc::now()),
+            });
+        }
+        Ok(result)
+    }
+
+    /// Check if a repository path is tracked in repo_mtimes.
+    pub fn has_repo_mtime(&self, repo_path: &str) -> Result<bool> {
+        let count: i64 = self
+            .conn
+            .query_row_with_params(
+                "SELECT COUNT(*) FROM repo_mtimes WHERE repo_path = ?",
+                &[SqliteValue::from(repo_path)],
+            )?
+            .get(0)
+            .and_then(SqliteValue::as_integer)
+            .unwrap_or(0);
+        Ok(count > 0)
+    }
+
     /// Check if an issue is a tombstone (deleted).
     ///
     /// # Errors
@@ -23083,5 +23163,115 @@ mod tests {
         assert!(created.agent_name.is_none());
         assert!(created.harness.is_none());
         assert!(created.model.is_none());
+    }
+
+    // ========================================================================
+    // RepoMtime CRUD tests (Issue #39)
+    // ========================================================================
+
+    #[test]
+    fn repo_mtime_create_and_get() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let mtime = RepoMtime {
+            repo_path: "/tmp/test-repo".to_string(),
+            jsonl_path: ".beads/beads.jsonl".to_string(),
+            mtime_ns: 1_700_000_000_000_000_000,
+            last_checked: Utc::now(),
+        };
+
+        // Should not exist initially
+        assert!(!storage.has_repo_mtime("/tmp/test-repo").unwrap());
+
+        // Create and read back
+        storage.upsert_repo_mtime(&mtime).unwrap();
+        assert!(storage.has_repo_mtime("/tmp/test-repo").unwrap());
+
+        let loaded = storage.get_repo_mtime("/tmp/test-repo").unwrap().unwrap();
+        assert_eq!(loaded.repo_path, "/tmp/test-repo");
+        assert_eq!(loaded.jsonl_path, ".beads/beads.jsonl");
+        assert_eq!(loaded.mtime_ns, 1_700_000_000_000_000_000);
+    }
+
+    #[test]
+    fn repo_mtime_get_nonexistent_returns_none() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        let result = storage.get_repo_mtime("/nonexistent").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn repo_mtime_upsert_replaces_existing() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let original = RepoMtime {
+            repo_path: "/tmp/repo".to_string(),
+            jsonl_path: ".beads/a.jsonl".to_string(),
+            mtime_ns: 100,
+            last_checked: Utc::now(),
+        };
+        storage.upsert_repo_mtime(&original).unwrap();
+
+        let updated = RepoMtime {
+            repo_path: "/tmp/repo".to_string(),
+            jsonl_path: ".beads/b.jsonl".to_string(),
+            mtime_ns: 200,
+            last_checked: Utc::now(),
+        };
+        storage.upsert_repo_mtime(&updated).unwrap();
+
+        let loaded = storage.get_repo_mtime("/tmp/repo").unwrap().unwrap();
+        assert_eq!(loaded.jsonl_path, ".beads/b.jsonl");
+        assert_eq!(loaded.mtime_ns, 200);
+    }
+
+    #[test]
+    fn repo_mtime_delete_removes_entry() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let mtime = RepoMtime {
+            repo_path: "/tmp/to-delete".to_string(),
+            jsonl_path: ".beads/x.jsonl".to_string(),
+            mtime_ns: 42,
+            last_checked: Utc::now(),
+        };
+        storage.upsert_repo_mtime(&mtime).unwrap();
+        assert!(storage.has_repo_mtime("/tmp/to-delete").unwrap());
+
+        storage.delete_repo_mtime("/tmp/to-delete").unwrap();
+        assert!(!storage.has_repo_mtime("/tmp/to-delete").unwrap());
+        assert!(storage.get_repo_mtime("/tmp/to-delete").unwrap().is_none());
+    }
+
+    #[test]
+    fn repo_mtime_list_returns_all_ordered() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        assert!(storage.list_repo_mtimes().unwrap().is_empty());
+
+        let old_entry = RepoMtime {
+            repo_path: "/tmp/old".to_string(),
+            jsonl_path: ".beads/old.jsonl".to_string(),
+            mtime_ns: 1,
+            last_checked: Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap(),
+        };
+        let new_entry = RepoMtime {
+            repo_path: "/tmp/new".to_string(),
+            jsonl_path: ".beads/new.jsonl".to_string(),
+            mtime_ns: 2,
+            last_checked: Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap(),
+        };
+
+        // Insert old first, then new (order should be DESC by last_checked)
+        storage.upsert_repo_mtime(&old_entry).unwrap();
+        storage.upsert_repo_mtime(&new_entry).unwrap();
+
+        let all = storage.list_repo_mtimes().unwrap();
+        assert_eq!(all.len(), 2);
+        // Newest should be first (ORDER BY last_checked DESC)
+        assert_eq!(all[0].repo_path, "/tmp/new");
+        assert_eq!(all[1].repo_path, "/tmp/old");
+    }
+
+    #[test]
+    fn repo_mtime_missing_row_has_false() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        assert!(!storage.has_repo_mtime("/does/not/exist").unwrap());
     }
 }
