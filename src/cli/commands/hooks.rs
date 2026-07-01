@@ -187,7 +187,7 @@ fn cmd_list(ctx: &OutputContext) -> Result<()> {
 /// The actual sync operations run as subprocess calls (`br sync --flush-only`,
 /// etc.) by the hook scripts, but this CLI path is available for manual
 /// debugging and one-off execution.
-fn cmd_run(args: &crate::cli::HooksRunArgs, ctx: &OutputContext) -> Result<()> {
+fn cmd_run(args: &crate::cli::HooksRunArgs, _ctx: &OutputContext) -> Result<()> {
     let valid_names: Vec<&str> = crate::hooks::MANAGED_HOOKS.iter().map(|h| h.name).collect();
 
     if !valid_names.contains(&args.hook.as_str()) {
@@ -200,12 +200,5 @@ fn cmd_run(args: &crate::cli::HooksRunArgs, ctx: &OutputContext) -> Result<()> {
         });
     }
 
-    ctx.print_line(&format!(
-        "beads: hooks run {} — this runs the same logic as the installed git hook script.\n\
-         Normally the hook script calls `br sync --flush-only` or `br sync --import-only`\n\
-         directly. Run the appropriate sync command manually to achieve the same effect.",
-        args.hook
-    ));
-
-    Ok(())
+    crate::hooks::run_hook(&args.hook)
 }
