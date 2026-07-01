@@ -13,7 +13,7 @@
 //! See `SyncSafetyValidator` for runtime guards.
 
 use crate::error::{BeadsError, ValidationError};
-use crate::model::{Comment, Dependency, Issue, Priority, Status};
+use crate::model::{Comment, CustomStatus, CustomType, Dependency, Issue, Priority, Status};
 use crate::util::id::MAX_ID_LENGTH;
 use std::path::Path;
 
@@ -530,6 +530,76 @@ impl SyncSafetyValidator {
     }
 }
 
+/// Validate a `Status::Custom` value against the registered status names.
+///
+/// Returns `Ok(())` if the status is a built-in variant or is listed in
+/// `registered`. When `registered` is empty, all custom statuses pass
+/// through (the registry is unconfigured).
+///
+/// # Errors
+///
+/// Returns a `BeadsError::validation` if the custom status is not registered.
+pub fn validate_custom_status_against_registry(
+    status: &Status,
+    registered: &[CustomStatus],
+) -> Result<(), BeadsError> {
+    let Status::Custom(value) = status else {
+        // Built-in statuses are always valid
+        return Ok(());
+    };
+    if registered.is_empty() {
+        // Registry unconfigured — pass through
+        return Ok(());
+    }
+    let registered_names: Vec<&str> = registered.iter().map(|s| s.name.as_str()).collect();
+    if registered_names.contains(&value.as_str()) {
+        Ok(())
+    } else {
+        Err(BeadsError::validation(
+            "status",
+            format!(
+                "'{value}' is not a registered custom status. \
+                 Registered: {}. Use `br custom-status add` to register it.",
+                registered_names.join(", ")
+            ),
+        ))
+    }
+}
+
+/// Validate a custom issue type against the registered type names.
+///
+/// Returns `Ok(())` if the type is a built-in variant or is listed in
+/// `registered`. When `registered` is empty, all custom types pass
+/// through.
+///
+/// # Errors
+///
+/// Returns a `BeadsError::validation` if the custom type is not registered.
+pub fn validate_custom_type_against_registry(
+    issue_type: &crate::model::IssueType,
+    registered: &[CustomType],
+) -> Result<(), BeadsError> {
+    let crate::model::IssueType::Custom(value) = issue_type else {
+        return Ok(());
+    };
+    if registered.is_empty() {
+        return Ok(());
+    }
+    let registered_names: Vec<&str> = registered.iter().map(|t| t.name.as_str()).collect();
+    if registered_names.contains(&value.as_str()) {
+        Ok(())
+    } else {
+        Err(BeadsError::validation(
+            "issue_type",
+            format!(
+                "'{value}' is not a registered custom type. \
+                 Registered: {}. Use `br custom-type add` to register it.",
+                registered_names.join(", ")
+            ),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -889,6 +959,89 @@ mod tests {
     fn id_format_validation_accepts_long_hash() {
         // Fallback generates 12+ chars. Should be accepted.
         assert!(is_valid_id_format("bd-abc123456789"));
+    }
+
+    #[test]
+    fn validate_custom_status_registry_passes_builtin() {
+        let registered = [CustomStatus {
+            name: "review".to_string(),
+            category: "wip".to_string(),
+        }];
+        // Built-in statuses always pass
+        assert!(validate_custom_status_against_registry(&Status::Open, &registered).is_ok());
+        assert!(validate_custom_status_against_registry(&Status::InProgress, &registered).is_ok());
+        assert!(validate_custom_status_against_registry(&Status::Hooked, &registered).is_ok());
+    }
+
+    #[test]
+    fn validate_custom_status_registry_rejects_unregistered() {
+        let registered = [CustomStatus {
+            name: "review".to_string(),
+            category: "wip".to_string(),
+        }];
+        let err = validate_custom_status_against_registry(
+            &Status::Custom("nope".to_string()),
+            &registered,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not a registered custom status"));
+    }
+
+    #[test]
+    fn validate_custom_status_registry_passes_empty_registry() {
+        // Empty registry = pass through (unconfigured)
+        assert!(
+            validate_custom_status_against_registry(
+                &Status::Custom("anything".to_string()),
+                &[],
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_custom_type_registry_passes_builtin() {
+        let registered = [CustomType {
+            name: "spike".to_string(),
+        }];
+        assert!(
+            validate_custom_type_against_registry(
+                &crate::model::IssueType::Task,
+                &registered,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_custom_type_against_registry(
+                &crate::model::IssueType::Bug,
+                &registered,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_custom_type_registry_rejects_unregistered() {
+        let registered = [CustomType {
+            name: "spike".to_string(),
+        }];
+        let err = validate_custom_type_against_registry(
+            &crate::model::IssueType::Custom("nope".to_string()),
+            &registered,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not a registered custom type"));
+    }
+
+    #[test]
+    fn validate_custom_type_registry_passes_empty_registry() {
+        assert!(
+            validate_custom_type_against_registry(
+                &crate::model::IssueType::Custom("anything".to_string()),
+                &[],
+            )
+            .is_ok()
+        );
     }
 
     // =========================================================================
