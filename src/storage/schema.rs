@@ -3,6 +3,7 @@
 use chrono::Utc;
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
+use sha2::{Digest, Sha256};
 
 use crate::error::{BeadsError, Result};
 use crate::model::{IssueType, Priority, Status};
@@ -389,6 +390,17 @@ pub const SCHEMA_SQL: &str = r"
         updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
     CREATE INDEX IF NOT EXISTS idx_fed_peers_sovereignty ON federation_peers(sovereignty);
+
+    -- Schema migration hashes (Issue #55): per-migration SHA-256 content hash
+    -- so cross-release skew detection can verify that a migration step at a
+    -- given user_version has the same SQL as the binary that wrote it.
+    -- An empty `version` row (inserted at schema creation) records the hash
+    -- of the SCHEMA_SQL itself, not any incremental migration step.
+    CREATE TABLE IF NOT EXISTS schema_migration_hashes (
+        version INTEGER PRIMARY KEY,
+        content_hash TEXT NOT NULL,
+        applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
 ";
 
 /// Split a SQL script into individual statements, respecting string literals,
@@ -886,6 +898,26 @@ fn current_schema_version_declared(conn: &Connection) -> bool {
         .ok()
         .and_then(|row| row.get(0).and_then(SqliteValue::as_integer))
         .is_some_and(|version| version >= i64::from(CURRENT_SCHEMA_VERSION))
+}
+
+/// Compute the SHA-256 hex hash of a SQL string for migration content tracking.
+fn hash_sql(sql: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(sql.as_bytes());
+    let result = hasher.finalize();
+    result.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Record a schema_migration_hashes row for a completed version step.
+/// Idempotent: INSERT OR REPLACE against the migration's version key.
+fn record_migration_hash(conn: &Connection, version: i32, sql: &str) -> Result<()> {
+    let hash = hash_sql(sql);
+    conn.execute_with_params(
+        "INSERT OR REPLACE INTO schema_migration_hashes (version, content_hash, applied_at)
+         VALUES (?1, ?2, datetime('now'))",
+        &[SqliteValue::from(version), SqliteValue::from(hash)],
+    )?;
+    Ok(())
 }
 
 /// Check for schema version skew between the database and the binary.
@@ -2053,6 +2085,16 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
             CREATE INDEX IF NOT EXISTS idx_events_actor ON events(actor) WHERE actor != '';
         ",
         )?;
+    }
+
+    // Record schema migration hash for the current version.
+    // The hash covers all migration SQL (SCHEMA_SQL + all version steps) so that
+    // cross-release skew detection can detect silent schema changes even when
+    // user_version hasn't been bumped. Insert OR REPLACE handles the case
+    // where run_migrations is called multiple times (fresh + runtime-compatible).
+    if table_exists(conn, "schema_migration_hashes") {
+        let combined_sql = format!("{SCHEMA_SQL}\n{CURRENT_SCHEMA_VERSION}");
+        record_migration_hash(conn, CURRENT_SCHEMA_VERSION, &combined_sql)?;
     }
 
     Ok(())
@@ -3633,5 +3675,55 @@ mod tests {
         assert!(check_schema_skew(&conn, false, false).is_ok());
         // Read-only should also pass (0 means no schema yet)
         assert!(check_schema_skew(&conn, true, false).is_ok());
+    }
+
+    #[test]
+    fn test_hash_sql_deterministic() {
+        // Same input produces same hash
+        let sql_1 = "CREATE TABLE foo (id INT);";
+        let sql_2 = "CREATE TABLE foo (id INT);";
+        assert_eq!(hash_sql(sql_1), hash_sql(sql_2));
+
+        // Different input produces different hash
+        let sql_3 = "CREATE TABLE foo (id INT NOT NULL);";
+        assert_ne!(hash_sql(sql_1), hash_sql(sql_3));
+    }
+
+    #[test]
+    fn test_hash_sql_non_empty() {
+        let sql = "SELECT 1";
+        let hash = hash_sql(sql);
+        // SHA-256 hex is 64 chars
+        assert_eq!(hash.len(), 64);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_record_migration_hash() {
+        let conn = Connection::open(":memory:").unwrap();
+        // Create the table manually (apply_schema would do this)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migration_hashes (
+                version INTEGER PRIMARY KEY,
+                content_hash TEXT NOT NULL,
+                applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )",
+        )
+        .unwrap();
+
+        let sql_19 = format!("{SCHEMA_SQL}\n19");
+        record_migration_hash(&conn, CURRENT_SCHEMA_VERSION, &sql_19).unwrap();
+
+        // Verify the row
+        let row = conn
+            .query_row_with_params("SELECT version, content_hash FROM schema_migration_hashes WHERE version = ?1",
+                       &[SqliteValue::from(CURRENT_SCHEMA_VERSION)])
+            .unwrap();
+        assert_eq!(row.get(0).and_then(SqliteValue::as_integer), Some(i64::from(CURRENT_SCHEMA_VERSION)));
+        let expected_hash = hash_sql(&sql_19);
+        assert_eq!(row.get(1).and_then(SqliteValue::as_text), Some(expected_hash.as_str()));
+
+        // INSERT OR REPLACE — calling again should succeed
+        record_migration_hash(&conn, CURRENT_SCHEMA_VERSION, &sql_19).unwrap();
     }
 }
