@@ -821,6 +821,15 @@ fn set_config_value(
         }
     };
 
+    // Reserved: kv.memory.* (and shorthand memory.*) keys must be managed via
+    // `br remember` / `br forget`, not `br config set`.
+    if key.starts_with("kv.memory.") || key.starts_with("memory.") {
+        return Err(BeadsError::Config(format!(
+            "Use 'br remember' to set persistent memories, not 'br config set'. \
+             Key '{key}' is reserved (kv.memory.* prefix)."
+        )));
+    }
+
     // Determine target config file
     let (config_path, is_project) =
         if let Some(beads_dir) = discover_optional_beads_dir_with_cli(overrides)? {

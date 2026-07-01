@@ -550,6 +550,9 @@ fn main() {
         Commands::Wisp { command } => {
             commands::wisp::execute(&command, &overrides, &output_ctx)
         }
+        Commands::Memory { command } => {
+            commands::memory::execute(&command, cli.json, &overrides, &output_ctx)
+        }
         Commands::CustomStatus { command } => {
             commands::custom_status::execute_status(&command, cli.json, &overrides, &output_ctx)
         }
@@ -968,8 +971,9 @@ const fn needs_write_lock(cmd: &Commands) -> bool {
  | Commands::Init { .. }
  | Commands::Doctor(_)
  | Commands::Template { .. }
- | Commands::Admin { .. } => true,
-        Commands::Config { command } => !matches!(
+ | Commands::Admin { .. }
+ | Commands::Memory { .. } => true,
+ Commands::Config { command } => !matches!(
             command,
             beads_rust::cli::ConfigCommands::Path | beads_rust::cli::ConfigCommands::Edit
         ),
@@ -1043,7 +1047,8 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Recipes { .. }
         | Commands::Worktree(_)
         | Commands::MergeSlot(_)
-        | Commands::Federation(_) => false,
+        | Commands::Federation(_)
+        | Commands::Memory { .. } => false,
 
         #[cfg(feature = "mcp")]
         Commands::Serve(_) => false,

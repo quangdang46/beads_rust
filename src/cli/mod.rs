@@ -1000,6 +1000,12 @@ EXAMPLES:
     /// Undefer issues (make ready again)
     Undefer(UndeferArgs),
 
+    /// Persistent agent memory (remember / memories / recall / forget)
+    Memory {
+        #[command(subcommand)]
+        command: commands::memory::MemoryCommands,
+    },
+
     /// Manage wisps (ephemeral, JSONL-excluded issues)
     Wisp {
         #[command(subcommand)]
