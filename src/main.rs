@@ -502,6 +502,12 @@ fn main() {
                 message: e.to_string(),
             })
         }
+        Commands::Federation(command) => {
+            commands::federation::run(&command, &output_ctx)
+                .map_err(|e| beads_rust::error::BeadsError::Internal {
+                    message: e.to_string(),
+                })
+        }
         Commands::Version(args) => commands::version::execute(&args, &output_ctx),
 
         #[cfg(feature = "mcp")]
@@ -1036,7 +1042,8 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Formula { .. }
         | Commands::Recipes { .. }
         | Commands::Worktree(_)
-        | Commands::MergeSlot(_) => false,
+        | Commands::MergeSlot(_)
+        | Commands::Federation(_) => false,
 
         #[cfg(feature = "mcp")]
         Commands::Serve(_) => false,

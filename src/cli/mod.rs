@@ -19,6 +19,7 @@ use crate::model::{IssueType, Status};
 
 pub mod commands;
 
+pub use commands::federation::FederationCommand;
 pub use commands::formula::FormulaCommands;
 
 /// Default cap for work-surface listings (`br list`).
@@ -1043,6 +1044,10 @@ EXAMPLES:
     /// Manage git worktrees
     #[command(subcommand)]
     Worktree(WorktreeCommand),
+
+    /// Manage federation peers for P2P sync
+    #[command(subcommand)]
+    Federation(FederationCommand),
 
     /// Manage the merge slot for exclusive conflict resolution access
     #[command(subcommand)]

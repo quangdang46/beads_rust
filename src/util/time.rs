@@ -324,6 +324,29 @@ fn local_to_utc_opt(naive_dt: &chrono::NaiveDateTime) -> Option<DateTime<Utc>> {
     }
 }
 
+use regex::Regex;
+
+/// Parse a duration shorthand string like "1d", "3h", "2w" into a past timestamp.
+/// Returns `Some(DateTime<Utc>)` representing that duration ago from now.
+pub fn parse_duration_shorthand(s: &str) -> Option<DateTime<Utc>> {
+    static RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"^(\d+)([smhdw])$").unwrap());
+
+    let caps = RE.captures(s)?;
+    let value: i64 = caps.get(1)?.as_str().parse().ok()?;
+    let unit = caps.get(2)?.as_str();
+    let now = Utc::now();
+    let duration = match unit {
+        "s" => Duration::seconds(value),
+        "m" => Duration::minutes(value),
+        "h" => Duration::hours(value),
+        "d" => Duration::days(value),
+        "w" => Duration::weeks(value),
+        _ => return None,
+    };
+    Some(now - duration)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
