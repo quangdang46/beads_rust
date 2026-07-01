@@ -121,6 +121,7 @@ impl Theme {
             Status::Deferred | Status::Draft => &self.status_deferred,
             Status::Closed | Status::Tombstone => &self.status_closed,
             Status::Pinned => &self.status_pinned,
+            Status::Hooked => &self.status_in_progress,
             Status::Custom(_) => &self.muted,
         }
     }
