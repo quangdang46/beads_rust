@@ -1093,6 +1093,8 @@ fn build_update(args: &UpdateArgs, actor: &str, claim_exclusive: bool) -> Result
         } else {
             None
         },
+        is_template: None,
+        metadata: None,
     })
 }
 

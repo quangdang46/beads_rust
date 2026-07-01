@@ -67,6 +67,7 @@ pub mod custom_status;
 
 #[cfg(feature = "self_update")]
 pub mod upgrade;
+pub mod federation;
 
 pub(crate) const GITHUB_REPO_OWNER: &str = "Dicklesworthstone";
 pub(crate) const GITHUB_REPO_NAME: &str = "beads_rust";

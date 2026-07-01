@@ -19,7 +19,7 @@
 use crate::error::{BeadsError, Result};
 use crate::model::{Event, Issue};
 use crate::storage::sqlite::{
-    IssueMetadata, IssueUpdate, ListFilters, ReadyFilters, StatsIssueRow,
+    IssueMetadata, ListFilters, ReadyFilters, StatsIssueRow,
 };
 
 /// Primary storage interface — implemented by [`SqliteStorage`][super::sqlite::SqliteStorage]
@@ -160,7 +160,7 @@ pub trait Storage {
 // In-memory storage backend (for testing)
 // ---------------------------------------------------------------------------
 
-use crate::model::{IssueType, Priority, Status};
+use crate::model::{IssueType, Status};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 

@@ -1217,6 +1217,13 @@ impl Default for Issue {
     }
 }
 
+// SAFETY: `quality_score` is `Option<f64>` and `f64` is not `Eq` (NaN != NaN),
+// so we cannot derive `Eq`. However, for the sync merge logic, we want
+// `Issue` to be comparable in `MergeResult::Keep(Issue)`. We implement `Eq`
+// by comparing only the deterministic, content-bearing fields — specifically
+// ignoring `quality_score` since it is derived/audit data, not content.
+impl Eq for Issue {}
+
 impl Issue {
     /// Compute the deterministic content hash for this issue.
     ///

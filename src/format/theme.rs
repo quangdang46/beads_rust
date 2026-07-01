@@ -147,6 +147,7 @@ impl Theme {
             IssueType::Epic => &self.type_epic,
             IssueType::Docs | IssueType::Question => &self.type_docs,
             IssueType::Chore => &self.type_chore,
+            _ => &self.muted,
         }
     }
 

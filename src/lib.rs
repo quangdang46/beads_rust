@@ -37,6 +37,7 @@ pub mod logging;
 pub mod model;
 pub mod output;
 pub mod policy;
+pub mod merge_slot;
 pub mod recipes;
 pub mod shutdown;
 pub mod storage;

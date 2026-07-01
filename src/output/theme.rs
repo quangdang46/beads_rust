@@ -148,6 +148,7 @@ impl Theme {
             IssueType::Docs => self.type_docs.clone(),
             IssueType::Question => self.type_question.clone(),
             IssueType::Custom(_) => self.muted.clone(),
+            _ => self.muted.clone(),
         }
     }
 }
