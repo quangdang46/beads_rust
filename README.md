@@ -407,6 +407,8 @@ git commit -m "Fix: login timeout (br-a1b2c3)"
 
 ## Commands
 
+> **BD vs BR scope matrix:** See [`docs/BD_VS_BR.md`](docs/BD_VS_BR.md) for a complete command parity map, intentionally out-of-scope features, and `br`-exclusive capabilities.
+
 ### Issue Lifecycle
 
 | Command | Description | Example |

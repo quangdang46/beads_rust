@@ -114,7 +114,7 @@ fn execute_install(args: &RecipesInstallArgs, ctx: &OutputContext) -> Result<()>
         }
         crate::recipes::RecipeType::Hooks => {
             ctx.print_line(
-                "\nHooks-based recipe installed. The AI tool needs to be configured to run `br prime` on session start.",
+                "\nHooks-based recipe installed. The AI tool needs to be configured to run `br agents` on session start.",
             );
         }
         crate::recipes::RecipeType::Section => {
