@@ -39,6 +39,7 @@ pub mod import;
 pub mod label;
 pub mod lint;
 pub mod list;
+pub mod memory;
 pub mod orphans;
 pub mod q;
 pub mod query;
