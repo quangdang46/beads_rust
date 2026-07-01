@@ -497,6 +497,12 @@ fn execute_prepared_route(
                 "update",
                 update_result,
             )?;
+            crate::storage::hooks::fire_hook_scripts(
+                &prepared.storage_ctx.paths.beads_dir,
+                "on_update",
+                id,
+                &prepared.actor,
+            );
             if prepared.update.status.is_some() {
                 blocked_cache_dirty = true;
             }

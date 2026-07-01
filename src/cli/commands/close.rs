@@ -1085,6 +1085,9 @@ fn execute_route(
     };
 
     storage_ctx.flush_no_db_if_dirty()?;
+    for closed in &closed_issues {
+        crate::storage::hooks::fire_hook_scripts(beads_dir, "on_close", &closed.id, &actor);
+    }
     if auto_flush_external && let Err(error) = storage_ctx.auto_flush_if_enabled() {
         report_auto_flush_failure(
             ctx,

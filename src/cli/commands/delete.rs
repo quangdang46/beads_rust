@@ -602,6 +602,7 @@ fn apply_delete_route(
         }
         batch_has_mutated = true;
         result.deleted.push(id.clone());
+        crate::storage::hooks::fire_hook_scripts(&route.beads_dir, "on_close", id, &actor);
     }
     result.deleted_count = result.deleted.len();
 

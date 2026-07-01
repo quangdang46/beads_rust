@@ -1,11 +1,26 @@
-//! HookFiringStore decorator (Issue #6).
+//! HookFiringStore decorator (Issue #6, #46).
 //!
 //! Wraps [`SqliteStorage`] and fires lifecycle hooks after successful
 //! mutations — `on_create`, `on_update`, `on_close`.  Hook failures are
 //! logged but do not fail the mutation.  When no hooks are registered
 //! the wrapper is a zero-overhead pass-through.
 //!
-//! # Usage
+//! # Shell Hooks (opt-in)
+//!
+//! Hook scripts live in `.beads/hooks/on_create`, `on_update`, `on_close`.
+//! Each must be an executable file (shell script, binary, etc.).  When
+//! present, they are invoked with two arguments: `issue_id` and `actor`.
+//!
+//! ```bash
+//! # Example: .beads/hooks/on_create
+//! #!/bin/sh
+//! echo "Issue $1 created by $2" >> /tmp/beads-hooks.log
+//! ```
+//!
+//! Register them via [`HookFiringStore::with_shell_hooks`] or the helper
+//! [`fire_hook_scripts`] for ad-hoc use.
+//!
+//! # Programmatic Hooks
 //!
 //! ```ignore
 //! use beads_rust::storage::hooks::{HookFiringStore, HookFn};
@@ -24,6 +39,10 @@ use crate::model::Issue;
 use crate::model::Status;
 use crate::storage::sqlite::{IssueUpdate, ListFilters, SqliteStorage};
 use crate::Result;
+use std::path::Path;
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 /// Signature for a lifecycle hook callback.
 ///
@@ -167,6 +186,59 @@ impl HookFiringStore {
 
     pub fn search_issues(&self, query: &str, filters: &ListFilters) -> Result<Vec<Issue>> {
         self.inner.search_issues(query, filters)
+    }
+}
+
+// ------------------------------------------------------------------
+// Shell hook runner
+// ------------------------------------------------------------------
+
+/// Run hook scripts from `.beads/hooks/{event}` for a given issue
+/// mutation event.
+///
+/// If the script file exists and is executable, it is invoked with
+/// `issue_id` and `actor` as arguments.  Failures are logged but
+/// never propagated to the caller.
+pub fn fire_hook_scripts(beads_dir: &Path, event: &str, id: &str, actor: &str) {
+    let hook_path = beads_dir.join("hooks").join(event);
+    if !hook_path.is_file() {
+        return;
+    }
+    #[cfg(unix)]
+    let is_exec = std::fs::metadata(&hook_path)
+        .map(|m| {
+            use std::os::unix::fs::PermissionsExt;
+            m.permissions().mode() & 0o111 != 0
+        })
+        .unwrap_or(false);
+    #[cfg(not(unix))]
+    let is_exec = true; // Windows: assume executable
+    if !is_exec {
+        tracing::warn!("Hook script {hook_path:?} exists but is not executable — skipping");
+        return;
+    }
+    match std::process::Command::new(&hook_path)
+        .arg(id)
+        .arg(actor)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .output()
+    {
+        Ok(output) => {
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                tracing::warn!(
+                    "Hook script {hook_path:?} for issue {id} exited with {}: {stderr}",
+                    output.status
+                );
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                "Failed to execute hook script {hook_path:?} for issue {id}: {e}",
+            );
+        }
     }
 }
 
