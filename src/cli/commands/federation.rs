@@ -10,9 +10,11 @@ use fsqlite_types::SqliteValue;
 
 use crate::error::{BeadsError, Result};
 use crate::output::OutputContext;
+use crate::storage::SqliteStorage;
+use crate::sync::{self, ExportConfig, ImportConfig};
 use crate::util::credentials::CredentialKey;
 use chrono::Utc;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -203,7 +205,7 @@ pub fn run(command: &FederationCommand, ctx: &OutputContext) -> Result<()> {
         FederationCommand::Add(args) => cmd_add(&conn, args, ctx),
         FederationCommand::List => cmd_list(&conn, ctx),
         FederationCommand::Remove(args) => cmd_remove(&conn, args, ctx),
-        FederationCommand::Sync(args) => cmd_sync(args, ctx),
+        FederationCommand::Sync(args) => cmd_sync(&conn, args, ctx),
         FederationCommand::Info(args) => cmd_info(&conn, args, ctx),
     }
 }
@@ -348,24 +350,118 @@ fn cmd_remove(conn: &Connection, args: &FederationRemoveArgs, ctx: &OutputContex
     Ok(())
 }
 
-/// Sync with a peer (stub — P2P sync is planned for a future release).
-fn cmd_sync(args: &FederationSyncArgs, ctx: &OutputContext) -> Result<()> {
+/// Sync with a peer via JSONL exchange.
+///
+/// - Exports the local database to the peer's JSONL path
+/// - Imports the peer's JSONL into the local database
+/// - Updates `last_sync` on successful exchange
+fn cmd_sync(conn: &Connection, args: &FederationSyncArgs, ctx: &OutputContext) -> Result<()> {
+    let peer = federation_peers_get(conn, &args.name)?;
+    let peer = match peer {
+        Some(p) => p,
+        None => {
+            let msg = format!("peer not found: {}", args.name);
+            return Err(BeadsError::Internal { message: msg });
+        }
+    };
+
+    // Resolve remote_url to a JSONL path
+    let remote_url = peer.remote_url.trim().to_string();
+    let sync_path = if remote_url.starts_with("file://") {
+        let stripped = remote_url.trim_start_matches("file://");
+        Path::new(stripped).to_path_buf()
+    } else if remote_url.contains("://") {
+        let msg = format!(
+            "unsupported protocol in remote_url: '{}'; use file:// or a bare path",
+            remote_url
+        );
+        return Err(BeadsError::Internal { message: msg });
+    } else {
+        Path::new(&remote_url).to_path_buf()
+    };
+
+    // Resolve beads dir
+    let beads_dir = default_beads_dir();
+
+    // Step 1: Export local DB to the peer path
+    let db_path = beads_dir.join("beads.db");
+    let storage = SqliteStorage::open(&db_path).map_err(|e| BeadsError::Internal {
+        message: format!("failed to open storage: {e}"),
+    })?;
+
+    let export_config = ExportConfig {
+        force: true,
+        is_default_path: false,
+        beads_dir: Some(beads_dir.clone()),
+        allow_external_jsonl: true,
+        show_progress: false,
+        max_parallel_workers: 1,
+        ..Default::default()
+    };
+
+    let export_result = sync::export_to_jsonl(&storage, &sync_path, &export_config)
+        .map_err(|e| BeadsError::Internal {
+            message: format!("export to peer failed: {e}"),
+        })?;
+
+    // Step 2: Import peer's JSONL into local DB
+    let import_config = ImportConfig {
+        skip_prefix_validation: true,
+        rename_on_import: true,
+        force_upsert: true,
+        allow_external_jsonl: true,
+        beads_dir: Some(beads_dir.clone()),
+        ..Default::default()
+    };
+
+    let mut storage = SqliteStorage::open(&db_path).map_err(|e| BeadsError::Internal {
+        message: format!("failed to re-open storage: {e}"),
+    })?;
+
+    let import_result = sync::import_from_jsonl(&mut storage, &sync_path, &import_config, None)
+        .map_err(|e| BeadsError::Internal {
+            message: format!("import from peer failed: {e}"),
+        })?;
+
+    // Step 3: Update last_sync timestamp
+    let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    conn.execute_with_params(
+        "UPDATE federation_peers SET last_sync = ?1, updated_at = ?2 WHERE name = ?3",
+        &[
+            SqliteValue::from(now.as_str()),
+            SqliteValue::from(now.as_str()),
+            SqliteValue::from(args.name.as_str()),
+        ],
+    )
+    .map_err(BeadsError::Database)?;
+
     if ctx.is_json() {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "ok": false,
-                "error": "not yet implemented",
+                "ok": true,
                 "peer": args.name,
+                "exported": export_result.exported_count,
+                "imported": import_result.imported_count,
+                "created": import_result.created_count,
+                "updated": import_result.updated_count,
+                "last_sync": now,
             }))
             .map_err(|e| BeadsError::Internal {
                 message: e.to_string()
             })?
         );
     } else {
-        println!("Sync with peer {}: not yet implemented", args.name);
-        println!("P2P federation sync is planned for a future release.");
+        println!("Sync with peer '{}' completed:", args.name);
+        println!("  Exported: {} issues", export_result.exported_count);
+        println!("  Imported: {} issues ({} created, {} updated)",
+            import_result.imported_count,
+            import_result.created_count,
+            import_result.updated_count,
+        );
+        println!("  Last sync: {}", now);
     }
+
     Ok(())
 }
 
