@@ -316,6 +316,134 @@ fn apply_comparison(
     }
 }
 
+/// Build an in-memory predicate function from a query AST.
+///
+/// This is used for complex queries (OR, NOT) that can't be expressed
+/// as SQL WHERE conditions alone.
+fn build_predicate(node: &QueryNode) -> Box<dyn Fn(&crate::model::Issue) -> bool + Send> {
+    match node {
+        QueryNode::Comparison { field, op, value } => {
+            let field = field.clone();
+            let value = value.clone();
+            let op = *op;
+            Box::new(move |issue| evaluate_predicate_on_issue(issue, &field, op, &value))
+        }
+        QueryNode::And(left, right) => {
+            let left_fn = build_predicate(left);
+            let right_fn = build_predicate(right);
+            Box::new(move |issue| left_fn(issue) && right_fn(issue))
+        }
+        QueryNode::Or(left, right) => {
+            let left_fn = build_predicate(left);
+            let right_fn = build_predicate(right);
+            Box::new(move |issue| left_fn(issue) || right_fn(issue))
+        }
+        QueryNode::Not(inner) => {
+            let inner_fn = build_predicate(inner);
+            Box::new(move |issue| !inner_fn(issue))
+        }
+    }
+}
+
+/// Evaluate a single comparison against an Issue's in-memory fields.
+fn evaluate_predicate_on_issue(
+    issue: &crate::model::Issue,
+    field: &str,
+    op: ComparisonOp,
+    value: &str,
+) -> bool {
+    use crate::model::Priority;
+
+    let apply_str_op = |a: &str, b: &str| -> bool {
+        match op {
+            ComparisonOp::Eq => a.eq_ignore_ascii_case(b),
+            ComparisonOp::NotEq => !a.eq_ignore_ascii_case(b),
+            _ => false,
+        }
+    };
+
+    match field {
+        "status" => apply_str_op(&issue.status.to_string(), value),
+        "type" => apply_str_op(&issue.issue_type.to_string(), value),
+        "priority" => {
+            let issue_p = issue.priority.0;
+            let v: i32 = Priority::from_str(value).map(|p| p.0).unwrap_or(-1);
+            match op {
+                ComparisonOp::Eq => issue_p == v,
+                ComparisonOp::NotEq => issue_p != v,
+                ComparisonOp::Less => issue_p < v,
+                ComparisonOp::LessEq => issue_p <= v,
+                ComparisonOp::Greater => issue_p > v,
+                ComparisonOp::GreaterEq => issue_p >= v,
+            }
+        }
+        "assignee" => {
+            let a = issue.assignee.as_deref().unwrap_or("");
+            apply_str_op(a, value)
+        }
+        "owner" => {
+            let a = issue.owner.as_deref().unwrap_or("");
+            apply_str_op(a, value)
+        }
+        "unassigned" => {
+            let expected = value == "true" || value == "1";
+            let is_unassigned = issue.assignee.is_none();
+            if op == ComparisonOp::NotEq {
+                is_unassigned != expected
+            } else {
+                is_unassigned == expected
+            }
+        }
+        "pinned" => {
+            let expected = value == "true" || value == "1";
+            if op == ComparisonOp::NotEq {
+                issue.pinned != expected
+            } else {
+                issue.pinned == expected
+            }
+        }
+        "title" => {
+            let issue_title = issue.title.to_lowercase();
+            let search = value.to_lowercase();
+            match op {
+                ComparisonOp::Eq => issue_title == search,
+                ComparisonOp::NotEq => issue_title != search,
+                _ => false,
+            }
+        }
+        "id" => {
+            let id = &issue.id;
+            if value.ends_with('*') {
+                let prefix = &value[..value.len() - 1];
+                id.starts_with(prefix)
+            } else {
+                apply_str_op(id, value)
+            }
+        }
+        "labels" => {
+            match op {
+                ComparisonOp::Eq => issue.labels.iter().any(|l| l.eq_ignore_ascii_case(value)),
+                ComparisonOp::NotEq => !issue.labels.iter().any(|l| l.eq_ignore_ascii_case(value)),
+                _ => false,
+            }
+        }
+        _ if field.starts_with("metadata.") => {
+            let key = &field["metadata.".len()..];
+            let issue_val: String = issue
+                .metadata
+                .as_deref()
+                .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+                .and_then(|v| v.get(key).and_then(|v| v.as_str().map(String::from)))
+                .unwrap_or_default();
+            apply_str_op(&issue_val, value)
+        }
+        _ => {
+            // Unknown field — treat as no match
+            false
+        }
+    }
+}
+
 /// Evaluate a query AST and produce a QueryResult.
 pub fn evaluate(node: &QueryNode) -> Result<QueryResult, QueryError> {
     let mut filters = ListFilters::default();
@@ -329,12 +457,13 @@ pub fn evaluate(node: &QueryNode) -> Result<QueryResult, QueryError> {
         });
     }
 
-    // Complex query: build base filters and signal predicate needed
+    // Complex query: build base filters (best-effort), build predicate
     let _ = build_filters(node, &mut filters);
+    let predicate = build_predicate(node);
     Ok(QueryResult {
         filters,
         requires_predicate: true,
-        predicate: None,
+        predicate: Some(predicate),
     })
 }
 

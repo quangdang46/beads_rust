@@ -72,7 +72,7 @@ fn execute_inner(
     let storage = &storage_ctx.storage;
 
     // Build filter from args
-    let mut filters = build_filters(args)?;
+    let (mut filters, predicate) = build_filters(args)?;
     let client_filters = needs_client_filters(args);
 
     // Determine output format early so we know whether to run a count query.
@@ -152,6 +152,12 @@ fn execute_inner(
     } else {
         storage.list_issues(&filters)?
     };
+
+    // Apply in-memory predicate for complex query DSL expressions (OR/NOT)
+    if let Some(ref pred) = predicate {
+        issues.retain(|issue| pred(issue));
+    }
+
     if client_filters {
         issues = apply_client_filters(issues, args)?;
     }
@@ -497,7 +503,7 @@ pub(crate) fn parse_metadata_filters(filters: &[String]) -> Result<Vec<(String, 
 }
 
 /// Convert CLI args to storage filter.
-fn build_filters(args: &ListArgs) -> Result<ListFilters> {
+fn build_filters(args: &ListArgs) -> Result<(ListFilters, Option<Box<dyn Fn(&crate::model::Issue) -> bool + Send>>)> {
     // Parse status strings to Status enums
     let statuses = if args.status.is_empty() {
         None
@@ -591,31 +597,62 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
     };
 
     // Apply query DSL filter (--filter) on top of explicit CLI filters
-    if let Some(filter_expr) = &args.filter {
-        let query_result = parse_and_evaluate(filter_expr).map_err(|e| {
-            BeadsError::Validation { field: "filter".into(), reason: e.to_string() }
-        })?;
-        // Merge query filters into the base filters
-        let qf = query_result.filters;
-        if let Some(s) = qf.statuses { filters.statuses = Some(s); }
-        if let Some(s) = qf.types { filters.types = Some(s); }
-        if let Some(p) = qf.priorities { filters.priorities = Some(p); }
-        if let Some(a) = qf.assignee { filters.assignee = Some(a); }
-        if qf.unassigned { filters.unassigned = true; }
-        if let Some(t) = qf.title_contains { filters.title_contains = Some(t); }
-        if let Some(l) = qf.labels { filters.labels = Some(l); }
-        if let Some(o) = qf.owner { filters.owner = Some(o); }
-        if let Some(p) = qf.pinned { filters.pinned = Some(p); }
-        if let Some(m) = qf.mol_type { filters.mol_type = Some(m); }
-        if let Some(ids) = qf.ids { filters.ids = Some(ids); }
-        if let Some(mf) = qf.metadata_filters { filters.metadata_filters = Some(mf); }
-        filters.updated_before = filters.updated_before.or(qf.updated_before);
-        filters.updated_after = filters.updated_after.or(qf.updated_after);
-        filters.created_before = filters.created_before.or(qf.created_before);
-        filters.created_after = filters.created_after.or(qf.created_after);
-    }
+    let predicate: Option<Box<dyn Fn(&crate::model::Issue) -> bool + Send>> =
+        if let Some(filter_expr) = &args.filter {
+            let query_result = parse_and_evaluate(filter_expr).map_err(|e| {
+                BeadsError::Validation {
+                    field: "filter".into(),
+                    reason: e.to_string(),
+                }
+            })?;
+            // Merge query filters into the base filters
+            let qf = query_result.filters;
+            if let Some(s) = qf.statuses {
+                filters.statuses = Some(s);
+            }
+            if let Some(s) = qf.types {
+                filters.types = Some(s);
+            }
+            if let Some(p) = qf.priorities {
+                filters.priorities = Some(p);
+            }
+            if let Some(a) = qf.assignee {
+                filters.assignee = Some(a);
+            }
+            if qf.unassigned {
+                filters.unassigned = true;
+            }
+            if let Some(t) = qf.title_contains {
+                filters.title_contains = Some(t);
+            }
+            if let Some(l) = qf.labels {
+                filters.labels = Some(l);
+            }
+            if let Some(o) = qf.owner {
+                filters.owner = Some(o);
+            }
+            if let Some(p) = qf.pinned {
+                filters.pinned = Some(p);
+            }
+            if let Some(m) = qf.mol_type {
+                filters.mol_type = Some(m);
+            }
+            if let Some(ids) = qf.ids {
+                filters.ids = Some(ids);
+            }
+            if let Some(mf) = qf.metadata_filters {
+                filters.metadata_filters = Some(mf);
+            }
+            filters.updated_before = filters.updated_before.or(qf.updated_before);
+            filters.updated_after = filters.updated_after.or(qf.updated_after);
+            filters.created_before = filters.created_before.or(qf.created_before);
+            filters.created_after = filters.created_after.or(qf.created_after);
+            query_result.predicate
+        } else {
+            None
+        };
 
-    Ok(filters)
+    Ok((filters, predicate))
 }
 
 /// Validate `list`-compatible CLI filters without executing the query.
@@ -856,7 +893,7 @@ mod tests {
             ..Default::default()
         };
 
-        let filters = build_filters(&args).expect("build filters");
+        let (filters, _predicate) = build_filters(&args).expect("build filters");
         assert!(filters.include_closed);
         assert!(
             filters
@@ -877,7 +914,7 @@ mod tests {
             ..Default::default()
         };
 
-        let filters = build_filters(&args).expect("build filters");
+        let (filters, _predicate) = build_filters(&args).expect("build filters");
         let priorities = filters.priorities.expect("priorities");
         let values: Vec<i32> = priorities.iter().map(|p| p.0).collect();
         assert_eq!(values, vec![0, 2]);
@@ -887,7 +924,7 @@ mod tests {
     #[test]
     fn test_build_filters_applies_list_defaults_when_cli_omits_pagination() {
         init_logging();
-        let filters = build_filters(&ListArgs::default()).expect("build filters");
+        let (filters, _predicate) = build_filters(&ListArgs::default()).expect("build filters");
 
         // #349: list is COMPLETE by default — the default limit is unlimited
         // (`0`), not a silent cap. `Some(0)` is the query layer's "no LIMIT".
