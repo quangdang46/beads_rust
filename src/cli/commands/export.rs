@@ -11,6 +11,7 @@ use crate::error::{BeadsError, Result};
 use crate::format::csv;
 use crate::model::Issue;
 use crate::output::OutputContext;
+use crate::sync::{self, ExportConfig, ExportErrorPolicy, HistoryConfig};
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
@@ -103,18 +104,24 @@ fn execute_inner(
 
     match export_format {
         ExportFormat::Jsonl => {
-            // JSONL output: one JSON object per line
             if let Some(ref output_path) = args.output {
-                if let Some(parent) = output_path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                let file = File::create(output_path)?;
-                let mut writer = BufWriter::new(file);
-                for issue in &issues {
-                    let line = serde_json::to_string(issue)
-                        .map_err(|e| BeadsError::Config(format!("Serialization error: {e}")))?;
-                    writeln!(writer, "{line}")?;
-                }
+                // Use the sync atomic export path (temp file + rename)
+                let export_config = ExportConfig {
+                    force: false,
+                    is_default_path: false,
+                    error_policy: ExportErrorPolicy::Strict,
+                    retention_days: None,
+                    beads_dir: Some(storage_ctx.paths.beads_dir.clone()),
+                    allow_external_jsonl: true,
+                    show_progress: false,
+                    history: HistoryConfig::default(),
+                    max_parallel_workers: 0,
+                };
+                let (_result, _report) = sync::export_to_jsonl_with_policy(
+                    &storage_ctx.storage,
+                    output_path,
+                    &export_config,
+                )?;
             } else {
                 // Write to stdout
                 let stdout = io::stdout();
