@@ -172,7 +172,9 @@ pub fn execute_with_storage(
             create_issue_impl(storage, args, &config)
         })?;
     let created_id = issue.id.clone();
-    let last_touched_dir = storage_ctx.paths.beads_dir.clone();
+    let beads_dir = &storage_ctx.paths.beads_dir;
+    crate::storage::hooks::fire_hook_scripts(beads_dir, "on_create", &created_id, &config.actor);
+    let last_touched_dir = beads_dir.clone();
     let update_last_touched_after_flush = storage_ctx.no_db;
     if !args.dry_run && !update_last_touched_after_flush {
         crate::util::set_last_touched_id(&last_touched_dir, &created_id);
