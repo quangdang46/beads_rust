@@ -1,220 +1,203 @@
 //! Federation / P2P Sync CLI commands.
 //!
 //! Manages federation peers for P2P synchronization.
+//! Uses the canonical `federation_peers` table from schema.rs (v17+)
+//! with parameterized queries (no SQL interpolation).
+
+use clap::{Args, Subcommand};
+use fsqlite::Connection;
+use fsqlite_types::SqliteValue;
 
 use crate::error::{BeadsError, Result};
 use crate::output::OutputContext;
+use crate::util::credentials::CredentialKey;
 use chrono::Utc;
-use clap::{Args, Subcommand};
-use fsqlite::Connection;
-use std::env;
+use std::path::PathBuf;
 
 // ---------------------------------------------------------------------------
-// CLI arg types
+// Types
 // ---------------------------------------------------------------------------
 
 /// Federation subcommands.
 #[derive(Subcommand, Debug, Clone)]
 pub enum FederationCommand {
-    /// Add a new peer
+    /// Add a new federation peer.
     Add(FederationAddArgs),
-    /// List all peers
+    /// List all configured peers.
     List,
-    /// Remove a peer
+    /// Remove a peer by name or URL.
     Remove(FederationRemoveArgs),
-    /// Sync with a peer
+    /// Sync with a peer (stub).
     Sync(FederationSyncArgs),
-    /// Show peer details
+    /// Show peer details.
     Info(FederationInfoArgs),
 }
 
 /// Arguments for `federation add`.
 #[derive(Args, Debug, Clone)]
 pub struct FederationAddArgs {
-    /// Unique peer name
+    /// Peer name (used as primary key)
     pub name: String,
-    /// Peer URL (e.g., https://peer.example.com)
-    pub url: String,
-    /// Tier: T1 (local), T2 (team), T3 (org), T4 (public)
+    /// Remote URL (e.g., https://beads.example.com)
+    pub remote_url: String,
+    /// Optional username for authentication
     #[arg(long)]
-    pub tier: Option<String>,
-    /// Authentication token (will be encrypted at rest)
+    pub username: Option<String>,
+    /// Optional password for authentication
     #[arg(long)]
-    pub auth_token: Option<String>,
+    pub password: Option<String>,
+    /// Sovereignty tier: T1, T2, T3, or T4 (default: T3)
+    #[arg(long, default_value = "T3")]
+    pub sovereignty: String,
 }
 
 /// Arguments for `federation remove`.
 #[derive(Args, Debug, Clone)]
 pub struct FederationRemoveArgs {
-    /// Peer ID to remove
-    pub id: String,
+    /// Name of the peer to remove
+    pub name: String,
 }
 
 /// Arguments for `federation sync`.
 #[derive(Args, Debug, Clone)]
 pub struct FederationSyncArgs {
-    /// Peer ID to sync with
-    pub id: String,
+    /// Name of the peer to sync with
+    pub name: String,
 }
 
 /// Arguments for `federation info`.
 #[derive(Args, Debug, Clone)]
 pub struct FederationInfoArgs {
-    /// Peer ID or name to show
-    pub id_or_name: String,
+    /// Name of the peer to inspect
+    pub name: String,
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Get the default database path.
-fn default_db_path() -> String {
-    env::var("BR_DATABASE_PATH")
-        .or_else(|_| env::var("BEADS_DATABASE_PATH"))
-        .unwrap_or_else(|_| ".beads/beads.db".to_string())
-}
-
-/// Get the current actor name.
-fn get_actor() -> String {
-    env::var("BR_ACTOR")
-        .or_else(|_| env::var("USER"))
-        .unwrap_or_else(|_| "federation".to_string())
-}
-
-/// Generate a unique ID for a peer.
-fn generate_peer_id() -> String {
-    use crate::util::id::generate_id;
-    let now = Utc::now();
-    generate_id("peer", Some("federation"), Some(&get_actor()), now)
-}
-
-/// Insert a new federation peer.
-fn federation_peers_insert(conn: &Connection, peer: &FederationPeer) -> Result<()> {
-    conn.execute(&format!(
-        "INSERT INTO federation_peers (
-            id, name, url, tier, auth_token_encrypted,
-            last_sync_at, last_sync_hash, created_at,
-            created_by, updated_at, enabled
-        ) VALUES ('{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', {})",
-        escape_sql(&peer.id),
-        escape_sql(&peer.name),
-        escape_sql(&peer.url),
-        escape_sql(&peer.tier),
-        escape_sql(&peer.auth_token_encrypted),
-        escape_sql(&peer.last_sync_at),
-        escape_sql(&peer.last_sync_hash),
-        escape_sql(&peer.created_at),
-        escape_sql(&peer.created_by),
-        escape_sql(&peer.updated_at),
-        peer.enabled
-    ))
-    .map_err(BeadsError::Database)?;
-    Ok(())
-}
-
-/// Escape single quotes for SQL.
-fn escape_sql(s: &str) -> String {
-    s.replace('\'', "''")
-}
-
-/// List all enabled federation peers.
-fn federation_peers_list(conn: &Connection) -> Result<Vec<FederationPeer>> {
-    let rows = conn
-        .query("SELECT * FROM federation_peers WHERE enabled=1")
-        .map_err(BeadsError::Database)?;
-
-    let mut peers = Vec::new();
-    for row in rows {
-        peers.push(FederationPeer::from_row(&row)?);
-    }
-    Ok(peers)
-}
-
-/// Get a peer by ID or name.
-fn federation_peers_get(conn: &Connection, id_or_name: &str) -> Result<Option<FederationPeer>> {
-    let id_escaped = id_or_name.replace('\'', "''");
-    let sql = format!(
-        "SELECT * FROM federation_peers WHERE id = '{}' OR (name = '{}' AND enabled = 1)",
-        id_escaped, id_escaped
-    );
-    let rows = conn.query(&sql).map_err(BeadsError::Database)?;
-
-    let mut iter = rows.into_iter();
-    if let Some(row) = iter.next() {
-        Ok(Some(FederationPeer::from_row(&row)?))
-    } else {
-        Ok(None)
-    }
-}
-
-/// Delete a peer by ID.
-fn federation_peers_delete(conn: &Connection, id: &str) -> Result<()> {
-    conn.execute(&format!(
-        "DELETE FROM federation_peers WHERE id = '{}'",
-        escape_sql(id)
-    ))
-    .map_err(BeadsError::Database)?;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Model
-// ---------------------------------------------------------------------------
-
-/// Federation peer representation.
+/// A federation peer as stored in the database.
 #[derive(Debug, Clone)]
 struct FederationPeer {
-    id: String,
     name: String,
-    url: String,
-    tier: String,
-    auth_token_encrypted: String,
-    last_sync_at: String,
-    last_sync_hash: String,
+    remote_url: String,
+    username: String,
+    sovereignty: String,
+    last_sync: String,
     created_at: String,
-    created_by: String,
     updated_at: String,
-    enabled: i32,
 }
 
 impl FederationPeer {
-    fn from_row(row: &fsqlite::Row) -> Result<Self> {
-        let get_text = |idx| {
+    fn from_row(row: &fsqlite::Row) -> Self {
+        let get_text = |idx: usize| -> String {
             row.get(idx)
-                .and_then(fsqlite_types::SqliteValue::as_text)
+                .and_then(SqliteValue::as_text)
                 .map(String::from)
                 .unwrap_or_default()
         };
-        let get_int = |idx| -> i32 {
-            row.get(idx)
-                .and_then(fsqlite_types::SqliteValue::as_integer)
-                .unwrap_or(1) as i32
-        };
-        Ok(Self {
-            id: get_text(0),
-            name: get_text(1),
-            url: get_text(2),
-            tier: get_text(3),
-            auth_token_encrypted: get_text(4),
-            last_sync_at: get_text(5),
-            last_sync_hash: get_text(6),
-            created_at: get_text(7),
-            created_by: get_text(8),
-            updated_at: get_text(9),
-            enabled: get_int(10),
-        })
+        Self {
+            name: get_text(0),
+            remote_url: get_text(1),
+            username: get_text(2),
+            sovereignty: get_text(4),
+            last_sync: get_text(5),
+            created_at: get_text(6),
+            updated_at: get_text(7),
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Commands
+// Database helpers
+// ---------------------------------------------------------------------------
+
+/// Path to the default beads database.
+fn default_beads_dir() -> PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let mut dir = cwd;
+    dir.push(".beads");
+    dir
+}
+
+/// Open a connection to the beads database.
+fn open_connection() -> Result<Connection> {
+    let mut db_path = default_beads_dir();
+    db_path.push("beads.db");
+    let path_str = db_path.to_str().ok_or_else(|| BeadsError::Internal {
+        message: "invalid beads directory path".to_string(),
+    })?;
+    Connection::open(path_str).map_err(BeadsError::Database)
+}
+
+/// Insert a new federation peer using parameterized queries.
+fn federation_peers_insert(
+    conn: &Connection,
+    peer: &FederationPeer,
+    encrypted_password: Option<Vec<u8>>,
+) -> Result<()> {
+    conn.execute_with_params(
+        "INSERT OR REPLACE INTO federation_peers
+         (name, remote_url, username, password_encrypted, sovereignty, last_sync, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        &[
+            SqliteValue::from(peer.name.as_str()),
+            SqliteValue::from(peer.remote_url.as_str()),
+            SqliteValue::from(peer.username.as_str()),
+            match &encrypted_password {
+                Some(bytes) => SqliteValue::Blob(std::sync::Arc::from(bytes.as_slice())),
+                None => SqliteValue::Null,
+            },
+            SqliteValue::from(peer.sovereignty.as_str()),
+            SqliteValue::from(peer.last_sync.as_str()),
+            SqliteValue::from(peer.created_at.as_str()),
+            SqliteValue::from(peer.updated_at.as_str()),
+        ],
+    )
+    .map_err(BeadsError::Database)?;
+    Ok(())
+}
+
+/// List all federation peers.
+fn federation_peers_list(conn: &Connection) -> Result<Vec<FederationPeer>> {
+    let rows = conn
+        .query(
+            "SELECT name, remote_url, username, password_encrypted,
+                    sovereignty, last_sync, created_at, updated_at
+             FROM federation_peers
+             ORDER BY name",
+        )
+        .map_err(BeadsError::Database)?;
+    Ok(rows.iter().map(FederationPeer::from_row).collect())
+}
+
+/// Get a single peer by name.
+fn federation_peers_get(conn: &Connection, name: &str) -> Result<Option<FederationPeer>> {
+    let rows = conn
+        .query_with_params(
+            "SELECT name, remote_url, username, password_encrypted,
+                    sovereignty, last_sync, created_at, updated_at
+             FROM federation_peers
+             WHERE name = ?1",
+            &[SqliteValue::from(name)],
+        )
+        .map_err(BeadsError::Database)?;
+    Ok(rows.first().map(|r| FederationPeer::from_row(r)))
+}
+
+/// Delete a peer by name.
+fn federation_peers_delete(conn: &Connection, name: &str) -> Result<()> {
+    conn.execute_with_params(
+        "DELETE FROM federation_peers WHERE name = ?1",
+        &[SqliteValue::from(name)],
+    )
+    .map_err(BeadsError::Database)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Command implementations
 // ---------------------------------------------------------------------------
 
 /// Run the federation command.
 pub fn run(command: &FederationCommand, ctx: &OutputContext) -> Result<()> {
-    let db_path = default_db_path();
-    let conn = Connection::open(&db_path).map_err(BeadsError::Database)?;
+    let conn = open_connection()?;
 
     match command {
         FederationCommand::Add(args) => cmd_add(&conn, args, ctx),
@@ -226,45 +209,55 @@ pub fn run(command: &FederationCommand, ctx: &OutputContext) -> Result<()> {
 }
 
 /// Add a new peer.
-fn cmd_add(conn: &Connection, args: &FederationAddArgs, ctx: &OutputContext) -> Result<()> {
-    let actor = get_actor();
+fn cmd_add(
+    conn: &Connection,
+    args: &FederationAddArgs,
+    ctx: &OutputContext,
+) -> Result<()> {
     let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    let tier = args.tier.as_deref().unwrap_or("T3");
 
-    let peer = FederationPeer {
-        id: generate_peer_id(),
-        name: args.name.clone(),
-        url: args.url.clone(),
-        tier: tier.to_string(),
-        auth_token_encrypted: args.auth_token.clone().unwrap_or_default(),
-        last_sync_at: String::new(),
-        last_sync_hash: String::new(),
-        created_at: now.clone(),
-        created_by: actor,
-        updated_at: now,
-        enabled: 1,
+    // Encrypt password if provided
+    let encrypted_password = if let Some(password) = &args.password {
+        let beads_dir = default_beads_dir();
+        let key = CredentialKey::load_or_create(&beads_dir).map_err(|e| BeadsError::Internal {
+            message: format!("failed to load credential key: {e}"),
+        })?;
+        key.encrypt_password(password)
+            .map_err(|e| BeadsError::Internal {
+                message: format!("failed to encrypt password: {e}"),
+            })?
+    } else {
+        None
     };
 
-    federation_peers_insert(conn, &peer)?;
+    let peer = FederationPeer {
+        name: args.name.clone(),
+        remote_url: args.remote_url.clone(),
+        username: args.username.clone().unwrap_or_default(),
+        sovereignty: args.sovereignty.clone(),
+        last_sync: String::new(),
+        created_at: now.clone(),
+        updated_at: now,
+    };
+
+    federation_peers_insert(conn, &peer, encrypted_password)?;
 
     if ctx.is_json() {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "ok": true,
-                "peer_id": peer.id,
                 "name": peer.name,
-                "url": peer.url,
-                "tier": peer.tier,
+                "remote_url": peer.remote_url,
+                "sovereignty": peer.sovereignty,
             }))
             .map_err(|e| BeadsError::Internal {
                 message: e.to_string()
             })?
         );
     } else {
-        println!("Added peer: {} ({})", peer.name, peer.id);
-        println!("  URL: {}", peer.url);
-        println!("  Tier: {}", peer.tier);
+        println!("Added peer: {} ({})", peer.name, peer.remote_url);
+        println!("  Sovereignty: {}", peer.sovereignty);
     }
 
     Ok(())
@@ -275,29 +268,24 @@ fn cmd_list(conn: &Connection, ctx: &OutputContext) -> Result<()> {
     let peers = federation_peers_list(conn)?;
 
     if ctx.is_json() {
-        let peer_list: Vec<serde_json::Value> = peers
+        let list: Vec<serde_json::Value> = peers
             .iter()
             .map(|p| {
                 serde_json::json!({
-                    "id": p.id,
                     "name": p.name,
-                    "url": p.url,
-                    "tier": p.tier,
-                    "last_sync_at": p.last_sync_at,
-                    "last_sync_hash": p.last_sync_hash,
-                    "created_at": p.created_at,
+                    "remote_url": p.remote_url,
+                    "username": p.username,
+                    "sovereignty": p.sovereignty,
+                    "last_sync": p.last_sync,
                 })
             })
             .collect();
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "peers": peer_list,
-                "count": peers.len(),
-            }))
-            .map_err(|e| BeadsError::Internal {
-                message: e.to_string()
-            })?
+            serde_json::to_string_pretty(&serde_json::json!({ "peers": list }))
+                .map_err(|e| BeadsError::Internal {
+                    message: e.to_string()
+                })?
         );
     } else {
         if peers.is_empty() {
@@ -305,25 +293,9 @@ fn cmd_list(conn: &Connection, ctx: &OutputContext) -> Result<()> {
             return Ok(());
         }
         println!("Federation Peers ({}):", peers.len());
-        println!(
-            "{:<12} {:<20} {:<30} {:<6} {:<20}",
-            "ID", "Name", "URL", "Tier", "Last Sync"
-        );
-        println!("{}", "-".repeat(90));
-        for peer in &peers {
-            let last_sync = if peer.last_sync_at.is_empty() {
-                "never".to_string()
-            } else {
-                peer.last_sync_at.clone()
-            };
-            println!(
-                "{:<12} {:<20} {:<30} {:<6} {:<20}",
-                &peer.id[..12.min(peer.id.len())],
-                &peer.name[..20.min(peer.name.len())],
-                &peer.url[..30.min(peer.url.len())],
-                peer.tier,
-                &last_sync[..20.min(last_sync.len())]
-            );
+        for p in &peers {
+            let last_sync = if p.last_sync.is_empty() { "never" } else { &p.last_sync };
+            println!("  {} ({}) [{}] last sync: {}", p.name, p.remote_url, p.sovereignty, last_sync);
         }
     }
 
@@ -332,68 +304,66 @@ fn cmd_list(conn: &Connection, ctx: &OutputContext) -> Result<()> {
 
 /// Remove a peer.
 fn cmd_remove(conn: &Connection, args: &FederationRemoveArgs, ctx: &OutputContext) -> Result<()> {
-    let peer = federation_peers_get(conn, &args.id)?;
+    let peer = federation_peers_get(conn, &args.name)?;
     let peer = match peer {
         Some(p) => p,
         None => {
+            let msg = format!("peer not found: {}", args.name);
             if ctx.is_json() {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "ok": false,
-                        "error": "peer not found"
+                        "error": msg
                     }))
                     .map_err(|e| BeadsError::Internal {
                         message: e.to_string()
                     })?
                 );
             } else {
-                println!("Peer not found: {}", args.id);
+                println!("{}", msg);
             }
-            return Err(BeadsError::Internal {
-                message: "peer not found".to_string(),
-            });
+            return Err(BeadsError::Internal { message: msg });
         }
     };
 
-    federation_peers_delete(conn, &args.id)?;
+    federation_peers_delete(conn, &args.name)?;
 
     if ctx.is_json() {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "ok": true,
-                "removed": peer.id,
-                "name": peer.name,
+                "removed": peer.name,
+                "remote_url": peer.remote_url,
             }))
             .map_err(|e| BeadsError::Internal {
                 message: e.to_string()
             })?
         );
     } else {
-        println!("Removed peer: {} ({})", peer.name, peer.id);
+        println!("Removed peer: {} ({})", peer.name, peer.remote_url);
     }
 
     Ok(())
 }
 
-/// Sync with a peer.
+/// Sync with a peer (stub — P2P sync is planned for a future release).
 fn cmd_sync(args: &FederationSyncArgs, ctx: &OutputContext) -> Result<()> {
     if ctx.is_json() {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "ok": true,
-                "peer_id": args.id,
-                "status": "not_implemented",
-                "message": "P2P sync not yet implemented"
+                "ok": false,
+                "error": "not yet implemented",
+                "peer": args.name,
             }))
             .map_err(|e| BeadsError::Internal {
                 message: e.to_string()
             })?
         );
     } else {
-        println!("Sync with peer {}: not yet implemented", args.id);
+        println!("Sync with peer {}: not yet implemented", args.name);
         println!("P2P federation sync is planned for a future release.");
     }
     Ok(())
@@ -401,7 +371,7 @@ fn cmd_sync(args: &FederationSyncArgs, ctx: &OutputContext) -> Result<()> {
 
 /// Show peer details.
 fn cmd_info(conn: &Connection, args: &FederationInfoArgs, ctx: &OutputContext) -> Result<()> {
-    let peer = federation_peers_get(conn, &args.id_or_name)?;
+    let peer = federation_peers_get(conn, &args.name)?;
 
     match peer {
         Some(p) => {
@@ -409,17 +379,13 @@ fn cmd_info(conn: &Connection, args: &FederationInfoArgs, ctx: &OutputContext) -
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
-                        "id": p.id,
                         "name": p.name,
-                        "url": p.url,
-                        "tier": p.tier,
-                        "auth_configured": !p.auth_token_encrypted.is_empty(),
-                        "last_sync_at": p.last_sync_at,
-                        "last_sync_hash": p.last_sync_hash,
+                        "remote_url": p.remote_url,
+                        "username": p.username,
+                        "sovereignty": p.sovereignty,
+                        "last_sync": p.last_sync,
                         "created_at": p.created_at,
-                        "created_by": p.created_by,
                         "updated_at": p.updated_at,
-                        "enabled": p.enabled == 1,
                     }))
                     .map_err(|e| BeadsError::Internal {
                         message: e.to_string()
@@ -427,53 +393,108 @@ fn cmd_info(conn: &Connection, args: &FederationInfoArgs, ctx: &OutputContext) -
                 );
             } else {
                 println!("Peer Details:");
-                println!("  ID: {}", p.id);
                 println!("  Name: {}", p.name);
-                println!("  URL: {}", p.url);
-                println!("  Tier: {}", p.tier);
-                let auth_status = if p.auth_token_encrypted.is_empty() {
-                    "not configured"
+                println!("  URL: {}", p.remote_url);
+                let username = if p.username.is_empty() {
+                    "none".to_string()
                 } else {
-                    "[configured]"
+                    p.username.clone()
                 };
-                println!("  Auth Token: {}", auth_status);
-                let last_sync = if p.last_sync_at.is_empty() {
-                    "never"
+                println!("  Username: {}", username);
+                println!("  Sovereignty: {}", p.sovereignty);
+                let last_sync = if p.last_sync.is_empty() {
+                    "never".to_string()
                 } else {
-                    &p.last_sync_at
+                    p.last_sync.clone()
                 };
                 println!("  Last Sync: {}", last_sync);
-                let sync_hash = if p.last_sync_hash.is_empty() {
-                    "none"
-                } else {
-                    &p.last_sync_hash
-                };
-                println!("  Last Sync Hash: {}", sync_hash);
-                println!("  Created: {} by {}", p.created_at, p.created_by);
+                println!("  Created: {}", p.created_at);
                 println!("  Updated: {}", p.updated_at);
-                let enabled = if p.enabled == 1 { "yes" } else { "no" };
-                println!("  Enabled: {}", enabled);
             }
             Ok(())
         }
         None => {
+            let msg = format!("peer not found: {}", args.name);
             if ctx.is_json() {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "ok": false,
-                        "error": "peer not found"
+                        "error": msg
                     }))
                     .map_err(|e| BeadsError::Internal {
                         message: e.to_string()
                     })?
                 );
             } else {
-                println!("Peer not found: {}", args.id_or_name);
+                println!("{}", msg);
             }
-            Err(BeadsError::Internal {
-                message: "peer not found".to_string(),
-            })
+            Err(BeadsError::Internal { message: msg })
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_federation_peer_from_row() {
+        // Create a minimal in-memory DB and verify peer insertion/listing
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let db_path_str = db_path.to_str().unwrap();
+        let conn = Connection::open(db_path_str).unwrap();
+
+        // Create the federation_peers table
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS federation_peers (
+                name TEXT PRIMARY KEY,
+                remote_url TEXT NOT NULL,
+                username TEXT,
+                password_encrypted BLOB,
+                sovereignty TEXT NOT NULL DEFAULT '',
+                last_sync TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )",
+        )
+        .unwrap();
+
+        let peer = FederationPeer {
+            name: "test-peer".to_string(),
+            remote_url: "https://beads.example.com".to_string(),
+            username: "admin".to_string(),
+            sovereignty: "T2".to_string(),
+            last_sync: String::new(),
+            created_at: "2026-01-01 00:00:00".to_string(),
+            updated_at: "2026-01-01 00:00:00".to_string(),
+        };
+
+        federation_peers_insert(&conn, &peer, None).unwrap();
+        let peers = federation_peers_list(&conn).unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].name, "test-peer");
+        assert_eq!(peers[0].remote_url, "https://beads.example.com");
+        assert_eq!(peers[0].sovereignty, "T2");
+
+        // Test fetch by name
+        let fetched = federation_peers_get(&conn, "test-peer").unwrap();
+        assert!(fetched.is_some());
+        assert_eq!(fetched.unwrap().remote_url, "https://beads.example.com");
+
+        // Test non-existent
+        let missing = federation_peers_get(&conn, "nonexistent").unwrap();
+        assert!(missing.is_none());
+
+        // Test delete
+        federation_peers_delete(&conn, "test-peer").unwrap();
+        let peers = federation_peers_list(&conn).unwrap();
+        assert!(peers.is_empty());
     }
 }
