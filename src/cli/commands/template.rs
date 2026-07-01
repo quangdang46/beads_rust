@@ -8,7 +8,7 @@ use super::{retry_mutation_with_jsonl_recovery, report_auto_flush_failure};
 use crate::cli::commands::create::create_issue_impl;
 use crate::cli::{
     config, CreateArgs, TemplateCommands, TemplateCreateArgs, TemplateDeleteArgs, TemplateListArgs,
-    TemplateShowArgs,
+    TemplateShowArgs, TemplateSpawnArgs,
 };
 use crate::config::{CliOverrides, OpenStorageResult};
 use crate::error::{BeadsError, Result};
@@ -39,6 +39,7 @@ pub fn execute(
         TemplateCommands::List(args) => execute_list(args, cli, ctx),
         TemplateCommands::Show(args) => execute_show(args, cli, ctx),
         TemplateCommands::Delete(args) => execute_delete(args, cli, ctx),
+        TemplateCommands::Spawn(args) => execute_spawn(args, cli, ctx),
     }
 }
 
@@ -63,7 +64,9 @@ pub fn execute_with_storage_ctx(
             execute_show_with_storage(args, cli, ctx, storage_ctx)?;
             Ok(true)
         }
-        TemplateCommands::Create(_) | TemplateCommands::Delete(_) => Ok(false),
+        TemplateCommands::Create(_) | TemplateCommands::Delete(_) | TemplateCommands::Spawn(_) => {
+            Ok(false)
+        }
     }
 }
 
@@ -390,4 +393,116 @@ fn execute_delete(
     });
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Spawn
+// ---------------------------------------------------------------------------
+
+/// Spawn a new issue from a template using a pre-opened storage context.
+fn execute_spawn_with_storage(
+    args: &TemplateSpawnArgs,
+    cli: &CliOverrides,
+    ctx: &OutputContext,
+    storage_ctx: &mut OpenStorageResult,
+) -> Result<()> {
+    let layer = storage_ctx.load_config(cli)?;
+    let id_config = config::id_config_from_layer(&layer);
+    let id_config_clone = id_config.clone();
+    let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+    let actor = config::resolve_actor(&layer);
+
+    let resolution = resolver.resolve_fallible(
+        &args.id,
+        |id| storage_ctx.storage.id_exists(id),
+        |hash| storage_ctx.storage.find_ids_by_hash(hash),
+    )?;
+    let resolved_id = resolution.id;
+
+    let template = storage_ctx
+        .storage
+        .get_issue(&resolved_id)?
+        .ok_or_else(|| BeadsError::IssueNotFound {
+            id: resolved_id.clone(),
+        })?;
+
+    if !template.is_template {
+        return Err(BeadsError::validation(
+            "id",
+            format!("issue {resolved_id} is not a template"),
+        ));
+    }
+
+    if matches!(template.status, crate::model::Status::Tombstone) {
+        return Err(BeadsError::validation(
+            "id",
+            format!("template {resolved_id} is already deleted"),
+        ));
+    }
+
+    // Build the spawned issue from template fields
+    let now = Utc::now();
+    let count = storage_ctx.storage.count_issues()?;
+
+    let title = args.title.clone().unwrap_or(template.title.clone());
+
+    let description = args.description.clone().or(template.description.clone());
+
+    let generator = crate::util::id::IdGenerator::new(id_config_clone);
+    let new_id = generator.generate(
+        &title,
+        description.as_deref(),
+        Some(&actor),
+        now,
+        count,
+        |id| storage_ctx.storage.id_exists(id).unwrap_or(false),
+    );
+
+    let new_issue = Issue {
+        id: new_id.clone(),
+        title,
+        description,
+        status: crate::model::Status::Open,
+        priority: template.priority,
+        issue_type: template.issue_type,
+        assignee: template.assignee.clone(),
+        owner: template.owner.clone(),
+        labels: template.labels.clone(),
+        estimated_minutes: template.estimated_minutes,
+        created_at: now,
+        created_by: Some(actor.clone()),
+        updated_at: now,
+        is_template: false,
+        ..Default::default()
+    };
+
+    storage_ctx.storage.create_issue(&new_issue, &actor)?;
+
+    if ctx.is_json() {
+        ctx.json_pretty(&serde_json::json!({
+            "spawned": new_id,
+            "template": resolved_id,
+        }));
+    } else if ctx.is_toon() {
+        ctx.toon(&serde_json::json!({"spawned": new_id}));
+    } else {
+        ctx.success(&format!(
+            "Spawned issue {} from template {}",
+            sanitize_terminal_inline(&new_id),
+            sanitize_terminal_inline(&resolved_id),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Spawn a new issue from a template (opens own storage).
+fn execute_spawn(
+    args: &TemplateSpawnArgs,
+    cli: &CliOverrides,
+    ctx: &OutputContext,
+) -> Result<()> {
+    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
+    let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+    execute_spawn_with_storage(args, cli, ctx, &mut storage_ctx)
 }

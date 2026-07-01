@@ -1309,6 +1309,8 @@ pub enum TemplateCommands {
     Show(TemplateShowArgs),
     /// Delete (tombstone) a template
     Delete(TemplateDeleteArgs),
+    /// Spawn a new issue from a template (copy fields, is_template=false)
+    Spawn(TemplateSpawnArgs),
 }
 
 /// Arguments for template create.
@@ -1374,6 +1376,21 @@ pub struct TemplateDeleteArgs {
     /// Delete reason
     #[arg(long)]
     pub reason: Option<String>,
+}
+
+/// Arguments for template spawn.
+#[derive(Args, Debug, Clone)]
+pub struct TemplateSpawnArgs {
+    /// Template ID to spawn from
+    pub id: String,
+
+    /// Override title for the spawned issue
+    #[arg(long, short = 'T')]
+    pub title: Option<String>,
+
+    /// Override description for the spawned issue
+    #[arg(long, short = 'd')]
+    pub description: Option<String>,
 }
 
 #[derive(Args, Debug, Clone, Default)]
