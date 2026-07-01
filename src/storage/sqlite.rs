@@ -5,7 +5,7 @@ use crate::format::{IssueDetails, IssueWithDependencyMetadata};
 use crate::model::{
     Comment, CompactionSnapshot, Dependency, DependencyType, Event, EventType, FederationPeer,
     Interaction, Issue, IssueCounter, IssueSnapshot, IssueType, MolType, Priority, RepoMtime,
-    Route, Status,
+    Route, Status, WispType, WorkType,
 };
 use crate::storage::events::get_events;
 use crate::storage::schema::CURRENT_SCHEMA_VERSION;
@@ -568,7 +568,8 @@ impl SearchIssueProjection {
                          due_at, defer_until, external_ref, source_system, source_repo,
                          deleted_at, deleted_by, delete_reason, original_type,
                          compaction_level, compacted_at, compacted_at_commit, original_size,
-                         sender, ephemeral, pinned, is_template, source_repo_path, agent_context, metadata
+                         sender, ephemeral, pinned, is_template, source_repo_path, agent_context, metadata,
+                         no_history, wisp_type, mol_type, work_type, started_at, spec_id
                   FROM issues
                   WHERE 1=1"
             }
@@ -601,6 +602,7 @@ impl BlockedIssueProjection {
                      i.compacted_at, i.compacted_at_commit, i.original_size, i.sender, i.ephemeral,
                      i.pinned, i.is_template, i.source_repo_path, i.agent_context,
                      i.metadata,
+                     i.no_history, i.wisp_type, i.mol_type, i.work_type, i.started_at, i.spec_id,
                      bc.blocked_by"
             }
             Self::Command => {
@@ -619,7 +621,8 @@ impl BlockedIssueProjection {
                      due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                      compacted_at, compacted_at_commit, original_size, sender, ephemeral,
-                     pinned, is_template, source_repo_path, agent_context, metadata"
+                     pinned, is_template, source_repo_path, agent_context, metadata,
+                     no_history, wisp_type, mol_type, work_type, started_at, spec_id"
             }
             Self::Command => {
                 r"SELECT id, title, description, status, priority, issue_type,
@@ -633,9 +636,9 @@ impl BlockedIssueProjection {
             // Bumped from 37 → 38 after `agent_context` was appended
             // to the Full SELECT at position 37 (beads_rust#297).
             // Then 38→39 after `metadata` was appended (beads_rust#16).
-            // Source_repo_path is at 36, agent_context at 37, metadata at 38, so
-            // bc.blocked_by lands at 39 in the joined projection.
-            Self::Full => 39,
+            // Then 39→45 after `no_history, wisp_type, mol_type, work_type, started_at, spec_id`
+            // were appended before bc.blocked_by (beads_rust#48).
+            Self::Full => 45,
             Self::Command => 9,
         }
     }
@@ -2312,8 +2315,9 @@ impl SqliteStorage {
                     closed_by_session, due_at, defer_until, external_ref, source_system,
                     source_repo, source_repo_path, deleted_at, deleted_by, delete_reason, original_type,
                     compaction_level, compacted_at, compacted_at_commit, original_size,
-                    sender, ephemeral, pinned, is_template, agent_context, metadata
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39)",
+                    sender, ephemeral, pinned, is_template, agent_context, metadata,
+                    no_history, wisp_type, mol_type, work_type, started_at, spec_id
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45)",
                 &[
                     SqliteValue::from(issue.id.as_str()),
                     SqliteValue::from(content_hash.as_str()),
@@ -2354,6 +2358,15 @@ impl SqliteStorage {
                     SqliteValue::from(i64::from(i32::from(issue.is_template))),
                     issue.agent_context.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
                     issue.metadata.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+                    // beads_rust#48: wisp/coordination fields
+                    SqliteValue::from(i64::from(i32::from(issue.no_history))),
+                    SqliteValue::from(issue.wisp_type.as_str()),
+                    SqliteValue::from(issue.mol_type.as_str()),
+                    SqliteValue::from(issue.work_type.as_str()),
+                    issue.started_at.as_ref().map_or(SqliteValue::Null, |dt| {
+                        SqliteValue::from(dt.to_rfc3339())
+                    }),
+                    issue.spec_id.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
                 ],
             )?;
 
@@ -10063,6 +10076,13 @@ impl SqliteStorage {
             source_repo_path: get_non_empty_str(36),
             agent_context: get_non_empty_str(37),
             metadata: get_non_empty_str(38),
+            // beads_rust#48: wisp/coordination fields (indices 39–44)
+            no_history: get_bool(39),
+            wisp_type: parse_wisp_type(row.get(40).and_then(SqliteValue::as_text)),
+            mol_type: parse_mol_type(row.get(41).and_then(SqliteValue::as_text)),
+            work_type: parse_work_type(row.get(42).and_then(SqliteValue::as_text)),
+            started_at: get_opt_datetime(43)?,
+            spec_id: get_non_empty_str(44),
             labels: vec![],
             dependencies: vec![],
             comments: vec![],
@@ -11017,6 +11037,37 @@ fn parse_status(s: Option<&str>) -> Status {
 
 fn parse_issue_type(s: Option<&str>) -> IssueType {
     s.and_then(|s| s.parse().ok()).unwrap_or_default()
+}
+
+fn parse_wisp_type(s: Option<&str>) -> WispType {
+    match s.unwrap_or("none") {
+        "none" => WispType::None,
+        "heartbeat" => WispType::Heartbeat,
+        "ping" => WispType::Ping,
+        "patrol" => WispType::Patrol,
+        "gc_report" => WispType::GcReport,
+        "recovery" => WispType::Recovery,
+        "error" => WispType::Error,
+        "escalation" => WispType::Escalation,
+        custom => WispType::Custom(custom.to_string()),
+    }
+}
+
+fn parse_mol_type(s: Option<&str>) -> MolType {
+    match s.unwrap_or("work") {
+        "work" => MolType::Work,
+        "swarm" => MolType::Swarm,
+        "patrol" => MolType::Patrol,
+        custom => MolType::Custom(custom.to_string()),
+    }
+}
+
+fn parse_work_type(s: Option<&str>) -> WorkType {
+    match s.unwrap_or("mutex") {
+        "mutex" => WorkType::Mutex,
+        "open_competition" => WorkType::OpenCompetition,
+        custom => WorkType::Custom(custom.to_string()),
+    }
 }
 
 fn dependency_metadata_from_row(

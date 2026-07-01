@@ -8,7 +8,7 @@ use crate::error::{BeadsError, Result};
 use crate::model::{IssueType, Priority, Status};
 use crate::util::content_hash_from_parts;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 18;
+pub const CURRENT_SCHEMA_VERSION: i32 = 19;
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 
 /// The complete SQL schema for the beads database.
@@ -67,8 +67,15 @@ pub const SCHEMA_SQL: &str = r"
         -- column itself stays a TEXT bag. NULL means no inherited context;
         -- emission for descendants silently skips ancestors with NULL.
         agent_context TEXT,
-        -- metadata JSON blob for key=value filtering (br list --metadata).
+        -- beads_rust#16: per-issue JSON metadata (key=value filtering).
         metadata TEXT DEFAULT '{}',
+        -- beads_rust#48: wisp/coordination fields
+        no_history INTEGER NOT NULL DEFAULT 0,
+        wisp_type TEXT NOT NULL DEFAULT 'none',
+        mol_type TEXT NOT NULL DEFAULT 'none',
+        work_type TEXT NOT NULL DEFAULT 'none',
+        started_at DATETIME,
+        spec_id TEXT,
         CHECK (
             (status = 'closed' AND closed_at IS NOT NULL) OR
             (status = 'tombstone') OR
@@ -814,6 +821,14 @@ const ISSUE_COLUMNS: &[(&str, &str)] = &[
     ("agent_context", "TEXT"),
     // beads_rust#16: per-issue JSON metadata (key=value filtering).
     ("metadata", "TEXT DEFAULT '{}'"),
+    // beads_rust#48: wisp/coordination columns appended at end so ALTER TABLE
+    // ADD COLUMN on existing DBs matches fresh SCHEMA_SQL column order.
+    ("no_history", "INTEGER NOT NULL DEFAULT 0"),
+    ("wisp_type", "TEXT NOT NULL DEFAULT 'none'"),
+    ("mol_type", "TEXT NOT NULL DEFAULT 'none'"),
+    ("work_type", "TEXT NOT NULL DEFAULT 'none'"),
+    ("started_at", "DATETIME"),
+    ("spec_id", "TEXT"),
 ];
 
 const DEPENDENCY_COLUMNS: &[(&str, &str)] = &[
@@ -979,6 +994,12 @@ const EXPECTED_ISSUE_COLUMN_ORDER: &[&str] = &[
     "source_repo_path",
     "agent_context",
     "metadata",
+    "no_history",
+    "wisp_type",
+    "mol_type",
+    "work_type",
+    "started_at",
+    "spec_id",
 ];
 
 /// Check whether the issues table has columns in the expected order.
