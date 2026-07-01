@@ -29,17 +29,22 @@ use fsqlite_error::FrankenError;
 use fsqlite_types::SqliteValue;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-
-use crate::util::hex_encode;
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::str::FromStr;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::time::Duration;
 use std::time::UNIX_EPOCH;
 use tempfile::tempdir;
 use tracing::warn;
+
+use crate::util::hex_encode;
 
 /// Check whether a directory name is a valid beads directory name.
 ///
@@ -286,7 +291,87 @@ fn discover_beads_dir_candidate_with_env(
         }
     }
 
+    // Git worktree fallback: if we didn't find .beads/ walking up, check whether
+    // we're in a git worktree whose main repository has a .beads/ directory.
+    if let Ok(cwd) = match start {
+        Some(p) => Ok(p.to_path_buf()),
+        None => env::current_dir(),
+    } {
+        if let Some(main_repo) = git_worktree_main_repo(&cwd) {
+            let candidate = main_repo.join(".beads");
+            if candidate.is_dir() {
+                return Ok(candidate);
+            }
+            let candidate_underscore = main_repo.join("_beads");
+            if candidate_underscore.is_dir() {
+                return Ok(candidate_underscore);
+            }
+        }
+    }
+
     Err(BeadsError::NotInitialized)
+}
+
+/// If `dir` is inside a git worktree (not the main repo), return the
+/// main repository root path by resolving `git rev-parse --git-common-dir`.
+///
+/// Returns `None` if:
+/// - `git` is not available
+/// - `dir` is not in a git repository or is in the main repo
+/// - `--git-common-dir` points outside its parent (defensive)
+fn git_worktree_main_repo(dir: &Path) -> Option<PathBuf> {
+    // Run `git rev-parse --git-common-dir` — this returns the shared git dir
+    // for worktrees (e.g., `/path/to/main/.git`), or the repo's own `.git` dir.
+    let common_dir_output = Command::new("git")
+        .args(["-c", "core.hooksPath=", "rev-parse", "--git-common-dir"])
+        .current_dir(dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .output()
+        .ok()?;
+
+    if !common_dir_output.status.success() {
+        return None;
+    }
+
+    let common_dir_str = String::from_utf8_lossy(&common_dir_output.stdout)
+        .trim()
+        .to_string();
+
+    if common_dir_str.is_empty() {
+        return None;
+    }
+
+    // Also get --git-dir to check if we're actually in a worktree
+    let git_dir_output = Command::new("git")
+        .args(["-c", "core.hooksPath=", "rev-parse", "--git-dir"])
+        .current_dir(dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .output()
+        .ok()?;
+
+    let git_dir_str = String::from_utf8_lossy(&git_dir_output.stdout)
+        .trim()
+        .to_string();
+
+    // If --git-dir and --git-common-dir are the same, we're in the main repo
+    // (not a worktree), and the walk-up loop already would have found .beads/.
+    let common_path = Path::new(&common_dir_str);
+    let git_path = Path::new(&git_dir_str);
+
+    if common_path == git_path {
+        return None;
+    }
+
+    // The common dir is typically the main repo's .git directory.
+    // Its parent is the main repo root.
+    let parent = common_path.parent()?;
+    if parent.is_dir() {
+        Some(parent.to_path_buf())
+    } else {
+        None
+    }
 }
 
 /// Discover beads directory, using `--db` path if provided.
@@ -5024,6 +5109,41 @@ labels:
         let result = discover_beads_dir(Some(temp.path()));
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), BeadsError::NotInitialized));
+    }
+
+    #[test]
+    fn git_worktree_main_repo_returns_none_for_non_git_dir() {
+        let temp = TempDir::new().expect("tempdir");
+        assert_eq!(git_worktree_main_repo(temp.path()), None);
+    }
+
+    #[test]
+    fn git_worktree_main_repo_returns_none_for_main_repo() {
+        let temp = TempDir::new().expect("tempdir");
+
+        // Initialize a git repo
+        let init_output = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(temp.path())
+            .output()
+            .expect("git init");
+        if !init_output.status.success() {
+            eprintln!("git init failed, skipping test");
+            return;
+        }
+        // Commit something so we're fully initialized
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(temp.path())
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(temp.path())
+            .output();
+
+        // For the main repo, git_worktree_main_repo should return None
+        // since --git-dir == --git-common-dir
+        assert_eq!(git_worktree_main_repo(temp.path()), None);
     }
 
     #[test]
