@@ -1093,7 +1093,16 @@ pub struct Issue {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub await_id: Option<String>,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Gate timeout in seconds.
+    ///
+    /// The Go `bd` tool serializes this as `"timeout"` with nanosecond precision.
+    /// The `alias` attribute allows br to import bd JSONL with `"timeout"` fields.
+    /// Export always uses `"timeout_seconds"` (seconds, not nanoseconds).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "timeout"
+    )]
     pub timeout_seconds: Option<i64>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
