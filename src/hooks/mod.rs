@@ -496,10 +496,92 @@ fn is_only_shebang_or_empty(content: &str) -> bool {
 /// # Errors
 ///
 /// Returns an error if the hook name is unknown.
-pub fn run_hook(_hook_name: &str) -> Result<()> {
-    // The actual execution is handled by the CLI command handler
-    // which opens storage and calls the appropriate sync operations.
-    // This function exists for the `br hooks run <name>` path.
+/// Execute a managed git hook by name.
+///
+/// This runs the same logic as the installed shell hook script would:
+///
+/// - `pre-commit`: export issues to JSONL (`br sync --flush-only`)
+/// - `post-merge`: import issues from JSONL (`br sync --import-only`)
+/// - `pre-push`: export issues to JSONL (same as pre-commit)
+/// - `post-checkout`: import issues from JSONL
+///
+/// # Errors
+///
+/// Returns an error if the hook name is unknown or the underlying
+/// sync operation fails.
+pub fn run_hook(hook_name: &str) -> Result<()> {
+    use crate::config;
+    use crate::sync::{self, ExportConfig, ExportErrorPolicy, ImportConfig};
+
+    let beads_dir = config::discover_beads_dir(None)?;
+    let mut storage_ctx = config::open_storage_with_cli(
+        &beads_dir,
+        &config::CliOverrides {
+            db: None,
+            actor: None,
+            identity: None,
+            json: None,
+            display_color: None,
+            quiet: None,
+            allow_stale: None,
+            no_db: None,
+            no_daemon: None,
+            no_auto_flush: None,
+            no_auto_import: None,
+            lock_timeout: None,
+            held_write_lock_beads_dir: None,
+            read_only_fast_open: true,
+        },
+    )?;
+
+    match hook_name {
+        "pre-commit" | "pre-push" => {
+            let jsonl_path = beads_dir.join("beads.jsonl");
+            let export_config = ExportConfig {
+                force: false,
+                is_default_path: true,
+                error_policy: ExportErrorPolicy::Strict,
+                retention_days: None,
+                beads_dir: Some(beads_dir),
+                allow_external_jsonl: false,
+                show_progress: false,
+                history: crate::sync::history::HistoryConfig::default(),
+                max_parallel_workers: 0,
+            };
+            sync::export_to_jsonl_with_policy(
+                &storage_ctx.storage,
+                &jsonl_path,
+                &export_config,
+            )?;
+        }
+        "post-merge" | "post-checkout" => {
+            let jsonl_path = beads_dir.join("beads.jsonl");
+            if jsonl_path.is_file() {
+                let import_config = ImportConfig {
+                    skip_prefix_validation: false,
+                    rename_on_import: false,
+                    clear_duplicate_external_refs: false,
+                    orphan_mode: sync::OrphanMode::Strict,
+                    force_upsert: false,
+                    beads_dir: Some(beads_dir),
+                    allow_external_jsonl: false,
+                    show_progress: false,
+                };
+                sync::import_from_jsonl(
+                    &mut storage_ctx.storage,
+                    &jsonl_path,
+                    &import_config,
+                    None,
+                )?;
+            }
+        }
+        _ => {
+            return Err(BeadsError::Internal {
+                message: format!("Unknown hook name: {hook_name}"),
+            });
+        }
+    }
+
     Ok(())
 }
 
