@@ -142,11 +142,7 @@ pub fn execute(
             "version": 1,
             "content": output,
         });
-        if json_mode || ctx.is_json() {
-            println!("{}", serde_json::to_string_pretty(&envelope)?);
-        } else {
-            println!("{output}");
-        }
+        println!("{}", serde_json::to_string_pretty(&envelope)?);
     } else if json_mode || ctx.is_json() {
         let json_output = serde_json::json!({
             "prime": output,
