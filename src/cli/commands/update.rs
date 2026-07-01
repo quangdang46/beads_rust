@@ -15,7 +15,7 @@ use crate::output::OutputContext;
 use crate::storage::{EventAttribution, IssueUpdate, SqliteStorage};
 use crate::util::id::{IdResolver, ResolverConfig};
 use crate::util::time::parse_flexible_timestamp;
-use crate::validation::LabelValidator;
+use crate::validation::{LabelValidator, validate_custom_status_against_registry, validate_custom_type_against_registry};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -345,6 +345,17 @@ fn prepare_single_route(
 
     let claim_exclusive = config::claim_exclusive_from_layer(&config_layer);
     let update = build_update(args, &actor, claim_exclusive)?;
+
+    // Validate custom status/type against registry (if configured).
+    // Applies only when the update explicitly sets a new status or type.
+    if let Some(ref new_status) = update.status {
+        let custom_statuses = storage_ctx.storage.list_custom_statuses()?;
+        validate_custom_status_against_registry(new_status, &custom_statuses)?;
+    }
+    if let Some(ref new_type) = update.issue_type {
+        let custom_types = storage_ctx.storage.list_custom_types()?;
+        validate_custom_type_against_registry(new_type, &custom_types)?;
+    }
 
     // Strict status-workflow enforcement (issue #311) + transition rules
     // (issue #312, layer 1). When the project's `.beads/policy.yaml` configures

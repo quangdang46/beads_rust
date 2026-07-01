@@ -9,7 +9,7 @@ use crate::storage::{EventAttribution, SqliteStorage};
 use crate::util::id::{IdGenerationInput, IdGenerator, IdResolver, ResolverConfig, child_id};
 use crate::util::markdown_import::{parse_dependency, parse_markdown_file};
 use crate::util::time::parse_flexible_timestamp;
-use crate::validation::{IssueValidator, LabelValidator};
+use crate::validation::{IssueValidator, LabelValidator, validate_custom_status_against_registry, validate_custom_type_against_registry};
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -493,6 +493,12 @@ pub fn create_issue_impl(
 
         // 5. Validate Issue
         IssueValidator::validate(&issue).map_err(BeadsError::from_validation_errors)?;
+
+        // 5a. Validate custom status/type against registry (if configured)
+        let custom_statuses = storage.list_custom_statuses()?;
+        validate_custom_status_against_registry(&issue.status, &custom_statuses)?;
+        let custom_types = storage.list_custom_types()?;
+        validate_custom_type_against_registry(&issue.issue_type, &custom_types)?;
 
         // 5b. Validate Relations (fail fast before DB writes)
         validate_relations(args, &id)?;
