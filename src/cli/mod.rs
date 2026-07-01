@@ -1024,6 +1024,9 @@ EXAMPLES:
         command: commands::custom_status::TypeCommands,
     },
 
+    /// AI session context with persistent memory injection
+    Prime(commands::prime::PrimeArgs),
+
     /// Issue tracking template commands
     Template {
         #[command(subcommand)]

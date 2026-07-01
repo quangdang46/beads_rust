@@ -553,6 +553,9 @@ fn main() {
         Commands::Memory { command } => {
             commands::memory::execute(&command, cli.json, &overrides, &output_ctx)
         }
+        Commands::Prime(args) => {
+            commands::prime::execute(&args, cli.json, &overrides, &output_ctx)
+        }
         Commands::CustomStatus { command } => {
             commands::custom_status::execute_status(&command, cli.json, &overrides, &output_ctx)
         }
@@ -972,7 +975,8 @@ const fn needs_write_lock(cmd: &Commands) -> bool {
  | Commands::Doctor(_)
  | Commands::Template { .. }
  | Commands::Admin { .. }
- | Commands::Memory { .. } => true,
+ | Commands::Memory { .. }
+ | Commands::Prime(_) => true,
  Commands::Config { command } => !matches!(
             command,
             beads_rust::cli::ConfigCommands::Path | beads_rust::cli::ConfigCommands::Edit
@@ -1048,7 +1052,8 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Worktree(_)
         | Commands::MergeSlot(_)
         | Commands::Federation(_)
-        | Commands::Memory { .. } => false,
+        | Commands::Memory { .. }
+        | Commands::Prime(_) => false,
 
         #[cfg(feature = "mcp")]
         Commands::Serve(_) => false,
