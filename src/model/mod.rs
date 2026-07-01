@@ -67,6 +67,10 @@ pub enum Status {
     Tombstone,
     #[serde(rename = "pinned")]
     Pinned,
+    /// Claimed by an agent for exclusive execution (Go parity).
+    /// Agent-claimed issues are excluded from `br ready` and have
+    /// claim-protection semantics — no other agent may claim them.
+    Hooked,
     #[serde(untagged)]
     Custom(String),
 }
@@ -92,6 +96,7 @@ impl Status {
             "closed" => Self::Closed,
             "tombstone" => Self::Tombstone,
             "pinned" => Self::Pinned,
+            "hooked" => Self::Hooked,
             _ => return None,
         })
     }
@@ -107,6 +112,7 @@ impl Status {
             Self::Closed => "closed",
             Self::Tombstone => "tombstone",
             Self::Pinned => "pinned",
+            Self::Hooked => "hooked",
             Self::Custom(value) => value,
         }
     }
@@ -118,7 +124,7 @@ impl Status {
 
     #[must_use]
     pub const fn is_active(&self) -> bool {
-        matches!(self, Self::Open | Self::InProgress)
+        matches!(self, Self::Open | Self::InProgress | Self::Hooked)
     }
 
     /// Returns true if the issue is in draft state (not yet ready for execution).
@@ -421,6 +427,17 @@ impl DependencyType {
     }
 
     #[must_use]
+    /// Returns `true` if this dependency type is treated as a blocker for
+    /// ready/cycle purposes.
+    ///
+    /// # Go parity note
+    ///
+    /// Go's `bd` excludes `ParentChild` from `IsBlockingEdge()` — a parent-child
+    /// edge only affects epic closure ordering, not the ready-work filter. Rust
+    /// `br` includes it for simplicity and stricter cycle detection. This means
+    /// a child of a blocked parent will appear as blocked in `br ready` but
+    /// would not in `bd ready`. If cross-tool parity is needed, `br` callers
+    /// should filter `ParentChild` edges before computing `is_blocking()`.
     pub const fn is_blocking(&self) -> bool {
         matches!(
             self,
@@ -1661,6 +1678,12 @@ mod tests {
     }
 
     #[test]
+    fn test_status_from_str_hooked() {
+        assert_eq!(Status::from_str("hooked").unwrap(), Status::Hooked);
+        assert_eq!(Status::from_str("HOOKED").unwrap(), Status::Hooked);
+    }
+
+    #[test]
     fn test_status_from_str_unknown_becomes_custom() {
         let result = Status::from_str("invalid_status").unwrap();
         assert_eq!(result, Status::Custom("invalid_status".to_string()));
@@ -1678,6 +1701,7 @@ mod tests {
         assert_eq!(Status::Closed.to_string(), "closed");
         assert_eq!(Status::Tombstone.to_string(), "tombstone");
         assert_eq!(Status::Pinned.to_string(), "pinned");
+        assert_eq!(Status::Hooked.to_string(), "hooked");
         assert_eq!(Status::Custom("custom".to_string()).to_string(), "custom");
     }
 
@@ -1690,6 +1714,7 @@ mod tests {
         assert!(!Status::Blocked.is_terminal());
         assert!(!Status::Deferred.is_terminal());
         assert!(!Status::Pinned.is_terminal());
+        assert!(!Status::Hooked.is_terminal());
         assert!(!Status::Custom("custom".to_string()).is_terminal());
     }
 
@@ -1697,6 +1722,7 @@ mod tests {
     fn test_status_is_active() {
         assert!(Status::Open.is_active());
         assert!(Status::InProgress.is_active());
+        assert!(Status::Hooked.is_active());
         assert!(!Status::Blocked.is_active());
         assert!(!Status::Deferred.is_active());
         assert!(!Status::Closed.is_active());
@@ -1714,6 +1740,7 @@ mod tests {
         assert_eq!(Status::Closed.as_str(), "closed");
         assert_eq!(Status::Tombstone.as_str(), "tombstone");
         assert_eq!(Status::Pinned.as_str(), "pinned");
+        assert_eq!(Status::Hooked.as_str(), "hooked");
         assert_eq!(
             Status::Custom("my_status".to_string()).as_str(),
             "my_status"

@@ -123,6 +123,7 @@ impl Theme {
             Status::Closed => self.status_closed.clone(),
             Status::Tombstone | Status::Custom(_) => self.muted.clone(),
             Status::Pinned => self.highlight.clone(),
+            Status::Hooked => self.status_in_progress.clone(),
         }
     }
 

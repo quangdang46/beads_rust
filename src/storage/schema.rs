@@ -1785,7 +1785,10 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
                 INSERT OR IGNORE INTO custom_statuses (name, category) VALUES ('closed', 'done');
                 INSERT OR IGNORE INTO custom_statuses (name, category) VALUES ('deferred', 'frozen');
                 INSERT OR IGNORE INTO custom_statuses (name, category) VALUES ('tombstone', 'done');
-                INSERT OR IGNORE INTO custom_statuses (name, category) VALUES ('blocked', 'active');
+                INSERT OR IGNORE INTO custom_statuses (name, category) VALUES ('blocked', 'wip');
+                INSERT OR IGNORE INTO custom_statuses (name, category) VALUES ('draft', 'frozen');
+                INSERT OR IGNORE INTO custom_statuses (name, category) VALUES ('pinned', 'active');
+                INSERT OR IGNORE INTO custom_statuses (name, category) VALUES ('hooked', 'wip');
                 "#,
             )?;
             tracing::info!("Backfilled built-in statuses into custom_statuses");

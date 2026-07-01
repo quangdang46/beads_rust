@@ -111,6 +111,7 @@ pub const fn format_status_icon(status: &Status) -> &'static str {
         Status::Closed => icons::CLOSED,
         Status::Tombstone => icons::TOMBSTONE,
         Status::Pinned => icons::PINNED,
+        Status::Hooked => icons::IN_PROGRESS,
         Status::Custom(_) => icons::UNKNOWN,
     }
 }
@@ -137,6 +138,7 @@ pub fn format_status_label(status: &Status, use_color: bool) -> String {
         Status::Deferred | Status::Draft => label.blue().to_string(),
         Status::Closed | Status::Tombstone => label.grey().to_string(),
         Status::Pinned => label.magenta().bold().to_string(),
+        Status::Hooked => label.cyan().to_string(),
         Status::Custom(_) => label.to_string(),
     }
 }
@@ -156,6 +158,7 @@ pub fn format_status_icon_colored(status: &Status, use_color: bool) -> String {
         Status::Deferred | Status::Draft => icon.blue().to_string(),
         Status::Closed | Status::Tombstone => icon.grey().to_string(),
         Status::Pinned => icon.magenta().bold().to_string(),
+        Status::Hooked => icon.cyan().to_string(),
         Status::Custom(_) => icon.to_string(),
     }
 }
