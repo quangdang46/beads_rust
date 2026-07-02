@@ -13,7 +13,7 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::sanitize_terminal_inline;
 use crate::output::OutputContext;
-use crate::storage::SqliteStorage;
+use crate::storage::{ListFilters, SqliteStorage};
 use crate::util::id::{IdResolver, ResolverConfig};
 use rich_rust::prelude::*;
 use serde::Serialize;
@@ -97,8 +97,51 @@ pub fn execute(
         ids.extend(file_ids);
     }
 
-    if ids.is_empty() {
+    // Allow `--hard` without IDs: prune all tombstones. (#367)
+    if ids.is_empty() && !args.hard {
         return Err(BeadsError::validation("ids", "no issue IDs provided"));
+    }
+
+    if ids.is_empty() && args.hard {
+        // Hard-delete without IDs: query all tombstones and purge them.
+        let beads_dir = config::discover_beads_dir_with_cli(cli)?;
+        let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+        let tombstones = storage_ctx
+            .storage
+            .list_issues(&ListFilters {
+                statuses: Some(vec![crate::model::Status::Tombstone]),
+                include_closed: true,
+                ..Default::default()
+            })
+            .map_err(|e| BeadsError::internal(&format!("failed to query tombstones: {e}")))?;
+        for ts in &tombstones {
+            storage_ctx
+                .storage
+                .purge_issue(&ts.id, "delete --hard")
+                .map_err(|e| {
+                    BeadsError::internal(&format!("failed to purge tombstone {}: {e}", ts.id))
+                })?;
+        }
+        if ctx.is_json() || ctx.is_toon() {
+            let result = DeleteResult {
+                deleted: tombstones.iter().map(|i| i.id.clone()).collect(),
+                deleted_count: tombstones.len(),
+                ..DeleteResult::new()
+            };
+            if ctx.is_toon() {
+                ctx.toon(&result);
+            } else {
+                ctx.json_pretty(&result);
+            }
+        } else if !tombstones.is_empty() {
+            ctx.success(&format!("Pruned {} tombstone(s)", tombstones.len()));
+            for ts in &tombstones {
+                ctx.print_line(&format!("  {}", ts.id));
+            }
+        } else {
+            ctx.success("No tombstones to prune.");
+        }
+        return Ok(());
     }
 
     // Deduplicate

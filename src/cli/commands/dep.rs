@@ -1636,18 +1636,25 @@ fn dep_cycles(
         } else {
             ctx.success(&format!("No {cycle_scope} cycles detected."));
         }
+        Ok(())
     } else if ctx.is_rich() {
         // Rich mode: Show cycles with red highlighting in a panel
         render_cycles_rich(ctx, &cycles, count, args.blocking_only);
+        Err(BeadsError::validation(
+            "dep_cycles",
+            format!("{count} {cycle_scope} cycle(s) detected"),
+        ))
     } else {
-        // Plain mode: Simple text output
-        ctx.warning(&format!("Found {count} {cycle_scope} cycle(s):"));
+        // Plain mode: Simple text output, then return non-zero exit
+        ctx.print_line(&format!("Found {count} {cycle_scope} cycle(s):"));
         for (i, cycle) in cycles.iter().enumerate() {
             ctx.print_line(&format!("  {}. {}", i + 1, format_cycle_plain(cycle)));
         }
+        Err(BeadsError::validation(
+            "dep_cycles",
+            format!("{count} {cycle_scope} cycle(s) detected"),
+        ))
     }
-
-    Ok(())
 }
 
 /// Render cycles in rich mode with red highlighting

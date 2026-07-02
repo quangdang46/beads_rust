@@ -1,5 +1,6 @@
 ---
 source: tests/storage_golden_snapshot.rs
+assertion_line: 211
 expression: snapshot
 ---
 issue:
@@ -42,5 +43,8 @@ jsonl:
   "external_ref": "GOLDEN-1",
   "source_repo": ".",
   "compaction_level": 0,
-  "original_size": 0
+  "original_size": 0,
+  "mol_type": "work",
+  "work_type": "mutex",
+  "wisp_type": "none"
 }

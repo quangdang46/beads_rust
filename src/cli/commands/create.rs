@@ -851,6 +851,7 @@ fn execute_import(
 
     let mut created_ids = Vec::new();
     let mut created_issues = Vec::new();
+    let mut dep_warnings: usize = 0;
 
     let id_resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix.clone()));
 
@@ -1299,6 +1300,7 @@ fn execute_import(
                 if let Err(err) =
                     storage.add_dependency(issue_id, &resolved_dep_id, &type_str, &actor)
                 {
+                    dep_warnings += 1;
                     eprintln!(
                         "warning: failed to add dependency {} → {}: {err}",
                         create_display_text(issue_id),
@@ -1383,7 +1385,18 @@ fn execute_import(
         }
     }
     auto_flush_after_create(&mut storage_ctx, ctx);
-    Ok(())
+
+    if dep_warnings > 0 {
+        Err(BeadsError::validation(
+            "bulk_dependencies",
+            format!(
+                "{dep_warnings} dependency warning(s) during bulk import from {}",
+                create_display_path(path)
+            ),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn duplicate_import_keys(keys: impl IntoIterator<Item = String>) -> HashSet<String> {
