@@ -3,7 +3,7 @@
 # br (beads_rust) installer - Ultra-robust multi-platform installer with beautiful output
 #
 # One-liner install:
-#   curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/beads_rust/main/install.sh?$(date +%s)" | bash
+#   curl -fsSL "https://raw.githubusercontent.com/quangdang46/beads_rust/main/install.sh?$(date +%s)" | bash
 #
 # Options:
 #   --version vX.Y.Z   Install specific version (default: latest)
@@ -59,7 +59,7 @@ shopt -s lastpipe 2>/dev/null || true
 # `exec` with no tty on an exotic runtime).
 if [[ -z "${BR_INSTALLER_SELF_REEXEC:-}" ]] \
     && [[ -z "${BASH_SOURCE[0]:-}" || ! -r "${BASH_SOURCE[0]:-}" ]]; then
-    __br_self_owner="${OWNER:-Dicklesworthstone}"
+    __br_self_owner="${OWNER:-quangdang46}"
     __br_self_repo="${REPO:-beads_rust}"
     __br_self_branch="${BR_INSTALLER_BRANCH:-main}"
     __br_self_url="${BR_INSTALLER_URL:-https://raw.githubusercontent.com/${__br_self_owner}/${__br_self_repo}/${__br_self_branch}/install.sh}"
@@ -106,7 +106,7 @@ fi
 # Configuration
 # ============================================================================
 VERSION="${VERSION:-}"
-OWNER="${OWNER:-Dicklesworthstone}"
+OWNER="${OWNER:-quangdang46}"
 REPO="${REPO:-beads_rust}"
 case "$(uname -s)" in
     MINGW*|MSYS*|CYGWIN*) BINARY_NAME="br.exe" ;;
@@ -425,7 +425,7 @@ usage() {
 
         gum style --foreground 214 --bold "EXAMPLES"
         gum style --foreground 39 "  # Default install"
-        echo "  curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/beads_rust/main/install.sh | bash"
+        echo "  curl -fsSL https://raw.githubusercontent.com/quangdang46/beads_rust/main/install.sh | bash"
         echo ""
         gum style --foreground 39 "  # System install with auto PATH"
         echo "  curl -fsSL .../install.sh | sudo bash -s -- --system --easy-mode"
@@ -452,7 +452,7 @@ usage() {
 br installer - Install beads_rust (br) CLI tool
 
 Usage:
-  curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/beads_rust/main/install.sh | bash
+  curl -fsSL https://raw.githubusercontent.com/quangdang46/beads_rust/main/install.sh | bash
   curl -fsSL .../install.sh | bash -s -- [OPTIONS]
 
 Options:

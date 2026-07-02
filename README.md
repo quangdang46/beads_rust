@@ -20,10 +20,15 @@ A Rust port of Steve Yegge's [beads](https://github.com/steveyegge/beads), froze
 <h3>Quick Install</h3>
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/beads_rust/main/install.sh?$(date +%s)" | bash
+curl -fsSL "https://raw.githubusercontent.com/quangdang46/beads_rust/main/install.sh?$(date +%s)" | bash
 ```
 
-<p><em>Works on Linux, macOS, and Windows (WSL). Auto-detects your platform and downloads the right binary.</em></p>
+```powershell
+# Windows PowerShell
+irm "https://raw.githubusercontent.com/quangdang46/beads_rust/main/install.ps1" | iex
+```
+
+<p><em>Works on Linux, macOS, and Windows (native PowerShell). Auto-detects your platform and downloads the right binary.</em></p>
 
 <p><em>Useful install flags: <code>--skip-skills</code> to skip all Claude Code / Codex skills, or <code>--no-migration-skill</code> to skip just the bd-to-br-migration skill (handy for clean agent sandboxes where you're only using <code>br</code>).</em></p>
 </div>
@@ -32,7 +37,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/beads_rust/main/
 
 ## Why This Project Exists
 
-I (Jeffrey Emanuel) LOVE [Steve Yegge's Beads project](https://github.com/steveyegge/beads). Discovering it and seeing how well it worked together with my [MCP Agent Mail](https://github.com/Dicklesworthstone/mcp_agent_mail) was a truly transformative moment in my development workflows and professional life. This quickly also led to [beads_viewer (bv)](https://github.com/Dicklesworthstone/beads_viewer), which added another layer of analysis to beads that gives swarms of agents the insight into what beads they should work on next to de-bottleneck the development process and increase velocity. I'm very grateful for finding beads when I did and to Steve for making it.
+I (Jeffrey Emanuel) LOVE [Steve Yegge's Beads project](https://github.com/steveyegge/beads). Discovering it and seeing how well it worked together with my [MCP Agent Mail](https://github.com/quangdang46/mcp_agent_mail) was a truly transformative moment in my development workflows and professional life. This quickly also led to [beads_viewer (bv)](https://github.com/quangdang46/beads_viewer), which added another layer of analysis to beads that gives swarms of agents the insight into what beads they should work on next to de-bottleneck the development process and increase velocity. I'm very grateful for finding beads when I did and to Steve for making it.
 
 At this point, my [Agent Flywheel](http://agent-flywheel.com/tldr) System is built around beads operating in a specific way. As Steve continues evolving beads toward [GasTown](https://github.com/steveyegge/gastown) and beyond, our use cases have naturally diverged. The hybrid SQLite + JSONL-git architecture that I built my tooling around (and independently mirrored in MCP Agent Mail) is being replaced with approaches better suited to Steve's vision.
 
@@ -278,14 +283,19 @@ git/VCS handoff, and no background services installed behind your back.
 ### Quick Install (Recommended)
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/beads_rust/main/install.sh?$(date +%s)" | bash
+curl -fsSL "https://raw.githubusercontent.com/quangdang46/beads_rust/main/install.sh?$(date +%s)" | bash
+```
+
+```powershell
+# Windows PowerShell
+irm "https://raw.githubusercontent.com/quangdang46/beads_rust/main/install.ps1" | iex
 ```
 
 ### From Source
 
 ```bash
 # Requires Rust nightly
-git clone https://github.com/Dicklesworthstone/beads_rust.git
+git clone https://github.com/quangdang46/beads_rust.git
 cd beads_rust
 cargo build --release
 ./target/release/br --help
@@ -297,7 +307,7 @@ cargo install --path .
 ### Cargo Install
 
 ```bash
-cargo install --git https://github.com/Dicklesworthstone/beads_rust.git
+cargo install --git https://github.com/quangdang46/beads_rust.git
 ```
 
 > **Note:** `cargo install` places binaries in `~/.cargo/bin/`, while the install script uses `~/.local/bin/`. If you have both in PATH, ensure the desired location has higher priority to avoid running an outdated version. Run `which br` to verify which binary is active.
@@ -309,7 +319,7 @@ cargo install --git https://github.com/Dicklesworthstone/beads_rust.git
 cargo build --release --no-default-features
 
 # Or install without it
-cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --no-default-features
+cargo install --git https://github.com/quangdang46/beads_rust.git --no-default-features
 ```
 
 ### Enable MCP Server Support
@@ -322,7 +332,7 @@ Context Protocol instead of shelling out to CLI commands.
 cargo build --release --features mcp
 
 # Or install globally with MCP support
-cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --features mcp
+cargo install --git https://github.com/quangdang46/beads_rust.git --features mcp
 ```
 
 Run it from an initialized beads workspace:
@@ -781,7 +791,7 @@ br intentionally does **not** support:
 
 ### Q: How do I integrate with beads_viewer (bv)?
 
-br works seamlessly with [beads_viewer](https://github.com/Dicklesworthstone/beads_viewer):
+br works seamlessly with [beads_viewer](https://github.com/quangdang46/beads_viewer):
 
 ```bash
 # Use bv for interactive TUI
