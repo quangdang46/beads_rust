@@ -1035,7 +1035,8 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Epic { .. }
         | Commands::Gate { .. }
         | Commands::Query { .. }
-        | Commands::Template { .. } => true,
+        | Commands::Template { .. }
+        | Commands::RenamePrefix(_) => true,
 
         Commands::Init { .. }
         | Commands::Sync(_)
