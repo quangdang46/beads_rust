@@ -284,6 +284,7 @@ fn execute_create(
         crystallizes: false,
         bonded_from: Vec::new(),
         labels: vec![],
+        waiters: vec![],
         dependencies: vec![],
         comments: vec![],
     };

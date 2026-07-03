@@ -74,6 +74,7 @@ fn make_open_issue(suffix: &str, title: &str, priority: Priority) -> Issue {
         crystallizes: false,
         bonded_from: Vec::new(),
         labels: Vec::new(),
+        waiters: Vec::new(),
         dependencies: Vec::new(),
         comments: Vec::new(),
     }

@@ -1810,7 +1810,7 @@ mod tests {
         init_test_logging();
         info!("test_blocking_dependency_types: starting");
         assert!(DependencyType::Blocks.is_blocking());
-        assert!(DependencyType::ParentChild.is_blocking());
+        assert!(!DependencyType::ParentChild.is_blocking());
         assert!(!DependencyType::Related.is_blocking());
         assert!(!DependencyType::Duplicates.is_blocking());
         info!("test_blocking_dependency_types: assertions passed");

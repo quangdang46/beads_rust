@@ -71,6 +71,7 @@ fn make_issue(id: &str, title: &str) -> Issue {
         crystallizes: false,
         bonded_from: vec![],
         labels: vec![],
+        waiters: vec![],
         dependencies: vec![],
         comments: vec![],
     }

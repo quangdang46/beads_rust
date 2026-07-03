@@ -181,6 +181,7 @@ mod tests {
             crystallizes: false,
             bonded_from: vec![],
             labels: vec![],
+            waiters: vec![],
             dependencies: vec![],
             comments: vec![],
         }

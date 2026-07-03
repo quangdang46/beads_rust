@@ -74,6 +74,7 @@ fn seed_issue(storage: &mut SqliteStorage, id: &str, assignee: Option<&str>) {
         crystallizes: false,
         bonded_from: Vec::new(),
         labels: Vec::new(),
+        waiters: Vec::new(),
         dependencies: Vec::new(),
         comments: Vec::new(),
     };

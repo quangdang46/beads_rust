@@ -1086,7 +1086,7 @@ impl SqliteStorage {
         let ignore_skew = std::env::var("BR_IGNORE_SCHEMA_SKEW").is_ok_and(|v| !v.is_empty());
         crate::storage::schema::check_schema_skew(&conn, false, ignore_skew)?;
 
-        if database_header_user_version(path)
+        if database_header_user_version(path)?
             .is_some_and(|version| version >= u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0))
         {
             crate::storage::schema::apply_runtime_pragmas(&conn)?;
@@ -1106,7 +1106,7 @@ impl SqliteStorage {
 
     pub(crate) fn open_current_read_only(path: &Path) -> Result<Option<Self>> {
         let current_schema_version = u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0);
-        if database_header_user_version(path).is_none_or(|version| version < current_schema_version)
+        if database_header_user_version(path)?.is_none_or(|version| version < current_schema_version)
         {
             return Ok(None);
         }
@@ -1364,7 +1364,9 @@ impl SqliteStorage {
         })();
 
         // Always roll back — even on error — so no DML slips through.
-        let _ = self.conn.execute("ROLLBACK");
+        if let Err(rb_err) = self.conn.execute("ROLLBACK") {
+            tracing::warn!(error = %rb_err, "ROLLBACK failed after execute_read_only_query — transaction may remain open");
+        }
 
         result
     }
@@ -3377,11 +3379,9 @@ impl SqliteStorage {
         let rows = self.conn.query(sql)?;
         let mut metas = Vec::with_capacity(rows.len());
         for row in &rows {
-            let id = row
-                .get(0)
-                .and_then(SqliteValue::as_text)
-                .unwrap_or_default()
-                .to_string();
+            let Some(id) = row.get(0).and_then(SqliteValue::as_text) else {
+                continue;
+            };
             let external_ref = row
                 .get(1)
                 .and_then(SqliteValue::as_text)
@@ -3394,7 +3394,7 @@ impl SqliteStorage {
             let status = parse_status(row.get(4).and_then(SqliteValue::as_text));
 
             metas.push(IssueMetadata {
-                id,
+                id: id.to_string(),
                 external_ref,
                 content_hash,
                 updated_at,
@@ -10621,11 +10621,9 @@ impl SqliteStorage {
 
         let mut map = std::collections::HashMap::with_capacity(rows.len());
         for row in &rows {
-            let id = row
-                .get(0)
-                .and_then(SqliteValue::as_text)
-                .unwrap_or("")
-                .to_string();
+            let Some(id) = row.get(0).and_then(SqliteValue::as_text) else {
+                continue;
+            };
             let title = row
                 .get(1)
                 .and_then(SqliteValue::as_text)
@@ -10639,7 +10637,7 @@ impl SqliteStorage {
                 .and_then(SqliteValue::as_text)
                 .unwrap_or("")
                 .to_string();
-            map.insert(id, (title, priority, status));
+            map.insert(id.to_string(), (title, priority, status));
         }
         Ok(map)
     }
@@ -10726,21 +10724,23 @@ fn remove_temp_db_files(path: &Path) {
     }
 }
 
-fn database_header_user_version(path: &Path) -> Option<u32> {
+fn database_header_user_version(path: &Path) -> Result<Option<u32>> {
     if path == Path::new(":memory:") || !path.is_file() {
-        return None;
+        return Ok(None);
     }
 
-    let mut file = std::fs::File::open(path).ok()?;
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| BeadsError::Config(format!("Cannot open database file to read header: {e}")))?;
     let mut header = [0_u8; 100];
-    file.read_exact(&mut header).ok()?;
+    file.read_exact(&mut header)
+        .map_err(|e| BeadsError::Config(format!("Cannot read database header: {e}")))?;
     if &header[..16] != b"SQLite format 3\0" {
-        return None;
+        return Ok(None);
     }
 
-    Some(u32::from_be_bytes([
+    Ok(Some(u32::from_be_bytes([
         header[60], header[61], header[62], header[63],
-    ]))
+    ])))
 }
 
 fn is_transient_wal_tail_read_error(error: &dyn std::fmt::Display) -> bool {
@@ -12146,14 +12146,12 @@ impl SqliteStorage {
             &[SqliteValue::from(repo_path)],
         ) {
             Ok(row) => {
-                let last_checked: &str = row.get(3).and_then(SqliteValue::as_text).unwrap_or("");
+                let last_checked = parse_datetime_value(row.get(3))?;
                 Ok(Some(RepoMtime {
                     repo_path: row.get(0).and_then(SqliteValue::as_text).unwrap_or("").to_string(),
                     jsonl_path: row.get(1).and_then(SqliteValue::as_text).unwrap_or("").to_string(),
                     mtime_ns: row.get(2).and_then(SqliteValue::as_integer).unwrap_or(0),
-                    last_checked: chrono::DateTime::parse_from_rfc3339(last_checked)
-                        .map(|dt| dt.with_timezone(&chrono::Utc))
-                        .unwrap_or_else(|_| Utc::now()),
+                    last_checked,
                 }))
             }
             Err(FrankenError::QueryReturnedNoRows) => Ok(None),
@@ -12192,14 +12190,12 @@ impl SqliteStorage {
         let rows = stmt.query_with_params(&[])?;
         let mut result = Vec::with_capacity(rows.len());
         for row in &rows {
-            let last_checked: &str = row.get(3).and_then(SqliteValue::as_text).unwrap_or("");
+            let last_checked = parse_datetime_value(row.get(3))?;
             result.push(RepoMtime {
                 repo_path: row.get(0).and_then(SqliteValue::as_text).unwrap_or("").to_string(),
                 jsonl_path: row.get(1).and_then(SqliteValue::as_text).unwrap_or("").to_string(),
                 mtime_ns: row.get(2).and_then(SqliteValue::as_integer).unwrap_or(0),
-                last_checked: chrono::DateTime::parse_from_rfc3339(last_checked)
-                    .map(|dt| dt.with_timezone(&chrono::Utc))
-                    .unwrap_or_else(|_| Utc::now()),
+                last_checked,
             });
         }
         Ok(result)
@@ -12253,11 +12249,7 @@ impl SqliteStorage {
             &[SqliteValue::from(id)],
         ) {
             Ok(row) => {
-                let parsed = chrono::DateTime::parse_from_rfc3339(
-                    row.get(2).and_then(SqliteValue::as_text).unwrap_or(""),
-                )
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-                .unwrap_or_else(|_| Utc::now());
+                let snapshot_time = parse_datetime_value(row.get(2))?;
 
                 Ok(Some(IssueSnapshot {
                     id: row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0),
@@ -12266,7 +12258,7 @@ impl SqliteStorage {
                         .and_then(SqliteValue::as_text)
                         .unwrap_or("")
                         .to_string(),
-                    snapshot_time: parsed,
+                    snapshot_time,
                     compaction_level: row
                         .get(3)
                         .and_then(SqliteValue::as_integer)
@@ -12306,11 +12298,7 @@ impl SqliteStorage {
         )?;
         let mut result = Vec::new();
         for row in &rows {
-            let parsed = chrono::DateTime::parse_from_rfc3339(
-                row.get(2).and_then(SqliteValue::as_text).unwrap_or(""),
-            )
-            .map(|dt| dt.with_timezone(&chrono::Utc))
-            .unwrap_or_else(|_| Utc::now());
+            let snapshot_time = parse_datetime_value(row.get(2))?;
             result.push(IssueSnapshot {
                 id: row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0),
                 issue_id: row
@@ -12318,7 +12306,7 @@ impl SqliteStorage {
                     .and_then(SqliteValue::as_text)
                     .unwrap_or("")
                     .to_string(),
-                snapshot_time: parsed,
+                snapshot_time,
                 compaction_level: row
                     .get(3)
                     .and_then(SqliteValue::as_integer)
@@ -12380,11 +12368,7 @@ impl SqliteStorage {
             &[SqliteValue::from(id)],
         ) {
             Ok(row) => {
-                let parsed = chrono::DateTime::parse_from_rfc3339(
-                    row.get(4).and_then(SqliteValue::as_text).unwrap_or(""),
-                )
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-                .unwrap_or_else(|_| Utc::now());
+                let created_at = parse_datetime_value(row.get(4))?;
 
                 Ok(Some(CompactionSnapshot {
                     id: row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0),
@@ -12403,7 +12387,7 @@ impl SqliteStorage {
                         .and_then(SqliteValue::as_blob)
                         .unwrap_or_default()
                         .to_vec(),
-                    created_at: parsed,
+                    created_at,
                 }))
             }
             Err(FrankenError::QueryReturnedNoRows) => Ok(None),
@@ -19304,7 +19288,7 @@ mod tests {
         conn.close().unwrap();
 
         assert_eq!(
-            database_header_user_version(&db_path),
+            database_header_user_version(&db_path).unwrap(),
             Some(u32::try_from(CURRENT_SCHEMA_VERSION).unwrap())
         );
     }

@@ -109,6 +109,7 @@ fn make_issue(
         crystallizes: false,
         bonded_from: Vec::new(),
         labels: Vec::new(),
+        waiters: Vec::new(),
         dependencies: Vec::new(),
         comments: Vec::new(),
     }

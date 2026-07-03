@@ -172,6 +172,7 @@ pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext)
         pinned: false,
         is_template: false,
         labels: valid_labels,
+        waiters: vec![],
         dependencies: vec![],
         comments: vec![],
         mol_type: Default::default(),

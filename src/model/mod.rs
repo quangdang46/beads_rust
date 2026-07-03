@@ -422,7 +422,7 @@ impl DependencyType {
     pub const fn affects_ready_work(&self) -> bool {
         matches!(
             self,
-            Self::Blocks | Self::ParentChild | Self::ConditionalBlocks | Self::WaitsFor
+            Self::Blocks | Self::ConditionalBlocks | Self::WaitsFor
         )
     }
 
@@ -430,19 +430,11 @@ impl DependencyType {
     /// Returns `true` if this dependency type is treated as a blocker for
     /// ready/cycle purposes.
     ///
-    /// # Go parity note
-    ///
-    /// Go's `bd` excludes `ParentChild` from `IsBlockingEdge()` — a parent-child
-    /// edge only affects epic closure ordering, not the ready-work filter. Rust
-    /// `br` includes it for simplicity and stricter cycle detection. This means
-    /// a child of a blocked parent will appear as blocked in `br ready` but
-    /// would not in `bd ready`. If cross-tool parity is needed, `br` callers
-    /// should filter `ParentChild` edges before computing `is_blocking()`.
+    /// Only `Blocks` edges are blocking. `ParentChild` edges affect epic
+    /// closure ordering, not the ready-work filter — matching Go `bd`'s
+    /// `IsBlockingEdge()` behavior.
     pub const fn is_blocking(&self) -> bool {
-        matches!(
-            self,
-            Self::Blocks | Self::ParentChild | Self::ConditionalBlocks | Self::WaitsFor
-        )
+        matches!(self, Self::Blocks)
     }
 }
 
@@ -1165,6 +1157,9 @@ pub struct Issue {
     // Relations (for export/display, not always in DB table directly)
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub labels: Vec<String>,
+    /// List of issue IDs waiting on this issue (coordination waiters).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waiters: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub dependencies: Vec<Dependency>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -1237,6 +1232,7 @@ impl Default for Issue {
             crystallizes: false,
             bonded_from: Vec::new(),
             labels: Vec::new(),
+            waiters: Vec::new(),
             dependencies: Vec::new(),
             comments: Vec::new(),
         }
@@ -1539,7 +1535,7 @@ mod tests {
     #[test]
     fn dependency_type_affects_ready_work() {
         assert!(DependencyType::Blocks.affects_ready_work());
-        assert!(DependencyType::ParentChild.affects_ready_work());
+        assert!(!DependencyType::ParentChild.affects_ready_work());
         assert!(!DependencyType::Related.affects_ready_work());
     }
 
@@ -1957,9 +1953,9 @@ mod tests {
     #[test]
     fn test_dependency_type_is_blocking() {
         assert!(DependencyType::Blocks.is_blocking());
-        assert!(DependencyType::ParentChild.is_blocking());
-        assert!(DependencyType::ConditionalBlocks.is_blocking());
-        assert!(DependencyType::WaitsFor.is_blocking());
+        assert!(!DependencyType::ParentChild.is_blocking());
+        assert!(!DependencyType::ConditionalBlocks.is_blocking());
+        assert!(!DependencyType::WaitsFor.is_blocking());
         assert!(!DependencyType::Related.is_blocking());
         assert!(!DependencyType::DiscoveredFrom.is_blocking());
         assert!(!DependencyType::RepliesTo.is_blocking());
@@ -1973,7 +1969,7 @@ mod tests {
     #[test]
     fn test_dependency_type_affects_ready_work_all() {
         assert!(DependencyType::Blocks.affects_ready_work());
-        assert!(DependencyType::ParentChild.affects_ready_work());
+        assert!(!DependencyType::ParentChild.affects_ready_work());
         assert!(DependencyType::ConditionalBlocks.affects_ready_work());
         assert!(DependencyType::WaitsFor.affects_ready_work());
         assert!(!DependencyType::Related.affects_ready_work());

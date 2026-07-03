@@ -21,6 +21,7 @@ pub fn issue(title: &str) -> Issue {
         priority: Priority::MEDIUM,
         assignee: None,
         labels: vec![],
+        waiters: vec![],
         created_at: base,
         updated_at: base + Duration::seconds(1),
         content_hash: None,
