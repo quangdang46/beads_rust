@@ -2,7 +2,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::formula::{parser, Formula, FormulaType, Step};
+    use crate::formula::{parser, Formula, FormulaType, Step, VarDef};
     use std::collections::HashMap;
 
     #[test]
@@ -202,5 +202,54 @@ mod tests {
         assert_eq!(gate.id.as_deref(), Some("approval-1"));
         let loop_spec = steps[1].r#loop.as_ref().unwrap();
         assert_eq!(loop_spec.count, Some(3));
+    }
+
+    #[test]
+    fn test_parse_vars_as_array() {
+        let json = r#"{
+            "formula": "mol-array-vars",
+            "vars": [
+                {"name": "component", "description": "Component name", "default": "api"},
+                {"name": "severity", "required": true, "enum": ["low", "high"]}
+            ]
+        }"#;
+        let formula = parser::Parser::parse_json(json.as_bytes()).unwrap();
+        let vars = formula.vars.unwrap();
+        assert_eq!(vars.len(), 2);
+        assert_eq!(vars[0].name, "component");
+        assert_eq!(vars[0].description.as_deref(), Some("Component name"));
+        assert_eq!(vars[0].default.as_deref(), Some("api"));
+        assert!(!vars[0].required);
+        assert_eq!(vars[1].name, "severity");
+        assert!(vars[1].required);
+        assert_eq!(vars[1].r#enum, vec!["low", "high"]);
+    }
+
+    #[test]
+    fn test_parse_vars_as_map() {
+        let json = r#"{
+            "formula": "mol-map-vars",
+            "vars": {
+                "component": {"description": "Component name", "default": "api"},
+                "severity": {"required": true, "enum": ["low", "high"]}
+            }
+        }"#;
+        let formula = parser::Parser::parse_json(json.as_bytes()).unwrap();
+        let vars = formula.vars.unwrap();
+        assert_eq!(vars.len(), 2);
+        assert_eq!(vars[0].name, "component");
+        assert_eq!(vars[0].description.as_deref(), Some("Component name"));
+        assert_eq!(vars[0].default.as_deref(), Some("api"));
+        assert!(!vars[0].required);
+        assert_eq!(vars[1].name, "severity");
+        assert!(vars[1].required);
+        assert_eq!(vars[1].r#enum, vec!["low", "high"]);
+    }
+
+    #[test]
+    fn test_parse_vars_empty() {
+        let json = r#"{"formula": "mol-no-vars"}"#;
+        let formula = parser::Parser::parse_json(json.as_bytes()).unwrap();
+        assert!(formula.vars.is_none());
     }
 }

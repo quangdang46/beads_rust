@@ -255,6 +255,15 @@ fn execute_inner(
     let quiet = cli.quiet.unwrap_or(false);
     let ctx = OutputContext::from_output_format(output_format, quiet, !use_color);
 
+    // Handle --oneline flag: print `{id}: {title}` for each issue
+    if args.oneline {
+        for details in &details_list {
+            let issue = &details.issue;
+            println!("{}: {}", issue.id, issue.title);
+        }
+        return Ok(());
+    }
+
     if matches!(ctx.mode(), OutputMode::Quiet) {
         return Ok(());
     }

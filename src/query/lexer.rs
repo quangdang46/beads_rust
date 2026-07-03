@@ -149,7 +149,7 @@ impl<'a> Lexer<'a> {
                 let value: String = self.input[start..self.pos].to_string();
                 Ok(Token { type_: TokenType::Ident, value, pos: start })
             }
-            _ if ch.is_ascii_digit() || ch == '+' => {
+            _ if ch.is_ascii_digit() || ch == '+' || ch == '-' => {
                 self.read_number_or_duration(start)
             }
             _ if is_ident_start(ch) => self.read_ident_or_keyword(start),
@@ -163,9 +163,40 @@ impl<'a> Lexer<'a> {
 
         // Check if next char is a duration suffix
         match self.peek() {
-            Some(&'d') | Some(&'h') | Some(&'m') | Some(&'s') => {
+            Some(&'d') | Some(&'h') | Some(&'m') | Some(&'s') | Some(&'w') => {
                 let ch = self.next().unwrap();
                 Ok(Token { type_: TokenType::Duration, value: format!("{value}{ch}"), pos: start })
+            }
+            Some(&'-') if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) => {
+                // ISO date pattern: YYYY-MM-DD
+                let _saved_pos = self.pos;
+                let _saved_chars = self.chars.clone();
+
+                self.next(); // consume '-'
+                let month_start = self.pos;
+                let month_end = self.read_digits(month_start);
+                let month_len = month_end - month_start;
+
+                if month_len == 2 && self.peek() == Some(&'-') {
+                    self.next(); // consume second '-'
+                    let day_start = self.pos;
+                    let day_end = self.read_digits(day_start);
+                    let day_len = day_end - day_start;
+
+                    if day_len == 2 {
+                        let full = self.input[start..self.pos].to_string();
+                        return Ok(Token {
+                            type_: TokenType::Ident,
+                            value: full,
+                            pos: start,
+                        });
+                    }
+                }
+
+                // Not a full ISO date, restore state after the first digit sequence
+                self.pos = end;
+                self.chars = self.input[end..].chars().peekable();
+                Ok(Token { type_: TokenType::Number, value, pos: start })
             }
             _ => Ok(Token { type_: TokenType::Number, value, pos: start }),
         }

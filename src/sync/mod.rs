@@ -4000,25 +4000,83 @@ struct ImportMetadataMaps {
     id_by_hash: HashMap<String, String>,
 }
 
-fn parse_normalized_import_issue(trimmed: &str, line_num: usize) -> Result<Issue> {
-    let mut issue: Issue = serde_json::from_str(trimmed)
-        .map_err(|e| BeadsError::Config(format!("Invalid JSON at line {line_num}: {e}")))?;
+/// Wrapper struct for bd-style JSONL records like `{"_type": "issue", "payload": {...}}`.
+#[derive(Deserialize)]
+struct BdJsonlWrapper {
+    #[serde(rename = "_type")]
+    type_: Option<String>,
+    payload: Option<serde_json::Value>,
+}
 
-    normalize_issue(&mut issue);
+fn parse_normalized_import_issue(trimmed: &str, line_num: usize) -> Result<Option<Issue>> {
+    // First, try the current flat Issue format (backward compatible).
+    if let Ok(mut issue) = serde_json::from_str::<Issue>(trimmed) {
+        normalize_issue(&mut issue);
 
-    if let Err(errors) = IssueValidator::validate(&issue) {
-        let details = errors
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(BeadsError::Config(format!(
-            "Validation failed for issue {} at line {}: {}",
-            issue.id, line_num, details
-        )));
+        if let Err(errors) = IssueValidator::validate(&issue) {
+            let details = errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(BeadsError::Config(format!(
+                "Validation failed for issue {} at line {}: {}",
+                issue.id, line_num, details
+            )));
+        }
+
+        return Ok(Some(issue));
     }
 
-    Ok(issue)
+    // Flat Issue parse failed; try bd wrapper format.
+    if let Ok(wrapper) = serde_json::from_str::<BdJsonlWrapper>(trimmed) {
+        let type_ = wrapper.type_.as_deref().unwrap_or("<missing>");
+        match type_ {
+            "issue" => {
+                let payload = wrapper.payload.ok_or_else(|| {
+                    BeadsError::Config(format!(
+                        "bd JSONL wrapper at line {} has _type 'issue' but no payload field",
+                        line_num
+                    ))
+                })?;
+                let mut issue: Issue = serde_json::from_value(payload).map_err(|e| {
+                    BeadsError::Config(format!(
+                        "Invalid payload JSON at line {}: {}",
+                        line_num, e
+                    ))
+                })?;
+                normalize_issue(&mut issue);
+
+                if let Err(errors) = IssueValidator::validate(&issue) {
+                    let details = errors
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(BeadsError::Config(format!(
+                        "Validation failed for issue {} at line {}: {}",
+                        issue.id, line_num, details
+                    )));
+                }
+
+                Ok(Some(issue))
+            }
+            _ => {
+                // Unknown wrapper type -- skip with a warning.
+                eprintln!(
+                    "Warning: skipping JSONL line {} with unknown _type '{}'",
+                    line_num, type_
+                );
+                Ok(None)
+            }
+        }
+    } else {
+        // Neither flat Issue nor bd wrapper -- report the original error.
+        Err(BeadsError::Config(format!(
+            "Invalid JSON at line {}: expected a flat Issue or a bd JSONL wrapper",
+            line_num
+        )))
+    }
 }
 
 fn for_each_jsonl_import_issue(
@@ -4035,8 +4093,9 @@ fn for_each_jsonl_import_issue(
         line_num += 1;
         let trimmed = line.trim();
         if !trimmed.is_empty() {
-            let issue = parse_normalized_import_issue(trimmed, line_num)?;
-            handle_issue(line_num, issue)?;
+            if let Some(issue) = parse_normalized_import_issue(trimmed, line_num)? {
+                handle_issue(line_num, issue)?;
+            }
         }
         line.clear();
     }

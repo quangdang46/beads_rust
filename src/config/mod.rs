@@ -390,7 +390,58 @@ fn git_worktree_main_repo(dir: &Path) -> Option<PathBuf> {
 /// - `--db` path is external and no workspace can be discovered from CWD/BEADS_DIR
 /// - No beads directory found (when `--db` not provided)
 pub fn discover_beads_dir_with_cli(cli: &CliOverrides) -> Result<PathBuf> {
-    discover_beads_dir_with_cli_from(None, cli, None, None)
+    let beads_dir = discover_beads_dir_with_cli_from(None, cli, None, None)?;
+
+    if cli.require_local {
+        ensure_beads_dir_is_local(&beads_dir)?;
+    }
+
+    Ok(beads_dir)
+}
+
+/// Ensure that `beads_dir` is local to the current working directory:
+/// either it is an ancestor of CWD, or both CWD and `beads_dir` are
+/// reachable via the same git worktree relationship.
+///
+/// This prevents agents running outside a `.beads` workspace (e.g. in
+/// `/tmp`) from silently writing to a global database resolved via
+/// `BEADS_DIR`, `--db`, or the git-worktree fallback.
+///
+/// # Errors
+///
+/// Returns `BeadsError::Config` with a descriptive message when the
+/// workspace is not local.
+fn ensure_beads_dir_is_local(beads_dir: &Path) -> Result<()> {
+    let cwd = env::current_dir()?;
+
+    // Canonicalize to resolve symlinks.
+    let canonical_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
+    let canonical_parent = beads_dir
+        .parent()
+        .and_then(|p| p.canonicalize().ok())
+        .unwrap_or_else(|| beads_dir.to_path_buf());
+
+    // Fast path: CWD starts with (or equals) beads_dir's parent — the
+    // workspace was found by walking up from CWD.
+    if canonical_cwd.starts_with(&canonical_parent) {
+        return Ok(());
+    }
+
+    // Slower path: CWD is inside a git worktree whose main repository
+    // owns beads_dir. This is still "local" to the project.
+    let is_git_worktree = git_worktree_main_repo(&cwd)
+        .as_ref()
+        .and_then(|main_repo| main_repo.canonicalize().ok())
+        .is_some_and(|canonical_main| canonical_parent.starts_with(&canonical_main));
+
+    if is_git_worktree {
+        return Ok(());
+    }
+
+    Err(BeadsError::Config(format!(
+        "No .beads workspace found in or above {}. Use --db to specify one.",
+        cwd.display()
+    )))
 }
 
 /// Discover the active `.beads` directory, but allow "no workspace" when no
@@ -3433,6 +3484,11 @@ pub struct CliOverrides {
     /// `main` instead of trying to acquire the same advisory lock again.
     pub held_write_lock_beads_dir: Option<PathBuf>,
     pub read_only_fast_open: bool,
+    /// When true, refuse to use a `.beads` workspace that is not an ancestor
+    /// of the current working directory (or accessible via git worktree).
+    /// Prevents agents running outside a project from silently writing to a
+    /// global database outside the CWD tree.
+    pub require_local: bool,
 }
 
 impl CliOverrides {
@@ -5545,6 +5601,7 @@ labels:
             identity: None,
             held_write_lock_beads_dir: None,
             read_only_fast_open: false,
+            require_local: false,
         };
 
         let layer = cli.as_layer();

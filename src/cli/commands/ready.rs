@@ -12,9 +12,9 @@ use crate::error::Result;
 use crate::format::{
     ReadyIssue, format_priority_badge, format_type_badge, terminal_width, truncate_title,
 };
-use crate::model::{IssueType, Priority};
+use crate::model::{IssueType, Priority, Status};
 use crate::output::{IssueTable, IssueTableColumns, OutputContext, OutputMode};
-use crate::storage::{ReadyFilters, ReadySortPolicy, SqliteStorage};
+use crate::storage::{IssueUpdate, ReadyFilters, ReadySortPolicy, SqliteStorage};
 use crate::util::id::{IdResolver, ResolverConfig};
 use std::io::IsTerminal;
 use std::path::Path;
@@ -182,6 +182,38 @@ fn execute_inner(
         if !external_blockers.is_empty() {
             ready_issues.retain(|issue| !external_blockers.contains_key(&issue.id));
         }
+    }
+
+    // Handle --claim: atomically claim the first ready issue
+    if args.claim && !ready_issues.is_empty() {
+        let config_layer = load_config_layer()?;
+        let actor = config::resolve_actor(&config_layer);
+        let claim_exclusive = config::claim_exclusive_from_layer(&config_layer);
+
+        let id = ready_issues[0].id.clone();
+
+        let update = IssueUpdate {
+            status: Some(Status::InProgress),
+            assignee: Some(Some(actor.clone())),
+            expect_unassigned: true,
+            claim_exclusive: args.claim && claim_exclusive,
+            claim_actor: Some(actor.clone()),
+            ..IssueUpdate::default()
+        };
+
+        // Open a writeable storage connection for the mutation
+        let mut writeable_cli = cli.clone();
+        writeable_cli.read_only_fast_open = false;
+        let mut claim_ctx = config::open_storage_with_cli(beads_dir, &writeable_cli)?;
+        claim_ctx.storage.update_issue(&id, &update, &actor)?;
+
+        // Print claim acknowledgement
+        if matches!(output_format, OutputFormat::Text | OutputFormat::Csv) {
+            println!("Claimed {id} for {actor}");
+        }
+
+        // Remove the claimed issue from the output list
+        ready_issues.remove(0);
     }
 
     // Apply the user-visible limit in Rust (after external-blocker filtering),

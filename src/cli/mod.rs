@@ -907,6 +907,9 @@ pub enum Commands {
     /// Rename an issue (alias for `br update <id> --title <new-title>`)
     Rename(RenameArgs),
 
+    /// Rename the issue ID prefix across all issues (e.g., `br-*` -> `bd-*`)
+    RenamePrefix(RenamePrefixArgs),
+
     /// Reopen an issue
     Reopen(ReopenArgs),
 
@@ -1064,6 +1067,10 @@ EXAMPLES:
 
     /// Show the active .beads directory
     Where,
+
+    /// Execute a read-only SQL query against the database
+    Sql(SqlArgs),
+
 }
 
 /// Worktree subcommands.
@@ -1425,9 +1432,17 @@ pub struct UpdateArgs {
     #[arg(long, visible_alias = "acceptance")]
     pub acceptance_criteria: Option<String>,
 
-    /// Update additional notes
+    /// Update additional notes (REPLACES existing notes -- use `--notes-push`
+    /// to append instead)
     #[arg(long)]
     pub notes: Option<String>,
+
+    /// Append to existing notes with a timestamp prefix.
+    /// Format: `---\n[2026-07-03 12:00:00 UTC] <text>`
+    /// Preserves existing notes (safe for multi-agent use).
+    /// Mutually exclusive with `--notes`.
+    #[arg(long, conflicts_with = "notes")]
+    pub notes_push: Option<String>,
 
     /// Change status. Terminal states (`closed`, `tombstone`) are refused —
     /// use the dedicated `br close` / `br delete` commands so close-policy
@@ -2192,6 +2207,10 @@ pub struct ShowArgs {
     /// Show token savings stats when using TOON output
     #[arg(long)]
     pub stats: bool,
+
+    /// One-line output: `{id}: {title}`
+    #[arg(long, conflicts_with = "format")]
+    pub oneline: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -2812,6 +2831,10 @@ pub struct ReadyArgs {
     /// Machine-readable output (alias for --json)
     #[arg(long)]
     pub robot: bool,
+
+    /// Atomically claim the top ready issue (assign to self, set status to in_progress)
+    #[arg(short = 'c', long)]
+    pub claim: bool,
 }
 
 /// Arguments for the scheduler command.
@@ -2981,6 +3004,21 @@ pub struct RenameArgs {
     /// New issue ID (the ID to rename to)
     #[arg(value_name = "NEW_ID")]
     pub new_id: String,
+}
+
+/// Arguments for the rename-prefix command.
+///
+/// Renames the issue ID prefix across all issues in the database and updates
+/// the stored prefix configuration. For example, changing `br` to `bd` would
+/// rename `br-abc123` to `bd-abc123`.
+#[derive(Args, Debug, Clone, Default)]
+pub struct RenamePrefixArgs {
+    /// New prefix for issue IDs (e.g., `bd`, `gt`, `myproj`)
+    pub new_prefix: String,
+
+    /// Preview the rename without applying changes
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 /// Sort policy for ready command.
@@ -3465,6 +3503,8 @@ pub enum AdminCommands {
     Vacuum(AdminVacuumArgs),
     /// Print database statistics (issue count by status, etc.)
     Stats(AdminStatsArgs),
+    /// Factory reset the database (requires --force)
+    Reset(AdminResetArgs),
 }
 
 /// Arguments for `br admin doctor`.
@@ -3483,6 +3523,14 @@ pub struct AdminVacuumArgs {
 #[derive(Args, Debug, Clone, Default)]
 pub struct AdminStatsArgs {}
 
+
+/// Arguments for `br admin reset`.
+#[derive(Args, Debug, Clone, Default)]
+pub struct AdminResetArgs {
+    /// Confirm destructive factory reset (required)
+    #[arg(long)]
+    pub force: bool,
+}
 /// Arguments for the upgrade command.
 #[cfg(feature = "self_update")]
 #[derive(Args, Debug, Clone, Default)]
@@ -3633,6 +3681,17 @@ pub struct AgentsArgs {
     pub force: bool,
 }
 
+
+/// Arguments for the sql command.
+#[derive(Args, Debug)]
+pub struct SqlArgs {
+    /// SQL query string (read-only: wrapped in a transaction that rolls back)
+    pub query: String,
+
+    /// Output format (json, text). Default: json.
+    #[arg(long, value_enum, default_value_t = OutputFormatBasic::Json)]
+    pub format: OutputFormatBasic,
+}
 #[cfg(test)]
 mod tests {
     use super::{

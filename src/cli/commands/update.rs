@@ -137,6 +137,9 @@ struct PreparedUpdateRoute {
     resolved_ids: Vec<String>,
     update: IssueUpdate,
     has_updates: bool,
+    /// Raw `--notes-push` value. Applied in `execute_prepared_route` by
+    /// reading the current issue's notes and appending with a timestamp.
+    notes_push: Option<String>,
     add_labels: Vec<String>,
     remove_labels: Vec<String>,
     set_labels: bool,
@@ -404,7 +407,8 @@ fn prepare_single_route(
         || !args.add_label.is_empty()
         || !args.remove_label.is_empty()
         || !args.set_labels.is_empty()
-        || args.parent.is_some();
+        || args.parent.is_some()
+        || args.notes_push.is_some();
 
     validate_mutable_target_issues(&storage_ctx.storage, &resolved_ids, has_updates)?;
 
@@ -442,6 +446,7 @@ fn prepare_single_route(
         resolved_ids,
         update,
         has_updates,
+        notes_push: args.notes_push.as_ref().map(|v| v.to_owned()),
         add_labels: args.add_label.clone(),
         remove_labels: args.remove_label.clone(),
         set_labels: !args.set_labels.is_empty(),
@@ -484,8 +489,21 @@ fn execute_prepared_route(
         )?;
 
         // Apply basic field updates
-        if !prepared.update.is_empty() {
+        if !prepared.update.is_empty() || prepared.notes_push.is_some() {
             let mut issue_update = prepared.update.clone();
+            // Handle --notes-push: append to existing notes with a timestamp
+            // prefix. Reads the current notes from `issue_before` so multi-agent
+            // append is safe (no data loss from silent replace).
+            if let Some(ref push_content) = prepared.notes_push {
+                let existing_notes = issue_before.as_ref().and_then(|i| i.notes.as_deref()).unwrap_or("");
+                let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
+                let new_notes = if existing_notes.is_empty() {
+                    format!("[{timestamp}] {push_content}")
+                } else {
+                    format!("{existing_notes}\n---\n[{timestamp}] {push_content}")
+                };
+                issue_update.notes = Some(Some(new_notes));
+            }
             issue_update.skip_cache_rebuild = defer_blocked_cache_rebuild;
             // Stage Tier 1 attribution (issue #312, Layer 3 capture-only) so the
             // update / status-change audit events record the self-reported agent
@@ -1886,6 +1904,7 @@ mod tests {
                 ..IssueUpdate::default()
             },
             has_updates: true,
+            notes_push: None,
             add_labels: vec!["late-runtime-error".to_string()],
             remove_labels: Vec::new(),
             set_labels: false,

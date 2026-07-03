@@ -8,7 +8,7 @@
 
 use crate::query::ast::{ComparisonOp, QueryNode};
 use crate::storage::sqlite::ListFilters;
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use std::str::FromStr;
 
 /// Error during query evaluation.
@@ -79,6 +79,32 @@ fn parse_duration_shorthand(s: &str) -> Result<Duration, QueryError> {
         "m" => Ok(Duration::minutes(num)),
         "s" => Ok(Duration::seconds(num)),
         _ => Err(QueryError::InvalidValue(format!("unknown duration unit: {s}"))),
+    }
+}
+
+/// Parse a timestamp value from a query comparison string.
+///
+/// Supports:
+/// - Duration shorthand: "7d", "30m" (relative to now, meaning that long ago)
+/// - ISO 8601 dates: "2026-01-15" (parsed as UTC midnight in local timezone)
+/// - Natural language: "yesterday", "today", "now", "tomorrow", "next-week",
+///   "last-week", "last-month"
+/// - Relative offsets: "+1d" = one day from now, "-3d" = three days ago
+fn parse_timestamp_value(s: &str) -> Result<DateTime<Utc>, QueryError> {
+    // First try duration shorthand (old behavior: "7d" = 7 days ago)
+    if s.ends_with(|c| c == 'd' || c == 'h' || c == 'm' || c == 's')
+        && s.starts_with(|c: char| c.is_ascii_digit())
+    {
+        let dur = parse_duration_shorthand(s)?;
+        return Ok(Utc::now() - dur);
+    }
+
+    // Fall through to flexible timestamp parsing (ISO dates, natural language, +/- offsets)
+    match crate::util::time::parse_flexible_timestamp(s, "timestamp") {
+        Ok(dt) => Ok(dt),
+        Err(_) => Err(QueryError::InvalidValue(format!(
+            "invalid date/time value: {s} (try: 7d, 30m, 2026-01-15, yesterday, now, tomorrow, next-week)"
+        ))),
     }
 }
 
@@ -219,13 +245,7 @@ fn apply_comparison(
             Ok(())
         }
         "created" | "created_at" => {
-            if !value.ends_with('d') && !value.ends_with('h') && !value.ends_with('m') && !value.ends_with('s') {
-                return Err(QueryError::InvalidValue(
-                    "created filter requires duration shorthand (e.g. 7d)".into(),
-                ));
-            }
-            let dur = parse_duration_shorthand(value)?;
-            let ts = Utc::now() - dur;
+            let ts = parse_timestamp_value(value)?;
             match op {
                 ComparisonOp::Eq => {
                     filters.created_after = Some(ts);
@@ -246,13 +266,7 @@ fn apply_comparison(
             Ok(())
         }
         "updated" | "updated_at" => {
-            if !value.ends_with('d') && !value.ends_with('h') && !value.ends_with('m') && !value.ends_with('s') {
-                return Err(QueryError::InvalidValue(
-                    "updated filter requires duration shorthand (e.g. 7d)".into(),
-                ));
-            }
-            let dur = parse_duration_shorthand(value)?;
-            let ts = Utc::now() - dur;
+            let ts = parse_timestamp_value(value)?;
             match op {
                 ComparisonOp::Eq => {
                     filters.updated_after = Some(ts);
@@ -581,5 +595,81 @@ mod tests {
     fn test_owner_filter() {
         let result = parse_and_evaluate("owner=bob").unwrap();
         assert_eq!(result.filters.owner, Some("bob".to_string()));
+    }
+
+    #[test]
+    fn test_iso_date_created() {
+        let result = parse_and_evaluate("created_at>2026-01-15").unwrap();
+        assert!(!result.requires_predicate);
+        assert!(result.filters.created_after.is_some());
+    }
+
+    #[test]
+    fn test_natural_language_yesterday() {
+        let result = parse_and_evaluate("created>yesterday").unwrap();
+        assert!(!result.requires_predicate);
+        assert!(result.filters.created_after.is_some());
+    }
+
+    #[test]
+    fn test_natural_language_today() {
+        let result = parse_and_evaluate("updated<today").unwrap();
+        assert!(!result.requires_predicate);
+        assert!(result.filters.updated_before.is_some());
+    }
+
+    #[test]
+    fn test_natural_language_tomorrow() {
+        let result = parse_and_evaluate("created<tomorrow").unwrap();
+        assert!(!result.requires_predicate);
+        assert!(result.filters.created_before.is_some());
+    }
+
+    #[test]
+    fn test_natural_language_next_week() {
+        let result = parse_and_evaluate("updated>next-week").unwrap();
+        assert!(!result.requires_predicate);
+        assert!(result.filters.updated_after.is_some());
+    }
+
+    #[test]
+    fn test_natural_language_last_week() {
+        let result = parse_and_evaluate("created_at>last-week").unwrap();
+        assert!(!result.requires_predicate);
+        assert!(result.filters.created_after.is_some());
+    }
+
+    #[test]
+    fn test_natural_language_last_month() {
+        let result = parse_and_evaluate("created<last-month").unwrap();
+        assert!(!result.requires_predicate);
+        assert!(result.filters.created_before.is_some());
+    }
+
+    #[test]
+    fn test_natural_language_now() {
+        let result = parse_and_evaluate("created<now").unwrap();
+        assert!(!result.requires_predicate);
+        assert!(result.filters.created_before.is_some());
+    }
+
+    #[test]
+    fn test_positive_relative_offset() {
+        let result = parse_and_evaluate("updated<+1d").unwrap();
+        assert!(!result.requires_predicate);
+        assert!(result.filters.updated_before.is_some());
+    }
+
+    #[test]
+    fn test_negative_relative_offset() {
+        let result = parse_and_evaluate("created>-3d").unwrap();
+        assert!(!result.requires_predicate);
+        assert!(result.filters.created_after.is_some());
+    }
+
+    #[test]
+    fn test_invalid_timestamp_value() {
+        let err = parse_and_evaluate("created>not-a-date").unwrap_err();
+        assert!(matches!(err, QueryError::InvalidValue(_)));
     }
 }

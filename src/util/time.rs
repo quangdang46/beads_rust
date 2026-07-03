@@ -16,7 +16,7 @@ enum RelativeTimeError {
 /// - RFC3339: `2025-01-15T12:00:00Z`, `2025-01-15T12:00:00+00:00`
 /// - Simple date: `2025-01-15` (defaults to 9:00 AM local time)
 /// - Relative duration: `+1h`, `+2d`, `+1w`, `+30m`
-/// - Keywords: `tomorrow`, `next-week`
+/// - Keywords: `tomorrow`, `next-week`, `last-week`, `last-month`, `now`
 ///
 /// # Errors
 ///
@@ -81,15 +81,28 @@ pub fn parse_flexible_timestamp(s: &str, field_name: &str) -> Result<DateTime<Ut
             let naive_dt = tomorrow.and_time(time);
             Ok(local_to_utc(&naive_dt, field_name)?)
         }
+        "now" => Ok(Utc::now()),
         "next-week" | "nextweek" => {
             let next_week = now.date_naive() + Duration::weeks(1);
             let time = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
             let naive_dt = next_week.and_time(time);
             Ok(local_to_utc(&naive_dt, field_name)?)
         }
+        "last-week" | "lastweek" => {
+            let last_week = now.date_naive() - Duration::weeks(1);
+            let time = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
+            let naive_dt = last_week.and_time(time);
+            Ok(local_to_utc(&naive_dt, field_name)?)
+        }
+        "last-month" | "lastmonth" => {
+            let last_month = now.date_naive() - Duration::days(30);
+            let time = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
+            let naive_dt = last_month.and_time(time);
+            Ok(local_to_utc(&naive_dt, field_name)?)
+        }
         _ => Err(BeadsError::validation(
             field_name,
-            "invalid time format (try: +1h, -7d, tomorrow, next-week, or 2025-01-15)",
+            "invalid time format (try: +1h, -7d, tomorrow, next-week, last-month, or 2025-01-15)",
         )),
     }
 }
@@ -98,7 +111,7 @@ pub fn parse_flexible_timestamp(s: &str, field_name: &str) -> Result<DateTime<Ut
 ///
 /// Supports:
 /// - Relative duration: `+1h`, `+2d`, `+1w`, `+30m`, `-7d`
-/// - Keywords: `today`, `yesterday`, `tomorrow`, `next-week`
+/// - Keywords: `today`, `yesterday`, `tomorrow`, `next-week`, `last-week`, `last-month`, `now`
 ///
 /// Returns `None` if the input cannot be parsed as a relative time.
 #[must_use]
@@ -129,10 +142,23 @@ pub fn parse_relative_time(s: &str) -> Option<DateTime<Utc>> {
             let naive_dt = tomorrow.and_time(time);
             local_to_utc_opt(&naive_dt)
         }
+        "now" => Some(Utc::now()),
         "next-week" | "nextweek" => {
             let next_week = now.date_naive() + Duration::weeks(1);
             let time = NaiveTime::from_hms_opt(9, 0, 0)?;
             let naive_dt = next_week.and_time(time);
+            local_to_utc_opt(&naive_dt)
+        }
+        "last-week" | "lastweek" => {
+            let last_week = now.date_naive() - Duration::weeks(1);
+            let time = NaiveTime::from_hms_opt(9, 0, 0)?;
+            let naive_dt = last_week.and_time(time);
+            local_to_utc_opt(&naive_dt)
+        }
+        "last-month" | "lastmonth" => {
+            let last_month = now.date_naive() - Duration::days(30);
+            let time = NaiveTime::from_hms_opt(9, 0, 0)?;
+            let naive_dt = last_month.and_time(time);
             local_to_utc_opt(&naive_dt)
         }
         _ => None,
@@ -477,5 +503,47 @@ mod tests {
         let now = Utc::now();
         let dt = now - Duration::days(330);
         assert_eq!(format_relative_time(dt, now), "11 months ago");
+    }
+
+    #[test]
+    fn test_parse_flexible_now() {
+        let result = parse_flexible_timestamp("now", "test").unwrap();
+        let diff = Utc::now() - result;
+        assert!(diff.num_seconds().abs() < 2);
+    }
+
+    #[test]
+    fn test_parse_flexible_last_week() {
+        let result = parse_flexible_timestamp("last-week", "test").unwrap();
+        assert!(result < Utc::now());
+        let result2 = parse_flexible_timestamp("lastweek", "test").unwrap();
+        assert!((result - result2).num_seconds().abs() < 2);
+    }
+
+    #[test]
+    fn test_parse_flexible_last_month() {
+        let result = parse_flexible_timestamp("last-month", "test").unwrap();
+        assert!(result < Utc::now());
+        let result2 = parse_flexible_timestamp("lastmonth", "test").unwrap();
+        assert!((result - result2).num_seconds().abs() < 2);
+    }
+
+    #[test]
+    fn test_parse_relative_now() {
+        let result = parse_relative_time("now").unwrap();
+        let diff = Utc::now() - result;
+        assert!(diff.num_seconds().abs() < 2);
+    }
+
+    #[test]
+    fn test_parse_relative_last_week() {
+        let result = parse_relative_time("last-week").unwrap();
+        assert!(result < Utc::now());
+    }
+
+    #[test]
+    fn test_parse_relative_last_month() {
+        let result = parse_relative_time("last-month").unwrap();
+        assert!(result < Utc::now());
     }
 }

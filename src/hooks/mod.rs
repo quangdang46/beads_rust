@@ -45,6 +45,10 @@ pub const MANAGED_HOOKS: &[HookDef] = &[
         name: "post-checkout",
         description: "Refresh beads state after branch switch",
     },
+    HookDef {
+        name: "prepare-commit-msg",
+        description: "Auto-prepend issue reference to commit messages",
+    },
 ];
 
 /// Definition of a managed git hook.
@@ -177,6 +181,35 @@ fn generate_hook_script(hook_name: &str) -> String {
             "# Check if the new branch has a different beads state\n\
              br sync --import-only 2>&1 || true"
         }
+        "prepare-commit-msg" => {
+            "# Auto-prepend issue reference to commit message.\n\
+             # Extracts issue ID from branch name (e.g. fix-#123-something → #123)\n\
+             # and prepends '#123: Issue Title' to the commit message.\n\
+             _branch=\"$(git rev-parse --abbrev-ref HEAD 2>/dev/null)\"\n\
+             if [ -z \"$_branch\" ] || [ \"$_branch\" = \"HEAD\" ]; then\n\
+             \x20 exit 0\n\
+             fi\n\
+             _issue=\"$(printf '%s' \"$_branch\" | grep -oE '#[0-9]+' | head -1)\"\n\
+             if [ -z \"$_issue\" ]; then\n\
+             \x20 exit 0\n\
+             fi\n\
+             _msg_file=\"$1\"\n\
+             if [ -z \"$_msg_file\" ] || [ ! -f \"$_msg_file\" ]; then\n\
+             \x20 exit 0\n\
+             fi\n\
+             _existing=\"$(head -1 \"$_msg_file\" 2>/dev/null)\"\n\
+             case \"$_existing\" in\n\
+             \x20 \"$_issue\"*)\n\
+             \x20\x20 exit 0 ;;\n\
+             esac\n\
+             _title=\"$(br show \"$_issue\" --oneline 2>/dev/null)\"\n\
+             if [ -n \"$_title\" ]; then\n\
+             \x20 _tmp=\"$(mktemp)\"\n\
+             \x20 printf '%s\\n\\n' \"$_title\" > \"$_tmp\"\n\
+             \x20 cat \"$_msg_file\" >> \"$_tmp\"\n\
+             \x20 mv \"$_tmp\" \"$_msg_file\"\n\
+             fi"
+        }
         _ => "",
     };
 
@@ -190,7 +223,7 @@ if command -v br >/dev/null 2>&1; then
   export BR_GIT_HOOK=1
   _br_timeout=${{BR_HOOK_TIMEOUT:-{timeout}}}
   if command -v timeout >/dev/null 2>&1; then
-    timeout "$_br_timeout" sh -c '{br_cmd}' < /dev/null
+    timeout "$_br_timeout" sh -c '{br_cmd}' _ "$@" < /dev/null
     _br_exit=$?
   else
     {br_cmd}
@@ -531,6 +564,7 @@ pub fn run_hook(hook_name: &str) -> Result<()> {
             lock_timeout: None,
             held_write_lock_beads_dir: None,
             read_only_fast_open: true,
+            require_local: false,
         },
     )?;
 

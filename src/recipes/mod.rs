@@ -161,11 +161,13 @@ This repository uses **Beads (br)** for issue tracking.
     },
     Recipe {
         name: "Codex CLI",
-        description: "Codex CLI skill guidance",
-        recipe_type: RecipeType::Section,
-        path: "AGENTS.md",
-        paths: &[],
-        contents: &[],
+        description: "Codex CLI hooks.json + skill guidance",
+        recipe_type: RecipeType::MultiFile,
+        path: "",
+        paths: &[".codex/hooks.json", "AGENTS.md"],
+        contents: &[
+            (".codex/hooks.json", CODEX_HOOKS_JSON),
+        ],
     },
     Recipe {
         name: "Mux",
@@ -206,7 +208,82 @@ This repository uses **Beads (br)** for issue tracking.
 "#),
         ],
     },
+    Recipe {
+        name: "Cursor IDE MCP",
+        description: "Cursor IDE MCP server config (~/.cursor/mcp.json)",
+        recipe_type: RecipeType::MultiFile,
+        path: "",
+        paths: &["~/.cursor/mcp.json"],
+        contents: &[
+            ("~/.cursor/mcp.json", IDE_MCP_JSON),
+        ],
+    },
+    Recipe {
+        name: "Windsurf MCP",
+        description: "Windsurf editor MCP server config (~/.codeium/windsurf.json)",
+        recipe_type: RecipeType::MultiFile,
+        path: "",
+        paths: &["~/.codeium/windsurf.json"],
+        contents: &[
+            ("~/.codeium/windsurf.json", IDE_MCP_JSON),
+        ],
+    },
+    Recipe {
+        name: "GitHub Copilot MCP",
+        description: "Copilot VS Code MCP server config (~/.github/copilot/mcp.json)",
+        recipe_type: RecipeType::MultiFile,
+        path: "",
+        paths: &["~/.github/copilot/mcp.json"],
+        contents: &[
+            ("~/.github/copilot/mcp.json", IDE_MCP_JSON),
+        ],
+    },
 ];
+
+/// JSON content for `.codex/hooks.json` — configures `br prime` to run via
+/// Codex CLI lifecycle hooks at session start and on every user prompt submit.
+const CODEX_HOOKS_JSON: &str = r#"{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "br prime",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "br prime",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
+"#;
+
+/// Shared MCP server JSON configuration for IDE integrations.
+///
+/// Registers `br` as a stdio MCP server so the IDE can discover and
+/// invoke beads_rust tools through the Model Context Protocol.
+const IDE_MCP_JSON: &str = r#"{
+  "mcpServers": {
+    "br": {
+      "command": "br",
+      "args": ["ag", "--listen"],
+      "type": "stdio"
+    }
+  }
+}
+"#;
 
 /// Find a recipe by display name (case-insensitive).
 ///
@@ -227,6 +304,14 @@ pub fn find_recipe(name: &str) -> Option<&'static Recipe> {
                     | ("sourcegraph cody", "sourcegraph")
                     | ("github copilot cli", "copilot")
                     | ("github copilot cli", "copilotcli")
+                    | ("cursor ide mcp", "cursor-mcp")
+                    | ("cursor ide mcp", "cursor_mcp")
+                    | ("windsurf mcp", "windsurf-mcp")
+                    | ("windsurf mcp", "windsurf_mcp")
+                    | ("github copilot mcp", "copilot-mcp")
+                    | ("github copilot mcp", "copilot_mcp")
+                    | ("codex cli", "codex-hook")
+                    | ("codex cli", "codex_hook")
             )
     })
 }
@@ -244,15 +329,30 @@ pub fn list_recipes() -> Vec<(&'static str, &'static str, RecipeType)> {
 
 /// Install a recipe by writing its files to the specified project directory.
 ///
+/// Recipe paths beginning with `~/` are treated as absolute home-directory
+/// paths and are written outside the project directory.
+///
 /// # Errors
 ///
 /// Returns an error if file operations fail.
 pub fn install_recipe(recipe: &Recipe, project_dir: &Path) -> Result<Vec<PathBuf>> {
     let mut written = Vec::new();
 
+    // Helper: resolve a raw recipe path to the actual filesystem target.
+    // If `raw` starts with `~/`, expand `~` to HOME (absolute, ignore project_dir).
+    // Otherwise join with project_dir.
+    let resolve_path = |raw: &str| -> PathBuf {
+        if let Some(stripped) = raw.strip_prefix("~/") {
+            if let Ok(home) = std::env::var("HOME") {
+                return Path::new(&home).join(stripped);
+            }
+        }
+        project_dir.join(raw)
+    };
+
     match recipe.recipe_type {
         RecipeType::File => {
-            let target = project_dir.join(recipe.path);
+            let target = resolve_path(recipe.path);
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -261,7 +361,7 @@ pub fn install_recipe(recipe: &Recipe, project_dir: &Path) -> Result<Vec<PathBuf
         }
         RecipeType::MultiFile => {
             for p in recipe.paths {
-                let target = project_dir.join(p);
+                let target = resolve_path(p);
                 if let Some(parent) = target.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
@@ -272,7 +372,7 @@ pub fn install_recipe(recipe: &Recipe, project_dir: &Path) -> Result<Vec<PathBuf
         RecipeType::Section | RecipeType::Hooks => {
             // Section and hooks types require AGENTS.md or settings modification
             // which is handled by the `agents` command
-            let target = project_dir.join(recipe.path);
+            let target = resolve_path(recipe.path);
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
             }

@@ -46,6 +46,7 @@ pub mod quickstart;
 pub mod ready;
 pub mod recipes;
 pub mod rename;
+pub mod rename_prefix;
 pub mod reopen;
 pub mod robot_docs;
 pub mod scheduler;
@@ -70,6 +71,7 @@ pub mod custom_status;
 #[cfg(feature = "self_update")]
 pub mod upgrade;
 pub mod federation;
+pub mod sql_cmd;
 
 pub(crate) const GITHUB_REPO_OWNER: &str = "Dicklesworthstone";
 pub(crate) const GITHUB_REPO_NAME: &str = "beads_rust";

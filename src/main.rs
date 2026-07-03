@@ -334,6 +334,9 @@ fn main() {
             commands::reopen::execute(&args, cli.json || args.robot, &overrides, &output_ctx)
         }
         Commands::Rename(args) => commands::rename::execute(&args, &overrides, &output_ctx),
+        Commands::RenamePrefix(args) => {
+            commands::rename_prefix::execute(&args, &overrides, &output_ctx)
+        }
         Commands::Q(args) => commands::q::execute(args, &overrides, &output_ctx),
         Commands::Quickstart(_) => commands::quickstart::execute(&output_ctx),
         Commands::Dep { command } => {
@@ -658,6 +661,13 @@ fn main() {
                 commands::template::execute(&command, cli.json, &overrides, &output_ctx)
             }
         }
+        Commands::Sql(args) => {
+            if let Some(res) = storage_result.as_ref() {
+                commands::sql_cmd::execute_with_storage(&args, &output_ctx, &res.storage)
+            } else {
+                commands::sql_cmd::execute(&args, &overrides, &output_ctx)
+            }
+        }
     };
 
     // Handle command result
@@ -870,6 +880,7 @@ const fn is_mutating_command(cmd: &Commands) -> bool {
         Commands::Create(_)
         | Commands::Update(_)
         | Commands::Rename(_)
+        | Commands::RenamePrefix(_)
         | Commands::Delete(_)
         | Commands::Close(_)
         | Commands::Reopen(_)
@@ -976,7 +987,8 @@ const fn needs_write_lock(cmd: &Commands) -> bool {
  | Commands::Template { .. }
  | Commands::Admin { .. }
  | Commands::Memory { .. }
- | Commands::Prime(_) => true,
+ | Commands::Prime(_)
+ | Commands::Sql(_) => true,
  Commands::Config { command } => !matches!(
             command,
             beads_rust::cli::ConfigCommands::Path | beads_rust::cli::ConfigCommands::Edit
@@ -1053,7 +1065,8 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::MergeSlot(_)
         | Commands::Federation(_)
         | Commands::Memory { .. }
-        | Commands::Prime(_) => false,
+        | Commands::Prime(_)
+        | Commands::Sql(_) => false,
 
         #[cfg(feature = "mcp")]
         Commands::Serve(_) => false,
@@ -1096,6 +1109,7 @@ const fn supports_read_only_fast_open(cmd: &Commands) -> bool {
         Commands::Dep { command } => is_read_only_dep_command(command),
         Commands::Label { command } => is_read_only_label_listing(command),
         Commands::Query { command } => is_read_only_query_command(command),
+        Commands::Sql(_) => true,
         _ => false,
     }
 }
@@ -1130,6 +1144,7 @@ const fn supports_auto_import_read_only_probe(cmd: &Commands) -> bool {
         Commands::Label { command } => is_read_only_label_listing(command),
         Commands::Dep { command } => is_read_only_dep_command(command),
         Commands::Query { command } => is_read_only_query_command(command),
+        Commands::Sql(_) => true,
         Commands::Sync(args) => args.status,
         Commands::Stats(args) | Commands::Status(args) => args.no_activity,
         _ => false,
@@ -1284,6 +1299,7 @@ fn build_cli_overrides(cli: &Cli) -> config::CliOverrides {
         lock_timeout: cli.lock_timeout,
         held_write_lock_beads_dir: None,
         read_only_fast_open,
+        require_local: is_mutating_command(&cli.command),
     }
 }
 

@@ -1337,6 +1337,38 @@ impl SqliteStorage {
         Ok(rows.iter().map(|r| r.values().to_vec()).collect())
     }
 
+    /// Execute a read-only SQL query, returning column names and rows.
+    ///
+    /// Wraps the query in a `BEGIN`/`ROLLBACK` transaction pair so that any
+    /// accidental DML (INSERT/UPDATE/DELETE) is never committed.  Column names
+    /// are extracted from the prepared statement so the caller can construct
+    /// keyed output (e.g. JSON objects, formatted tables).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails to prepare or execute.  The
+    /// rollback is attempted regardless of success/failure.
+    pub(crate) fn execute_read_only_query(&self, sql: &str) -> Result<(Vec<String>, Vec<Vec<SqliteValue>>)> {
+        // Start an explicit transaction.  Even BEGIN DEFERRED acquires a
+        // shared read lock, preventing concurrent writers from conflicting
+        // while we inspect the database.
+        self.conn.execute("BEGIN")?;
+
+        let result = (|| -> Result<(Vec<String>, Vec<Vec<SqliteValue>>)> {
+            let prepared = self.conn.prepare(sql)?;
+            let column_names = prepared.column_names().to_vec();
+            let rows = prepared.query()?;
+            let data: Vec<Vec<SqliteValue>> =
+                rows.into_iter().map(|r| r.values().to_vec()).collect();
+            Ok((column_names, data))
+        })();
+
+        // Always roll back — even on error — so no DML slips through.
+        let _ = self.conn.execute("ROLLBACK");
+
+        result
+    }
+
     /// Check whether a foreign-key-backed table contains rows whose reference
     /// column points at a missing issue.
     ///

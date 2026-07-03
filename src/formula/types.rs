@@ -64,7 +64,12 @@ pub struct Formula {
     pub extends: Vec<String>,
 
     /// Template variables with defaults and validation.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Accepts both array format `[{"name":"x",...}]` and map format `{"x":{...}}`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_vars"
+    )]
     pub vars: Option<Vec<VarDef>>,
 
     /// Steps defining the work items.
@@ -112,8 +117,8 @@ const fn default_version() -> i32 {
 /// Defines a template variable with optional validation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VarDef {
-    /// Variable name (set from map key, not serialized).
-    #[serde(skip)]
+    /// Variable name. Present in array format; captured from map key in map format.
+    #[serde(default)]
     pub name: String,
 
     /// Human-readable description.
@@ -555,4 +560,64 @@ pub struct AroundAdvice {
     /// Steps to insert after the target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after: Option<Vec<AdviceStep>>,
+}
+
+// ---------------------------------------------------------------------------
+// Custom deserialization: vars as array or map
+// ---------------------------------------------------------------------------
+
+/// Deserialize `Option<Vec<VarDef>>` from either an array `[{"name":"x",...}]`
+/// or a map `{"x":{...}}` where keys become `VarDef.name`.
+fn deserialize_vars<'de, D>(deserializer: D) -> Result<Option<Vec<VarDef>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct VarsVisitor;
+
+    impl<'de> de::Visitor<'de> for VarsVisitor {
+        type Value = Option<Vec<VarDef>>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("an array of VarDef objects or a map of name -> VarDef")
+        }
+
+        /// Handle null (JSON null / absent field).
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        /// Handle array format: `[{"name":"x","description":"..."}, ...]`
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: de::SeqAccess<'de>,
+        {
+            let mut vars = Vec::new();
+            while let Some(v) = seq.next_element::<VarDef>()? {
+                vars.push(v);
+            }
+            Ok(if vars.is_empty() { None } else { Some(vars) })
+        }
+
+        /// Handle map format: `{"x":{"description":"..."}, "y":{"default":"z"}}`
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: de::MapAccess<'de>,
+        {
+            let mut vars = Vec::new();
+            while let Some(key) = map.next_key::<String>()? {
+                // Parse the value as VarDef, then inject the key as the name
+                let mut vardef: VarDef = map.next_value::<VarDef>()?;
+                vardef.name = key;
+                vars.push(vardef);
+            }
+            Ok(if vars.is_empty() { None } else { Some(vars) })
+        }
+    }
+
+    deserializer.deserialize_any(VarsVisitor)
 }
