@@ -594,6 +594,7 @@ fn build_filters(args: &ListArgs) -> Result<(ListFilters, Option<Box<dyn Fn(&cra
         owner: args.owner.clone(),
         pinned: args.pinned.then_some(true),
         mol_type: args.mol_type.as_ref().and_then(|m| MolType::from_str(m).ok()),
+        external_ref: args.external_ref.clone(),
     };
 
     // Apply query DSL filter (--filter) on top of explicit CLI filters

@@ -408,6 +408,7 @@ impl SqliteStorage {
             assignee: None,
             owner: None,
             estimated_minutes: None,
+            points: None,
             due_at: None,
             defer_until: None,
             external_ref: None,

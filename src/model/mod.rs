@@ -1080,6 +1080,10 @@ pub struct Issue {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec_id: Option<String>,
 
+    // Points (story points for estimation)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub points: Option<i32>,
+
     // StartedAt (when work actually started)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<DateTime<Utc>>,
@@ -1212,6 +1216,7 @@ impl Default for Issue {
             work_type: WorkType::default(),
             wisp_type: WispType::default(),
             spec_id: None,
+            points: None,
             started_at: None,
             metadata: None,
             source_formula: None,
@@ -1278,6 +1283,7 @@ impl Issue {
             || self.assignee != other.assignee
             || self.owner != other.owner
             || self.estimated_minutes != other.estimated_minutes
+            || self.points != other.points
             || self.created_by != other.created_by
             || self.closed_at != other.closed_at
             || self.close_reason != other.close_reason

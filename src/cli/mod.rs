@@ -2144,6 +2144,10 @@ pub struct ListArgs {
     #[arg(long)]
     pub stats: bool,
 
+    /// Filter by external reference
+    #[arg(long)]
+    pub external_ref: Option<String>,
+
     /// Filter by metadata key=value (can be repeated, AND logic)
     #[arg(long, value_name = "KEY=VALUE")]
     pub metadata: Vec<String>,
@@ -2835,6 +2839,10 @@ pub struct ReadyArgs {
     /// Atomically claim the top ready issue (assign to self, set status to in_progress)
     #[arg(short = 'c', long)]
     pub claim: bool,
+
+    /// Filter to only issues with gate fields set (await_type and/or await_id)
+    #[arg(long)]
+    pub gated: bool,
 }
 
 /// Arguments for the scheduler command.

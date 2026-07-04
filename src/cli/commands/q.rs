@@ -179,6 +179,7 @@ pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext)
         work_type: Default::default(),
         wisp_type: Default::default(),
         spec_id: None,
+        points: None,
         started_at: None,
         metadata: None,
         source_formula: None,

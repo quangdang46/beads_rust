@@ -9,6 +9,7 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::formula::Parser;
 use crate::model::{Issue, IssueType, Priority, Status};
+use std::borrow::Cow;
 use crate::output::OutputContext;
 use crate::validation::IssueValidator;
 use std::collections::HashMap;
@@ -132,7 +133,7 @@ fn parse_and_resolve(
 ) -> std::result::Result<(crate::formula::Formula, Vec<crate::formula::Step>), BeadsError> {
     let mut parser = Parser::new(vec![]);
 
-    let mut formula = parser
+    let formula = parser
         .parse_file(file)
         .map_err(|e| BeadsError::Config(format!("Failed to parse formula: {e}")))?;
 
@@ -301,7 +302,7 @@ fn execute_apply(
                 "description": resolved.description,
                 "step_count": steps.len(),
                 "steps": steps.iter().map(|s| {
-                    serde_json::json!({
+                    let mut obj = serde_json::json!({
                         "id": s.id,
                         "title": s.title,
                         "type": s.r#type,
@@ -310,7 +311,17 @@ fn execute_apply(
                         "depends_on": s.depends_on,
                         "needs": s.needs,
                         "assignee": s.assignee,
-                    })
+                    });
+                    if let Some(gate) = &s.gate {
+                        obj["await_type"] = serde_json::json!(gate.r#type);
+                        if let Some(ref aid) = gate.await_id {
+                            obj["await_id"] = serde_json::json!(aid);
+                        }
+                        if let Some(ref t) = gate.timeout {
+                            obj["timeout"] = serde_json::json!(t);
+                        }
+                    }
+                    obj
                 }).collect::<Vec<_>>(),
             });
             output_ctx.print(&serde_json::to_string_pretty(&output).unwrap_or_default());
@@ -331,6 +342,14 @@ fn execute_apply(
                     output_ctx
                         .print(&format!("       Depends on: {}", step.depends_on.join(", ")));
                 }
+                if let Some(gate) = &step.gate {
+                    output_ctx.print(&format!(
+                        "       Gate: await_type={}, await_id={}, timeout={}",
+                        gate.r#type,
+                        gate.await_id.as_deref().unwrap_or("-"),
+                        gate.timeout.as_deref().unwrap_or("-"),
+                    ));
+                }
             }
         }
         return Ok(());
@@ -347,6 +366,8 @@ fn execute_apply(
 
     // Build a map of step ID -> created issue ID
     let mut step_to_issue: HashMap<String, Issue> = HashMap::new();
+    // Map of step ID -> created gate issue (only for steps with a gate).
+    let mut step_to_gate_issue: HashMap<String, Issue> = HashMap::new();
 
     // Phase 1: Create all issues
     for step in &steps {
@@ -357,7 +378,62 @@ fn execute_apply(
         let issue_type = parse_issue_type(step.r#type.as_deref());
         let priority = step.priority.map(Priority).unwrap_or(Priority::MEDIUM);
 
-        let mut new_issue = Issue {
+        // Gate fields: when a step has a `gate` defined, propagate the async
+        // wait information onto the created issue so downstream consumers
+        // (gate list, close policy, etc.) can see it.
+        let (await_type, await_id, timeout_seconds) = match &step.gate {
+            Some(gate) => {
+                let tid = gate
+                    .timeout
+                    .as_deref()
+                    .and_then(parse_timeout_seconds);
+                (Some(gate.r#type.clone()), gate.await_id.clone(), tid)
+            }
+            None => (None, None, None),
+        };
+
+        // Issue #70: When a step has a gate, also create a separate
+        // IssueType::Gate issue so the gate is a first-class work item that
+        // can be tracked, assigned, and reported on independently.
+        if step.gate.is_some() {
+            let gate_title: Cow<'_, str> = match step.title.as_deref() {
+                Some(t) => Cow::Owned(format!("Gate: {t}")),
+                None => Cow::Borrowed("Gate"),
+            };
+            let gate_desc = step.description.clone().or_else(|| {
+                step.gate.as_ref().map(|g| {
+                    let mut d = format!("Async gate ({})", g.r#type);
+                    if let Some(ref id) = g.await_id {
+                        d.push_str(&format!(" — {id}"));
+                    }
+                    if let Some(ref t) = g.timeout {
+                        d.push_str(&format!(" (timeout: {t})"));
+                    }
+                    d
+                })
+            });
+            let gate_issue = Issue {
+                id: String::new(),
+                title: gate_title.into_owned(),
+                description: gate_desc,
+                status: Status::Open,
+                priority,
+                issue_type: IssueType::Gate,
+                labels: step.labels.clone(),
+                created_at: now,
+                updated_at: now,
+                await_type: await_type.clone(),
+                await_id: await_id.clone(),
+                timeout_seconds,
+                ..Default::default()
+            };
+            IssueValidator::validate(&gate_issue)
+                .map_err(BeadsError::from_validation_errors)?;
+            storage.create_issue(&gate_issue, actor)?;
+            step_to_gate_issue.insert(step.id.clone(), gate_issue);
+        }
+
+        let new_issue = Issue {
             id: String::new(), // storage will assign
             title,
             description: step.description.clone(),
@@ -369,6 +445,9 @@ fn execute_apply(
             assignee: step.assignee.clone(),
             created_at: now,
             updated_at: now,
+            await_type,
+            await_id,
+            timeout_seconds,
             ..Default::default()
         };
 
@@ -382,6 +461,17 @@ fn execute_apply(
 
     // Phase 2: Create dependencies between issues that reference each other
     let mut dep_count = 0usize;
+
+    // 2a. Create waits-for edges from gated step issues to their gate issues.
+    for (step_id, gate_issue) in &step_to_gate_issue {
+        let Some(step_issue) = step_to_issue.get(step_id.as_str()) else {
+            continue;
+        };
+        storage.add_dependency(&step_issue.id, &gate_issue.id, "waits-for", actor)?;
+        dep_count += 1;
+    }
+
+    // 2b. Create blocks edges for step-level depends_on and needs.
     for step in &steps {
         let Some(issue) = step_to_issue.get(&step.id) else {
             continue;
@@ -398,29 +488,64 @@ fn execute_apply(
 
     // Report results
     if use_json {
+        let gate_count = step_to_gate_issue.len();
+        let mut issue_ids: Vec<String> = step_to_issue
+            .values()
+            .map(|i| i.id.clone())
+            .collect();
+        let gate_ids: Vec<String> = step_to_gate_issue
+            .values()
+            .map(|i| i.id.clone())
+            .collect();
+        issue_ids.extend(gate_ids.iter().cloned());
         let output = serde_json::json!({
             "formula": resolved.formula,
             "issues_created": step_to_issue.len(),
+            "gate_issues_created": gate_count,
             "dependencies_created": dep_count,
-            "issue_ids": step_to_issue
-                .values()
-                .map(|i| i.id.clone())
-                .collect::<Vec<_>>(),
+            "gated_issues": gate_count,
+            "issue_ids": issue_ids,
         });
         output_ctx.print(&serde_json::to_string_pretty(&output).unwrap_or_default());
     } else {
+        let gate_count = step_to_gate_issue.len();
         output_ctx.print(&format!(
-            "Applied formula '{}': created {} issue(s) and {} dependency(ies)",
+            "Applied formula '{}': created {} issue(s) and {} dependency(ies) ({} gated)",
             resolved.formula,
             step_to_issue.len(),
             dep_count,
+            gate_count,
         ));
         for (step_id, issue) in &step_to_issue {
-            output_ctx.print(&format!("  {step_id} -> {}", issue.id));
+            let gate_info = step_to_gate_issue
+                .get(step_id)
+                .map(|g| format!(" [gate: {}]", g.id))
+                .unwrap_or_default();
+            output_ctx.print(&format!("  {step_id} -> {}{gate_info}", issue.id));
         }
     }
 
     Ok(())
+}
+
+/// Parse a duration shorthand like "1h", "30m", "2d" into seconds.
+fn parse_timeout_seconds(s: &str) -> Option<i64> {
+    let s = s.trim();
+    // Try to parse a numeric-only string as seconds directly.
+    if let Ok(n) = s.parse::<i64>() {
+        return Some(n);
+    }
+    let (num_str, unit) = s.split_at(s.len() - 1);
+    let n: i64 = num_str.parse().ok()?;
+    let secs = match unit {
+        "s" => n,
+        "m" => n * 60,
+        "h" => n * 3600,
+        "d" => n * 86400,
+        "w" => n * 604800,
+        _ => return None,
+    };
+    Some(secs)
 }
 
 /// Parse an optional type string into an IssueType.

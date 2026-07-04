@@ -63,6 +63,7 @@ fn make_issue(id: &str, title: &str) -> Issue {
         work_type: Default::default(),
         wisp_type: Default::default(),
         spec_id: None,
+        points: None,
         started_at: None,
         metadata: None,
         source_formula: None,

@@ -124,6 +124,14 @@ const BUILTIN_RECIPES: &[Recipe] = &[
         contents: &[(".agents/skills/beads/SKILL.md", GOOSE_SKILL_MD)],
     },
     Recipe {
+        name: "Crush",
+        description: "Crush agent skill files",
+        recipe_type: RecipeType::File,
+        path: ".agents/skills/beads/SKILL.md",
+        paths: &[],
+        contents: &[(".agents/skills/beads/SKILL.md", CRUSH_SKILL_MD)],
+    },
+    Recipe {
         name: "GitHub Copilot CLI",
         description: "Copilot CLI plugin manifest + instructions",
         recipe_type: RecipeType::MultiFile,
@@ -311,6 +319,37 @@ When creating issues, use `--deps "blocks:<dep-id>"` to block on other issues. U
 Use `br remember -k <key> <text>` to store session context. Use `br recall <key>` to retrieve it.
 "#;
 
+/// Crush skill markdown content written to `.agents/skills/beads/SKILL.md`.
+///
+/// Crush (by Charmbracelet) discovers project-local skills from
+/// `.agents/skills/<name>/SKILL.md`.
+const CRUSH_SKILL_MD: &str = r#"---
+title: beads
+description: Use Beads (br) for durable issue tracking, dependencies, memory, and session handoff.
+---
+
+# Beads Issue Tracking
+
+This project uses beads_rust (br) for issue tracking. Issues are stored in .beads/ and tracked in git.
+
+## Essential Commands
+
+br ready              - View ready issues (open, unblocked, not deferred)
+br list --status open - All open issues
+br create <title>     - Create a new issue
+br update <id> --claim - Claim an issue to start working
+br close <id>         - Close when done
+br sync --flush-only  - Export DB to JSONL before session end
+
+## Dependencies
+
+When creating issues, use --deps "blocks:<dep-id>" to block on other issues. Use br ready to find unblocked work.
+
+## Memories
+
+Use br remember -k <key> <text> to store session context. Use br recall <key> to retrieve it.
+"#;
+
 /// Shared MCP server JSON configuration for IDE integrations.
 ///
 /// Registers `br` as a stdio MCP server so the IDE can discover and
@@ -352,6 +391,7 @@ pub fn find_recipe(name: &str) -> Option<&'static Recipe> {
                     | ("github copilot mcp", "copilot-mcp")
                     | ("github copilot mcp", "copilot_mcp")
                     | ("goose", "goose")
+                    | ("crush", "crush")
                     | ("codex cli", "codex-hook")
                     | ("codex cli", "codex_hook")
             )

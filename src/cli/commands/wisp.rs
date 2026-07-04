@@ -264,6 +264,7 @@ fn execute_create(
         work_type: WorkType::default(),
         wisp_type: WispType::default(),
         spec_id: None,
+        points: None,
         started_at: None,
         metadata: None,
         source_formula: None,

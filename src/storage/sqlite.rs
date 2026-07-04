@@ -536,7 +536,8 @@ impl ReadyIssueProjection {
                          due_at, defer_until, external_ref, source_system, source_repo,
                          deleted_at, deleted_by, delete_reason, original_type,
                          compaction_level, compacted_at, compacted_at_commit, original_size,
-                         sender, ephemeral, pinned, is_template, source_repo_path, agent_context, metadata"
+                         sender, ephemeral, pinned, is_template, source_repo_path, agent_context, metadata,
+                         no_history, wisp_type, mol_type, work_type, started_at, spec_id, points"
             }
             Self::Command => {
                 r"SELECT id, title, description, acceptance_criteria, notes, status, priority,
@@ -569,7 +570,7 @@ impl SearchIssueProjection {
                          deleted_at, deleted_by, delete_reason, original_type,
                          compaction_level, compacted_at, compacted_at_commit, original_size,
                          sender, ephemeral, pinned, is_template, source_repo_path, agent_context, metadata,
-                         no_history, wisp_type, mol_type, work_type, started_at, spec_id
+                         no_history, wisp_type, mol_type, work_type, started_at, spec_id, points
                   FROM issues
                   WHERE 1=1"
             }
@@ -602,7 +603,7 @@ impl BlockedIssueProjection {
                      i.compacted_at, i.compacted_at_commit, i.original_size, i.sender, i.ephemeral,
                      i.pinned, i.is_template, i.source_repo_path, i.agent_context,
                      i.metadata,
-                     i.no_history, i.wisp_type, i.mol_type, i.work_type, i.started_at, i.spec_id,
+                     i.no_history, i.wisp_type, i.mol_type, i.work_type, i.started_at, i.spec_id, i.points,
                      bc.blocked_by"
             }
             Self::Command => {
@@ -622,7 +623,7 @@ impl BlockedIssueProjection {
                      deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                      compacted_at, compacted_at_commit, original_size, sender, ephemeral,
                      pinned, is_template, source_repo_path, agent_context, metadata,
-                     no_history, wisp_type, mol_type, work_type, started_at, spec_id"
+                     no_history, wisp_type, mol_type, work_type, started_at, spec_id, points"
             }
             Self::Command => {
                 r"SELECT id, title, description, status, priority, issue_type,
@@ -638,7 +639,8 @@ impl BlockedIssueProjection {
             // Then 38→39 after `metadata` was appended (beads_rust#16).
             // Then 39→45 after `no_history, wisp_type, mol_type, work_type, started_at, spec_id`
             // were appended before bc.blocked_by (beads_rust#48).
-            Self::Full => 45,
+            // Then 45→46 after `points` was appended (beads_rust).
+            Self::Full => 46,
             Self::Command => 9,
         }
     }
@@ -2350,8 +2352,8 @@ impl SqliteStorage {
                     source_repo, source_repo_path, deleted_at, deleted_by, delete_reason, original_type,
                     compaction_level, compacted_at, compacted_at_commit, original_size,
                     sender, ephemeral, pinned, is_template, agent_context, metadata,
-                    no_history, wisp_type, mol_type, work_type, started_at, spec_id
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45)",
+                    no_history, wisp_type, mol_type, work_type, started_at, spec_id, points
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46)",
                 &[
                     SqliteValue::from(issue.id.as_str()),
                     SqliteValue::from(content_hash.as_str()),
@@ -2401,6 +2403,7 @@ impl SqliteStorage {
                         SqliteValue::from(dt.to_rfc3339())
                     }),
                     issue.spec_id.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+                    issue.points.map_or(SqliteValue::Null, |v| SqliteValue::from(i64::from(v))),
                 ],
             )?;
 
@@ -2856,6 +2859,13 @@ impl SqliteStorage {
                 issue.estimated_minutes = *val;
                 add_update(
                     "estimated_minutes",
+                    val.map_or(SqliteValue::Null, |v| SqliteValue::from(i64::from(v))),
+                );
+            }
+            if let Some(ref val) = updates.points {
+                issue.points = *val;
+                add_update(
+                    "points",
                     val.map_or(SqliteValue::Null, |v| SqliteValue::from(i64::from(v))),
                 );
             }
@@ -3436,7 +3446,8 @@ impl SqliteStorage {
                    due_at, defer_until, external_ref, source_system, source_repo,
                    deleted_at, deleted_by, delete_reason, original_type,
                    compaction_level, compacted_at, compacted_at_commit, original_size,
-                   sender, ephemeral, pinned, is_template, source_repo_path, agent_context, metadata
+                   sender, ephemeral, pinned, is_template, source_repo_path, agent_context, metadata,
+                   no_history, wisp_type, mol_type, work_type, started_at, spec_id, points
             FROM issues
             WHERE id = ?
         ";
@@ -3476,7 +3487,8 @@ impl SqliteStorage {
                          due_at, defer_until, external_ref, source_system, source_repo,
                          deleted_at, deleted_by, delete_reason, original_type,
                          compaction_level, compacted_at, compacted_at_commit, original_size,
-                         sender, ephemeral, pinned, is_template, source_repo_path, agent_context, metadata
+                         sender, ephemeral, pinned, is_template, source_repo_path, agent_context, metadata,
+                         no_history, wisp_type, mol_type, work_type, started_at, spec_id, points
                   FROM issues WHERE id IN ({})",
                 placeholders.join(",")
             );
@@ -3612,7 +3624,8 @@ impl SqliteStorage {
                      due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type,
                      compaction_level, compacted_at, compacted_at_commit, original_size,
-                     sender, ephemeral, pinned, is_template, source_repo_path, agent_context, metadata",
+                     sender, ephemeral, pinned, is_template, source_repo_path, agent_context, metadata,
+                     no_history, wisp_type, mol_type, work_type, started_at, spec_id, points",
         );
 
         let mut params: Vec<SqliteValue> = Vec::new();
@@ -3723,6 +3736,11 @@ impl SqliteStorage {
             params.push(SqliteValue::from(ts.to_rfc3339()));
         }
 
+        if let Some(ref external_ref) = filters.external_ref {
+            sql.push_str(" AND external_ref = ?");
+            params.push(SqliteValue::from(external_ref.as_str()));
+        }
+
         if !sort_default_in_rust {
             // Apply custom sort if provided
             if let Some(ref sort_field) = filters.sort {
@@ -3813,7 +3831,8 @@ impl SqliteStorage {
                          due_at, defer_until, external_ref, source_system, source_repo,
                          deleted_at, deleted_by, delete_reason, original_type,
                          compaction_level, compacted_at, compacted_at_commit, original_size,
-                         sender, ephemeral, pinned, is_template, source_repo_path, agent_context, metadata
+                         sender, ephemeral, pinned, is_template, source_repo_path, agent_context, metadata,
+                         no_history, wisp_type, mol_type, work_type, started_at, spec_id, points
                   FROM issues
                   WHERE {status_filter}
                     AND (is_template = 0 OR is_template IS NULL)
@@ -9412,7 +9431,8 @@ impl SqliteStorage {
                            due_at, defer_until, external_ref, source_system, source_repo,
                            deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                            compacted_at, compacted_at_commit, original_size, sender, ephemeral,
-                           pinned, is_template, source_repo_path, agent_context, metadata
+                           pinned, is_template, source_repo_path, agent_context, metadata,
+                           no_history, wisp_type, mol_type, work_type, started_at, spec_id, points
                     FROM issues
                     WHERE (ephemeral = 0 OR ephemeral IS NULL)
                       AND id NOT LIKE '%-wisp-%'
@@ -10115,6 +10135,7 @@ impl SqliteStorage {
             work_type: parse_work_type(row.get(42).and_then(SqliteValue::as_text)),
             started_at: get_opt_datetime(43)?,
             spec_id: get_non_empty_str(44),
+            points: get_opt_i32(45),
             labels: vec![],
             dependencies: vec![],
             comments: vec![],
@@ -10791,6 +10812,8 @@ pub struct ListFilters {
     pub pinned: Option<bool>,
     /// Filter by molecular type.
     pub mol_type: Option<MolType>,
+    /// Filter by external reference.
+    pub external_ref: Option<String>,
 }
 
 /// Closure-time policy metadata row (issue #274 Phase 1).
@@ -10842,6 +10865,7 @@ pub struct IssueUpdate {
     pub assignee: Option<Option<String>>,
     pub owner: Option<Option<String>>,
     pub estimated_minutes: Option<Option<i32>>,
+    pub points: Option<Option<i32>>,
     pub due_at: Option<Option<DateTime<Utc>>>,
     pub defer_until: Option<Option<DateTime<Utc>>>,
     pub external_ref: Option<Option<String>>,
@@ -10895,6 +10919,7 @@ impl IssueUpdate {
             && self.assignee.is_none()
             && self.owner.is_none()
             && self.estimated_minutes.is_none()
+            && self.points.is_none()
             && self.due_at.is_none()
             && self.defer_until.is_none()
             && self.external_ref.is_none()
@@ -12106,7 +12131,8 @@ impl SqliteStorage {
                      due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                      compacted_at, compacted_at_commit, original_size, sender, ephemeral,
-                     pinned, is_template, source_repo_path, agent_context, metadata
+                     pinned, is_template, source_repo_path, agent_context, metadata,
+                     no_history, wisp_type, mol_type, work_type, started_at, spec_id, points
                FROM issues WHERE external_ref = ?",
             &[SqliteValue::from(external_ref)],
         ) {
@@ -12129,7 +12155,8 @@ impl SqliteStorage {
                      due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                      compacted_at, compacted_at_commit, original_size, sender, ephemeral,
-                     pinned, is_template, source_repo_path, agent_context, metadata
+                     pinned, is_template, source_repo_path, agent_context, metadata,
+                     no_history, wisp_type, mol_type, work_type, started_at, spec_id, points
                FROM issues WHERE content_hash = ?",
             &[SqliteValue::from(content_hash)],
         ) {

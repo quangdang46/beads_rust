@@ -145,6 +145,7 @@ impl SavedFilters {
             owner: None,
             pinned: false,
             mol_type: None,
+            external_ref: None,
             metadata: Vec::new(),
             created_before: None,
             created_after: None,
@@ -224,6 +225,7 @@ impl SavedFilters {
             owner: cli.owner.clone().or(base.owner),
             pinned: cli.pinned || base.pinned,
             mol_type: cli.mol_type.clone().or(base.mol_type),
+            external_ref: cli.external_ref.clone().or(base.external_ref.clone()),
             metadata: if cli.metadata.is_empty() {
                 base.metadata.clone()
             } else {

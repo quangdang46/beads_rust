@@ -9,7 +9,7 @@ use crate::error::{BeadsError, Result};
 use crate::model::{IssueType, Priority, Status};
 use crate::util::content_hash_from_parts;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 19;
+pub const CURRENT_SCHEMA_VERSION: i32 = 20;
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 
 /// The complete SQL schema for the beads database.
@@ -77,6 +77,7 @@ pub const SCHEMA_SQL: &str = r"
         work_type TEXT NOT NULL DEFAULT 'none',
         started_at DATETIME,
         spec_id TEXT,
+        points INTEGER,
         CHECK (
             (status = 'closed' AND closed_at IS NOT NULL) OR
             (status = 'tombstone') OR
@@ -841,6 +842,7 @@ const ISSUE_COLUMNS: &[(&str, &str)] = &[
     ("work_type", "TEXT NOT NULL DEFAULT 'none'"),
     ("started_at", "DATETIME"),
     ("spec_id", "TEXT"),
+    ("points", "INTEGER"),
 ];
 
 const DEPENDENCY_COLUMNS: &[(&str, &str)] = &[
@@ -1032,6 +1034,7 @@ const EXPECTED_ISSUE_COLUMN_ORDER: &[&str] = &[
     "work_type",
     "started_at",
     "spec_id",
+    "points",
 ];
 
 /// Check whether the issues table has columns in the expected order.
@@ -1985,6 +1988,20 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
             CREATE INDEX IF NOT EXISTS idx_fed_peers_sovereignty ON federation_peers(sovereignty);
         "#,
         )?;
+    }
+
+    // Migration v19 -> v20: add `points INTEGER` to `issues` for story-point
+    // estimation. Pure additive — nullable column with no default, existing rows
+    // get NULL. Idempotent: skipped when the column already exists.
+    if !issues_rebuilt
+        && user_version < 20
+        && table_exists(conn, "issues")
+        && !column_exists(conn, "issues", "points")
+    {
+        tracing::info!(
+            "Migrating database to schema version 20 (points on issues)"
+        );
+        conn.execute("ALTER TABLE issues ADD COLUMN points INTEGER")?;
     }
 
     // Migration: Add missing indexes for bd parity

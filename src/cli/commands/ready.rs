@@ -172,6 +172,11 @@ fn execute_inner(
     let mut ready_issues =
         get_ready_issues_for_output(storage, &filters, sort_policy, output_format)?;
 
+    // --gated: further filter to only issues that have gate fields set
+    if args.gated {
+        ready_issues.retain(|issue| issue.await_type.is_some() || issue.await_id.is_some());
+    }
+
     if !ready_issues.is_empty() && storage.has_external_dependencies(true)? {
         let config_layer = load_config_layer()?;
         auto_import_external_projects_if_stale(&config_layer, beads_dir, cli);

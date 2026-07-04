@@ -494,6 +494,7 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
         owner: None,
         pinned: None,
         mol_type: None,
+        external_ref: None,
     })
 }
 

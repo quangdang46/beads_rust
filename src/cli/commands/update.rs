@@ -1108,6 +1108,7 @@ fn build_update(args: &UpdateArgs, actor: &str, claim_exclusive: bool) -> Result
         assignee,
         owner,
         estimated_minutes: args.estimate.map(Some),
+        points: None,
         due_at,
         defer_until,
         external_ref: optional_string_field(args.external_ref.as_deref()),
