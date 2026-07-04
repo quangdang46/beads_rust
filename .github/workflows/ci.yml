@@ -41,13 +41,13 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy (all features)
-        run: cargo clippy --all-targets --features self_update
+        run: cargo clippy --all-targets --all-features
 
       - name: Clippy (no default features)
         run: cargo clippy --all-targets --no-default-features
 
       - name: Check (all targets)
-        run: cargo check --all-targets --features self_update
+        run: cargo check --all-targets --all-features
 
   security:
     name: Security Audit
@@ -85,7 +85,7 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2.9.1
 
       - name: Run all tests (all features)
-        run: cargo test --features self_update -- --nocapture
+        run: cargo test --all-features -- --nocapture
         env:
           RUST_LOG: beads_rust=debug
 
@@ -232,7 +232,7 @@ jobs:
           tool: cargo-llvm-cov
 
       - name: Generate coverage report
-        run: cargo llvm-cov --features self_update --workspace --lcov --output-path lcov.info
+        run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
         continue-on-error: true
 
       - name: Upload coverage to Codecov
