@@ -633,6 +633,7 @@ fn content_hash_trait_implementation() {
         crystallizes: false,
         bonded_from: vec![],
         labels: vec![],
+        waiters: vec![],
         dependencies: vec![],
         comments: vec![],
     };

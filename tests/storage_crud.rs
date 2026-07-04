@@ -61,6 +61,7 @@ fn create_issue_all_fields_populated() {
         is_template: false,
         // Relations are populated separately
         labels: vec![],
+        waiters: vec![],
         dependencies: vec![],
         comments: vec![],
         // Other optional fields
@@ -585,6 +586,7 @@ fn update_issue_clear_optional_fields() {
         crystallizes: false,
         bonded_from: vec![],
         labels: vec![],
+        waiters: vec![],
         dependencies: vec![],
         comments: vec![],
     };
@@ -896,6 +898,7 @@ fn upsert_issue_stores_all_fields() {
         pinned: true,
         is_template: false,
         labels: vec![],
+        waiters: vec![],
         dependencies: vec![],
         comments: vec![],
         content_hash: Some("abc123".to_string()),

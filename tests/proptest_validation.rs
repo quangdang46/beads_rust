@@ -89,6 +89,7 @@ fn make_valid_issue(title: &str) -> Issue {
         crystallizes: false,
         bonded_from: vec![],
         labels: vec![],
+        waiters: vec![],
         dependencies: vec![],
         comments: vec![],
     }

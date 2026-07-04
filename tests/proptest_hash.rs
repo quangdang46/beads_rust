@@ -90,7 +90,6 @@ fn make_issue(title: &str, description: Option<&str>) -> Issue {
         bonded_from: vec![],
         labels: vec![],
         waiters: vec![],
-        waiters: vec![],
         dependencies: vec![],
         comments: vec![],
     }

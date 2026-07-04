@@ -153,7 +153,6 @@ fn make_issue(
         bonded_from: Vec::new(),
         labels: Vec::new(),
         waiters: Vec::new(),
-        waiters: Vec::new(),
         dependencies: Vec::new(),
         comments: Vec::new(),
     }
