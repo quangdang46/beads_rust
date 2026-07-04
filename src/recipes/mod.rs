@@ -116,6 +116,14 @@ const BUILTIN_RECIPES: &[Recipe] = &[
         contents: &[],
     },
     Recipe {
+        name: "Goose",
+        description: "Goose skill/instruction files",
+        recipe_type: RecipeType::File,
+        path: ".agents/skills/beads/SKILL.md",
+        paths: &[],
+        contents: &[(".agents/skills/beads/SKILL.md", GOOSE_SKILL_MD)],
+    },
+    Recipe {
         name: "GitHub Copilot CLI",
         description: "Copilot CLI plugin manifest + instructions",
         recipe_type: RecipeType::MultiFile,
@@ -270,6 +278,39 @@ const CODEX_HOOKS_JSON: &str = r#"{
 }
 "#;
 
+/// Goose skill markdown content written to `.agents/skills/beads/SKILL.md`.
+///
+/// Goose discovers project-local skills from `.agents/skills/<name>/SKILL.md`.
+/// The YAML frontmatter makes it discoverable via `goose skills list`.
+const GOOSE_SKILL_MD: &str = r#"---
+title: beads
+description: Use Beads (br) for durable issue tracking, dependencies, memory, and session handoff.
+---
+
+# Beads Issue Tracking
+
+This project uses [beads_rust](https://github.com/Dicklesworthstone/beads_rust) (`br`/`bd`) for issue tracking. Issues are stored in `.beads/` and tracked in git.
+
+## Essential Commands
+
+```bash
+br ready              # View ready issues (open, unblocked, not deferred)
+br list --status=open # All open issues
+br create <title>     # Create a new issue
+br update <id> --claim # Claim an issue to start working
+br close <id>         # Close when done
+br sync --flush-only  # Export DB to JSONL before session end
+```
+
+## Dependencies
+
+When creating issues, use `--deps "blocks:<dep-id>"` to block on other issues. Use `br ready` to find unblocked work.
+
+## Memories
+
+Use `br remember -k <key> <text>` to store session context. Use `br recall <key>` to retrieve it.
+"#;
+
 /// Shared MCP server JSON configuration for IDE integrations.
 ///
 /// Registers `br` as a stdio MCP server so the IDE can discover and
@@ -310,6 +351,7 @@ pub fn find_recipe(name: &str) -> Option<&'static Recipe> {
                     | ("windsurf mcp", "windsurf_mcp")
                     | ("github copilot mcp", "copilot-mcp")
                     | ("github copilot mcp", "copilot_mcp")
+                    | ("goose", "goose")
                     | ("codex cli", "codex-hook")
                     | ("codex cli", "codex_hook")
             )
