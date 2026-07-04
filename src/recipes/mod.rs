@@ -313,7 +313,7 @@ description: Use Beads (br) for durable issue tracking, dependencies, memory, an
 
 # Beads Issue Tracking
 
-This project uses [beads_rust](https://github.com/Dicklesworthstone/beads_rust) (`br`/`bd`) for issue tracking. Issues are stored in `.beads/` and tracked in git.
+This project uses [beads_rust](https://github.com/quangdang46/beads_rust) (`br`/`bd`) for issue tracking. Issues are stored in `.beads/` and tracked in git.
 
 ## Essential Commands
 

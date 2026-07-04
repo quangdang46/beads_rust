@@ -1055,7 +1055,7 @@ fn reject_terminal_status_transition(raw_status: Option<&str>) -> Result<()> {
              (close-reason / AC / attribution) is enforced. \
              Use `br close <id> --reason \"...\"` instead, or `br close <id> \
              --bypass-policy --bypass-reason \"...\"` to opt out explicitly. \
-             See https://github.com/Dicklesworthstone/beads_rust/issues/301.",
+             See https://github.com/quangdang46/beads_rust/issues/301.",
         )),
         Status::Tombstone => Err(BeadsError::validation(
             "status",

@@ -2,14 +2,14 @@
   {
     "id": 1,
     "issue_id": "bd-2cr",
-    "author": "Dicklesworthstone",
+    "author": "quangdang46",
     "text": "This is a test comment",
     "created_at": "2026-01-19T22:12:49Z"
   },
   {
     "id": 2,
     "issue_id": "bd-2cr",
-    "author": "Dicklesworthstone",
+    "author": "quangdang46",
     "text": "Another comment for testing",
     "created_at": "2026-01-19T22:12:49Z"
   }

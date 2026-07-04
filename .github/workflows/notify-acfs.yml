@@ -24,7 +24,7 @@ on:
 env:
   TOOL_NAME: 'br'
   INSTALLER_PATH: 'install.sh'
-  ACFS_REPO: 'Dicklesworthstone/agentic_coding_flywheel_setup'
+  ACFS_REPO: 'quangdang46/agentic_coding_flywheel_setup'
 
 jobs:
   compute-and-notify:

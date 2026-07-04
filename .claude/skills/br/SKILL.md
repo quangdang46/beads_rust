@@ -19,7 +19,7 @@ triggers:
   - dependencies
   - ready work
 metadata:
-  author: Dicklesworthstone
+  author: quangdang46
   version: 1.0.0
 ---
 

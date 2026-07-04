@@ -250,9 +250,9 @@ Examples:
 #### Downstream `--slug` integration
 
 Three commits made `--slug` end-to-end:
-- [`5c0af3d4`](https://github.com/Dicklesworthstone/beads_rust/commit/5c0af3d4) `feat(create): --slug for human-readable issue IDs (#283)` — the feature itself.
-- [`f454486f`](https://github.com/Dicklesworthstone/beads_rust/commit/f454486f) `fix(sync): accept slugged IDs in prefix guard` — sync's prefix guard now tolerates slugged IDs during import/export.
-- [`52ff1722`](https://github.com/Dicklesworthstone/beads_rust/commit/52ff1722) `feat(orphans): scan all candidate-issue prefixes when finding commit refs` — `br orphans` finds commit references to slugged IDs.
+- [`5c0af3d4`](https://github.com/quangdang46/beads_rust/commit/5c0af3d4) `feat(create): --slug for human-readable issue IDs (#283)` — the feature itself.
+- [`f454486f`](https://github.com/quangdang46/beads_rust/commit/f454486f) `fix(sync): accept slugged IDs in prefix guard` — sync's prefix guard now tolerates slugged IDs during import/export.
+- [`52ff1722`](https://github.com/quangdang46/beads_rust/commit/52ff1722) `feat(orphans): scan all candidate-issue prefixes when finding commit refs` — `br orphans` finds commit references to slugged IDs.
 
 The full lifecycle round-trip (create with slug → show → update → close → orphans references) is verified by `tests/e2e_scripts/slug_round_trip.sh` (added by `beads_rust-l6xl`).
 
@@ -1338,7 +1338,7 @@ br serve [OPTIONS]
 
 ```bash
 cargo build --release --features mcp
-cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --features mcp
+cargo install --git https://github.com/quangdang46/beads_rust.git --features mcp
 ```
 
 **Options:**

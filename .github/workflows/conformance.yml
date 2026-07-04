@@ -54,7 +54,7 @@ jobs:
         id: build_bd
         continue-on-error: true
         run: |
-          git clone --depth 1 https://github.com/Dicklesworthstone/beads.git ../beads-go
+          git clone --depth 1 https://github.com/quangdang46/beads.git ../beads-go
           cd ../beads-go
           go build -o bd ./cmd/beads
           echo "BD_BINARY=$(pwd)/bd" >> "$GITHUB_ENV"

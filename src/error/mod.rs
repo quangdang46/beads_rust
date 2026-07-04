@@ -150,10 +150,6 @@ pub enum BeadsError {
     #[error("External command failed: {command}: {reason}")]
     ExternalCommand { command: String, reason: String },
 
-    /// Self-update or upgrade operation failed.
-    #[error("Upgrade failed: {reason}")]
-    Upgrade { reason: String },
-
     /// Internal consistency check failed.
     #[error("Internal error: {message}")]
     Internal { message: String },
@@ -340,14 +336,6 @@ impl BeadsError {
         }
     }
 
-    /// Create a self-update failure.
-    #[must_use]
-    pub fn upgrade(reason: impl Into<String>) -> Self {
-        Self::Upgrade {
-            reason: reason.into(),
-        }
-    }
-
     /// Create an internal consistency error.
     #[must_use]
     pub fn internal(message: impl Into<String>) -> Self {
@@ -410,20 +398,6 @@ mod tests {
 
         assert_eq!(structured.code, ErrorCode::InternalError);
         assert_eq!(err.exit_code(), 1);
-    }
-
-    #[test]
-    fn test_upgrade_uses_io_error_code_with_context() {
-        let err = BeadsError::upgrade("network timeout");
-        let structured = StructuredError::from_error(&err);
-
-        assert_eq!(structured.code, ErrorCode::IoError);
-        assert_eq!(err.exit_code(), 8);
-        let context = structured.context.expect("upgrade context");
-        assert_eq!(
-            context["operation"],
-            serde_json::Value::String("upgrade".to_string())
-        );
     }
 
     #[test]

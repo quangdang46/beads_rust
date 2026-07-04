@@ -44,13 +44,13 @@ esac
 
 if [[ ! -d ../frankensqlite/crates/fsqlite ]]; then
   echo "error: sibling frankensqlite checkout not found at ../frankensqlite" >&2
-  echo "       run \`git clone https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite\` first" >&2
+  echo "       run \`git clone https://github.com/quangdang46/frankensqlite ../frankensqlite\` first" >&2
   exit 1
 fi
 
 if [[ "$ENABLE_FASTMCP" == true && ! -d ../fastmcp_rust/crates/fastmcp ]]; then
   echo "error: sibling fastmcp_rust checkout not found at ../fastmcp_rust" >&2
-  echo "       run \`git clone https://github.com/Dicklesworthstone/fastmcp_rust ../fastmcp_rust\` first" >&2
+  echo "       run \`git clone https://github.com/quangdang46/fastmcp_rust ../fastmcp_rust\` first" >&2
   exit 1
 fi
 

@@ -123,7 +123,7 @@ jobs:
           # Use jq to update the manifest
           jq --arg version "$VERSION" --arg hash "$HASH" '
             .version = $version |
-            .architecture."64bit".url = "https://github.com/Dicklesworthstone/beads_rust/releases/download/v\($version)/br-\($version)-windows_amd64.zip" |
+            .architecture."64bit".url = "https://github.com/quangdang46/beads_rust/releases/download/v\($version)/br-\($version)-windows_amd64.zip" |
             .architecture."64bit".hash = $hash
           ' packaging/scoop/br.json > packaging/scoop/br.json.tmp
 

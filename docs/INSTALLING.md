@@ -49,13 +49,13 @@ Complete installation instructions for `br` (beads_rust), including all supporte
 ### One-liner (Cargo)
 
 ```bash
-cargo install --git https://github.com/Dicklesworthstone/beads_rust.git
+cargo install --git https://github.com/quangdang46/beads_rust.git
 ```
 
 ### One-liner (Build from Source)
 
 ```bash
-git clone https://github.com/Dicklesworthstone/beads_rust.git && cd beads_rust && cargo build --release && sudo cp target/release/br /usr/local/bin/
+git clone https://github.com/quangdang46/beads_rust.git && cd beads_rust && cargo build --release && sudo cp target/release/br /usr/local/bin/
 ```
 
 ---
@@ -68,10 +68,10 @@ The simplest method using Rust's package manager:
 
 ```bash
 # Install with all features (including self-update)
-cargo install --git https://github.com/Dicklesworthstone/beads_rust.git
+cargo install --git https://github.com/quangdang46/beads_rust.git
 
 # Install without self-update feature
-cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --no-default-features
+cargo install --git https://github.com/quangdang46/beads_rust.git --no-default-features
 ```
 
 **Requirements:**
@@ -88,7 +88,7 @@ rustup install nightly
 rustup default nightly
 
 # Or use nightly for just this install
-rustup run nightly cargo install --git https://github.com/Dicklesworthstone/beads_rust.git
+rustup run nightly cargo install --git https://github.com/quangdang46/beads_rust.git
 ```
 
 ### Build from Source
@@ -97,7 +97,7 @@ For development or customization:
 
 ```bash
 # Clone the repository
-git clone https://github.com/Dicklesworthstone/beads_rust.git
+git clone https://github.com/quangdang46/beads_rust.git
 cd beads_rust
 
 # Build release binary (optimized for size)
@@ -135,13 +135,13 @@ Pre-built binaries are available from GitHub Releases:
 ```bash
 # Example for Linux x86_64
 VERSION=v0.1.23
-curl -L "https://github.com/Dicklesworthstone/beads_rust/releases/download/${VERSION}/br-${VERSION}-linux_amd64.tar.gz" -o br.tar.gz
+curl -L "https://github.com/quangdang46/beads_rust/releases/download/${VERSION}/br-${VERSION}-linux_amd64.tar.gz" -o br.tar.gz
 tar -xzf br.tar.gz br
 sudo install -m 0755 br /usr/local/bin/br
 
 # Example for macOS ARM64
 VERSION=v0.1.23
-curl -L "https://github.com/Dicklesworthstone/beads_rust/releases/download/${VERSION}/br-${VERSION}-darwin_arm64.tar.gz" -o br.tar.gz
+curl -L "https://github.com/quangdang46/beads_rust/releases/download/${VERSION}/br-${VERSION}-darwin_arm64.tar.gz" -o br.tar.gz
 tar -xzf br.tar.gz br
 sudo install -m 0755 br /usr/local/bin/br
 ```
@@ -150,7 +150,7 @@ sudo install -m 0755 br /usr/local/bin/br
 
 ```bash
 # Download checksum file
-curl -L https://github.com/Dicklesworthstone/beads_rust/releases/latest/download/checksums.sha256 -o checksums.sha256
+curl -L https://github.com/quangdang46/beads_rust/releases/latest/download/checksums.sha256 -o checksums.sha256
 
 # Verify (Linux)
 sha256sum -c checksums.sha256 --ignore-missing
@@ -179,7 +179,7 @@ rustup install nightly
 rustup default nightly
 
 # Install br
-cargo install --git https://github.com/Dicklesworthstone/beads_rust.git
+cargo install --git https://github.com/quangdang46/beads_rust.git
 ```
 
 **Fedora/RHEL:**
@@ -193,7 +193,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source ~/.cargo/env
 rustup install nightly
 rustup default nightly
-cargo install --git https://github.com/Dicklesworthstone/beads_rust.git
+cargo install --git https://github.com/quangdang46/beads_rust.git
 ```
 
 **Arch Linux:**
@@ -205,7 +205,7 @@ sudo pacman -S rust
 # Install br
 rustup install nightly
 rustup default nightly
-cargo install --git https://github.com/Dicklesworthstone/beads_rust.git
+cargo install --git https://github.com/quangdang46/beads_rust.git
 ```
 
 ### macOS
@@ -222,7 +222,7 @@ rustup install nightly
 rustup default nightly
 
 # Install br
-cargo install --git https://github.com/Dicklesworthstone/beads_rust.git
+cargo install --git https://github.com/quangdang46/beads_rust.git
 ```
 
 **Apple Silicon (M1/M2/M3):**
@@ -248,7 +248,7 @@ rustup install nightly
 rustup default nightly
 
 # Install br
-cargo install --git https://github.com/Dicklesworthstone/beads_rust.git
+cargo install --git https://github.com/quangdang46/beads_rust.git
 ```
 
 **With WSL2 (Recommended for Windows):**
@@ -260,7 +260,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source ~/.cargo/env
 rustup install nightly
 rustup default nightly
-cargo install --git https://github.com/Dicklesworthstone/beads_rust.git
+cargo install --git https://github.com/quangdang46/beads_rust.git
 ```
 
 ---
@@ -354,7 +354,7 @@ br upgrade --force
 If you prefer to manage updates manually, build without the self_update feature:
 
 ```bash
-cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --no-default-features
+cargo install --git https://github.com/quangdang46/beads_rust.git --no-default-features
 ```
 
 ---
@@ -401,7 +401,7 @@ Make sure you're running the cargo install command, not trying to build from a n
 
 ```bash
 # Correct: install from git
-cargo install --git https://github.com/Dicklesworthstone/beads_rust.git
+cargo install --git https://github.com/quangdang46/beads_rust.git
 
 # Wrong: trying to build without cloning first
 cargo build  # This requires Cargo.toml in current directory
@@ -465,14 +465,14 @@ If `br upgrade` fails:
 
 ```bash
 # Manual update
-cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --force
+cargo install --git https://github.com/quangdang46/beads_rust.git --force
 ```
 
 ### Getting Help
 
 - **Documentation**: [docs/](./README.md)
 - **Troubleshooting**: [docs/TROUBLESHOOTING.md](./TROUBLESHOOTING.md)
-- **Issues**: [GitHub Issues](https://github.com/Dicklesworthstone/beads_rust/issues)
+- **Issues**: [GitHub Issues](https://github.com/quangdang46/beads_rust/issues)
 
 ---
 

@@ -2,25 +2,15 @@ use super::common::cli::{BrWorkspace, run_br};
 use super::{create_issue, init_workspace, normalize_output};
 use insta::assert_snapshot;
 
-#[cfg(feature = "self_update")]
 #[test]
 fn snapshot_help_output() {
-    let workspace = BrWorkspace::new();
-    let output = run_br(&workspace, ["--help"], "help");
-    assert!(output.status.success(), "help failed: {}", output.stderr);
-    assert_snapshot!("help_output", normalize_output(&output.stdout));
-}
-
-#[test]
-#[cfg(not(feature = "self_update"))]
-fn snapshot_help_output_no_upgrade() {
     let workspace = BrWorkspace::new();
     let output = run_br(&workspace, ["--help"], "help");
     assert!(output.status.success(), "help failed: {}", output.stderr);
     let stdout = &output.stdout;
     assert!(
         !stdout.contains("upgrade"),
-        "help should not list upgrade subcommand without self_update feature"
+        "help should not list upgrade subcommand (removed for RUSTSEC-2026-0194/0195)"
     );
     for cmd in ["create", "list", "show", "close", "search"] {
         assert!(

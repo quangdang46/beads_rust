@@ -561,13 +561,13 @@ jobs:
           ### Quick Install (Recommended)
 
           ```bash
-          curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/beads_rust/main/install.sh | bash
+          curl -fsSL https://raw.githubusercontent.com/quangdang46/beads_rust/main/install.sh | bash
           ```
 
           ### Cargo Install
 
           ```bash
-          cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --tag ${{ steps.asset_version.outputs.release_tag }}
+          cargo install --git https://github.com/quangdang46/beads_rust.git --tag ${{ steps.asset_version.outputs.release_tag }}
           ```
 
           ### Manual Download
@@ -593,7 +593,7 @@ jobs:
 
           ## Full Changelog
 
-          See [CHANGELOG.md](https://github.com/Dicklesworthstone/beads_rust/blob/main/CHANGELOG.md) for the complete history.
+          See [CHANGELOG.md](https://github.com/quangdang46/beads_rust/blob/main/CHANGELOG.md) for the complete history.
           EOF
           } > RELEASE_NOTES.md
 

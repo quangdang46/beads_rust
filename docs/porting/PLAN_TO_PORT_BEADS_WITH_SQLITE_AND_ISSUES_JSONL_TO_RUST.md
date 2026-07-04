@@ -1375,7 +1375,7 @@ edition = "2024"
 rust-version = "1.85"
 description = "Agent-first issue tracker (SQLite + JSONL)"
 license = "MIT"
-repository = "https://github.com/Dicklesworthstone/beads_rust"
+repository = "https://github.com/quangdang46/beads_rust"
 keywords = ["cli", "issue-tracker", "sqlite", "agent"]
 categories = ["command-line-utilities", "development-tools"]
 

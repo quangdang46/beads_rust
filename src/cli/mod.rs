@@ -1046,10 +1046,6 @@ EXAMPLES:
     #[cfg(feature = "mcp")]
     Serve(crate::mcp::ServeArgs),
 
-    /// Upgrade br to the latest version
-    #[cfg(feature = "self_update")]
-    Upgrade(UpgradeArgs),
-
     /// Show version information
     Version(VersionArgs),
 
@@ -3537,26 +3533,7 @@ pub struct AdminResetArgs {
     #[arg(long)]
     pub force: bool,
 }
-/// Arguments for the upgrade command.
-#[cfg(feature = "self_update")]
-#[derive(Args, Debug, Clone, Default)]
-pub struct UpgradeArgs {
-    /// Check only, don't install
-    #[arg(long)]
-    pub check: bool,
-
-    /// Force reinstall current version
-    #[arg(long)]
-    pub force: bool,
-
-    /// Install specific version (e.g., "0.2.0")
-    #[arg(long)]
-    pub version: Option<String>,
-
-    /// Show what would happen without making changes
-    #[arg(long)]
-    pub dry_run: bool,
-}
+// UpgradeArgs was removed in v0.2.16+ (RUSTSEC-2026-0194/0195).
 
 /// Arguments for the orphans command.
 #[derive(Args, Debug, Clone, Default)]

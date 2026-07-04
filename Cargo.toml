@@ -6,7 +6,7 @@ rust-version = "1.88"
 autobenches = false
 description = "Agent-first issue tracker (SQLite + JSONL)"
 license = "MIT"
-repository = "https://github.com/Dicklesworthstone/beads_rust"
+repository = "https://github.com/quangdang46/beads_rust"
 keywords = ["cli", "issue-tracker", "sqlite", "agent"]
 categories = ["command-line-utilities", "development-tools"]
 readme = "README.md"
@@ -110,8 +110,8 @@ semver = "1.0.27"
 # MCP server (optional; gated behind the `mcp` feature)
 fastmcp-rust = { version = "0.3.1", optional = true }
 
-# Self-update (optional; gated behind the `self_update` feature)
-self_update = { version = "0.44", features = ["reqwest", "rustls", "archive-tar", "compression-flate2"], default-features = false, optional = true }
+# Self-update removed for RUSTSEC-2026-0194/0195. Users install via install.sh
+# (https://github.com/quangdang46/beads_rust#installation).
 
 # Cooperative shutdown so SIGINT/SIGTERM/SIGHUP unwind through main and let
 # SqliteStorage::Drop flush the WAL instead of stranding frames on disk (#270).
@@ -156,23 +156,15 @@ strip = false
 opt-level = 1
 
 [features]
-default = ["self_update"]
+default = []
 mcp = ["dep:fastmcp-rust"]
-self_update = [
-    "dep:self_update",
-    "self_update/rustls",
-    "self_update/archive-tar",
-    "self_update/archive-zip",
-    "self_update/compression-flate2",
-    "self_update/compression-zip-deflate",
-]
 
 # NOTE: no `[patch.crates-io]` here.
 #
 # All dependencies — fsqlite 0.1.3+, its fsqlite-* transitive crates, and
 # fastmcp-rust 0.3.1+ — are published on crates.io, so this crate
 # resolves everything from the registry out of the box.  That makes
-# `cargo install --git https://github.com/Dicklesworthstone/beads_rust.git`
+# `cargo install --git https://github.com/quangdang46/beads_rust.git`
 # work without requiring sibling `frankensqlite` or `fastmcp_rust`
 # checkouts (issue #250 bug 1).
 #

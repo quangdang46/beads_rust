@@ -60,9 +60,6 @@ pub fn execute(args: &VersionArgs, ctx: &OutputContext) -> Result<()> {
 
     // Collect enabled features
     let mut features = Vec::new();
-    if cfg!(feature = "self_update") {
-        features.push("self_update");
-    }
     if cfg!(feature = "mcp") {
         features.push("mcp");
     }
@@ -265,7 +262,7 @@ fn execute_update_check(current_version: &str, ctx: &OutputContext) {
     } else if ctx.is_quiet() {
     } else if update_available {
         println!("Update available: {current_version} → {latest}");
-        println!("Run `br upgrade` to update.");
+        println!("To update, see docs/INSTALLING.md (br upgrade was removed in v0.2.16+).");
     } else {
         println!("br {current_version} is up to date (latest: {latest})");
     }
@@ -331,7 +328,7 @@ mod tests {
             branch: Some("main"),
             rust_version: Some("1.85.0"),
             target: Some("x86_64-unknown-linux-gnu"),
-            features: vec!["self_update"],
+            features: vec!["mcp"],
         };
 
         let json = serde_json::to_value(&output).unwrap();
@@ -341,7 +338,7 @@ mod tests {
         assert_eq!(json["branch"], "main");
         assert_eq!(json["rust_version"], "1.85.0");
         assert_eq!(json["target"], "x86_64-unknown-linux-gnu");
-        assert_eq!(json["features"], serde_json::json!(["self_update"]));
+        assert_eq!(json["features"], serde_json::json!(["mcp"]));
     }
 
     #[test]
@@ -389,17 +386,9 @@ mod tests {
     fn test_feature_flags_detection() {
         // Test that feature flags can be detected at compile time
         let mut features = Vec::new();
-        if cfg!(feature = "self_update") {
-            features.push("self_update");
+        if cfg!(feature = "mcp") {
+            features.push("mcp");
         }
-
-        // In default build, self_update should be enabled
-        #[cfg(feature = "self_update")]
-        assert!(features.contains(&"self_update"));
-
-        // Without the feature, the list should be empty
-        #[cfg(not(feature = "self_update"))]
-        assert!(features.is_empty());
     }
 
     #[test]
