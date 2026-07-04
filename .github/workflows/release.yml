@@ -33,8 +33,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@nightly
         with:
           targets: ${{ matrix.target }}
 
@@ -42,7 +41,7 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Install cross (Linux musl targets)
+      - name: Install cross (Linux musl)
         if: contains(matrix.target, 'linux-musl')
         run: cargo install cross --git https://github.com/cross-rs/cross
 
