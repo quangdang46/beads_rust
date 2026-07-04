@@ -76,32 +76,6 @@ fn create_test_issue(i: usize) -> Issue {
         ephemeral: false,
         pinned: false,
         is_template: false,
-        no_history: false,
-        mol_type: Default::default(),
-        work_type: Default::default(),
-        wisp_type: Default::default(),
-        spec_id: None,
-        points: None,
-        started_at: None,
-        metadata: None,
-        source_formula: None,
-        source_location: None,
-        await_type: None,
-        await_id: None,
-        timeout_seconds: None,
-        holder: None,
-        hook_bead: None,
-        role_bead: None,
-        agent_state: None,
-        role_type: None,
-        rig: None,
-        event_kind: None,
-        target: None,
-        payload: None,
-        quality_score: None,
-        crystallizes: false,
-        bonded_from: vec![],
-        waiters: vec![],
         labels: vec![format!("label-{}", i % 5)],
         dependencies: vec![],
         comments: vec![],
@@ -366,7 +340,7 @@ fn bench_update_issue(c: &mut Criterion) {
         let bench_start = log_bench_start(bench_name);
         b.iter(|| {
             let id = format!("bench-{:06}", counter % 100);
-            let update = IssueUpdate { points: None, metadata: None, is_template: None,
+            let update = IssueUpdate {
                 title: Some(format!("Updated title {counter}")),
                 priority: Some(Priority(((counter % 4) + 1) as i32)),
                 status: None,
@@ -432,7 +406,7 @@ fn bench_close_issue_with_reason(c: &mut Criterion) {
         let bench_start = log_bench_start(bench_name);
         b.iter(|| {
             let id = format!("bench-{:06}", counter % 100);
-            let update = IssueUpdate { points: None, metadata: None, is_template: None,
+            let update = IssueUpdate {
                 status: Some(Status::Closed),
                 closed_at: Some(Some(Utc::now())),
                 close_reason: Some(Some("benchmark close".to_string())),
@@ -756,7 +730,7 @@ fn bench_dirty_tracking_mark(c: &mut Criterion) {
         let bench_start = log_bench_start(bench_name);
         b.iter(|| {
             let id = format!("bench-{:06}", counter % 100);
-            let update = IssueUpdate { points: None, metadata: None, is_template: None,
+            let update = IssueUpdate {
                 notes: Some(Some(format!("dirty-note-{counter}"))),
                 ..IssueUpdate::default()
             };
@@ -793,7 +767,7 @@ fn bench_dirty_tracking_query(c: &mut Criterion) {
 
     for i in 0..100 {
         let id = format!("bench-{i:06}");
-        let update = IssueUpdate { points: None, metadata: None, is_template: None,
+        let update = IssueUpdate {
             notes: Some(Some(format!("dirty-note-{i}"))),
             ..IssueUpdate::default()
         };
