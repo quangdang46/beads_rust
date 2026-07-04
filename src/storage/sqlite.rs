@@ -3902,7 +3902,8 @@ impl SqliteStorage {
             || filters.updated_before.is_some()
             || filters.updated_after.is_some()
             || filters.sort.is_some()
-            || filters.reverse;
+            || filters.reverse
+            || filters.external_ref.is_some();
         if unsupported_filter {
             return self.list_issues(filters);
         }
@@ -11029,7 +11030,14 @@ fn default_visible_limited_page_limit(filters: &ListFilters) -> Option<usize> {
         && filters.labels.as_ref().is_none_or(Vec::is_empty)
         && filters.labels_or.as_ref().is_none_or(Vec::is_empty)
         && filters.updated_before.is_none()
-        && filters.updated_after.is_none();
+        && filters.updated_after.is_none()
+        && filters.external_ref.is_none()
+        && filters.ids.is_none()
+        && filters.created_after.is_none()
+        && filters.created_before.is_none()
+        && filters.metadata_filters.as_ref().is_none_or(Vec::is_empty)
+        && filters.owner.is_none()
+        && filters.pinned.is_none();
 
     is_default_visible.then_some(limit)
 }
