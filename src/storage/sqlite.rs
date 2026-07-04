@@ -22394,7 +22394,15 @@ mod tests {
                 pinned INTEGER,
                 is_template INTEGER,
                 source_repo_path TEXT,
-                agent_context TEXT
+                agent_context TEXT,
+                metadata TEXT DEFAULT '{}',
+                no_history INTEGER NOT NULL DEFAULT 0,
+                wisp_type TEXT NOT NULL DEFAULT 'none',
+                mol_type TEXT NOT NULL DEFAULT 'none',
+                work_type TEXT NOT NULL DEFAULT 'none',
+                started_at DATETIME,
+                spec_id TEXT,
+                points INTEGER
             );
             CREATE TABLE blocked_issues_cache (
                 issue_id TEXT PRIMARY KEY,
