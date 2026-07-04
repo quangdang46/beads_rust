@@ -9,9 +9,9 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::formula::Parser;
 use crate::model::{Issue, IssueType, Priority, Status};
-use std::borrow::Cow;
 use crate::output::OutputContext;
 use crate::validation::IssueValidator;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -267,7 +267,10 @@ fn execute_expand(args: &FormulaExpandArgs, output_ctx: &OutputContext) -> crate
                 step.title.as_deref().unwrap_or("(untitled)")
             ));
             if !step.depends_on.is_empty() {
-                output_ctx.print(&format!("       Depends on: {}", step.depends_on.join(", ")));
+                output_ctx.print(&format!(
+                    "       Depends on: {}",
+                    step.depends_on.join(", ")
+                ));
             }
             if !step.needs.is_empty() {
                 output_ctx.print(&format!("       Needs: {}", step.needs.join(", ")));
@@ -339,8 +342,10 @@ fn execute_apply(
                     step.title.as_deref().unwrap_or("(untitled)")
                 ));
                 if !step.depends_on.is_empty() {
-                    output_ctx
-                        .print(&format!("       Depends on: {}", step.depends_on.join(", ")));
+                    output_ctx.print(&format!(
+                        "       Depends on: {}",
+                        step.depends_on.join(", ")
+                    ));
                 }
                 if let Some(gate) = &step.gate {
                     output_ctx.print(&format!(
@@ -383,10 +388,7 @@ fn execute_apply(
         // (gate list, close policy, etc.) can see it.
         let (await_type, await_id, timeout_seconds) = match &step.gate {
             Some(gate) => {
-                let tid = gate
-                    .timeout
-                    .as_deref()
-                    .and_then(parse_timeout_seconds);
+                let tid = gate.timeout.as_deref().and_then(parse_timeout_seconds);
                 (Some(gate.r#type.clone()), gate.await_id.clone(), tid)
             }
             None => (None, None, None),
@@ -427,8 +429,7 @@ fn execute_apply(
                 timeout_seconds,
                 ..Default::default()
             };
-            IssueValidator::validate(&gate_issue)
-                .map_err(BeadsError::from_validation_errors)?;
+            IssueValidator::validate(&gate_issue).map_err(BeadsError::from_validation_errors)?;
             storage.create_issue(&gate_issue, actor)?;
             step_to_gate_issue.insert(step.id.clone(), gate_issue);
         }
@@ -489,14 +490,8 @@ fn execute_apply(
     // Report results
     if use_json {
         let gate_count = step_to_gate_issue.len();
-        let mut issue_ids: Vec<String> = step_to_issue
-            .values()
-            .map(|i| i.id.clone())
-            .collect();
-        let gate_ids: Vec<String> = step_to_gate_issue
-            .values()
-            .map(|i| i.id.clone())
-            .collect();
+        let mut issue_ids: Vec<String> = step_to_issue.values().map(|i| i.id.clone()).collect();
+        let gate_ids: Vec<String> = step_to_gate_issue.values().map(|i| i.id.clone()).collect();
         issue_ids.extend(gate_ids.iter().cloned());
         let output = serde_json::json!({
             "formula": resolved.formula,

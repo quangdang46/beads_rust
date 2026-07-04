@@ -27,7 +27,10 @@ pub enum FormulaType {
 
 impl FormulaType {
     pub fn is_valid(&self) -> bool {
-        matches!(self, Self::Workflow | Self::Expansion | Self::Aspect | Self::Convoy)
+        matches!(
+            self,
+            Self::Workflow | Self::Expansion | Self::Aspect | Self::Convoy
+        )
     }
 }
 

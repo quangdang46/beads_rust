@@ -132,10 +132,7 @@ fn print_same_prefix(ctx: &OutputContext, old_prefix: &str, new_prefix: &str) {
             let theme = ctx.theme();
             let mut text = Text::new("");
             text.append_styled("\u{26a0} No change: ", theme.warning.clone());
-            text.append_styled(
-                "old and new prefix are the same",
-                theme.dimmed.clone(),
-            );
+            text.append_styled("old and new prefix are the same", theme.dimmed.clone());
             console.print_renderable(&text);
         } else {
             println!("No change: old and new prefix are the same");
@@ -175,7 +172,12 @@ fn print_no_matches(ctx: &OutputContext, old_prefix: &str) {
     }
 }
 
-fn print_dry_run(ctx: &OutputContext, old_prefix: &str, new_prefix: &str, renames: &[(String, String)]) {
+fn print_dry_run(
+    ctx: &OutputContext,
+    old_prefix: &str,
+    new_prefix: &str,
+    renames: &[(String, String)],
+) {
     let entries: Vec<PrefixRenameEntry> = renames
         .iter()
         .map(|(old, new)| PrefixRenameEntry {
@@ -238,7 +240,12 @@ fn print_dry_run(ctx: &OutputContext, old_prefix: &str, new_prefix: &str, rename
     }
 }
 
-fn print_result(ctx: &OutputContext, old_prefix: &str, new_prefix: &str, entries: &[PrefixRenameEntry]) {
+fn print_result(
+    ctx: &OutputContext,
+    old_prefix: &str,
+    new_prefix: &str,
+    entries: &[PrefixRenameEntry],
+) {
     if ctx.is_json() {
         let result = RenamePrefixResult {
             old_prefix: old_prefix.to_string(),

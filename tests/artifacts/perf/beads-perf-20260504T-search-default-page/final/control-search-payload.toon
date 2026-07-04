@@ -10,8 +10,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-00,swarm
     dependency_count: 0
     dependent_count: 0
@@ -26,8 +24,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-05,swarm
     dependency_count: 0
     dependent_count: 0
@@ -42,8 +38,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-10,swarm
     dependency_count: 0
     dependent_count: 0
@@ -58,8 +52,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-15,swarm
     dependency_count: 0
     dependent_count: 0
@@ -74,8 +66,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-20,swarm
     dependency_count: 0
     dependent_count: 0
@@ -90,8 +80,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-25,swarm
     dependency_count: 0
     dependent_count: 0
@@ -106,8 +94,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-30,swarm
     dependency_count: 0
     dependent_count: 0
@@ -122,8 +108,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-35,swarm
     dependency_count: 0
     dependent_count: 0
@@ -138,8 +122,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-40,swarm
     dependency_count: 0
     dependent_count: 0
@@ -154,8 +136,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-45,swarm
     dependency_count: 0
     dependent_count: 0
@@ -170,8 +150,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-50,swarm
     dependency_count: 0
     dependent_count: 0
@@ -186,8 +164,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-55,swarm
     dependency_count: 0
     dependent_count: 0
@@ -202,8 +178,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-60,swarm
     dependency_count: 0
     dependent_count: 0
@@ -218,8 +192,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-01,swarm
     dependency_count: 0
     dependent_count: 0
@@ -234,8 +206,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-06,swarm
     dependency_count: 0
     dependent_count: 0
@@ -250,8 +220,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-11,swarm
     dependency_count: 0
     dependent_count: 0
@@ -266,8 +234,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-16,swarm
     dependency_count: 0
     dependent_count: 0
@@ -282,8 +248,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-21,swarm
     dependency_count: 0
     dependent_count: 0
@@ -298,8 +262,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-26,swarm
     dependency_count: 0
     dependent_count: 0
@@ -314,8 +276,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-31,swarm
     dependency_count: 0
     dependent_count: 0
@@ -330,8 +290,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-36,swarm
     dependency_count: 0
     dependent_count: 0
@@ -346,8 +304,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-41,swarm
     dependency_count: 0
     dependent_count: 0
@@ -362,8 +318,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-46,swarm
     dependency_count: 0
     dependent_count: 0
@@ -378,8 +332,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-51,swarm
     dependency_count: 0
     dependent_count: 0
@@ -394,8 +346,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-56,swarm
     dependency_count: 0
     dependent_count: 0
@@ -410,8 +360,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-61,swarm
     dependency_count: 0
     dependent_count: 0
@@ -426,8 +374,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-02,swarm
     dependency_count: 0
     dependent_count: 0
@@ -442,8 +388,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-07,swarm
     dependency_count: 0
     dependent_count: 0
@@ -458,8 +402,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-12,swarm
     dependency_count: 0
     dependent_count: 0
@@ -474,8 +416,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-17,swarm
     dependency_count: 0
     dependent_count: 0
@@ -490,8 +430,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-22,swarm
     dependency_count: 0
     dependent_count: 0
@@ -506,8 +444,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-27,swarm
     dependency_count: 0
     dependent_count: 0
@@ -522,8 +458,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-32,swarm
     dependency_count: 0
     dependent_count: 0
@@ -538,8 +472,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-37,swarm
     dependency_count: 0
     dependent_count: 0
@@ -554,8 +486,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-42,swarm
     dependency_count: 0
     dependent_count: 0
@@ -570,8 +500,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-47,swarm
     dependency_count: 0
     dependent_count: 0
@@ -586,8 +514,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-52,swarm
     dependency_count: 0
     dependent_count: 0
@@ -602,8 +528,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-57,swarm
     dependency_count: 0
     dependent_count: 0
@@ -618,8 +542,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-62,swarm
     dependency_count: 0
     dependent_count: 0
@@ -634,8 +556,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-03,swarm
     dependency_count: 0
     dependent_count: 0
@@ -650,8 +570,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-08,swarm
     dependency_count: 0
     dependent_count: 0
@@ -666,8 +584,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-13,swarm
     dependency_count: 0
     dependent_count: 0
@@ -682,8 +598,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-18,swarm
     dependency_count: 0
     dependent_count: 0
@@ -698,8 +612,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-23,swarm
     dependency_count: 0
     dependent_count: 0
@@ -714,8 +626,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-28,swarm
     dependency_count: 0
     dependent_count: 0
@@ -730,8 +640,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-33,swarm
     dependency_count: 0
     dependent_count: 0
@@ -746,8 +654,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-38,swarm
     dependency_count: 0
     dependent_count: 0
@@ -762,8 +668,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-43,swarm
     dependency_count: 0
     dependent_count: 0
@@ -778,8 +682,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-48,swarm
     dependency_count: 0
     dependent_count: 0
@@ -794,8 +696,6 @@
     created_by: generator
     updated_at: "2026-05-04T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[3]: export,lane-53,swarm
     dependency_count: 0
     dependent_count: 0

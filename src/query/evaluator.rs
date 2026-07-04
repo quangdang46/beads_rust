@@ -78,7 +78,9 @@ fn parse_duration_shorthand(s: &str) -> Result<Duration, QueryError> {
         "h" => Ok(Duration::hours(num)),
         "m" => Ok(Duration::minutes(num)),
         "s" => Ok(Duration::seconds(num)),
-        _ => Err(QueryError::InvalidValue(format!("unknown duration unit: {s}"))),
+        _ => Err(QueryError::InvalidValue(format!(
+            "unknown duration unit: {s}"
+        ))),
     }
 }
 
@@ -125,15 +127,18 @@ fn can_use_filter_only(node: &QueryNode) -> bool {
 /// Build ListFilters from a filter-compatible AST node.
 fn build_filters(node: &QueryNode, filters: &mut ListFilters) -> Result<(), QueryError> {
     match node {
-        QueryNode::Comparison { field, op, value } => {
-            apply_comparison(field, *op, value, filters)
-        }
+        QueryNode::Comparison { field, op, value } => apply_comparison(field, *op, value, filters),
         QueryNode::And(left, right) => {
             build_filters(left, filters)?;
             build_filters(right, filters)
         }
         QueryNode::Not(inner) => {
-            if let QueryNode::Comparison { field, op: ComparisonOp::Eq, value } = inner.as_ref() {
+            if let QueryNode::Comparison {
+                field,
+                op: ComparisonOp::Eq,
+                value,
+            } = inner.as_ref()
+            {
                 match field.as_str() {
                     "status" => {
                         let excl = crate::model::Status::from_str(value).map_err(|_| {
@@ -157,9 +162,9 @@ fn build_filters(node: &QueryNode, filters: &mut ListFilters) -> Result<(), Quer
                         ));
                     }
                     _ => {
-                        return Err(QueryError::InvalidOperator(
-                            format!("NOT not supported for field {field}"),
-                        ));
+                        return Err(QueryError::InvalidOperator(format!(
+                            "NOT not supported for field {field}"
+                        )));
                     }
                 }
                 Ok(())
@@ -184,7 +189,9 @@ fn apply_comparison(
     match field {
         "status" => {
             if op != ComparisonOp::Eq && op != ComparisonOp::NotEq {
-                return Err(QueryError::InvalidOperator("status only supports = and !=".into()));
+                return Err(QueryError::InvalidOperator(
+                    "status only supports = and !=".into(),
+                ));
             }
             let status = crate::model::Status::from_str(value)
                 .map_err(|_| QueryError::InvalidValue(format!("invalid status: {value}")))?;
@@ -196,18 +203,23 @@ fn apply_comparison(
         "priority" => {
             if op != ComparisonOp::Eq {
                 return Err(QueryError::ComplexQuery(
-                    "priority !=, >, <, >=, <= requires predicate filtering (only = supported)".into(),
+                    "priority !=, >, <, >=, <= requires predicate filtering (only = supported)"
+                        .into(),
                 ));
             }
             let priority = crate::model::Priority::from_str(value).map_err(|_| {
-                QueryError::InvalidValue(format!("invalid priority: {value} (expected P0-P4 or 0-4)"))
+                QueryError::InvalidValue(format!(
+                    "invalid priority: {value} (expected P0-P4 or 0-4)"
+                ))
             })?;
             filters.priorities.get_or_insert(Vec::new()).push(priority);
             Ok(())
         }
         "type" => {
             if op != ComparisonOp::Eq && op != ComparisonOp::NotEq {
-                return Err(QueryError::InvalidOperator("type only supports = and !=".into()));
+                return Err(QueryError::InvalidOperator(
+                    "type only supports = and !=".into(),
+                ));
             }
             let issue_type = crate::model::IssueType::from_str(value)
                 .map_err(|_| QueryError::InvalidValue(format!("invalid type: {value}")))?;
@@ -218,9 +230,14 @@ fn apply_comparison(
         }
         "assignee" => {
             if op != ComparisonOp::Eq {
-                return Err(QueryError::InvalidOperator("assignee only supports =".into()));
+                return Err(QueryError::InvalidOperator(
+                    "assignee only supports =".into(),
+                ));
             }
-            if value.eq_ignore_ascii_case("none") || value.eq_ignore_ascii_case("null") || value.is_empty() {
+            if value.eq_ignore_ascii_case("none")
+                || value.eq_ignore_ascii_case("null")
+                || value.is_empty()
+            {
                 filters.unassigned = true;
             } else {
                 filters.assignee = Some(value.to_string());
@@ -231,15 +248,25 @@ fn apply_comparison(
             if op != ComparisonOp::Eq {
                 return Err(QueryError::InvalidOperator("label only supports =".into()));
             }
-            if value.eq_ignore_ascii_case("none") || value.eq_ignore_ascii_case("null") || value.is_empty() {
-                return Err(QueryError::ComplexQuery("label=none requires predicate".into()));
+            if value.eq_ignore_ascii_case("none")
+                || value.eq_ignore_ascii_case("null")
+                || value.is_empty()
+            {
+                return Err(QueryError::ComplexQuery(
+                    "label=none requires predicate".into(),
+                ));
             }
-            filters.labels.get_or_insert(Vec::new()).push(value.to_string());
+            filters
+                .labels
+                .get_or_insert(Vec::new())
+                .push(value.to_string());
             Ok(())
         }
         "title" => {
             if op != ComparisonOp::Eq {
-                return Err(QueryError::InvalidOperator("title only supports = (substring match)".into()));
+                return Err(QueryError::InvalidOperator(
+                    "title only supports = (substring match)".into(),
+                ));
             }
             filters.title_contains = Some(value.to_string());
             Ok(())
@@ -288,9 +315,15 @@ fn apply_comparison(
         }
         "id" => {
             if value.contains('*') {
-                filters.ids.get_or_insert(Vec::new()).push(value.replace('*', "%"));
+                filters
+                    .ids
+                    .get_or_insert(Vec::new())
+                    .push(value.replace('*', "%"));
             } else {
-                filters.ids.get_or_insert(Vec::new()).push(value.to_string());
+                filters
+                    .ids
+                    .get_or_insert(Vec::new())
+                    .push(value.to_string());
             }
             Ok(())
         }
@@ -301,7 +334,9 @@ fn apply_comparison(
         }
         "mol_type" | "mol-type" => {
             if op != ComparisonOp::Eq {
-                return Err(QueryError::InvalidOperator("mol_type only supports =".into()));
+                return Err(QueryError::InvalidOperator(
+                    "mol_type only supports =".into(),
+                ));
             }
             let mt = crate::model::MolType::from_str(value)
                 .map_err(|_| QueryError::InvalidValue(format!("invalid mol_type: {value}")))?;
@@ -318,7 +353,9 @@ fn apply_comparison(
         f if f.starts_with("metadata.") => {
             let key = &f["metadata.".len()..];
             if op != ComparisonOp::Eq {
-                return Err(QueryError::InvalidOperator("metadata only supports =".into()));
+                return Err(QueryError::InvalidOperator(
+                    "metadata only supports =".into(),
+                ));
             }
             filters
                 .metadata_filters
@@ -434,13 +471,11 @@ fn evaluate_predicate_on_issue(
                 apply_str_op(id, value)
             }
         }
-        "labels" => {
-            match op {
-                ComparisonOp::Eq => issue.labels.iter().any(|l| l.eq_ignore_ascii_case(value)),
-                ComparisonOp::NotEq => !issue.labels.iter().any(|l| l.eq_ignore_ascii_case(value)),
-                _ => false,
-            }
-        }
+        "labels" => match op {
+            ComparisonOp::Eq => issue.labels.iter().any(|l| l.eq_ignore_ascii_case(value)),
+            ComparisonOp::NotEq => !issue.labels.iter().any(|l| l.eq_ignore_ascii_case(value)),
+            _ => false,
+        },
         _ if field.starts_with("metadata.") => {
             let key = &field["metadata.".len()..];
             let issue_val: String = issue
@@ -495,15 +530,24 @@ mod tests {
     fn test_simple_status() {
         let result = parse_and_evaluate("status=open").unwrap();
         assert!(!result.requires_predicate);
-        assert_eq!(result.filters.statuses, Some(vec![crate::model::Status::Open]));
+        assert_eq!(
+            result.filters.statuses,
+            Some(vec![crate::model::Status::Open])
+        );
     }
 
     #[test]
     fn test_and_chain() {
         let result = parse_and_evaluate("status=open AND type=bug").unwrap();
         assert!(!result.requires_predicate);
-        assert_eq!(result.filters.statuses, Some(vec![crate::model::Status::Open]));
-        assert_eq!(result.filters.types, Some(vec![crate::model::IssueType::Bug]));
+        assert_eq!(
+            result.filters.statuses,
+            Some(vec![crate::model::Status::Open])
+        );
+        assert_eq!(
+            result.filters.types,
+            Some(vec![crate::model::IssueType::Bug])
+        );
     }
 
     #[test]
@@ -567,7 +611,10 @@ mod tests {
     #[test]
     fn test_priority_exact() {
         let result = parse_and_evaluate("priority=2").unwrap();
-        assert_eq!(result.filters.priorities, Some(vec![crate::model::Priority(2)]));
+        assert_eq!(
+            result.filters.priorities,
+            Some(vec![crate::model::Priority(2)])
+        );
     }
 
     #[test]
@@ -579,8 +626,14 @@ mod tests {
     #[test]
     fn test_multiple_and() {
         let result = parse_and_evaluate("status=open AND priority=1 AND label=urgent").unwrap();
-        assert_eq!(result.filters.statuses, Some(vec![crate::model::Status::Open]));
-        assert_eq!(result.filters.priorities, Some(vec![crate::model::Priority(1)]));
+        assert_eq!(
+            result.filters.statuses,
+            Some(vec![crate::model::Status::Open])
+        );
+        assert_eq!(
+            result.filters.priorities,
+            Some(vec![crate::model::Priority(1)])
+        );
         assert_eq!(result.filters.labels, Some(vec!["urgent".to_string()]));
     }
 

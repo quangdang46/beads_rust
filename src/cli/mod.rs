@@ -773,7 +773,7 @@ pub enum Commands {
     /// Formula Language: workflow-as-code engine
     Formula {
         #[command(subcommand)]
-            command: FormulaCommands,
+        command: FormulaCommands,
     },
 
     /// Manage comments
@@ -1070,7 +1070,6 @@ EXAMPLES:
 
     /// Execute a read-only SQL query against the database
     Sql(SqlArgs),
-
 }
 
 /// Worktree subcommands.
@@ -3531,7 +3530,6 @@ pub struct AdminVacuumArgs {
 #[derive(Args, Debug, Clone, Default)]
 pub struct AdminStatsArgs {}
 
-
 /// Arguments for `br admin reset`.
 #[derive(Args, Debug, Clone, Default)]
 pub struct AdminResetArgs {
@@ -3688,7 +3686,6 @@ pub struct AgentsArgs {
     #[arg(long, short = 'f')]
     pub force: bool,
 }
-
 
 /// Arguments for the sql command.
 #[derive(Args, Debug)]

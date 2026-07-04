@@ -5,7 +5,7 @@
 
 use clap::Subcommand;
 
-use crate::config::{discover_beads_dir_with_cli, open_storage_with_cli, CliOverrides};
+use crate::config::{CliOverrides, discover_beads_dir_with_cli, open_storage_with_cli};
 use crate::error::BeadsError;
 use crate::output::OutputContext;
 
@@ -26,12 +26,14 @@ fn slug_from_key(key: &str) -> Option<&str> {
 fn slugify(text: &str) -> String {
     text.chars()
         .take(40)
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' {
-            c
-        } else if c.is_whitespace() {
-            '-'
-        } else {
-            '_'
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else if c.is_whitespace() {
+                '-'
+            } else {
+                '_'
+            }
         })
         .collect::<String>()
         .trim_matches('-')
@@ -82,13 +84,17 @@ pub fn execute(
 ) -> Result<(), BeadsError> {
     match command {
         MemoryCommands::Remember { text, key } => remember(text, key, overrides, output_ctx),
-        MemoryCommands::Memories { search } => memories(search.as_deref(), json_mode, overrides, output_ctx),
+        MemoryCommands::Memories { search } => {
+            memories(search.as_deref(), json_mode, overrides, output_ctx)
+        }
         MemoryCommands::Recall { key } => recall(key, json_mode, overrides, output_ctx),
         MemoryCommands::Forget { key } => forget(key, json_mode, overrides, output_ctx),
     }
 }
 
-fn get_storage(overrides: &CliOverrides) -> Result<(crate::storage::SqliteStorage, std::path::PathBuf), BeadsError> {
+fn get_storage(
+    overrides: &CliOverrides,
+) -> Result<(crate::storage::SqliteStorage, std::path::PathBuf), BeadsError> {
     let beads_dir = discover_beads_dir_with_cli(overrides)?;
     let storage_result = open_storage_with_cli(&beads_dir, overrides)?;
     Ok((storage_result.storage, beads_dir))
@@ -171,7 +177,9 @@ fn memories(
         println!("{msg}");
     } else {
         if memories.is_empty() {
-            let suffix = search.map(|q| format!(" matching '{q}'")).unwrap_or_default();
+            let suffix = search
+                .map(|q| format!(" matching '{q}'"))
+                .unwrap_or_default();
             println!("No memories stored{suffix}.");
             return Ok(());
         }
@@ -210,9 +218,7 @@ fn recall(
             }
             Ok(())
         }
-        None => Err(BeadsError::Config(format!(
-            "Memory not found: '{key}'"
-        ))),
+        None => Err(BeadsError::Config(format!("Memory not found: '{key}'"))),
     }
 }
 
@@ -238,9 +244,7 @@ fn forget(
         }
         Ok(())
     } else {
-        Err(BeadsError::Config(format!(
-            "Memory not found: '{key}'"
-        )))
+        Err(BeadsError::Config(format!("Memory not found: '{key}'")))
     }
 }
 

@@ -69,9 +69,7 @@ fn execute_list(args: &RecipesListArgs, ctx: &OutputContext) -> Result<()> {
             ctx.print_line(&format!("  {:<20}  {}", name, desc));
         }
     }
-    ctx.print_line(&format!(
-        "\nInstall a recipe: br recipes install <name>"
-    ));
+    ctx.print_line(&format!("\nInstall a recipe: br recipes install <name>"));
 
     Ok(())
 }
@@ -80,13 +78,11 @@ fn execute_list(args: &RecipesListArgs, ctx: &OutputContext) -> Result<()> {
 fn execute_install(args: &RecipesInstallArgs, ctx: &OutputContext) -> Result<()> {
     let project_dir = resolve_project_dir(args.project_dir.as_deref())?;
 
-    let recipe = recipes::find_recipe(&args.recipe).ok_or_else(|| {
-        BeadsError::Internal {
-            message: format!(
-                "Unknown recipe '{}'. Use `br recipes list` to see available recipes.",
-                args.recipe
-            ),
-        }
+    let recipe = recipes::find_recipe(&args.recipe).ok_or_else(|| BeadsError::Internal {
+        message: format!(
+            "Unknown recipe '{}'. Use `br recipes list` to see available recipes.",
+            args.recipe
+        ),
     })?;
 
     let written = recipes::install_recipe(recipe, &project_dir)?;

@@ -10,7 +10,7 @@
 //! 1. **Cold-start miss** — agent claims a child and never reads the
 //!    epic.
 //! 2. **Context decay** — agent had the instructions at session start
-//!    but compaction has dropped them.
+//!    but they were dropped from context.
 //! 3. **Stale propagation** — ancestor instructions were updated mid-
 //!    flight but descendants read only the cold-start snapshot.
 //!

@@ -22,8 +22,8 @@ use std::path::Path;
 
 pub use aes_gcm::aead::OsRng;
 use aes_gcm::{
-    aead::{Aead, AeadCore, KeyInit},
     Aes256Gcm, Key, Nonce,
+    aead::{Aead, AeadCore, KeyInit},
 };
 use thiserror::Error;
 
@@ -253,11 +253,17 @@ mod tests {
         let key = CredentialKey::load_or_create(dir.path()).unwrap();
         // The key file should now exist
         let key_path = dir.path().join(CREDENTIAL_KEY_FILE);
-        assert!(key_path.exists(), "key file should exist after load_or_create");
+        assert!(
+            key_path.exists(),
+            "key file should exist after load_or_create"
+        );
 
         // Loading again should read the same key
         let key2 = CredentialKey::load_or_create(dir.path()).unwrap();
-        assert_eq!(key.key_bytes, key2.key_bytes, "key should be stable across loads");
+        assert_eq!(
+            key.key_bytes, key2.key_bytes,
+            "key should be stable across loads"
+        );
     }
 
     #[test]
@@ -302,7 +308,10 @@ mod tests {
         let key = CredentialKey::load_or_create(dir.path()).unwrap();
         let a = key.encrypt_password("same").unwrap().unwrap();
         let b = key.encrypt_password("same").unwrap().unwrap();
-        assert_ne!(a, b, "same plaintext should produce different ciphertext (nonce)");
+        assert_ne!(
+            a, b,
+            "same plaintext should produce different ciphertext (nonce)"
+        );
     }
 
     #[test]
@@ -313,7 +322,10 @@ mod tests {
         // Flip a byte in the ciphertext (after the nonce)
         encrypted[13] ^= 0xFF;
         let result = key.decrypt_password(&encrypted);
-        assert!(result.is_err(), "tampered ciphertext should fail decryption");
+        assert!(
+            result.is_err(),
+            "tampered ciphertext should fail decryption"
+        );
     }
 
     #[test]

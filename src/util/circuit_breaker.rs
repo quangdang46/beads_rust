@@ -70,10 +70,7 @@ pub struct CircuitOpenError;
 
 impl std::fmt::Display for CircuitOpenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "circuit breaker is open: failing fast (cooldown active)"
-        )
+        write!(f, "circuit breaker is open: failing fast (cooldown active)")
     }
 }
 
@@ -334,15 +331,13 @@ impl PersistentCircuitBreaker {
                 },
                 failure_count: ps.failure_count,
                 success_count: ps.success_count,
-                last_tripped_at: ps
-                    .last_tripped_at
-                    .and_then(|ns| {
-                        let d = Duration::from_nanos(ns);
-                        // Instant is platform‑relative; we store raw nanos
-                        // since the tripped event. On restore we approximate
-                        // using Instant::now() minus the elapsed nanos.
-                        Instant::now().checked_sub(d)
-                    }),
+                last_tripped_at: ps.last_tripped_at.and_then(|ns| {
+                    let d = Duration::from_nanos(ns);
+                    // Instant is platform‑relative; we store raw nanos
+                    // since the tripped event. On restore we approximate
+                    // using Instant::now() minus the elapsed nanos.
+                    Instant::now().checked_sub(d)
+                }),
                 config: config.clone(),
             },
             None => CircuitBreaker::new(config.clone()),
@@ -438,18 +433,19 @@ impl PersistentCircuitBreaker {
 
     fn persist_on_change(&self, inner: &CircuitBreaker) {
         // Only write when there's meaningful state (not just Closed with 0)
-        if inner.failure_count() > 0 || inner.success_count() > 0 || inner.state() != CircuitState::Closed {
+        if inner.failure_count() > 0
+            || inner.success_count() > 0
+            || inner.state() != CircuitState::Closed
+        {
             self.write_state(inner);
         }
     }
 
     fn write_state(&self, inner: &CircuitBreaker) {
-        let elapsed_ns = inner
-            .last_tripped_at
-            .map(|instant| {
-                // Store the Instant–relative elapsed as proxy nanos
-                instant.elapsed().as_nanos() as u64
-            });
+        let elapsed_ns = inner.last_tripped_at.map(|instant| {
+            // Store the Instant–relative elapsed as proxy nanos
+            instant.elapsed().as_nanos() as u64
+        });
 
         let ps = PersistedBreakerState {
             state: inner.state().as_str().to_string(),
@@ -644,7 +640,10 @@ mod persistent_tests {
         let dir = Path::new(BREAKER_DIR);
         let _ = std::fs::create_dir_all(dir);
         let file = dir.join("stale-test.json");
-        let _ = std::fs::write(&file, r#"{"state":"open","failure_count":5,"success_count":0}"#);
+        let _ = std::fs::write(
+            &file,
+            r#"{"state":"open","failure_count":5,"success_count":0}"#,
+        );
 
         let count = clean_stale_circuit_files().unwrap_or(0);
         // File may already be gone; just check no crash

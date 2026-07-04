@@ -2,7 +2,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::formula::{parser, Formula, FormulaType, Step, VarDef};
+    use crate::formula::{Formula, FormulaType, Step, VarDef, parser};
     use std::collections::HashMap;
 
     #[test]
@@ -52,13 +52,11 @@ mod tests {
             formula: "mol-valid".to_string(),
             version: 1,
             r#type: FormulaType::Workflow,
-            steps: Some(vec![
-                Step {
-                    id: "step1".to_string(),
-                    title: Some("Step 1".to_string()),
-                    ..Default::default()
-                },
-            ]),
+            steps: Some(vec![Step {
+                id: "step1".to_string(),
+                title: Some("Step 1".to_string()),
+                ..Default::default()
+            }]),
             ..Default::default()
         };
         assert!(formula.validate().is_ok());
@@ -128,14 +126,12 @@ mod tests {
         let formula = Formula {
             formula: "mol-bad-prio".to_string(),
             version: 1,
-            steps: Some(vec![
-                Step {
-                    id: "step1".to_string(),
-                    title: Some("Bad".to_string()),
-                    priority: Some(99),
-                    ..Default::default()
-                },
-            ]),
+            steps: Some(vec![Step {
+                id: "step1".to_string(),
+                title: Some("Bad".to_string()),
+                priority: Some(99),
+                ..Default::default()
+            }]),
             ..Default::default()
         };
         let err = formula.validate().unwrap_err();

@@ -12,6 +12,4 @@ expression: normalized
     created_by: fixture
     updated_at: "2026-02-02T00:00:00Z"
     source_repo: .
-    compaction_level: 0
-    original_size: 0
     labels[2]: agent,ops

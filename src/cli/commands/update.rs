@@ -15,7 +15,9 @@ use crate::output::OutputContext;
 use crate::storage::{EventAttribution, IssueUpdate, SqliteStorage};
 use crate::util::id::{IdResolver, ResolverConfig};
 use crate::util::time::parse_flexible_timestamp;
-use crate::validation::{LabelValidator, validate_custom_status_against_registry, validate_custom_type_against_registry};
+use crate::validation::{
+    LabelValidator, validate_custom_status_against_registry, validate_custom_type_against_registry,
+};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -495,7 +497,10 @@ fn execute_prepared_route(
             // prefix. Reads the current notes from `issue_before` so multi-agent
             // append is safe (no data loss from silent replace).
             if let Some(ref push_content) = prepared.notes_push {
-                let existing_notes = issue_before.as_ref().and_then(|i| i.notes.as_deref()).unwrap_or("");
+                let existing_notes = issue_before
+                    .as_ref()
+                    .and_then(|i| i.notes.as_deref())
+                    .unwrap_or("");
                 let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
                 let new_notes = if existing_notes.is_empty() {
                     format!("[{timestamp}] {push_content}")

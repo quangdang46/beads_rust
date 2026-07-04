@@ -750,7 +750,6 @@ fn normalize_value(value: &mut Value) {
                 "deleted_at",
                 "due_at",
                 "defer_until",
-                "compacted_at",
             ]
             .into_iter()
             .collect();

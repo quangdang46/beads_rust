@@ -35,10 +35,10 @@
 //! store.create_issue(&issue, "alice")?;  // fires hook after commit
 //! ```
 
+use crate::Result;
 use crate::model::Issue;
 use crate::model::Status;
 use crate::storage::sqlite::{IssueUpdate, ListFilters, SqliteStorage};
-use crate::Result;
 use std::path::Path;
 
 #[cfg(unix)]
@@ -150,7 +150,10 @@ impl HookFiringStore {
     /// Update an issue, then fire the `on_update` hook.
     /// If the update changes status to `Closed`, also fires `on_close`.
     pub fn update_issue(&mut self, id: &str, updates: &IssueUpdate, actor: &str) -> Result<Issue> {
-        let is_close = updates.status.as_ref().map_or(false, |s| *s == Status::Closed);
+        let is_close = updates
+            .status
+            .as_ref()
+            .map_or(false, |s| *s == Status::Closed);
         let updated = self.inner.update_issue(id, updates, actor)?;
         Self::fire(&self.on_update_hook, id, actor, "on_update");
         if is_close {
@@ -160,14 +163,11 @@ impl HookFiringStore {
     }
 
     /// Delete an issue, then fire `on_close`.
-    pub fn delete_issue(
-        &mut self,
-        id: &str,
-        actor: &str,
-        reason: &str,
-    ) -> Result<Issue> {
+    pub fn delete_issue(&mut self, id: &str, actor: &str, reason: &str) -> Result<Issue> {
         use chrono::Utc;
-        let deleted = self.inner.delete_issue(id, actor, reason, Some(Utc::now()))?;
+        let deleted = self
+            .inner
+            .delete_issue(id, actor, reason, Some(Utc::now()))?;
         Self::fire(&self.on_close_hook, id, actor, "on_close");
         Ok(deleted)
     }
@@ -235,9 +235,7 @@ pub fn fire_hook_scripts(beads_dir: &Path, event: &str, id: &str, actor: &str) {
             }
         }
         Err(e) => {
-            tracing::error!(
-                "Failed to execute hook script {hook_path:?} for issue {id}: {e}",
-            );
+            tracing::error!("Failed to execute hook script {hook_path:?} for issue {id}: {e}",);
         }
     }
 }
@@ -297,7 +295,9 @@ mod tests {
             title: Some("Updated".to_string()),
             ..Default::default()
         };
-        store.update_issue("hook-upd-1", &updates, "tester").unwrap();
+        store
+            .update_issue("hook-upd-1", &updates, "tester")
+            .unwrap();
 
         let fired = fired.lock().unwrap();
         assert!(fired.iter().any(|(id, _)| id == "hook-upd-1"));
@@ -319,7 +319,9 @@ mod tests {
             status: Some(Status::Closed),
             ..Default::default()
         };
-        store.update_issue("hook-close-1", &updates, "tester").unwrap();
+        store
+            .update_issue("hook-close-1", &updates, "tester")
+            .unwrap();
         let fired = fired.lock().unwrap();
         assert!(fired.iter().any(|(id, _)| id == "hook-close-1"));
     }
@@ -370,7 +372,9 @@ mod tests {
             title: Some("v2".to_string()),
             ..Default::default()
         };
-        store.update_issue("hook-indep-1", &updates, "tester").unwrap();
+        store
+            .update_issue("hook-indep-1", &updates, "tester")
+            .unwrap();
 
         assert_eq!(created.lock().unwrap().len(), 1);
         assert_eq!(updated.lock().unwrap().len(), 1);

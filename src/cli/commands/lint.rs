@@ -469,7 +469,9 @@ fn lint_issue(issue: &Issue) -> Option<LintResult> {
             .into_iter()
             .filter(|section| {
                 !matches!(
-                    strip_heading_prefix(section.heading).to_lowercase().as_str(),
+                    strip_heading_prefix(section.heading)
+                        .to_lowercase()
+                        .as_str(),
                     "acceptance criteria" | "success criteria"
                 )
             })
@@ -574,10 +576,6 @@ mod tests {
             deleted_by: None,
             delete_reason: None,
             original_type: None,
-            compaction_level: None,
-            compacted_at: None,
-            compacted_at_commit: None,
-            original_size: None,
             sender: None,
             ephemeral: false,
             pinned: false,

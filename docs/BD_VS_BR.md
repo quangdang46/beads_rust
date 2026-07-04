@@ -8,9 +8,7 @@ The following `bd` features are **not** planned for `br`:
 
 | Feature | `bd` Command | Rationale |
 |---------|-------------|-----------|
-| Dolt version control | `bd dolt`, `bd branch`, `bd vc`, `bd merge`, `bd commit`, `--as-of` | `br` uses SQLite + JSONL; Dolt adds complexity with no clear agent benefit |
 | External tracker sync | `bd track`, `bd sync-linear`, `bd sync-jira`, `bd sync-ado`, `bd sync-github`, `bd sync-notion` | Agents use MCP / APIs directly; `bd` shell-outs are brittle |
-| Semantic compaction | `bd admin compact`, `bd restore` | Haiku-format compaction is experimental; `br` stores full content with SHA-256 dedup |
 | Persistent memory | `bd remember`, `bd prime` | Use `br robot-docs` + `br agents` for session context; LLM memory handled externally |
 | Mol/Swarm user domain | `bd mol`, `bd swarm`, full formula cook | Swarm orchestration has its own external tooling |
 | RPC daemon | `bd daemon rpc`, `bd daemon start` | `br serve` uses MCP over stdio (no network daemon) |
@@ -99,4 +97,3 @@ See the intentionally out-of-scope table above.
 - **`bd daemon start`** → use `br serve` (MCP) or direct CLI invocation
 - **`bd prime`** → `br robot-docs` + `br agents session` for session context
 - **`bd remember`** → external LLM memory system
-- **`bd dolt`** → no equivalent; `br` uses SQLite-native sync

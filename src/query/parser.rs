@@ -15,7 +15,11 @@ pub struct ParseError {
 
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "query parse error at position {}: {}", self.pos, self.message)
+        write!(
+            f,
+            "query parse error at position {}: {}",
+            self.pos, self.message
+        )
     }
 }
 
@@ -46,10 +50,10 @@ impl<'a> Parser<'a> {
             self.current = tok;
             Ok(())
         } else {
-            let tok = self
-                .lexer
-                .next_token()
-                .map_err(|msg| ParseError { message: msg, pos: self.current.pos })?;
+            let tok = self.lexer.next_token().map_err(|msg| ParseError {
+                message: msg,
+                pos: self.current.pos,
+            })?;
             self.current = tok;
             Ok(())
         }
@@ -57,10 +61,10 @@ impl<'a> Parser<'a> {
 
     fn peek(&mut self) -> Result<&Token, ParseError> {
         if self.peeked.is_none() {
-            let tok = self
-                .lexer
-                .next_token()
-                .map_err(|msg| ParseError { message: msg, pos: self.current.pos })?;
+            let tok = self.lexer.next_token().map_err(|msg| ParseError {
+                message: msg,
+                pos: self.current.pos,
+            })?;
             self.peeked = Some(tok);
         }
         Ok(self.peeked.as_ref().unwrap())
@@ -168,7 +172,7 @@ impl<'a> Parser<'a> {
                         self.current.pos, self.current.value
                     ),
                     pos: self.current.pos,
-                })
+                });
             }
         };
         self.advance()?;
@@ -184,7 +188,7 @@ impl<'a> Parser<'a> {
                         self.current.pos, self.current.value
                     ),
                     pos: self.current.pos,
-                })
+                });
             }
         };
         self.advance()?;

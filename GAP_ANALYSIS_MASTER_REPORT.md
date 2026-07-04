@@ -1,4 +1,6 @@
-# Master Gap Analysis Report: Go beads (bd) vs Rust beads_rust (br)
+# [ARCHIVED] Master Gap Analysis Report: Go beads (bd) vs Rust beads_rust (br)
+
+**Status: ARCHIVED** — This report reflects an earlier phase of the project. The Dolt/compaction/Haiku references below are historical and no longer represent planned work for `br`.
 
 **Generated:** 2026-06-28  
 **Source:** Multi-agent deep comparison workflow (26/30 agents completed, 7 phases)  

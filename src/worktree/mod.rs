@@ -168,12 +168,10 @@ pub fn create_worktree(
 
     let branch_name = match branch {
         Some(b) => b.to_string(),
-        None => {
-            resolved_path
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default()
-        }
+        None => resolved_path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default(),
     };
 
     let resolved_str = resolved_path.to_string_lossy().to_string();
@@ -219,8 +217,7 @@ pub fn remove_worktree(
 
     // Safety checks unless --force
     if !force {
-        check_worktree_safety(&resolved)
-            .context("safety check failed (use --force to skip)")?;
+        check_worktree_safety(&resolved).context("safety check failed (use --force to skip)")?;
     }
 
     let mut args = vec!["worktree", "remove"];
@@ -477,8 +474,11 @@ fn add_to_gitignore(repo_root: &Path, entry: &str) -> Result<()> {
 
 /// Check if git is already ignoring a path.
 fn is_ignored_by_git(repo_root: &Path, entry: &str) -> bool {
-    capture_git(repo_root, &["check-ignore", "-q", "--no-index", "--", entry])
-        .is_ok()
+    capture_git(
+        repo_root,
+        &["check-ignore", "-q", "--no-index", "--", entry],
+    )
+    .is_ok()
 }
 
 /// Remove a path from .gitignore (removes the marker comment + entry).
@@ -503,8 +503,7 @@ fn remove_from_gitignore(repo_root: &Path, entry: &str) -> Result<()> {
         new_lines.push(line);
     }
 
-    std::fs::write(&gitignore, new_lines.join("\n"))
-        .context("failed to write .gitignore")?;
+    std::fs::write(&gitignore, new_lines.join("\n")).context("failed to write .gitignore")?;
 
     Ok(())
 }
@@ -576,31 +575,26 @@ bare
     #[test]
     fn test_detect_beads_state_none() {
         let dir = tempfile::TempDir::new().unwrap();
-        assert_eq!(
-            detect_beads_state(dir.path(), None),
-            BeadsState::None
-        );
+        assert_eq!(detect_beads_state(dir.path(), None), BeadsState::None);
     }
 
     #[test]
     fn test_detect_beads_state_local() {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::create_dir(dir.path().join(".beads")).unwrap();
-        assert_eq!(
-            detect_beads_state(dir.path(), None),
-            BeadsState::Local
-        );
+        assert_eq!(detect_beads_state(dir.path(), None), BeadsState::Local);
     }
 
     #[test]
     fn test_detect_beads_state_redirect() {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::create_dir_all(dir.path().join(".beads")).unwrap();
-        std::fs::write(dir.path().join(".beads").join(REDIRECT_FILE_NAME), "/some/target").unwrap();
-        assert_eq!(
-            detect_beads_state(dir.path(), None),
-            BeadsState::Redirect
-        );
+        std::fs::write(
+            dir.path().join(".beads").join(REDIRECT_FILE_NAME),
+            "/some/target",
+        )
+        .unwrap();
+        assert_eq!(detect_beads_state(dir.path(), None), BeadsState::Redirect);
     }
 
     #[test]

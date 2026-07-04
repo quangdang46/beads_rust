@@ -433,11 +433,7 @@ fn remove_broken_markers(content: &str) -> String {
                     .find('\n')
                     .map(|i| end_of_end + i + 1)
                     .unwrap_or(result.len());
-                result = format!(
-                    "{}{}",
-                    &result[..line_start],
-                    &result[end_of_line..]
-                );
+                result = format!("{}{}", &result[..line_start], &result[end_of_line..]);
             }
             (Some(b), _) => {
                 result = remove_orphan_begin(&result, b);
@@ -582,11 +578,7 @@ pub fn run_hook(hook_name: &str) -> Result<()> {
                 history: crate::sync::history::HistoryConfig::default(),
                 max_parallel_workers: 0,
             };
-            sync::export_to_jsonl_with_policy(
-                &storage_ctx.storage,
-                &jsonl_path,
-                &export_config,
-            )?;
+            sync::export_to_jsonl_with_policy(&storage_ctx.storage, &jsonl_path, &export_config)?;
         }
         "post-merge" | "post-checkout" => {
             let jsonl_path = beads_dir.join("beads.jsonl");
@@ -662,10 +654,7 @@ mod tests {
         let result = inject_hook_section(&existing, &new_section);
         // Should contain the markers once
         let begin_count = result.matches(SECTION_BEGIN_PREFIX).count();
-        assert_eq!(
-            begin_count, 1,
-            "Should have exactly one BEGIN marker"
-        );
+        assert_eq!(begin_count, 1, "Should have exactly one BEGIN marker");
     }
 
     #[test]

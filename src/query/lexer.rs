@@ -107,32 +107,70 @@ impl<'a> Lexer<'a> {
         };
 
         match ch {
-            '(' => Ok(Token { type_: TokenType::LParen, value: "(".into(), pos: start }),
-            ')' => Ok(Token { type_: TokenType::RParen, value: ")".into(), pos: start }),
-            ',' => Ok(Token { type_: TokenType::Comma, value: ",".into(), pos: start }),
-            '=' => Ok(Token { type_: TokenType::Equals, value: "=".into(), pos: start }),
+            '(' => Ok(Token {
+                type_: TokenType::LParen,
+                value: "(".into(),
+                pos: start,
+            }),
+            ')' => Ok(Token {
+                type_: TokenType::RParen,
+                value: ")".into(),
+                pos: start,
+            }),
+            ',' => Ok(Token {
+                type_: TokenType::Comma,
+                value: ",".into(),
+                pos: start,
+            }),
+            '=' => Ok(Token {
+                type_: TokenType::Equals,
+                value: "=".into(),
+                pos: start,
+            }),
             '!' => {
                 if self.peek() == Some(&'=') {
                     self.next();
-                    Ok(Token { type_: TokenType::NotEquals, value: "!=".into(), pos: start })
+                    Ok(Token {
+                        type_: TokenType::NotEquals,
+                        value: "!=".into(),
+                        pos: start,
+                    })
                 } else {
-                    Err(format!("unexpected '!' at position {start} (did you mean '!=' or 'NOT'?)"))
+                    Err(format!(
+                        "unexpected '!' at position {start} (did you mean '!=' or 'NOT'?)"
+                    ))
                 }
             }
             '<' => {
                 if self.peek() == Some(&'=') {
                     self.next();
-                    Ok(Token { type_: TokenType::LessEq, value: "<=".into(), pos: start })
+                    Ok(Token {
+                        type_: TokenType::LessEq,
+                        value: "<=".into(),
+                        pos: start,
+                    })
                 } else {
-                    Ok(Token { type_: TokenType::Less, value: "<".into(), pos: start })
+                    Ok(Token {
+                        type_: TokenType::Less,
+                        value: "<".into(),
+                        pos: start,
+                    })
                 }
             }
             '>' => {
                 if self.peek() == Some(&'=') {
                     self.next();
-                    Ok(Token { type_: TokenType::GreaterEq, value: ">=".into(), pos: start })
+                    Ok(Token {
+                        type_: TokenType::GreaterEq,
+                        value: ">=".into(),
+                        pos: start,
+                    })
                 } else {
-                    Ok(Token { type_: TokenType::Greater, value: ">".into(), pos: start })
+                    Ok(Token {
+                        type_: TokenType::Greater,
+                        value: ">".into(),
+                        pos: start,
+                    })
                 }
             }
             '\"' | '\'' => self.read_string(ch, start),
@@ -140,14 +178,23 @@ impl<'a> Lexer<'a> {
                 // Wildcard: re-interpret as an identifier character
                 // Read remaining ident chars
                 while let Some(&ch) = self.peek() {
-                    if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '.' || ch == '*' {
+                    if ch.is_ascii_alphanumeric()
+                        || ch == '_'
+                        || ch == '-'
+                        || ch == '.'
+                        || ch == '*'
+                    {
                         self.next();
                     } else {
                         break;
                     }
                 }
                 let value: String = self.input[start..self.pos].to_string();
-                Ok(Token { type_: TokenType::Ident, value, pos: start })
+                Ok(Token {
+                    type_: TokenType::Ident,
+                    value,
+                    pos: start,
+                })
             }
             _ if ch.is_ascii_digit() || ch == '+' || ch == '-' => {
                 self.read_number_or_duration(start)
@@ -165,7 +212,11 @@ impl<'a> Lexer<'a> {
         match self.peek() {
             Some(&'d') | Some(&'h') | Some(&'m') | Some(&'s') | Some(&'w') => {
                 let ch = self.next().unwrap();
-                Ok(Token { type_: TokenType::Duration, value: format!("{value}{ch}"), pos: start })
+                Ok(Token {
+                    type_: TokenType::Duration,
+                    value: format!("{value}{ch}"),
+                    pos: start,
+                })
             }
             Some(&'-') if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) => {
                 // ISO date pattern: YYYY-MM-DD
@@ -196,9 +247,17 @@ impl<'a> Lexer<'a> {
                 // Not a full ISO date, restore state after the first digit sequence
                 self.pos = end;
                 self.chars = self.input[end..].chars().peekable();
-                Ok(Token { type_: TokenType::Number, value, pos: start })
+                Ok(Token {
+                    type_: TokenType::Number,
+                    value,
+                    pos: start,
+                })
             }
-            _ => Ok(Token { type_: TokenType::Number, value, pos: start }),
+            _ => Ok(Token {
+                type_: TokenType::Number,
+                value,
+                pos: start,
+            }),
         }
     }
 
@@ -228,7 +287,11 @@ impl<'a> Lexer<'a> {
             "NOT" => TokenType::Not,
             _ => TokenType::Ident,
         };
-        Ok(Token { type_, value, pos: start })
+        Ok(Token {
+            type_,
+            value,
+            pos: start,
+        })
     }
 }
 

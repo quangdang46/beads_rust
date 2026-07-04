@@ -37,8 +37,8 @@ use std::io::{BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 use std::time::UNIX_EPOCH;
 use tempfile::tempdir;
@@ -6566,8 +6566,6 @@ routing:
                 .with_timezone(&Utc),
             created_by: Some("ubuntu".to_string()),
             source_repo: Some(".".to_string()),
-            compaction_level: Some(0),
-            original_size: Some(0),
             ..Issue::default()
         };
         write_issue_jsonl(&jsonl_path, &issue);

@@ -3,8 +3,8 @@
 //! Imports issues from JSON, CSV, or markdown files into the database.
 //! Uses existing sync infrastructure for JSONL imports via `br sync --import-only`.
 
-use crate::cli::ImportArgs;
 use crate::cli::ExportFormat;
+use crate::cli::ImportArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::model::*;
@@ -16,11 +16,7 @@ use std::str::FromStr;
 
 /// Execute the import command.
 #[allow(clippy::too_many_lines)]
-pub fn execute(
-    args: &ImportArgs,
-    cli: &config::CliOverrides,
-    ctx: &OutputContext,
-) -> Result<()> {
+pub fn execute(args: &ImportArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
     execute_inner(args, cli, ctx, &mut storage_ctx)
@@ -84,8 +80,12 @@ fn execute_inner(
                 show_progress: false,
             };
 
-            let result =
-                crate::sync::import_from_jsonl(storage, &input_path, &import_config, args.rename_prefix.as_deref())?;
+            let result = crate::sync::import_from_jsonl(
+                storage,
+                &input_path,
+                &import_config,
+                args.rename_prefix.as_deref(),
+            )?;
 
             if ctx.is_json() {
                 ctx.json_pretty(&serde_json::json!({
@@ -152,10 +152,7 @@ fn report_count(imported: usize, input_path: &Path, ctx: &OutputContext) {
 }
 
 /// Import issues into storage, trying create then update on conflict.
-fn import_issues(
-    storage: &mut crate::storage::SqliteStorage,
-    issues: &[Issue],
-) -> Result<usize> {
+fn import_issues(storage: &mut crate::storage::SqliteStorage, issues: &[Issue]) -> Result<usize> {
     let mut count = 0;
     for issue in issues {
         match storage.create_issue(issue, "br-import") {
@@ -227,7 +224,10 @@ fn issue_from_csv_row(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
-            BeadsError::Config(format!("Row {}: missing required 'title' field", row_idx + 2))
+            BeadsError::Config(format!(
+                "Row {}: missing required 'title' field",
+                row_idx + 2
+            ))
         })?;
 
     issue.description = fields
@@ -261,9 +261,7 @@ fn issue_from_csv_row(
         .get("closed_at")
         .and_then(|s| parse_datetime(s.trim()));
 
-    issue.due_at = fields
-        .get("due_at")
-        .and_then(|s| parse_datetime(s.trim()));
+    issue.due_at = fields.get("due_at").and_then(|s| parse_datetime(s.trim()));
 
     issue.defer_until = fields
         .get("defer_until")

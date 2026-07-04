@@ -102,17 +102,10 @@ schemas:
       deleted_by.type[2]: string,"null"
       delete_reason.type[2]: string,"null"
       original_type.type[2]: string,"null"
-      compaction_level:
-        type[2]: integer,"null"
-        format: int32
-        default: 0
       compacted_at:
         type[2]: string,"null"
         format: date-time
       compacted_at_commit.type[2]: string,"null"
-      original_size:
-        type[2]: integer,"null"
-        format: int32
       sender.type[2]: string,"null"
       ephemeral.type: boolean
       pinned.type: boolean
@@ -916,17 +909,10 @@ schemas:
       deleted_by.type[2]: string,"null"
       delete_reason.type[2]: string,"null"
       original_type.type[2]: string,"null"
-      compaction_level:
-        type[2]: integer,"null"
-        format: int32
-        default: 0
       compacted_at:
         type[2]: string,"null"
         format: date-time
       compacted_at_commit.type[2]: string,"null"
-      original_size:
-        type[2]: integer,"null"
-        format: int32
       sender.type[2]: string,"null"
       ephemeral.type: boolean
       pinned.type: boolean
@@ -1103,17 +1089,10 @@ schemas:
       deleted_by.type[2]: string,"null"
       delete_reason.type[2]: string,"null"
       original_type.type[2]: string,"null"
-      compaction_level:
-        type[2]: integer,"null"
-        format: int32
-        default: 0
       compacted_at:
         type[2]: string,"null"
         format: date-time
       compacted_at_commit.type[2]: string,"null"
-      original_size:
-        type[2]: integer,"null"
-        format: int32
       sender.type[2]: string,"null"
       ephemeral.type: boolean
       pinned.type: boolean
@@ -1329,17 +1308,10 @@ schemas:
       deleted_by.type[2]: string,"null"
       delete_reason.type[2]: string,"null"
       original_type.type[2]: string,"null"
-      compaction_level:
-        type[2]: integer,"null"
-        format: int32
-        default: 0
       compacted_at:
         type[2]: string,"null"
         format: date-time
       compacted_at_commit.type[2]: string,"null"
-      original_size:
-        type[2]: integer,"null"
-        format: int32
       sender.type[2]: string,"null"
       ephemeral.type: boolean
       pinned.type: boolean
@@ -1431,7 +1403,7 @@ schemas:
   ReadyIssue:
     "$schema": "https://json-schema.org/draft/2020-12/schema"
     title: ReadyIssue
-    description: "Minimal issue output for ready command (bd parity).\n\nContains only the fields that bd's ready command outputs.\nDoes NOT include: `compaction_level`, `original_size`, `dependency_count`, `dependent_count`"
+    description: "Minimal issue output for ready command (bd parity).\n\nContains only the fields that bd's ready command outputs.\nDoes NOT include: `dependency_count`, `dependent_count`"
     type: object
     properties:
       acceptance_criteria.type[2]: string,"null"

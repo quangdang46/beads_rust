@@ -274,10 +274,6 @@ fn assert_ignored_fields_do_not_affect_hash(
     variant.deleted_by = Some(String::from("ignored deleter"));
     variant.delete_reason = Some(String::from("ignored delete reason"));
     variant.original_type = Some(String::from("ignored original type"));
-    variant.compaction_level = Some(7);
-    variant.compacted_at = Some(created_at);
-    variant.compacted_at_commit = Some(String::from("ignored-commit"));
-    variant.original_size = Some(123);
     variant.sender = Some(String::from("ignored sender"));
     variant.ephemeral = !variant.ephemeral;
     variant.labels.reverse();

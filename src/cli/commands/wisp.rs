@@ -10,13 +10,13 @@
 //! - `close`:  Close a wisp
 //! - `gc`:     Garbage-collect old wisps
 
+use crate::Result;
 use crate::config;
 use crate::config::CliOverrides;
 use crate::error::BeadsError;
 use crate::model::{Issue, IssueType, MolType, Priority, Status, WispType, WorkType};
 use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
-use crate::Result;
 use chrono::{DateTime, Utc};
 use clap::{Args, Subcommand};
 use std::str::FromStr;
@@ -116,11 +116,7 @@ pub fn execute(
 // List implementation
 // ---------------------------------------------------------------------------
 
-fn execute_list(
-    args: &WispListArgs,
-    store: &mut SqliteStorage,
-    _actor: &str,
-) -> Result<()> {
+fn execute_list(args: &WispListArgs, store: &mut SqliteStorage, _actor: &str) -> Result<()> {
     let all_issues = store.list_issues(&crate::storage::ListFilters {
         include_closed: args.all,
         include_templates: false,
@@ -181,11 +177,7 @@ fn truncate(s: &str, max: usize) -> String {
 // Create implementation
 // ---------------------------------------------------------------------------
 
-fn execute_create(
-    args: &WispCreateArgs,
-    store: &mut SqliteStorage,
-    actor: &str,
-) -> Result<()> {
+fn execute_create(args: &WispCreateArgs, store: &mut SqliteStorage, actor: &str) -> Result<()> {
     let title = if args.title.is_empty() {
         return Err(BeadsError::validation("title", "cannot be empty"));
     } else {
@@ -208,9 +200,7 @@ fn execute_create(
 
     // Generate a wsp-prefixed ID
     let issue_count = store.count_issues()?;
-    let id_gen = crate::util::id::IdGenerator::new(
-        crate::util::id::IdConfig::with_prefix("wsp"),
-    );
+    let id_gen = crate::util::id::IdGenerator::new(crate::util::id::IdConfig::with_prefix("wsp"));
     let id = id_gen.generate(
         &title,
         None,
@@ -252,10 +242,6 @@ fn execute_create(
         deleted_by: None,
         delete_reason: None,
         original_type: None,
-        compaction_level: None,
-        compacted_at: None,
-        compacted_at_commit: None,
-        original_size: None,
         sender: None,
         pinned: false,
         is_template: false,
@@ -300,11 +286,7 @@ fn execute_create(
 // Close implementation
 // ---------------------------------------------------------------------------
 
-fn execute_close(
-    args: &WispCloseArgs,
-    store: &mut SqliteStorage,
-    actor: &str,
-) -> Result<()> {
+fn execute_close(args: &WispCloseArgs, store: &mut SqliteStorage, actor: &str) -> Result<()> {
     let now = Utc::now();
     for id in &args.ids {
         let updates = crate::storage::IssueUpdate {
@@ -324,11 +306,7 @@ fn execute_close(
 // GC implementation
 // ---------------------------------------------------------------------------
 
-fn execute_gc(
-    args: &WispGcArgs,
-    store: &mut SqliteStorage,
-    actor: &str,
-) -> Result<()> {
+fn execute_gc(args: &WispGcArgs, store: &mut SqliteStorage, actor: &str) -> Result<()> {
     let max_age = chrono::Duration::hours(args.max_age_hours as i64);
     let cutoff = Utc::now() - max_age;
 

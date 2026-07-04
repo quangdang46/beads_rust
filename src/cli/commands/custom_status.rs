@@ -102,7 +102,10 @@ pub fn execute_status(
             let use_json = json || args.json;
             if use_json {
                 let statuses = store.list_custom_statuses()?;
-                println!("{}", serde_json::to_string_pretty(&statuses).unwrap_or_default());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&statuses).unwrap_or_default()
+                );
             } else {
                 let statuses = store.list_custom_statuses()?;
                 if statuses.is_empty() {
@@ -123,7 +126,9 @@ pub fn execute_status(
             if !["active", "wip", "done", "frozen", "unspecified"].contains(&cat.as_str()) {
                 return Err(BeadsError::validation(
                     "category",
-                    &format!("invalid category '{cat}'; expected active, wip, done, frozen, or unspecified"),
+                    &format!(
+                        "invalid category '{cat}'; expected active, wip, done, frozen, or unspecified"
+                    ),
                 ));
             }
             store.add_custom_status(&args.name, &cat)?;
@@ -154,7 +159,10 @@ pub fn execute_type(
             let use_json = json || args.json;
             if use_json {
                 let types = store.list_custom_types()?;
-                println!("{}", serde_json::to_string_pretty(&types).unwrap_or_default());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&types).unwrap_or_default()
+                );
             } else {
                 let types = store.list_custom_types()?;
                 if types.is_empty() {

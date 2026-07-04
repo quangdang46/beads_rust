@@ -2,9 +2,7 @@
 //!
 //! Administrative commands for database maintenance and diagnostics.
 
-use crate::cli::{
-    AdminCommands, AdminDoctorArgs, AdminResetArgs, AdminStatsArgs, AdminVacuumArgs,
-};
+use crate::cli::{AdminCommands, AdminDoctorArgs, AdminResetArgs, AdminStatsArgs, AdminVacuumArgs};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::output::OutputContext;
@@ -152,8 +150,6 @@ fn execute_reset(
     storage.execute_raw("DELETE FROM child_counters")?;
     storage.execute_raw("DELETE FROM close_metadata")?;
     storage.execute_raw("DELETE FROM gate_results")?;
-    storage.execute_raw("DELETE FROM issue_snapshots")?;
-    storage.execute_raw("DELETE FROM compaction_snapshots")?;
     storage.execute_raw("DELETE FROM interactions")?;
     storage.execute_raw("DELETE FROM routes")?;
     storage.execute_raw("DELETE FROM issue_counter")?;

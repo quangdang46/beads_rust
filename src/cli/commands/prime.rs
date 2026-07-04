@@ -5,7 +5,7 @@
 
 use clap::Args;
 
-use crate::config::{discover_beads_dir_with_cli, open_storage_with_cli, CliOverrides};
+use crate::config::{CliOverrides, discover_beads_dir_with_cli, open_storage_with_cli};
 use crate::error::BeadsError;
 use crate::output::OutputContext;
 
@@ -28,7 +28,7 @@ pub struct PrimeArgs {
     #[arg(long, conflicts_with_all = &["full", "memories_only"])]
     pub mcp: bool,
 
-    /// Output only the memories section (for pre-compact / post-compaction hooks)
+    /// Output only the memories section (for pre-compact / post-mode hooks)
     #[arg(long, conflicts_with_all = &["full", "mcp"])]
     pub memories_only: bool,
 
@@ -113,7 +113,9 @@ pub fn execute(
     // Check for .beads/PRIME.md override (full mode only, not memories-only)
     let beads_dir = discover_optional_beads_dir(overrides);
     let prime_md_override = if !args.memories_only && !args.mcp {
-        beads_dir.as_ref().map(|d| d.join("PRIME.md"))
+        beads_dir
+            .as_ref()
+            .map(|d| d.join("PRIME.md"))
             .filter(|p| p.exists())
             .and_then(|p| std::fs::read_to_string(p).ok())
     } else {
@@ -260,7 +262,10 @@ mod tests {
     fn test_format_memories_block_with_entries() {
         let memories = vec![
             ("quickstart".to_string(), "Run br ready first".to_string()),
-            ("db-schema".to_string(), "Schema is at src/storage/schema.rs".to_string()),
+            (
+                "db-schema".to_string(),
+                "Schema is at src/storage/schema.rs".to_string(),
+            ),
         ];
         let block = format_memories_block(&memories);
         assert!(block.contains("quickstart"));

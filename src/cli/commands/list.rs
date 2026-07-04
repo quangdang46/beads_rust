@@ -8,7 +8,6 @@ use crate::cli::{
     resolve_output_format_with_outer_mode,
 };
 use crate::config;
-use regex::Regex;
 use crate::error::{BeadsError, Result};
 use crate::format::csv;
 use crate::format::{
@@ -17,11 +16,12 @@ use crate::format::{
 };
 use crate::model::{IssueType, MolType, Priority, Status};
 use crate::output::{IssueTable, IssueTableColumns, JsonArrayPageMeta, OutputContext, OutputMode};
+use crate::query::parse_and_evaluate;
 use crate::storage::ListFilters;
 use crate::storage::sqlite::ListRelationMetadata;
-use crate::query::{parse_and_evaluate};
 use crate::util::time::parse_duration_shorthand;
 use chrono::{DateTime, Utc};
+use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::str::FromStr;
@@ -503,7 +503,12 @@ pub(crate) fn parse_metadata_filters(filters: &[String]) -> Result<Vec<(String, 
 }
 
 /// Convert CLI args to storage filter.
-fn build_filters(args: &ListArgs) -> Result<(ListFilters, Option<Box<dyn Fn(&crate::model::Issue) -> bool + Send>>)> {
+fn build_filters(
+    args: &ListArgs,
+) -> Result<(
+    ListFilters,
+    Option<Box<dyn Fn(&crate::model::Issue) -> bool + Send>>,
+)> {
     // Parse status strings to Status enums
     let statuses = if args.status.is_empty() {
         None
@@ -587,25 +592,32 @@ fn build_filters(args: &ListArgs) -> Result<(ListFilters, Option<Box<dyn Fn(&cra
             if parsed.is_empty() {
                 None
             } else {
-                Some(parsed.into_iter().map(|(k, v)| format!("{k}={v}")).collect())
+                Some(
+                    parsed
+                        .into_iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect(),
+                )
             }
         },
         ids: Some(args.id.clone()),
         owner: args.owner.clone(),
         pinned: args.pinned.then_some(true),
-        mol_type: args.mol_type.as_ref().and_then(|m| MolType::from_str(m).ok()),
+        mol_type: args
+            .mol_type
+            .as_ref()
+            .and_then(|m| MolType::from_str(m).ok()),
         external_ref: args.external_ref.clone(),
     };
 
     // Apply query DSL filter (--filter) on top of explicit CLI filters
     let predicate: Option<Box<dyn Fn(&crate::model::Issue) -> bool + Send>> =
         if let Some(filter_expr) = &args.filter {
-            let query_result = parse_and_evaluate(filter_expr).map_err(|e| {
-                BeadsError::Validation {
+            let query_result =
+                parse_and_evaluate(filter_expr).map_err(|e| BeadsError::Validation {
                     field: "filter".into(),
                     reason: e.to_string(),
-                }
-            })?;
+                })?;
             // Merge query filters into the base filters
             let qf = query_result.filters;
             if let Some(s) = qf.statuses {

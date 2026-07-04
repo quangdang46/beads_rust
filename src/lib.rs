@@ -30,14 +30,16 @@ pub mod config;
 pub mod coordination;
 pub mod error;
 pub mod format;
+pub mod formula;
 pub mod health;
 pub mod hooks;
 pub mod inheritance;
 pub mod logging;
+pub mod merge_slot;
 pub mod model;
 pub mod output;
 pub mod policy;
-pub mod merge_slot;
+pub mod query;
 pub mod recipes;
 pub mod shutdown;
 pub mod storage;
@@ -46,8 +48,6 @@ pub mod util;
 pub mod validation;
 pub mod worktree;
 pub mod write_combining;
-pub mod formula;
-pub mod query;
 
 #[cfg(feature = "mcp")]
 pub mod mcp;

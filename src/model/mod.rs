@@ -19,15 +19,6 @@ const fn is_false(b: &bool) -> bool {
     !*b
 }
 
-/// Serialize Option<i32> as 0 when None (for bd conformance - bd expects integer, not null)
-#[allow(clippy::ref_option, clippy::trivially_copy_pass_by_ref)]
-fn serialize_compaction_level<S>(value: &Option<i32>, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    serializer.serialize_i32(value.unwrap_or(0))
-}
-
 /// Deserialize an optional metadata string, coercing a degenerate empty (or
 /// whitespace-only) string to `None`.
 ///
@@ -773,46 +764,6 @@ pub struct CustomType {
     pub name: String,
 }
 
-/// A point-in-time snapshot of an issue's full state (Issue #38).
-///
-/// Captured before compaction so the original state can be recovered.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct IssueSnapshot {
-    /// Auto-increment primary key.
-    pub id: i64,
-    /// The issue that was snapshotted.
-    pub issue_id: String,
-    /// When the snapshot was taken.
-    pub snapshot_time: DateTime<Utc>,
-    /// Compaction level at snapshot time.
-    pub compaction_level: i32,
-    /// Size of the issue content before compression.
-    pub original_size: i32,
-    /// Size of the issue content after compression.
-    pub compressed_size: i32,
-    /// The uncompressed issue content (titles, description, etc.).
-    pub original_content: String,
-    /// Archived events as JSON, or None.
-    pub archived_events: Option<String>,
-}
-
-/// A BLOB-based compaction snapshot for recovery (Issue #38).
-///
-/// Stores the entire compacted state as a JSON blob for bulk recovery.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct CompactionSnapshot {
-    /// Auto-increment primary key.
-    pub id: i64,
-    /// The issue that was compacted.
-    pub issue_id: String,
-    /// Compaction level when this was created.
-    pub compaction_level: i32,
-    /// Full JSON state blob.
-    pub snapshot_json: Vec<u8>,
-    /// When the snapshot was created.
-    pub created_at: DateTime<Utc>,
-}
-
 ///
 /// Records the latest observed modification time and content hash for each
 /// JSONL file tracked by the sync engine, enabling incremental re-sync
@@ -1036,18 +987,6 @@ pub struct Issue {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_type: Option<String>,
 
-    // Compaction (legacy/compat)
-    // Note: Always serialize compaction_level as integer (0 when None) for bd conformance
-    // bd's Go sql scanner cannot handle NULL for integer columns
-    #[serde(default, serialize_with = "serialize_compaction_level")]
-    pub compaction_level: Option<i32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub compacted_at: Option<DateTime<Utc>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub compacted_at_commit: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub original_size: Option<i32>,
-
     // Messaging
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender: Option<String>,
@@ -1111,11 +1050,7 @@ pub struct Issue {
     /// The Go `bd` tool serializes this as `"timeout"` with nanosecond precision.
     /// The `alias` attribute allows br to import bd JSONL with `"timeout"` fields.
     /// Export always uses `"timeout_seconds"` (seconds, not nanoseconds).
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        alias = "timeout"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "timeout")]
     pub timeout_seconds: Option<i64>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1203,10 +1138,6 @@ impl Default for Issue {
             deleted_by: None,
             delete_reason: None,
             original_type: None,
-            compaction_level: None,
-            compacted_at: None,
-            compacted_at_commit: None,
-            original_size: None,
             sender: None,
             ephemeral: false,
             no_history: false,
@@ -1298,19 +1229,11 @@ impl Issue {
             || self.deleted_by != other.deleted_by
             || self.delete_reason != other.delete_reason
             || self.original_type != other.original_type
-            || self.compacted_at != other.compacted_at
-            || self.compacted_at_commit != other.compacted_at_commit
-            || self.original_size != other.original_size
             || self.sender != other.sender
             || self.ephemeral != other.ephemeral
             || self.pinned != other.pinned
             || self.is_template != other.is_template
         {
-            return false;
-        }
-
-        // Handle compaction_level serialization quirk where None == 0
-        if self.compaction_level.unwrap_or(0) != other.compaction_level.unwrap_or(0) {
             return false;
         }
 
@@ -1578,10 +1501,6 @@ mod tests {
             deleted_by: None,
             delete_reason: None,
             original_type: None,
-            compaction_level: None,
-            compacted_at: None,
-            compacted_at_commit: None,
-            original_size: None,
             sender: None,
             ephemeral: false,
             pinned: false,
@@ -2049,10 +1968,6 @@ mod tests {
             deleted_by: None,
             delete_reason: None,
             original_type: None,
-            compaction_level: None,
-            compacted_at: None,
-            compacted_at_commit: None,
-            original_size: None,
             sender: None,
             ephemeral: false,
             pinned: false,

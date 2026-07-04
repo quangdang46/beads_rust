@@ -9,7 +9,10 @@ use crate::storage::{EventAttribution, SqliteStorage};
 use crate::util::id::{IdGenerationInput, IdGenerator, IdResolver, ResolverConfig, child_id};
 use crate::util::markdown_import::{parse_dependency, parse_markdown_file};
 use crate::util::time::parse_flexible_timestamp;
-use crate::validation::{IssueValidator, LabelValidator, validate_custom_status_against_registry, validate_custom_type_against_registry};
+use crate::validation::{
+    IssueValidator, LabelValidator, validate_custom_status_against_registry,
+    validate_custom_type_against_registry,
+};
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -452,10 +455,6 @@ pub fn create_issue_impl(
             },
             delete_reason: None,
             original_type: None,
-            compaction_level: None,
-            compacted_at: None,
-            compacted_at_commit: None,
-            original_size: None,
             sender: None,
             pinned: false,
             is_template: false,
@@ -1022,10 +1021,6 @@ fn execute_import(
                 },
                 delete_reason: None,
                 original_type: None,
-                compaction_level: None,
-                compacted_at: None,
-                compacted_at_commit: None,
-                original_size: None,
                 sender: None,
                 pinned: false,
                 is_template: false,

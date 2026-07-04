@@ -991,11 +991,8 @@ mod tests {
     fn validate_custom_status_registry_passes_empty_registry() {
         // Empty registry = pass through (unconfigured)
         assert!(
-            validate_custom_status_against_registry(
-                &Status::Custom("anything".to_string()),
-                &[],
-            )
-            .is_ok()
+            validate_custom_status_against_registry(&Status::Custom("anything".to_string()), &[],)
+                .is_ok()
         );
     }
 
@@ -1005,18 +1002,12 @@ mod tests {
             name: "spike".to_string(),
         }];
         assert!(
-            validate_custom_type_against_registry(
-                &crate::model::IssueType::Task,
-                &registered,
-            )
-            .is_ok()
+            validate_custom_type_against_registry(&crate::model::IssueType::Task, &registered,)
+                .is_ok()
         );
         assert!(
-            validate_custom_type_against_registry(
-                &crate::model::IssueType::Bug,
-                &registered,
-            )
-            .is_ok()
+            validate_custom_type_against_registry(&crate::model::IssueType::Bug, &registered,)
+                .is_ok()
         );
     }
 

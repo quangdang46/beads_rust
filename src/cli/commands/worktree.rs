@@ -31,7 +31,10 @@ fn cmd_list(ctx: &OutputContext) -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<20} {:<40} {:<20} {}", "NAME", "PATH", "BRANCH", "BEADS STATE");
+    println!(
+        "{:<20} {:<40} {:<20} {}",
+        "NAME", "PATH", "BRANCH", "BEADS STATE"
+    );
     for wt in &worktrees {
         let name = if wt.is_main {
             "(main)".to_string()

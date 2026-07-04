@@ -31,11 +31,7 @@ pub fn execute_with_storage(
 ///
 /// Returns an error if storage cannot be opened, the query fails, or the
 /// output cannot be written.
-pub fn execute(
-    args: &SqlArgs,
-    cli: &config::CliOverrides,
-    ctx: &OutputContext,
-) -> Result<()> {
+pub fn execute(args: &SqlArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
     execute_inner(args, ctx, &storage_ctx.storage)
@@ -48,8 +44,7 @@ fn execute_inner(args: &SqlArgs, ctx: &OutputContext, storage: &SqliteStorage) -
     match args.format {
         OutputFormatBasic::Json => {
             let json = rows_to_json(&column_names, &rows);
-            let output = serde_json::to_string_pretty(&json)
-                .unwrap_or_else(|_| "[]".to_string());
+            let output = serde_json::to_string_pretty(&json).unwrap_or_else(|_| "[]".to_string());
             if !ctx.is_quiet() {
                 println!("{output}");
             }
@@ -102,10 +97,7 @@ fn print_table(column_names: &[String], rows: &[Vec<SqliteValue>]) {
     let headers: Vec<&str> = column_names.iter().map(String::as_str).collect();
     let mut cell_strings: Vec<Vec<Cow<'_, str>>> = Vec::with_capacity(rows.len());
     for row in rows {
-        let cells: Vec<Cow<'_, str>> = row
-            .iter()
-            .map(|v| Cow::Owned(value_to_string(v)))
-            .collect();
+        let cells: Vec<Cow<'_, str>> = row.iter().map(|v| Cow::Owned(value_to_string(v))).collect();
         cell_strings.push(cells);
     }
 
@@ -153,7 +145,11 @@ fn print_table(column_names: &[String], rows: &[Vec<SqliteValue>]) {
 
     // Footer with row count.
     if !rows.is_empty() {
-        println!("({} row{})", rows.len(), if rows.len() == 1 { "" } else { "s" });
+        println!(
+            "({} row{})",
+            rows.len(),
+            if rows.len() == 1 { "" } else { "s" }
+        );
     }
 }
 

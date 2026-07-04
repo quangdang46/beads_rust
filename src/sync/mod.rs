@@ -4040,10 +4040,7 @@ fn parse_normalized_import_issue(trimmed: &str, line_num: usize) -> Result<Optio
                     ))
                 })?;
                 let mut issue: Issue = serde_json::from_value(payload).map_err(|e| {
-                    BeadsError::Config(format!(
-                        "Invalid payload JSON at line {}: {}",
-                        line_num, e
-                    ))
+                    BeadsError::Config(format!("Invalid payload JSON at line {}: {}", line_num, e))
                 })?;
                 normalize_issue(&mut issue);
 

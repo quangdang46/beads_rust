@@ -211,11 +211,7 @@ pub fn run(command: &FederationCommand, ctx: &OutputContext) -> Result<()> {
 }
 
 /// Add a new peer.
-fn cmd_add(
-    conn: &Connection,
-    args: &FederationAddArgs,
-    ctx: &OutputContext,
-) -> Result<()> {
+fn cmd_add(conn: &Connection, args: &FederationAddArgs, ctx: &OutputContext) -> Result<()> {
     let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
     // Encrypt password if provided
@@ -284,10 +280,11 @@ fn cmd_list(conn: &Connection, ctx: &OutputContext) -> Result<()> {
             .collect();
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({ "peers": list }))
-                .map_err(|e| BeadsError::Internal {
-                    message: e.to_string()
-                })?
+            serde_json::to_string_pretty(&serde_json::json!({ "peers": list })).map_err(|e| {
+                BeadsError::Internal {
+                    message: e.to_string(),
+                }
+            })?
         );
     } else {
         if peers.is_empty() {
@@ -296,8 +293,15 @@ fn cmd_list(conn: &Connection, ctx: &OutputContext) -> Result<()> {
         }
         println!("Federation Peers ({}):", peers.len());
         for p in &peers {
-            let last_sync = if p.last_sync.is_empty() { "never" } else { &p.last_sync };
-            println!("  {} ({}) [{}] last sync: {}", p.name, p.remote_url, p.sovereignty, last_sync);
+            let last_sync = if p.last_sync.is_empty() {
+                "never"
+            } else {
+                &p.last_sync
+            };
+            println!(
+                "  {} ({}) [{}] last sync: {}",
+                p.name, p.remote_url, p.sovereignty, last_sync
+            );
         }
     }
 
@@ -399,9 +403,11 @@ fn cmd_sync(conn: &Connection, args: &FederationSyncArgs, ctx: &OutputContext) -
         ..Default::default()
     };
 
-    let export_result = sync::export_to_jsonl(&storage, &sync_path, &export_config)
-        .map_err(|e| BeadsError::Internal {
-            message: format!("export to peer failed: {e}"),
+    let export_result =
+        sync::export_to_jsonl(&storage, &sync_path, &export_config).map_err(|e| {
+            BeadsError::Internal {
+                message: format!("export to peer failed: {e}"),
+            }
         })?;
 
     // Step 2: Import peer's JSONL into local DB
@@ -454,10 +460,9 @@ fn cmd_sync(conn: &Connection, args: &FederationSyncArgs, ctx: &OutputContext) -
     } else {
         println!("Sync with peer '{}' completed:", args.name);
         println!("  Exported: {} issues", export_result.exported_count);
-        println!("  Imported: {} issues ({} created, {} updated)",
-            import_result.imported_count,
-            import_result.created_count,
-            import_result.updated_count,
+        println!(
+            "  Imported: {} issues ({} created, {} updated)",
+            import_result.imported_count, import_result.created_count, import_result.updated_count,
         );
         println!("  Last sync: {}", now);
     }

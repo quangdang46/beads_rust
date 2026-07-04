@@ -379,20 +379,6 @@ fn write_toon_issue_source_fields<W: Write>(
         "original_type",
         issue.original_type.as_deref(),
     )?;
-    write_toon_i32_field(
-        writer,
-        line,
-        "compaction_level",
-        issue.compaction_level.unwrap_or_default(),
-    )?;
-    write_optional_toon_datetime_field(writer, line, "compacted_at", issue.compacted_at.as_ref())?;
-    write_optional_toon_string_field(
-        writer,
-        line,
-        "compacted_at_commit",
-        issue.compacted_at_commit.as_deref(),
-    )?;
-    write_optional_toon_i32_field(writer, line, "original_size", issue.original_size)?;
     write_optional_toon_string_field(writer, line, "sender", issue.sender.as_deref())?;
     write_toon_true_field_if_set(writer, line, "ephemeral", issue.ephemeral)?;
     write_toon_true_field_if_set(writer, line, "pinned", issue.pinned)?;
@@ -446,14 +432,6 @@ fn issue_counts_toon_fields(row: &IssueWithCounts) -> Option<Vec<&'static str>> 
     push_optional_toon_field(&mut fields, issue.deleted_by.as_ref(), "deleted_by");
     push_optional_toon_field(&mut fields, issue.delete_reason.as_ref(), "delete_reason");
     push_optional_toon_field(&mut fields, issue.original_type.as_ref(), "original_type");
-    fields.push("compaction_level");
-    push_optional_toon_field(&mut fields, issue.compacted_at.as_ref(), "compacted_at");
-    push_optional_toon_field(
-        &mut fields,
-        issue.compacted_at_commit.as_ref(),
-        "compacted_at_commit",
-    );
-    push_optional_toon_field(&mut fields, issue.original_size.as_ref(), "original_size");
     push_optional_toon_field(&mut fields, issue.sender.as_ref(), "sender");
     if issue.ephemeral {
         fields.push("ephemeral");
@@ -536,14 +514,6 @@ fn push_toon_issue_counts_field(out: &mut String, row: &IssueWithCounts, field: 
         "original_type" => {
             push_toon_string_value(out, issue.original_type.as_deref().unwrap_or(""));
         }
-        "compaction_level" => {
-            out.push_str(&issue.compaction_level.unwrap_or_default().to_string());
-        }
-        "compacted_at" => push_optional_toon_datetime_value(out, issue.compacted_at.as_ref()),
-        "compacted_at_commit" => {
-            push_toon_string_value(out, issue.compacted_at_commit.as_deref().unwrap_or(""));
-        }
-        "original_size" => out.push_str(&issue.original_size.unwrap_or_default().to_string()),
         "sender" => push_toon_string_value(out, issue.sender.as_deref().unwrap_or("")),
         "ephemeral" | "pinned" | "is_template" => out.push_str("true"),
         "dependency_count" => out.push_str(&row.dependency_count.to_string()),
@@ -1818,7 +1788,7 @@ mod tests {
         assert!(
             String::from_utf8(streamed)
                 .expect("TOON output should be utf8")
-            .starts_with("[2]{id,title,description,design,acceptance_criteria,notes,status,priority,issue_type,created_at,created_by,updated_at,source_repo,compaction_level,dependency_count,dependent_count}:")
+            .starts_with("[2]{id,title,description,design,acceptance_criteria,notes,status,priority,issue_type,created_at,created_by,updated_at,source_repo,dependency_count,dependent_count}:")
         );
     }
 
@@ -1836,8 +1806,6 @@ mod tests {
         first.close_reason = Some("fixed".to_string());
         first.due_at = Some(closed_at);
         first.external_ref = Some("JIRA-42".to_string());
-        first.compacted_at_commit = Some("abc123".to_string());
-        first.original_size = Some(0);
         first.sender = Some("agent,quoted".to_string());
         first.pinned = true;
         first.labels = vec![

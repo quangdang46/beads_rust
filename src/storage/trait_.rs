@@ -18,9 +18,7 @@
 
 use crate::error::{BeadsError, Result};
 use crate::model::{Event, Issue};
-use crate::storage::sqlite::{
-    IssueMetadata, ListFilters, ReadyFilters, StatsIssueRow,
-};
+use crate::storage::sqlite::{IssueMetadata, ListFilters, ReadyFilters, StatsIssueRow};
 
 /// Primary storage interface — implemented by [`SqliteStorage`][super::sqlite::SqliteStorage]
 /// and [`InMemoryStorage`][super::InMemoryStorage].
@@ -92,7 +90,7 @@ pub trait Storage {
 
     /// Remove a dependency.
     fn remove_dependency(&mut self, issue_id: &str, depends_on_id: &str, actor: &str)
-        -> Result<()>;
+    -> Result<()>;
 
     /// Get issues that `issue_id` depends on.
     fn get_dependencies(&self, issue_id: &str) -> Result<Vec<Issue>>;
@@ -402,7 +400,10 @@ impl Storage for InMemoryStorage {
         if !deps.contains(&depends_on_id.to_string()) {
             deps.push(depends_on_id.to_string());
         }
-        let dependents = self.dependents.entry(depends_on_id.to_string()).or_default();
+        let dependents = self
+            .dependents
+            .entry(depends_on_id.to_string())
+            .or_default();
         if !dependents.contains(&issue_id.to_string()) {
             dependents.push(issue_id.to_string());
         }
@@ -468,10 +469,7 @@ impl Storage for InMemoryStorage {
             .filter(|i| {
                 i.deleted_at.is_none()
                     && i.status == Status::Open
-                    && self
-                        .deps
-                        .get(&i.id)
-                        .map_or(false, |d| !d.is_empty())
+                    && self.deps.get(&i.id).map_or(false, |d| !d.is_empty())
             })
             .cloned()
             .collect())
@@ -563,7 +561,9 @@ mod tests {
     #[test]
     fn test_in_memory_labels() {
         let mut store = InMemoryStorage::new();
-        store.create_issue(&make_issue("test-1", "Test"), "alice").unwrap();
+        store
+            .create_issue(&make_issue("test-1", "Test"), "alice")
+            .unwrap();
 
         store.add_label("test-1", "backend", "alice").unwrap();
         store.add_label("test-1", "urgent", "alice").unwrap();
@@ -610,14 +610,19 @@ mod tests {
     fn test_in_memory_config() {
         let mut store = InMemoryStorage::new();
         store.set_config("issue_prefix", "test").unwrap();
-        assert_eq!(store.get_config("issue_prefix").unwrap(), Some("test".to_string()));
+        assert_eq!(
+            store.get_config("issue_prefix").unwrap(),
+            Some("test".to_string())
+        );
         assert_eq!(store.get_config("missing").unwrap(), None);
     }
 
     #[test]
     fn test_in_memory_id_exists() {
         let mut store = InMemoryStorage::new();
-        store.create_issue(&make_issue("test-1", "Test"), "alice").unwrap();
+        store
+            .create_issue(&make_issue("test-1", "Test"), "alice")
+            .unwrap();
         assert!(store.id_exists("test-1"));
         assert!(!store.id_exists("test-99"));
     }

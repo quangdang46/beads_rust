@@ -36,7 +36,7 @@ This document describes the internal architecture of `beads_rust` (br), a Rust p
 | Feature | br (Rust) | bd (Go) |
 |---------|-----------|---------|
 | Lines of Code | ~33k | ~276k |
-| Backend | SQLite only | SQLite + Dolt |
+| Backend | SQLite only | SQLite |
 | Daemon | None | RPC daemon |
 | Git operations | Manual | Can auto-commit |
 | Git hooks | None | Optional auto-install |

@@ -20,6 +20,6 @@ pub mod trait_;
 pub mod hooks;
 
 pub use sqlite::{
-    ChangelogIssueRow, CloseMetadataRow, EventAttribution, IssueUpdate, ListFilters,
-    ReadyFilters, ReadySortPolicy, SqliteStorage, StatsIssueRow,
+    ChangelogIssueRow, CloseMetadataRow, EventAttribution, IssueUpdate, ListFilters, ReadyFilters,
+    ReadySortPolicy, SqliteStorage, StatsIssueRow,
 };

@@ -136,15 +136,23 @@ const BUILTIN_RECIPES: &[Recipe] = &[
         description: "Copilot CLI plugin manifest + instructions",
         recipe_type: RecipeType::MultiFile,
         path: "",
-        paths: &[".copilot-plugin/plugin.json", ".github/copilot-instructions.md"],
+        paths: &[
+            ".copilot-plugin/plugin.json",
+            ".github/copilot-instructions.md",
+        ],
         contents: &[
-            (".copilot-plugin/plugin.json", r#"{
+            (
+                ".copilot-plugin/plugin.json",
+                r#"{
   "name": "beads",
   "description": "Beads issue tracking integration",
   "version": "1.0.0"
 }
-"#),
-            (".github/copilot-instructions.md", r#"# GitHub Copilot Instructions
+"#,
+            ),
+            (
+                ".github/copilot-instructions.md",
+                r#"# GitHub Copilot Instructions
 
 This repository uses **Beads (br)** for issue tracking.
 
@@ -156,7 +164,8 @@ This repository uses **Beads (br)** for issue tracking.
 - Use `br close <id>` when work is complete
 - Run `br sync --flush-only` before session end
 - Do not commit, push, or run git operations on .beads/ unless explicitly authorized
-"#),
+"#,
+            ),
         ],
     },
     Recipe {
@@ -181,9 +190,7 @@ This repository uses **Beads (br)** for issue tracking.
         recipe_type: RecipeType::MultiFile,
         path: "",
         paths: &[".codex/hooks.json", "AGENTS.md"],
-        contents: &[
-            (".codex/hooks.json", CODEX_HOOKS_JSON),
-        ],
+        contents: &[(".codex/hooks.json", CODEX_HOOKS_JSON)],
     },
     Recipe {
         name: "Mux",
@@ -200,9 +207,18 @@ This repository uses **Beads (br)** for issue tracking.
         path: "",
         paths: &[".aider.conf.yml", ".aider/BEADS.md", ".aider/README.md"],
         contents: &[
-            (".aider.conf.yml", "# Aider Configuration\n# https://aider.chat/docs/config.html\n\n# Beads workflow instructions in .aider/BEADS.md\nread: [.aider/BEADS.md]\n"),
-            (".aider/BEADS.md", "# Beads Issue Tracking\n\nThis project uses Beads (br) for issue tracking.\n\n## Workflow\n\n1. `br ready` - Find ready work\n2. `br update <id> --claim` - Claim an issue\n3. Do the work\n4. `br close <id>` - Mark complete\n5. `br sync --flush-only` - Export to JSONL\n\n## Quick Reference\n\n```bash\nbr ready                              # Show issues ready to work\nbr list --status=open                 # List all open issues\nbr create --title=\"...\" --type=task   # Create new issue\nbr show <id>                          # Issue details\nbr close <id>                         # Mark complete\n```\n"),
-            (".aider/README.md", "# Aider + Beads\n\nThis directory contains Aider configuration and instructions for working with Beads issues.\n\nSee `BEADS.md` for workflow instructions.\n"),
+            (
+                ".aider.conf.yml",
+                "# Aider Configuration\n# https://aider.chat/docs/config.html\n\n# Beads workflow instructions in .aider/BEADS.md\nread: [.aider/BEADS.md]\n",
+            ),
+            (
+                ".aider/BEADS.md",
+                "# Beads Issue Tracking\n\nThis project uses Beads (br) for issue tracking.\n\n## Workflow\n\n1. `br ready` - Find ready work\n2. `br update <id> --claim` - Claim an issue\n3. Do the work\n4. `br close <id>` - Mark complete\n5. `br sync --flush-only` - Export to JSONL\n\n## Quick Reference\n\n```bash\nbr ready                              # Show issues ready to work\nbr list --status=open                 # List all open issues\nbr create --title=\"...\" --type=task   # Create new issue\nbr show <id>                          # Issue details\nbr close <id>                         # Mark complete\n```\n",
+            ),
+            (
+                ".aider/README.md",
+                "# Aider + Beads\n\nThis directory contains Aider configuration and instructions for working with Beads issues.\n\nSee `BEADS.md` for workflow instructions.\n",
+            ),
         ],
     },
     Recipe {
@@ -212,8 +228,13 @@ This repository uses **Beads (br)** for issue tracking.
         path: "",
         paths: &[".junie/guidelines.md", ".junie/mcp/mcp.json"],
         contents: &[
-            (".junie/guidelines.md", "# Junie Guidelines\n\nThis project uses Beads (br) for issue tracking.\n\n- Run `br ready` at session start\n- Always run `br sync --flush-only` before ending session\n"),
-            (".junie/mcp/mcp.json", r#"{
+            (
+                ".junie/guidelines.md",
+                "# Junie Guidelines\n\nThis project uses Beads (br) for issue tracking.\n\n- Run `br ready` at session start\n- Always run `br sync --flush-only` before ending session\n",
+            ),
+            (
+                ".junie/mcp/mcp.json",
+                r#"{
   "mcpServers": {
     "beads": {
       "command": "br",
@@ -221,7 +242,8 @@ This repository uses **Beads (br)** for issue tracking.
     }
   }
 }
-"#),
+"#,
+            ),
         ],
     },
     Recipe {
@@ -230,9 +252,7 @@ This repository uses **Beads (br)** for issue tracking.
         recipe_type: RecipeType::MultiFile,
         path: "",
         paths: &["~/.cursor/mcp.json"],
-        contents: &[
-            ("~/.cursor/mcp.json", IDE_MCP_JSON),
-        ],
+        contents: &[("~/.cursor/mcp.json", IDE_MCP_JSON)],
     },
     Recipe {
         name: "Windsurf MCP",
@@ -240,9 +260,7 @@ This repository uses **Beads (br)** for issue tracking.
         recipe_type: RecipeType::MultiFile,
         path: "",
         paths: &["~/.codeium/windsurf.json"],
-        contents: &[
-            ("~/.codeium/windsurf.json", IDE_MCP_JSON),
-        ],
+        contents: &[("~/.codeium/windsurf.json", IDE_MCP_JSON)],
     },
     Recipe {
         name: "GitHub Copilot MCP",
@@ -250,9 +268,7 @@ This repository uses **Beads (br)** for issue tracking.
         recipe_type: RecipeType::MultiFile,
         path: "",
         paths: &["~/.github/copilot/mcp.json"],
-        contents: &[
-            ("~/.github/copilot/mcp.json", IDE_MCP_JSON),
-        ],
+        contents: &[("~/.github/copilot/mcp.json", IDE_MCP_JSON)],
     },
 ];
 

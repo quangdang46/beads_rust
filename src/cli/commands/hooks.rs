@@ -11,9 +11,9 @@
 //! Hook files use section markers (`BEGIN BEADS INTEGRATION` / `END BEADS
 //! INTEGRATION`) so custom user content outside the markers is preserved.
 
+use crate::Result;
 use crate::error::BeadsError;
 use crate::output::OutputContext;
-use crate::Result;
 
 /// Execute the `hooks` subcommand.
 ///
@@ -37,16 +37,10 @@ fn cmd_install(args: &crate::cli::HooksInstallArgs, ctx: &OutputContext) -> Resu
     let hooks_to_install: Vec<&str> = if let Some(name) = &args.hook {
         vec![name.as_str()]
     } else if all_hooks {
-        crate::hooks::MANAGED_HOOKS
-            .iter()
-            .map(|h| h.name)
-            .collect()
+        crate::hooks::MANAGED_HOOKS.iter().map(|h| h.name).collect()
     } else {
         // Default: install all if none specified
-        crate::hooks::MANAGED_HOOKS
-            .iter()
-            .map(|h| h.name)
-            .collect()
+        crate::hooks::MANAGED_HOOKS.iter().map(|h| h.name).collect()
     };
 
     let mut installed = Vec::new();
@@ -91,15 +85,9 @@ fn cmd_uninstall(args: &crate::cli::HooksUninstallArgs, ctx: &OutputContext) -> 
     let hooks_to_remove: Vec<&str> = if let Some(name) = &args.hook {
         vec![name.as_str()]
     } else if args.all {
-        crate::hooks::MANAGED_HOOKS
-            .iter()
-            .map(|h| h.name)
-            .collect()
+        crate::hooks::MANAGED_HOOKS.iter().map(|h| h.name).collect()
     } else {
-        crate::hooks::MANAGED_HOOKS
-            .iter()
-            .map(|h| h.name)
-            .collect()
+        crate::hooks::MANAGED_HOOKS.iter().map(|h| h.name).collect()
     };
 
     let mut removed = Vec::new();
@@ -143,39 +131,28 @@ fn cmd_list(ctx: &OutputContext) -> Result<()> {
 
     if ctx.is_json() || ctx.is_toon() {
         let payload = serde_json::json!(statuses);
-        ctx.print_line(
-            &serde_json::to_string(&payload)
-                .unwrap_or_else(|_| "[]".to_string()),
-        );
+        ctx.print_line(&serde_json::to_string(&payload).unwrap_or_else(|_| "[]".to_string()));
     } else {
         if statuses.is_empty() {
             ctx.print_line("No managed hooks.");
             return Ok(());
         }
 
-        ctx.print_line(&format!(
-            "  {:<20} {}",
-            "Hook", "Status"
-        ));
-        ctx.print_line(&format!(
-            "  {} {}",
-            "-".repeat(20),
-            "-".repeat(10)
-        ));
+        ctx.print_line(&format!("  {:<20} {}", "Hook", "Status"));
+        ctx.print_line(&format!("  {} {}", "-".repeat(20), "-".repeat(10)));
         for status in &statuses {
             let status_str = if status.installed {
                 "installed"
             } else {
                 "not installed"
             };
-            ctx.print_line(&format!(
-                "  {:<20} {}",
-                status.name, status_str
-            ));
+            ctx.print_line(&format!("  {:<20} {}", status.name, status_str));
         }
 
         ctx.print_line("");
-        ctx.print_line("Use `br hooks install <name>` or `br hooks install --all` to install hooks.");
+        ctx.print_line(
+            "Use `br hooks install <name>` or `br hooks install --all` to install hooks.",
+        );
     }
 
     Ok(())

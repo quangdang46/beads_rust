@@ -9,7 +9,7 @@ use crate::error::{BeadsError, Result};
 use crate::model::{IssueType, Priority, Status};
 use crate::util::content_hash_from_parts;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 20;
+pub const CURRENT_SCHEMA_VERSION: i32 = 21;
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 
 /// The complete SQL schema for the beads database.
@@ -48,10 +48,6 @@ pub const SCHEMA_SQL: &str = r"
         deleted_by TEXT DEFAULT '',
         delete_reason TEXT DEFAULT '',
         original_type TEXT DEFAULT '',
-        compaction_level INTEGER DEFAULT 0,
-        compacted_at DATETIME,
-        compacted_at_commit TEXT,
-        original_size INTEGER,
         sender TEXT DEFAULT '',
         ephemeral INTEGER NOT NULL DEFAULT 0,
         pinned INTEGER NOT NULL DEFAULT 0,
@@ -317,30 +313,6 @@ pub const SCHEMA_SQL: &str = r"
         last_checked DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
     CREATE INDEX IF NOT EXISTS idx_repo_mtimes_checked ON repo_mtimes(last_checked);
-
-    -- Issue snapshots for compaction recovery (Issue #38)
-    CREATE TABLE IF NOT EXISTS issue_snapshots (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        issue_id TEXT NOT NULL,
-        snapshot_time TEXT NOT NULL,
-        compaction_level INTEGER NOT NULL DEFAULT 0,
-        original_size INTEGER NOT NULL DEFAULT 0,
-        compressed_size INTEGER NOT NULL DEFAULT 0,
-        original_content TEXT NOT NULL DEFAULT '',
-        archived_events TEXT
-    );
-    CREATE INDEX IF NOT EXISTS idx_issue_snapshots_issue ON issue_snapshots(issue_id);
-    CREATE INDEX IF NOT EXISTS idx_issue_snapshots_level ON issue_snapshots(compaction_level);
-
-    -- Compaction snapshots for BLOB-based compaction recovery (Issue #38)
-    CREATE TABLE IF NOT EXISTS compaction_snapshots (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        issue_id TEXT NOT NULL,
-        compaction_level INTEGER NOT NULL DEFAULT 0,
-        snapshot_json BLOB NOT NULL,
-        created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-    CREATE INDEX IF NOT EXISTS idx_comp_snapshot_issue ON compaction_snapshots(issue_id, compaction_level, created_at);
 
     -- Routes table (Issue #36)
     CREATE TABLE IF NOT EXISTS routes (
@@ -817,10 +789,6 @@ const ISSUE_COLUMNS: &[(&str, &str)] = &[
     ("deleted_by", "TEXT DEFAULT ''"),
     ("delete_reason", "TEXT DEFAULT ''"),
     ("original_type", "TEXT DEFAULT ''"),
-    ("compaction_level", "INTEGER DEFAULT 0"),
-    ("compacted_at", "DATETIME"),
-    ("compacted_at_commit", "TEXT"),
-    ("original_size", "INTEGER"),
     ("sender", "TEXT DEFAULT ''"),
     ("ephemeral", "INTEGER NOT NULL DEFAULT 0"),
     ("pinned", "INTEGER NOT NULL DEFAULT 0"),
@@ -1017,10 +985,6 @@ const EXPECTED_ISSUE_COLUMN_ORDER: &[&str] = &[
     "deleted_by",
     "delete_reason",
     "original_type",
-    "compaction_level",
-    "compacted_at",
-    "compacted_at_commit",
-    "original_size",
     "sender",
     "ephemeral",
     "pinned",
@@ -1565,13 +1529,6 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
         conn.execute("COMMIT")?;
     }
 
-    // Migration: ensure compaction_level is never NULL (bd compatibility)
-    let has_compaction_level = column_exists(conn, "issues", "compaction_level");
-
-    if has_compaction_level {
-        conn.execute("UPDATE issues SET compaction_level = 0 WHERE compaction_level IS NULL")?;
-    }
-
     // Migration: Ensure filter columns are NOT NULL (v3)
     let user_version = conn
         .query_row("PRAGMA user_version")?
@@ -1882,9 +1839,7 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
     // Migration v14 -> v15 (Issue #39): add repo_mtimes table for file mtime tracking.
     // Pure additive — new table, no existing-row rewrite.
     if user_version < 15 {
-        tracing::info!(
-            "Migrating database to schema version 15 (repo_mtimes table - Issue #39)"
-        );
+        tracing::info!("Migrating database to schema version 15 (repo_mtimes table - Issue #39)");
         execute_batch(
             conn,
             r"
@@ -1895,40 +1850,6 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
                 last_checked DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE INDEX IF NOT EXISTS idx_repo_mtimes_checked ON repo_mtimes(last_checked);
-        ",
-        )?;
-    }
-
-    // Migration v15 -> v16 (Issue #38): add issue_snapshots and compaction_snapshots tables.
-    // Pure additive — new tables, no existing-row rewrite.
-    if user_version < 16 {
-        tracing::info!(
-            "Migrating database to schema version 16 (snapshot tables - Issue #38)"
-        );
-        execute_batch(
-            conn,
-            r"
-            CREATE TABLE IF NOT EXISTS issue_snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                issue_id TEXT NOT NULL,
-                snapshot_time TEXT NOT NULL,
-                compaction_level INTEGER NOT NULL DEFAULT 0,
-                original_size INTEGER NOT NULL DEFAULT 0,
-                compressed_size INTEGER NOT NULL DEFAULT 0,
-                original_content TEXT NOT NULL DEFAULT '',
-                archived_events TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_issue_snapshots_issue ON issue_snapshots(issue_id);
-            CREATE INDEX IF NOT EXISTS idx_issue_snapshots_level ON issue_snapshots(compaction_level);
-
-            CREATE TABLE IF NOT EXISTS compaction_snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                issue_id TEXT NOT NULL,
-                compaction_level INTEGER NOT NULL DEFAULT 0,
-                snapshot_json BLOB NOT NULL,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_comp_snapshot_issue ON compaction_snapshots(issue_id, compaction_level, created_at);
         ",
         )?;
     }
@@ -1998,10 +1919,21 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
         && table_exists(conn, "issues")
         && !column_exists(conn, "issues", "points")
     {
-        tracing::info!(
-            "Migrating database to schema version 20 (points on issues)"
-        );
+        tracing::info!("Migrating database to schema version 20 (points on issues)");
         conn.execute("ALTER TABLE issues ADD COLUMN points INTEGER")?;
+    }
+
+    // Migration v20 -> v21: drop snapshot tables (Issue #38 compaction rework).
+    // Safe to run repeatedly — DROP TABLE IF EXISTS is idempotent.
+    if user_version < 21 {
+        tracing::info!("Migrating database to schema version 21 (drop snapshot tables)");
+        execute_batch(
+            conn,
+            r"
+            DROP TABLE IF EXISTS compaction_snapshots;
+            DROP TABLE IF EXISTS issue_snapshots;
+        ",
+        )?;
     }
 
     // Migration: Add missing indexes for bd parity
@@ -2131,7 +2063,6 @@ fn repair_integer_datetime_columns(conn: &Connection) -> Result<()> {
         "due_at",
         "defer_until",
         "deleted_at",
-        "compacted_at",
     ];
     // Must stay in lock-step with datetime_from_epoch_auto in
     // src/storage/sqlite.rs. Each threshold is the smallest integer that,
@@ -2675,10 +2606,6 @@ mod tests {
                 deleted_by TEXT DEFAULT '',
                 delete_reason TEXT DEFAULT '',
                 original_type TEXT DEFAULT '',
-                compaction_level INTEGER DEFAULT 0,
-                compacted_at DATETIME,
-                compacted_at_commit TEXT,
-                original_size INTEGER,
                 sender TEXT DEFAULT '',
                 ephemeral INTEGER NOT NULL DEFAULT 0,
                 pinned INTEGER NOT NULL DEFAULT 0,
@@ -3080,7 +3007,6 @@ mod tests {
                 ephemeral INTEGER DEFAULT 0,
                 pinned INTEGER DEFAULT 0,
                 is_template INTEGER DEFAULT 0,
-                compaction_level INTEGER DEFAULT 0,
                 due_at DATETIME,
                 defer_until DATETIME
             );
@@ -3279,7 +3205,6 @@ mod tests {
             // the live INSERT/UPDATE SQL emitted by the storage layer doesn't
             // crash with "no such column" on the very next write.
             "source_repo_path",
-            "compaction_level",
             "sender",
             "is_template",
         ];
@@ -3733,12 +3658,20 @@ mod tests {
 
         // Verify the row
         let row = conn
-            .query_row_with_params("SELECT version, content_hash FROM schema_migration_hashes WHERE version = ?1",
-                       &[SqliteValue::from(CURRENT_SCHEMA_VERSION)])
+            .query_row_with_params(
+                "SELECT version, content_hash FROM schema_migration_hashes WHERE version = ?1",
+                &[SqliteValue::from(CURRENT_SCHEMA_VERSION)],
+            )
             .unwrap();
-        assert_eq!(row.get(0).and_then(SqliteValue::as_integer), Some(i64::from(CURRENT_SCHEMA_VERSION)));
+        assert_eq!(
+            row.get(0).and_then(SqliteValue::as_integer),
+            Some(i64::from(CURRENT_SCHEMA_VERSION))
+        );
         let expected_hash = hash_sql(&sql_19);
-        assert_eq!(row.get(1).and_then(SqliteValue::as_text), Some(expected_hash.as_str()));
+        assert_eq!(
+            row.get(1).and_then(SqliteValue::as_text),
+            Some(expected_hash.as_str())
+        );
 
         // INSERT OR REPLACE — calling again should succeed
         record_migration_hash(&conn, CURRENT_SCHEMA_VERSION, &sql_19).unwrap();

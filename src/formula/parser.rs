@@ -77,8 +77,7 @@ impl Parser {
         }
 
         // Read file
-        let data = fs::read(&abs_path)
-            .map_err(|e| format!("read {}: {}", path.display(), e))?;
+        let data = fs::read(&abs_path).map_err(|e| format!("read {}: {}", path.display(), e))?;
 
         // Detect format from extension
         let mut formula = if path_str.ends_with(".formula.toml") {
@@ -133,10 +132,7 @@ impl Parser {
                 .iter()
                 .map(|s| s.as_str())
                 .collect::<Vec<_>>();
-            return Err(format!(
-                "circular extends detected: {}",
-                chain.join(" -> ")
-            ));
+            return Err(format!("circular extends detected: {}", chain.join(" -> ")));
         }
         self.resolving_set.insert(formula.formula.clone());
         self.resolving_chain.push(formula.formula.clone());
@@ -211,8 +207,7 @@ impl Parser {
         merge_steps_into(&mut all_steps, formula.steps.as_deref().unwrap_or(&[]));
 
         // Apply child compose overrides
-        merged_compose =
-            merge_compose_rules(merged_compose.as_ref(), formula.compose.as_ref());
+        merged_compose = merge_compose_rules(merged_compose.as_ref(), formula.compose.as_ref());
 
         // Use child description if set
         if formula.description.is_some() {
@@ -338,7 +333,12 @@ impl Formula {
                 }
                 // Validate children's deps recursively
                 if let Some(children) = &step.children {
-                    validate_child_deps(children, &step_id_locations, &mut errors, &format!("steps[{}]", i));
+                    validate_child_deps(
+                        children,
+                        &step_id_locations,
+                        &mut errors,
+                        &format!("steps[{}]", i),
+                    );
                 }
             }
         }
@@ -428,10 +428,7 @@ fn validate_step(
     // Validate priority range
     if let Some(p) = step.priority {
         if !(0..=4).contains(&p) {
-            return Err(format!(
-                "{} ({}): priority must be 0-4",
-                prefix, step.id
-            ));
+            return Err(format!("{} ({}): priority must be 0-4", prefix, step.id));
         }
     }
 
@@ -560,7 +557,11 @@ fn set_step_source(step: &mut Step, formula_name: &str, location: &str) {
     step.source_location = Some(location.to_string());
     if let Some(children) = &mut step.children {
         for (i, child) in children.iter_mut().enumerate() {
-            set_step_source(child, formula_name, &format!("{}.children[{}]", location, i));
+            set_step_source(
+                child,
+                formula_name,
+                &format!("{}.children[{}]", location, i),
+            );
         }
     }
 }

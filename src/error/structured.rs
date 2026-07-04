@@ -678,13 +678,23 @@ impl StructuredError {
             BeadsError::Io(_) => (ErrorCode::IoError, None),
             BeadsError::Json(_) => (ErrorCode::JsonError, None),
             BeadsError::Yaml(_) => (ErrorCode::YamlError, None),
-            BeadsError::SchemaSkewForward { db_version, binary_version } => (
+            BeadsError::SchemaSkewForward {
+                db_version,
+                binary_version,
+            } => (
                 ErrorCode::SchemaSkew,
-                Some(json!({"db_version": db_version, "binary_version": binary_version, "direction": "forward"})),
+                Some(
+                    json!({"db_version": db_version, "binary_version": binary_version, "direction": "forward"}),
+                ),
             ),
-            BeadsError::SchemaSkewBehind { db_version, binary_version } => (
+            BeadsError::SchemaSkewBehind {
+                db_version,
+                binary_version,
+            } => (
                 ErrorCode::SchemaSkew,
-                Some(json!({"db_version": db_version, "binary_version": binary_version, "direction": "behind"})),
+                Some(
+                    json!({"db_version": db_version, "binary_version": binary_version, "direction": "behind"}),
+                ),
             ),
             BeadsError::WithContext { context, source } => {
                 if let Some(source_err) = source.downcast_ref::<BeadsError>() {

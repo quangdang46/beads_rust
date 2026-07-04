@@ -4,11 +4,11 @@
 //! so creating, listing, showing, and deleting templates maps to the same
 //! storage operations with the `is_template` flag set.
 
-use super::{retry_mutation_with_jsonl_recovery, report_auto_flush_failure};
+use super::{report_auto_flush_failure, retry_mutation_with_jsonl_recovery};
 use crate::cli::commands::create::create_issue_impl;
 use crate::cli::{
-    config, CreateArgs, TemplateCommands, TemplateCreateArgs, TemplateDeleteArgs, TemplateListArgs,
-    TemplateShowArgs, TemplateSpawnArgs,
+    CreateArgs, TemplateCommands, TemplateCreateArgs, TemplateDeleteArgs, TemplateListArgs,
+    TemplateShowArgs, TemplateSpawnArgs, config,
 };
 use crate::config::{CliOverrides, OpenStorageResult};
 use crate::error::{BeadsError, Result};
@@ -74,7 +74,11 @@ pub fn execute_with_storage_ctx(
 // Create
 // ---------------------------------------------------------------------------
 
-fn execute_create(args: &TemplateCreateArgs, cli: &CliOverrides, ctx: &OutputContext) -> Result<()> {
+fn execute_create(
+    args: &TemplateCreateArgs,
+    cli: &CliOverrides,
+    ctx: &OutputContext,
+) -> Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
     let layer = storage_ctx.load_config(cli)?;
@@ -497,11 +501,7 @@ fn execute_spawn_with_storage(
 }
 
 /// Spawn a new issue from a template (opens own storage).
-fn execute_spawn(
-    args: &TemplateSpawnArgs,
-    cli: &CliOverrides,
-    ctx: &OutputContext,
-) -> Result<()> {
+fn execute_spawn(args: &TemplateSpawnArgs, cli: &CliOverrides, ctx: &OutputContext) -> Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
     execute_spawn_with_storage(args, cli, ctx, &mut storage_ctx)

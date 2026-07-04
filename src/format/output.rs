@@ -21,7 +21,7 @@ pub struct StaleIssue {
 /// Minimal issue output for ready command (bd parity).
 ///
 /// Contains only the fields that bd's ready command outputs.
-/// Does NOT include: `compaction_level`, `original_size`, `dependency_count`, `dependent_count`
+/// Does NOT include: `dependency_count`, `dependent_count`
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ReadyIssue {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -78,7 +78,7 @@ impl From<Issue> for ReadyIssue {
 /// Minimal issue output for blocked command (bd parity).
 ///
 /// Contains only the fields that bd's blocked command outputs, plus `blocked_by` info.
-/// Does NOT include: `compaction_level`, `original_size`
+/// Does NOT include: `dependency_count`, `dependent_count`
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct BlockedIssueOutput {
     pub blocked_by: Vec<String>,

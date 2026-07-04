@@ -3,9 +3,8 @@
 use crate::error::{BeadsError, Result};
 use crate::format::{IssueDetails, IssueWithDependencyMetadata};
 use crate::model::{
-    Comment, CompactionSnapshot, Dependency, DependencyType, Event, EventType, FederationPeer,
-    Interaction, Issue, IssueCounter, IssueSnapshot, IssueType, MolType, Priority, RepoMtime,
-    Route, Status, WispType, WorkType,
+    Comment, Dependency, DependencyType, Event, EventType, FederationPeer, Interaction, Issue,
+    IssueCounter, IssueType, MolType, Priority, RepoMtime, Route, Status, WispType, WorkType,
 };
 use crate::storage::events::get_events;
 use crate::storage::schema::CURRENT_SCHEMA_VERSION;
@@ -261,11 +260,7 @@ fn append_issue_id_membership_filter(
 /// Uses LIKE instead of json_extract because SQLite's JSON1 extension is not
 /// available in all builds. Both `"key":"value"` and `"key": "value"` JSON
 /// whitespace formats are handled.
-fn append_metadata_filter(
-    sql: &mut String,
-    params: &mut Vec<SqliteValue>,
-    filters: &[String],
-) {
+fn append_metadata_filter(sql: &mut String, params: &mut Vec<SqliteValue>, filters: &[String]) {
     for filter in filters {
         if let Some(eq_pos) = filter.find('=') {
             let key = escape_like_pattern(&filter[..eq_pos]);
@@ -509,7 +504,6 @@ struct ImportIssueTimestampStrings {
     due_at: Option<String>,
     defer_until: Option<String>,
     deleted_at: Option<String>,
-    compacted_at: Option<String>,
 }
 
 impl ImportIssueTimestampStrings {
@@ -521,7 +515,6 @@ impl ImportIssueTimestampStrings {
             due_at: issue.due_at.map(|dt| dt.to_rfc3339()),
             defer_until: issue.defer_until.map(|dt| dt.to_rfc3339()),
             deleted_at: issue.deleted_at.map(|dt| dt.to_rfc3339()),
-            compacted_at: issue.compacted_at.map(|dt| dt.to_rfc3339()),
         }
     }
 }
@@ -535,7 +528,6 @@ impl ReadyIssueProjection {
                          created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
                          due_at, defer_until, external_ref, source_system, source_repo,
                          deleted_at, deleted_by, delete_reason, original_type,
-                         compaction_level, compacted_at, compacted_at_commit, original_size,
                          sender, ephemeral, pinned, is_template, source_repo_path, agent_context, metadata,
                          no_history, wisp_type, mol_type, work_type, started_at, spec_id, points"
             }
@@ -568,7 +560,6 @@ impl SearchIssueProjection {
                          created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
                          due_at, defer_until, external_ref, source_system, source_repo,
                          deleted_at, deleted_by, delete_reason, original_type,
-                         compaction_level, compacted_at, compacted_at_commit, original_size,
                          sender, ephemeral, pinned, is_template, source_repo_path, agent_context, metadata,
                          no_history, wisp_type, mol_type, work_type, started_at, spec_id, points
                   FROM issues
@@ -599,8 +590,8 @@ impl BlockedIssueProjection {
                      i.status, i.priority, i.issue_type, i.assignee, i.owner, i.estimated_minutes,
                      i.created_at, i.created_by, i.updated_at, i.closed_at, i.close_reason, i.closed_by_session,
                      i.due_at, i.defer_until, i.external_ref, i.source_system, i.source_repo,
-                     i.deleted_at, i.deleted_by, i.delete_reason, i.original_type, i.compaction_level,
-                     i.compacted_at, i.compacted_at_commit, i.original_size, i.sender, i.ephemeral,
+                     i.deleted_at, i.deleted_by, i.delete_reason, i.original_type,
+                     i.sender, i.ephemeral,
                      i.pinned, i.is_template, i.source_repo_path, i.agent_context,
                      i.metadata,
                      i.no_history, i.wisp_type, i.mol_type, i.work_type, i.started_at, i.spec_id, i.points,
@@ -620,8 +611,8 @@ impl BlockedIssueProjection {
                      status, priority, issue_type, assignee, owner, estimated_minutes,
                      created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
                      due_at, defer_until, external_ref, source_system, source_repo,
-                     deleted_at, deleted_by, delete_reason, original_type, compaction_level,
-                     compacted_at, compacted_at_commit, original_size, sender, ephemeral,
+                     deleted_at, deleted_by, delete_reason, original_type,
+                     sender, ephemeral,
                      pinned, is_template, source_repo_path, agent_context, metadata,
                      no_history, wisp_type, mol_type, work_type, started_at, spec_id, points"
             }
@@ -640,7 +631,9 @@ impl BlockedIssueProjection {
             // Then 39→45 after `no_history, wisp_type, mol_type, work_type, started_at, spec_id`
             // were appended before bc.blocked_by (beads_rust#48).
             // Then 45→46 after `points` was appended (beads_rust).
-            Self::Full => 46,
+            // Then 46→42 after removing compaction_level, compacted_at,
+            // compacted_at_commit, original_size (beads_rust).
+            Self::Full => 42,
             Self::Command => 9,
         }
     }
@@ -1108,7 +1101,8 @@ impl SqliteStorage {
 
     pub(crate) fn open_current_read_only(path: &Path) -> Result<Option<Self>> {
         let current_schema_version = u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0);
-        if database_header_user_version(path)?.is_none_or(|version| version < current_schema_version)
+        if database_header_user_version(path)?
+            .is_none_or(|version| version < current_schema_version)
         {
             return Ok(None);
         }
@@ -1350,7 +1344,10 @@ impl SqliteStorage {
     ///
     /// Returns an error if the query fails to prepare or execute.  The
     /// rollback is attempted regardless of success/failure.
-    pub(crate) fn execute_read_only_query(&self, sql: &str) -> Result<(Vec<String>, Vec<Vec<SqliteValue>>)> {
+    pub(crate) fn execute_read_only_query(
+        &self,
+        sql: &str,
+    ) -> Result<(Vec<String>, Vec<Vec<SqliteValue>>)> {
         // Start an explicit transaction.  Even BEGIN DEFERRED acquires a
         // shared read lock, preventing concurrent writers from conflicting
         // while we inspect the database.
@@ -2340,7 +2337,6 @@ impl SqliteStorage {
             let due_at_str = issue.due_at.map(|dt| dt.to_rfc3339());
             let defer_until_str = issue.defer_until.map(|dt| dt.to_rfc3339());
             let deleted_at_str = issue.deleted_at.map(|dt| dt.to_rfc3339());
-            let compacted_at_str = issue.compacted_at.map(|dt| dt.to_rfc3339());
             let content_hash = issue.compute_content_hash();
 
             conn.execute_with_params(
@@ -2350,10 +2346,9 @@ impl SqliteStorage {
                     created_at, created_by, updated_at, closed_at, close_reason,
                     closed_by_session, due_at, defer_until, external_ref, source_system,
                     source_repo, source_repo_path, deleted_at, deleted_by, delete_reason, original_type,
-                    compaction_level, compacted_at, compacted_at_commit, original_size,
                     sender, ephemeral, pinned, is_template, agent_context, metadata,
                     no_history, wisp_type, mol_type, work_type, started_at, spec_id, points
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42)",
                 &[
                     SqliteValue::from(issue.id.as_str()),
                     SqliteValue::from(content_hash.as_str()),
@@ -2384,10 +2379,6 @@ impl SqliteStorage {
                     SqliteValue::from(issue.deleted_by.as_deref().unwrap_or("")),
                     SqliteValue::from(issue.delete_reason.as_deref().unwrap_or("")),
                     SqliteValue::from(issue.original_type.as_deref().unwrap_or("")),
-                    SqliteValue::from(i64::from(issue.compaction_level.unwrap_or(0))),
-                    compacted_at_str.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
-                    issue.compacted_at_commit.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
-                    SqliteValue::from(i64::from(issue.original_size.unwrap_or(0))),
                     SqliteValue::from(issue.sender.as_deref().unwrap_or("")),
                     SqliteValue::from(i64::from(i32::from(issue.ephemeral))),
                     SqliteValue::from(i64::from(i32::from(issue.pinned))),
@@ -3209,16 +3200,14 @@ impl SqliteStorage {
     ///
     /// Returns an error if the old issue doesn't exist, the new ID already exists,
     /// or any database update fails.
-    pub fn update_issue_id(
-        &mut self,
-        old_id: &str,
-        new_id: &str,
-        actor: &str,
-    ) -> Result<Issue> {
+    pub fn update_issue_id(&mut self, old_id: &str, new_id: &str, actor: &str) -> Result<Issue> {
         self.mutate("update_issue_id", actor, |conn, ctx| {
             // Fetch the existing issue
-            let issue = Self::get_issue_from_conn(conn, old_id)?
-                .ok_or_else(|| BeadsError::IssueNotFound { id: old_id.to_string() })?;
+            let issue = Self::get_issue_from_conn(conn, old_id)?.ok_or_else(|| {
+                BeadsError::IssueNotFound {
+                    id: old_id.to_string(),
+                }
+            })?;
 
             // Verify the new ID doesn't already exist
             if Self::get_issue_from_conn(conn, new_id)?.is_some() {
@@ -3271,8 +3260,9 @@ impl SqliteStorage {
             ctx.force_flush = true;
 
             // Return the updated issue
-            Self::get_issue_from_conn(conn, new_id)?
-                .ok_or_else(|| BeadsError::IssueNotFound { id: new_id.to_string() })
+            Self::get_issue_from_conn(conn, new_id)?.ok_or_else(|| BeadsError::IssueNotFound {
+                id: new_id.to_string(),
+            })
         })
     }
 
@@ -3306,7 +3296,11 @@ impl SqliteStorage {
                     .map(String::from)
             };
 
-            let id: String = row.get(0).and_then(SqliteValue::as_text).unwrap_or("").to_string();
+            let id: String = row
+                .get(0)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .to_string();
             let title = get_text(1);
             let description = get_text(2);
             let design = get_text(3);
@@ -3321,23 +3315,46 @@ impl SqliteStorage {
             let mut new_ac = acceptance_criteria.clone();
 
             if title.as_ref().is_some_and(|t| pattern.is_match(t)) {
-                new_title = Some(pattern.replace_all(title.as_deref().unwrap(), new_id).to_string());
+                new_title = Some(
+                    pattern
+                        .replace_all(title.as_deref().unwrap(), new_id)
+                        .to_string(),
+                );
                 any_updated = true;
             }
             if description.as_ref().is_some_and(|d| pattern.is_match(d)) {
-                new_desc = Some(pattern.replace_all(description.as_deref().unwrap(), new_id).to_string());
+                new_desc = Some(
+                    pattern
+                        .replace_all(description.as_deref().unwrap(), new_id)
+                        .to_string(),
+                );
                 any_updated = true;
             }
             if design.as_ref().is_some_and(|d| pattern.is_match(d)) {
-                new_design = Some(pattern.replace_all(design.as_deref().unwrap(), new_id).to_string());
+                new_design = Some(
+                    pattern
+                        .replace_all(design.as_deref().unwrap(), new_id)
+                        .to_string(),
+                );
                 any_updated = true;
             }
             if notes.as_ref().is_some_and(|n| pattern.is_match(n)) {
-                new_notes = Some(pattern.replace_all(notes.as_deref().unwrap(), new_id).to_string());
+                new_notes = Some(
+                    pattern
+                        .replace_all(notes.as_deref().unwrap(), new_id)
+                        .to_string(),
+                );
                 any_updated = true;
             }
-            if acceptance_criteria.as_ref().is_some_and(|a| pattern.is_match(a)) {
-                new_ac = Some(pattern.replace_all(acceptance_criteria.as_deref().unwrap(), new_id).to_string());
+            if acceptance_criteria
+                .as_ref()
+                .is_some_and(|a| pattern.is_match(a))
+            {
+                new_ac = Some(
+                    pattern
+                        .replace_all(acceptance_criteria.as_deref().unwrap(), new_id)
+                        .to_string(),
+                );
                 any_updated = true;
             }
 
@@ -3445,7 +3462,6 @@ impl SqliteStorage {
                    updated_at, closed_at, close_reason, closed_by_session,
                    due_at, defer_until, external_ref, source_system, source_repo,
                    deleted_at, deleted_by, delete_reason, original_type,
-                   compaction_level, compacted_at, compacted_at_commit, original_size,
                    sender, ephemeral, pinned, is_template, source_repo_path, agent_context, metadata,
                    no_history, wisp_type, mol_type, work_type, started_at, spec_id, points
             FROM issues
@@ -3486,7 +3502,6 @@ impl SqliteStorage {
                          created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
                          due_at, defer_until, external_ref, source_system, source_repo,
                          deleted_at, deleted_by, delete_reason, original_type,
-                         compaction_level, compacted_at, compacted_at_commit, original_size,
                          sender, ephemeral, pinned, is_template, source_repo_path, agent_context, metadata,
                          no_history, wisp_type, mol_type, work_type, started_at, spec_id, points
                   FROM issues WHERE id IN ({})",
@@ -3623,7 +3638,6 @@ impl SqliteStorage {
                      created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
                      due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type,
-                     compaction_level, compacted_at, compacted_at_commit, original_size,
                      sender, ephemeral, pinned, is_template, source_repo_path, agent_context, metadata,
                      no_history, wisp_type, mol_type, work_type, started_at, spec_id, points",
         );
@@ -3830,7 +3844,6 @@ impl SqliteStorage {
                          created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
                          due_at, defer_until, external_ref, source_system, source_repo,
                          deleted_at, deleted_by, delete_reason, original_type,
-                         compaction_level, compacted_at, compacted_at_commit, original_size,
                          sender, ephemeral, pinned, is_template, source_repo_path, agent_context, metadata,
                          no_history, wisp_type, mol_type, work_type, started_at, spec_id, points
                   FROM issues
@@ -8041,11 +8054,21 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn list_custom_statuses(&self) -> Result<Vec<crate::model::CustomStatus>> {
-        let rows = self.conn.query("SELECT name, category FROM custom_statuses ORDER BY name")?;
+        let rows = self
+            .conn
+            .query("SELECT name, category FROM custom_statuses ORDER BY name")?;
         let mut statuses = Vec::with_capacity(rows.len());
         for row in &rows {
-            let name = row.get(0).and_then(SqliteValue::as_text).unwrap_or_default().to_string();
-            let category = row.get(1).and_then(SqliteValue::as_text).unwrap_or_default().to_string();
+            let name = row
+                .get(0)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or_default()
+                .to_string();
+            let category = row
+                .get(1)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or_default()
+                .to_string();
             statuses.push(crate::model::CustomStatus { name, category });
         }
         Ok(statuses)
@@ -8083,10 +8106,16 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn list_custom_types(&self) -> Result<Vec<crate::model::CustomType>> {
-        let rows = self.conn.query("SELECT name FROM custom_types ORDER BY name")?;
+        let rows = self
+            .conn
+            .query("SELECT name FROM custom_types ORDER BY name")?;
         let mut types = Vec::with_capacity(rows.len());
         for row in &rows {
-            let name = row.get(0).and_then(SqliteValue::as_text).unwrap_or_default().to_string();
+            let name = row
+                .get(0)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or_default()
+                .to_string();
             types.push(crate::model::CustomType { name });
         }
         Ok(types)
@@ -9429,8 +9458,8 @@ impl SqliteStorage {
                            status, priority, issue_type, assignee, owner, estimated_minutes,
                            created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
                            due_at, defer_until, external_ref, source_system, source_repo,
-                           deleted_at, deleted_by, delete_reason, original_type, compaction_level,
-                           compacted_at, compacted_at_commit, original_size, sender, ephemeral,
+                           deleted_at, deleted_by, delete_reason, original_type,
+                           sender, ephemeral,
                            pinned, is_template, source_repo_path, agent_context, metadata,
                            no_history, wisp_type, mol_type, work_type, started_at, spec_id, points
                     FROM issues
@@ -10112,30 +10141,21 @@ impl SqliteStorage {
             deleted_by: get_non_empty_str(25),
             delete_reason: get_non_empty_str(26),
             original_type: get_non_empty_str(27),
-            compaction_level: get_opt_i32(28),
-            compacted_at: get_opt_datetime(29)?,
-            compacted_at_commit: get_opt_str(30),
-            original_size: get_opt_i32(31),
-            sender: get_non_empty_str(32),
-            ephemeral: get_bool(33),
-            pinned: get_bool(34),
-            is_template: get_bool(35),
-            // Position 36 lands after `is_template` in the Full SELECT
-            // and before `bc.blocked_by` in the BlockedIssue::Full
-            // variant; the cached_blocked_by_index was bumped to 37
-            // in lock-step so the projection-specific blocked-by
-            // accessor still finds the right column.
-            source_repo_path: get_non_empty_str(36),
-            agent_context: get_non_empty_str(37),
-            metadata: get_non_empty_str(38),
-            // beads_rust#48: wisp/coordination fields (indices 39–44)
-            no_history: get_bool(39),
-            wisp_type: parse_wisp_type(row.get(40).and_then(SqliteValue::as_text)),
-            mol_type: parse_mol_type(row.get(41).and_then(SqliteValue::as_text)),
-            work_type: parse_work_type(row.get(42).and_then(SqliteValue::as_text)),
-            started_at: get_opt_datetime(43)?,
-            spec_id: get_non_empty_str(44),
-            points: get_opt_i32(45),
+            sender: get_non_empty_str(28),
+            ephemeral: get_bool(29),
+            pinned: get_bool(30),
+            is_template: get_bool(31),
+            source_repo_path: get_non_empty_str(32),
+            agent_context: get_non_empty_str(33),
+            metadata: get_non_empty_str(34),
+            // beads_rust#48: wisp/coordination fields (indices 35–40)
+            no_history: get_bool(35),
+            wisp_type: parse_wisp_type(row.get(36).and_then(SqliteValue::as_text)),
+            mol_type: parse_mol_type(row.get(37).and_then(SqliteValue::as_text)),
+            work_type: parse_work_type(row.get(38).and_then(SqliteValue::as_text)),
+            started_at: get_opt_datetime(39)?,
+            spec_id: get_non_empty_str(40),
+            points: get_opt_i32(41),
             labels: vec![],
             dependencies: vec![],
             comments: vec![],
@@ -10195,10 +10215,6 @@ impl SqliteStorage {
             deleted_by: None,
             delete_reason: None,
             original_type: None,
-            compaction_level: None,
-            compacted_at: None,
-            compacted_at_commit: None,
-            original_size: None,
             sender: None,
             ephemeral: false,
             pinned: false,
@@ -10262,10 +10278,6 @@ impl SqliteStorage {
             deleted_by: None,
             delete_reason: None,
             original_type: None,
-            compaction_level: None,
-            compacted_at: None,
-            compacted_at_commit: None,
-            original_size: None,
             sender: None,
             ephemeral: false,
             pinned: false,
@@ -10329,10 +10341,6 @@ impl SqliteStorage {
             deleted_by: None,
             delete_reason: None,
             original_type: None,
-            compaction_level: None,
-            compacted_at: None,
-            compacted_at_commit: None,
-            original_size: None,
             sender: None,
             ephemeral: false,
             pinned: false,
@@ -10390,10 +10398,6 @@ impl SqliteStorage {
             deleted_by: None,
             delete_reason: None,
             original_type: None,
-            compaction_level: None,
-            compacted_at: None,
-            compacted_at_commit: None,
-            original_size: None,
             sender: None,
             ephemeral: false,
             pinned: false,
@@ -10457,10 +10461,6 @@ impl SqliteStorage {
             deleted_by: None,
             delete_reason: None,
             original_type: None,
-            compaction_level: None,
-            compacted_at: None,
-            compacted_at_commit: None,
-            original_size: None,
             sender: None,
             ephemeral: false,
             pinned: false,
@@ -10518,10 +10518,6 @@ impl SqliteStorage {
             deleted_by: None,
             delete_reason: None,
             original_type: None,
-            compaction_level: None,
-            compacted_at: None,
-            compacted_at_commit: None,
-            original_size: None,
             sender: None,
             ephemeral: false,
             pinned: false,
@@ -10750,8 +10746,9 @@ fn database_header_user_version(path: &Path) -> Result<Option<u32>> {
         return Ok(None);
     }
 
-    let mut file = std::fs::File::open(path)
-        .map_err(|e| BeadsError::Config(format!("Cannot open database file to read header: {e}")))?;
+    let mut file = std::fs::File::open(path).map_err(|e| {
+        BeadsError::Config(format!("Cannot open database file to read header: {e}"))
+    })?;
     let mut header = [0_u8; 100];
     file.read_exact(&mut header)
         .map_err(|e| BeadsError::Config(format!("Cannot read database header: {e}")))?;
@@ -12129,8 +12126,8 @@ impl SqliteStorage {
                      status, priority, issue_type, assignee, owner, estimated_minutes,
                      created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
                      due_at, defer_until, external_ref, source_system, source_repo,
-                     deleted_at, deleted_by, delete_reason, original_type, compaction_level,
-                     compacted_at, compacted_at_commit, original_size, sender, ephemeral,
+                     deleted_at, deleted_by, delete_reason, original_type,
+                     sender, ephemeral,
                      pinned, is_template, source_repo_path, agent_context, metadata,
                      no_history, wisp_type, mol_type, work_type, started_at, spec_id, points
                FROM issues WHERE external_ref = ?",
@@ -12153,8 +12150,8 @@ impl SqliteStorage {
                      status, priority, issue_type, assignee, owner, estimated_minutes,
                      created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
                      due_at, defer_until, external_ref, source_system, source_repo,
-                     deleted_at, deleted_by, delete_reason, original_type, compaction_level,
-                     compacted_at, compacted_at_commit, original_size, sender, ephemeral,
+                     deleted_at, deleted_by, delete_reason, original_type,
+                     sender, ephemeral,
                      pinned, is_template, source_repo_path, agent_context, metadata,
                      no_history, wisp_type, mol_type, work_type, started_at, spec_id, points
                FROM issues WHERE content_hash = ?",
@@ -12219,8 +12216,16 @@ impl SqliteStorage {
         for row in &rows {
             let last_checked = parse_datetime_value(row.get(3))?;
             result.push(RepoMtime {
-                repo_path: row.get(0).and_then(SqliteValue::as_text).unwrap_or("").to_string(),
-                jsonl_path: row.get(1).and_then(SqliteValue::as_text).unwrap_or("").to_string(),
+                repo_path: row
+                    .get(0)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or("")
+                    .to_string(),
+                jsonl_path: row
+                    .get(1)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or("")
+                    .to_string(),
                 mtime_ns: row.get(2).and_then(SqliteValue::as_integer).unwrap_or(0),
                 last_checked,
             });
@@ -12242,194 +12247,7 @@ impl SqliteStorage {
         Ok(count > 0)
     }
 
-    // ---- Issue Snapshot CRUD (Issue #38) -----------------------------------
-
-    /// Create a new issue snapshot.
-    pub fn create_issue_snapshot(&self, snapshot: &IssueSnapshot) -> Result<i64> {
-        self.conn.execute_with_params(
-            "INSERT INTO issue_snapshots \
-             (issue_id, snapshot_time, compaction_level, original_size, \
-              compressed_size, original_content, archived_events) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
-            &[
-                SqliteValue::from(snapshot.issue_id.as_str()),
-                SqliteValue::from(snapshot.snapshot_time.to_rfc3339()),
-                SqliteValue::from(i64::from(snapshot.compaction_level)),
-                SqliteValue::from(i64::from(snapshot.original_size)),
-                SqliteValue::from(i64::from(snapshot.compressed_size)),
-                SqliteValue::from(snapshot.original_content.as_str()),
-                snapshot
-                    .archived_events
-                    .as_deref()
-                    .map_or(SqliteValue::Null, SqliteValue::from),
-            ],
-        )?;
-        Ok(self.conn.last_insert_rowid())
-    }
-
-    /// Retrieve a single issue snapshot by ID.
-    pub fn get_issue_snapshot(&self, id: i64) -> Result<Option<IssueSnapshot>> {
-        match self.conn.query_row_with_params(
-            "SELECT id, issue_id, snapshot_time, compaction_level, \
-             original_size, compressed_size, original_content, archived_events \
-             FROM issue_snapshots WHERE id = ?",
-            &[SqliteValue::from(id)],
-        ) {
-            Ok(row) => {
-                let snapshot_time = parse_datetime_value(row.get(2))?;
-
-                Ok(Some(IssueSnapshot {
-                    id: row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0),
-                    issue_id: row
-                        .get(1)
-                        .and_then(SqliteValue::as_text)
-                        .unwrap_or("")
-                        .to_string(),
-                    snapshot_time,
-                    compaction_level: row
-                        .get(3)
-                        .and_then(SqliteValue::as_integer)
-                        .map(|v| v as i32)
-                        .unwrap_or(0),
-                    original_size: row
-                        .get(4)
-                        .and_then(SqliteValue::as_integer)
-                        .map(|v| v as i32)
-                        .unwrap_or(0),
-                    compressed_size: row
-                        .get(5)
-                        .and_then(SqliteValue::as_integer)
-                        .map(|v| v as i32)
-                        .unwrap_or(0),
-                    original_content: row
-                        .get(6)
-                        .and_then(SqliteValue::as_text)
-                        .unwrap_or("")
-                        .to_string(),
-                    archived_events: row.get(7).and_then(SqliteValue::as_text).map(String::from),
-                }))
-            }
-            Err(FrankenError::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    /// List issue snapshots for a given issue, newest first.
-    pub fn list_issue_snapshots(&self, issue_id: &str) -> Result<Vec<IssueSnapshot>> {
-        let rows = self.conn.query_with_params(
-            "SELECT id, issue_id, snapshot_time, compaction_level, \
-             original_size, compressed_size, original_content, archived_events \
-             FROM issue_snapshots WHERE issue_id = ? \
-             ORDER BY snapshot_time DESC",
-            &[SqliteValue::from(issue_id)],
-        )?;
-        let mut result = Vec::new();
-        for row in &rows {
-            let snapshot_time = parse_datetime_value(row.get(2))?;
-            result.push(IssueSnapshot {
-                id: row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0),
-                issue_id: row
-                    .get(1)
-                    .and_then(SqliteValue::as_text)
-                    .unwrap_or("")
-                    .to_string(),
-                snapshot_time,
-                compaction_level: row
-                    .get(3)
-                    .and_then(SqliteValue::as_integer)
-                    .map(|v| v as i32)
-                    .unwrap_or(0),
-                original_size: row
-                    .get(4)
-                    .and_then(SqliteValue::as_integer)
-                    .map(|v| v as i32)
-                    .unwrap_or(0),
-                compressed_size: row
-                    .get(5)
-                    .and_then(SqliteValue::as_integer)
-                    .map(|v| v as i32)
-                    .unwrap_or(0),
-                original_content: row
-                    .get(6)
-                    .and_then(SqliteValue::as_text)
-                    .unwrap_or("")
-                    .to_string(),
-                archived_events: row.get(7).and_then(SqliteValue::as_text).map(String::from),
-            });
-        }
-        Ok(result)
-    }
-
-    /// Delete an issue snapshot by ID.
-    pub fn delete_issue_snapshot(&self, id: i64) -> Result<()> {
-        self.conn.execute_with_params(
-            "DELETE FROM issue_snapshots WHERE id = ?",
-            &[SqliteValue::from(id)],
-        )?;
-        Ok(())
-    }
-
-    // ---- Compaction Snapshot CRUD (Issue #38) ------------------------------
-
-    /// Create a new compaction snapshot.
-    pub fn create_compaction_snapshot(&self, snap: &CompactionSnapshot) -> Result<i64> {
-        self.conn.execute_with_params(
-            "INSERT INTO compaction_snapshots \
-             (issue_id, compaction_level, snapshot_json, created_at) \
-             VALUES (?, ?, ?, ?)",
-            &[
-                SqliteValue::from(snap.issue_id.as_str()),
-                SqliteValue::from(i64::from(snap.compaction_level)),
-                SqliteValue::from(&snap.snapshot_json[..]),
-                SqliteValue::from(snap.created_at.to_rfc3339()),
-            ],
-        )?;
-        Ok(self.conn.last_insert_rowid())
-    }
-
-    /// Retrieve a compaction snapshot by ID.
-    pub fn get_compaction_snapshot(&self, id: i64) -> Result<Option<CompactionSnapshot>> {
-        match self.conn.query_row_with_params(
-            "SELECT id, issue_id, compaction_level, snapshot_json, created_at \
-             FROM compaction_snapshots WHERE id = ?",
-            &[SqliteValue::from(id)],
-        ) {
-            Ok(row) => {
-                let created_at = parse_datetime_value(row.get(4))?;
-
-                Ok(Some(CompactionSnapshot {
-                    id: row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0),
-                    issue_id: row
-                        .get(1)
-                        .and_then(SqliteValue::as_text)
-                        .unwrap_or("")
-                        .to_string(),
-                    compaction_level: row
-                        .get(2)
-                        .and_then(SqliteValue::as_integer)
-                        .map(|v| v as i32)
-                        .unwrap_or(0),
-                    snapshot_json: row
-                        .get(3)
-                        .and_then(SqliteValue::as_blob)
-                        .unwrap_or_default()
-                        .to_vec(),
-                    created_at,
-                }))
-            }
-            Err(FrankenError::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    /// Delete a compaction snapshot by ID.
-    pub fn delete_compaction_snapshot(&self, id: i64) -> Result<()> {
-        self.conn.execute_with_params(
-            "DELETE FROM compaction_snapshots WHERE id = ?",
-            &[SqliteValue::from(id)],
-        )?;
-        Ok(())
-    }
+    // ---- Route CRUD (Issue #36) ------------------------------------------
 
     // ---- Route CRUD (Issue #36) ------------------------------------------
 
@@ -12453,10 +12271,26 @@ impl SqliteStorage {
         );
         match result {
             Ok(row) => Ok(Some(Route {
-                prefix: row.get(0).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
-                path: row.get(1).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
-                created_at: row.get(2).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
-                updated_at: row.get(3).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
+                prefix: row
+                    .get(0)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or_default()
+                    .to_string(),
+                path: row
+                    .get(1)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or_default()
+                    .to_string(),
+                created_at: row
+                    .get(2)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or_default()
+                    .to_string(),
+                updated_at: row
+                    .get(3)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or_default()
+                    .to_string(),
             })),
             Err(FrankenError::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
@@ -12464,14 +12298,32 @@ impl SqliteStorage {
     }
 
     pub fn list_routes(&self) -> Result<Vec<Route>> {
-        let rows = self.conn.query("SELECT prefix, path, created_at, updated_at FROM routes ORDER BY prefix")?;
+        let rows = self
+            .conn
+            .query("SELECT prefix, path, created_at, updated_at FROM routes ORDER BY prefix")?;
         let mut routes = Vec::new();
         for row in &rows {
             routes.push(Route {
-                prefix: row.get(0).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
-                path: row.get(1).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
-                created_at: row.get(2).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
-                updated_at: row.get(3).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
+                prefix: row
+                    .get(0)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or_default()
+                    .to_string(),
+                path: row
+                    .get(1)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or_default()
+                    .to_string(),
+                created_at: row
+                    .get(2)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or_default()
+                    .to_string(),
+                updated_at: row
+                    .get(3)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or_default()
+                    .to_string(),
             });
         }
         Ok(routes)
@@ -12494,7 +12346,11 @@ impl SqliteStorage {
         );
         match result {
             Ok(row) => Ok(Some(IssueCounter {
-                prefix: row.get(0).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
+                prefix: row
+                    .get(0)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or_default()
+                    .to_string(),
                 last_id: row.get(1).and_then(SqliteValue::as_integer).unwrap_or(0) as i64,
             })),
             Err(FrankenError::QueryReturnedNoRows) => Ok(None),
@@ -12553,9 +12409,21 @@ impl SqliteStorage {
         );
         match result {
             Ok(row) => Ok(Some(Interaction {
-                id: row.get(0).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
-                kind: row.get(1).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
-                created_at: row.get(2).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
+                id: row
+                    .get(0)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or_default()
+                    .to_string(),
+                kind: row
+                    .get(1)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or_default()
+                    .to_string(),
+                created_at: row
+                    .get(2)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or_default()
+                    .to_string(),
                 actor: row.get(3).and_then(SqliteValue::as_text).map(String::from),
                 issue_id: row.get(4).and_then(SqliteValue::as_text).map(String::from),
                 model: row.get(5).and_then(SqliteValue::as_text).map(String::from),
@@ -12563,7 +12431,10 @@ impl SqliteStorage {
                 response: row.get(7).and_then(SqliteValue::as_text).map(String::from),
                 error: row.get(8).and_then(SqliteValue::as_text).map(String::from),
                 tool_name: row.get(9).and_then(SqliteValue::as_text).map(String::from),
-                exit_code: row.get(10).and_then(SqliteValue::as_integer).map(|v| v as i32),
+                exit_code: row
+                    .get(10)
+                    .and_then(SqliteValue::as_integer)
+                    .map(|v| v as i32),
                 parent_id: row.get(11).and_then(SqliteValue::as_text).map(String::from),
                 label: row.get(12).and_then(SqliteValue::as_text).map(String::from),
                 reason: row.get(13).and_then(SqliteValue::as_text).map(String::from),
@@ -12582,9 +12453,21 @@ impl SqliteStorage {
         let mut interactions = Vec::new();
         for row in &rows {
             interactions.push(Interaction {
-                id: row.get(0).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
-                kind: row.get(1).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
-                created_at: row.get(2).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
+                id: row
+                    .get(0)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or_default()
+                    .to_string(),
+                kind: row
+                    .get(1)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or_default()
+                    .to_string(),
+                created_at: row
+                    .get(2)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or_default()
+                    .to_string(),
                 actor: row.get(3).and_then(SqliteValue::as_text).map(String::from),
                 issue_id: row.get(4).and_then(SqliteValue::as_text).map(String::from),
                 model: row.get(5).and_then(SqliteValue::as_text).map(String::from),
@@ -12592,7 +12475,10 @@ impl SqliteStorage {
                 response: row.get(7).and_then(SqliteValue::as_text).map(String::from),
                 error: row.get(8).and_then(SqliteValue::as_text).map(String::from),
                 tool_name: row.get(9).and_then(SqliteValue::as_text).map(String::from),
-                exit_code: row.get(10).and_then(SqliteValue::as_integer).map(|v| v as i32),
+                exit_code: row
+                    .get(10)
+                    .and_then(SqliteValue::as_integer)
+                    .map(|v| v as i32),
                 parent_id: row.get(11).and_then(SqliteValue::as_text).map(String::from),
                 label: row.get(12).and_then(SqliteValue::as_text).map(String::from),
                 reason: row.get(13).and_then(SqliteValue::as_text).map(String::from),
@@ -12610,9 +12496,21 @@ impl SqliteStorage {
         let mut interactions = Vec::new();
         for row in &rows {
             interactions.push(Interaction {
-                id: row.get(0).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
-                kind: row.get(1).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
-                created_at: row.get(2).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
+                id: row
+                    .get(0)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or_default()
+                    .to_string(),
+                kind: row
+                    .get(1)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or_default()
+                    .to_string(),
+                created_at: row
+                    .get(2)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or_default()
+                    .to_string(),
                 actor: row.get(3).and_then(SqliteValue::as_text).map(String::from),
                 issue_id: row.get(4).and_then(SqliteValue::as_text).map(String::from),
                 model: row.get(5).and_then(SqliteValue::as_text).map(String::from),
@@ -12620,7 +12518,10 @@ impl SqliteStorage {
                 response: row.get(7).and_then(SqliteValue::as_text).map(String::from),
                 error: row.get(8).and_then(SqliteValue::as_text).map(String::from),
                 tool_name: row.get(9).and_then(SqliteValue::as_text).map(String::from),
-                exit_code: row.get(10).and_then(SqliteValue::as_integer).map(|v| v as i32),
+                exit_code: row
+                    .get(10)
+                    .and_then(SqliteValue::as_integer)
+                    .map(|v| v as i32),
                 parent_id: row.get(11).and_then(SqliteValue::as_text).map(String::from),
                 label: row.get(12).and_then(SqliteValue::as_text).map(String::from),
                 reason: row.get(13).and_then(SqliteValue::as_text).map(String::from),
@@ -12664,14 +12565,37 @@ impl SqliteStorage {
         );
         match result {
             Ok(row) => Ok(Some(FederationPeer {
-                name: row.get(0).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
-                remote_url: row.get(1).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
+                name: row
+                    .get(0)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or_default()
+                    .to_string(),
+                remote_url: row
+                    .get(1)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or_default()
+                    .to_string(),
                 username: row.get(2).and_then(SqliteValue::as_text).map(String::from),
-                password_encrypted: row.get(3).and_then(SqliteValue::as_blob).map(|b| b.to_vec()),
-                sovereignty: row.get(4).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
+                password_encrypted: row
+                    .get(3)
+                    .and_then(SqliteValue::as_blob)
+                    .map(|b| b.to_vec()),
+                sovereignty: row
+                    .get(4)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or_default()
+                    .to_string(),
                 last_sync: row.get(5).and_then(SqliteValue::as_text).map(String::from),
-                created_at: row.get(6).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
-                updated_at: row.get(7).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
+                created_at: row
+                    .get(6)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or_default()
+                    .to_string(),
+                updated_at: row
+                    .get(7)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or_default()
+                    .to_string(),
             })),
             Err(FrankenError::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
@@ -12685,14 +12609,37 @@ impl SqliteStorage {
         let mut peers = Vec::new();
         for row in &rows {
             peers.push(FederationPeer {
-                name: row.get(0).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
-                remote_url: row.get(1).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
+                name: row
+                    .get(0)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or_default()
+                    .to_string(),
+                remote_url: row
+                    .get(1)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or_default()
+                    .to_string(),
                 username: row.get(2).and_then(SqliteValue::as_text).map(String::from),
-                password_encrypted: row.get(3).and_then(SqliteValue::as_blob).map(|b| b.to_vec()),
-                sovereignty: row.get(4).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
+                password_encrypted: row
+                    .get(3)
+                    .and_then(SqliteValue::as_blob)
+                    .map(|b| b.to_vec()),
+                sovereignty: row
+                    .get(4)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or_default()
+                    .to_string(),
                 last_sync: row.get(5).and_then(SqliteValue::as_text).map(String::from),
-                created_at: row.get(6).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
-                updated_at: row.get(7).and_then(SqliteValue::as_text).unwrap_or_default().to_string(),
+                created_at: row
+                    .get(6)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or_default()
+                    .to_string(),
+                updated_at: row
+                    .get(7)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or_default()
+                    .to_string(),
             });
         }
         Ok(peers)
@@ -12788,16 +12735,6 @@ impl SqliteStorage {
             SqliteValue::from(issue.deleted_by.as_deref().unwrap_or("")),
             SqliteValue::from(issue.delete_reason.as_deref().unwrap_or("")),
             SqliteValue::from(issue.original_type.as_deref().unwrap_or("")),
-            SqliteValue::from(i64::from(issue.compaction_level.unwrap_or(0))),
-            timestamps
-                .compacted_at
-                .as_deref()
-                .map_or(SqliteValue::Null, SqliteValue::from),
-            issue
-                .compacted_at_commit
-                .as_deref()
-                .map_or(SqliteValue::Null, SqliteValue::from),
-            SqliteValue::from(i64::from(issue.original_size.unwrap_or(0))),
             SqliteValue::from(issue.sender.as_deref().unwrap_or("")),
             SqliteValue::from(i64::from(i32::from(issue.ephemeral))),
             SqliteValue::from(i64::from(i32::from(issue.pinned))),
@@ -12814,7 +12751,7 @@ impl SqliteStorage {
         issue: &Issue,
         timestamps: &ImportIssueTimestampStrings,
     ) -> Result<usize> {
-        let mut insert_params = Vec::with_capacity(38);
+        let mut insert_params = Vec::with_capacity(34);
         insert_params.push(SqliteValue::from(issue.id.as_str()));
         insert_params.extend(Self::import_issue_field_values(issue, timestamps));
 
@@ -12824,11 +12761,11 @@ impl SqliteStorage {
                 status, priority, issue_type, assignee, owner, estimated_minutes,
                 created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
                 due_at, defer_until, external_ref, source_system, source_repo, source_repo_path,
-                deleted_at, deleted_by, delete_reason, original_type, compaction_level,
-                compacted_at, compacted_at_commit, original_size, sender, ephemeral,
+                deleted_at, deleted_by, delete_reason, original_type,
+                sender, ephemeral,
                 pinned, is_template, agent_context
             ) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )",
             &insert_params,
         )?;
@@ -12851,8 +12788,8 @@ impl SqliteStorage {
                 created_at = ?, created_by = ?, updated_at = ?, closed_at = ?,
                 close_reason = ?, closed_by_session = ?, due_at = ?, defer_until = ?,
                 external_ref = ?, source_system = ?, source_repo = ?, source_repo_path = ?,
-                deleted_at = ?, deleted_by = ?, delete_reason = ?, original_type = ?, compaction_level = ?,
-                compacted_at = ?, compacted_at_commit = ?, original_size = ?, sender = ?,
+                deleted_at = ?, deleted_by = ?, delete_reason = ?, original_type = ?,
+                sender = ?,
                 ephemeral = ?, pinned = ?, is_template = ?, agent_context = ?
               WHERE id = ?",
             &params,
@@ -13117,8 +13054,15 @@ impl SqliteStorage {
                 .enumerate()
                 .map(|(i, _)| {
                     let base = i * 7 + 1;
-                    format!("(?{base}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{})",
-                        base + 1, base + 2, base + 3, base + 4, base + 5, base + 6)
+                    format!(
+                        "(?{base}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{})",
+                        base + 1,
+                        base + 2,
+                        base + 3,
+                        base + 4,
+                        base + 5,
+                        base + 6
+                    )
                 })
                 .collect();
             let sql = format!(
@@ -13587,10 +13531,6 @@ mod tests {
             deleted_by: None,
             delete_reason: None,
             original_type: None,
-            compaction_level: None,
-            compacted_at: None,
-            compacted_at_commit: None,
-            original_size: None,
             sender: None,
             ephemeral: false,
             pinned: false,
@@ -13904,10 +13844,6 @@ mod tests {
             deleted_by: None,
             delete_reason: None,
             original_type: None,
-            compaction_level: None,
-            compacted_at: None,
-            compacted_at_commit: None,
-            original_size: None,
             sender: None,
             ephemeral: false,
             pinned: false,
@@ -16648,10 +16584,6 @@ mod tests {
             deleted_by: None,
             delete_reason: None,
             original_type: None,
-            compaction_level: None,
-            compacted_at: None,
-            compacted_at_commit: None,
-            original_size: None,
             sender: None,
             ephemeral: false,
             pinned: false,
@@ -16731,10 +16663,6 @@ mod tests {
             deleted_by: None,
             delete_reason: None,
             original_type: None,
-            compaction_level: None,
-            compacted_at: None,
-            compacted_at_commit: None,
-            original_size: None,
             sender: None,
             ephemeral: false,
             pinned: false,
@@ -16808,10 +16736,6 @@ mod tests {
             deleted_by: None,
             delete_reason: None,
             original_type: None,
-            compaction_level: None,
-            compacted_at: None,
-            compacted_at_commit: None,
-            original_size: None,
             sender: None,
             ephemeral: false,
             pinned: false,
@@ -16942,10 +16866,6 @@ mod tests {
             deleted_by: None,
             delete_reason: None,
             original_type: None,
-            compaction_level: None,
-            compacted_at: None,
-            compacted_at_commit: None,
-            original_size: None,
             sender: None,
             ephemeral: false,
             pinned: false,
@@ -17450,10 +17370,6 @@ mod tests {
             deleted_by: None,
             delete_reason: None,
             original_type: None,
-            compaction_level: None,
-            compacted_at: None,
-            compacted_at_commit: None,
-            original_size: None,
             sender: None,
             ephemeral: false,
             pinned: false,
@@ -20322,10 +20238,6 @@ mod tests {
                 deleted_by TEXT DEFAULT '',
                 delete_reason TEXT DEFAULT '',
                 original_type TEXT DEFAULT '',
-                compaction_level INTEGER DEFAULT 0,
-                compacted_at DATETIME,
-                compacted_at_commit TEXT,
-                original_size INTEGER,
                 sender TEXT DEFAULT '',
                 ephemeral INTEGER DEFAULT 0,
                 pinned INTEGER DEFAULT 0,
@@ -22385,10 +22297,6 @@ mod tests {
                 deleted_by TEXT,
                 delete_reason TEXT,
                 original_type TEXT,
-                compaction_level INTEGER,
-                compacted_at DATETIME,
-                compacted_at_commit TEXT,
-                original_size INTEGER,
                 sender TEXT,
                 ephemeral INTEGER,
                 pinned INTEGER,
@@ -24156,144 +24064,6 @@ mod tests {
         assert!(!storage.has_repo_mtime("/does/not/exist").unwrap());
     }
 
-    // ---- Issue Snapshot tests (Issue #38) ---------------------------------
-
-    #[test]
-    fn issue_snapshot_create_and_get() {
-        let storage = SqliteStorage::open_memory().unwrap();
-        let now = Utc::now();
-        let snap = IssueSnapshot {
-            id: 0,
-            issue_id: "test-issue-1".to_string(),
-            snapshot_time: now,
-            compaction_level: 1,
-            original_size: 1000,
-            compressed_size: 500,
-            original_content: "original content".to_string(),
-            archived_events: None,
-        };
-        let id = storage.create_issue_snapshot(&snap).unwrap();
-        assert!(id > 0, "should return a positive rowid");
-
-        let got = storage.get_issue_snapshot(id).unwrap().expect("should exist");
-        assert_eq!(got.issue_id, "test-issue-1");
-        assert_eq!(got.compaction_level, 1);
-        assert_eq!(got.original_size, 1000);
-        assert_eq!(got.compressed_size, 500);
-        assert_eq!(got.original_content, "original content");
-        assert!(got.archived_events.is_none());
-    }
-
-    #[test]
-    fn issue_snapshot_get_nonexistent_returns_none() {
-        let storage = SqliteStorage::open_memory().unwrap();
-        let got = storage.get_issue_snapshot(9999).unwrap();
-        assert!(got.is_none());
-    }
-
-    #[test]
-    fn issue_snapshot_list_filters_by_issue() {
-        let storage = SqliteStorage::open_memory().unwrap();
-        let t1 = Utc::now();
-        let t2 = Utc::now();
-
-        let snap_a = IssueSnapshot {
-            id: 0,
-            issue_id: "issue-a".to_string(),
-            snapshot_time: t1,
-            compaction_level: 0,
-            original_size: 10,
-            compressed_size: 5,
-            original_content: "a1".to_string(),
-            archived_events: None,
-        };
-        let snap_b = IssueSnapshot {
-            id: 0,
-            issue_id: "issue-b".to_string(),
-            snapshot_time: t2,
-            compaction_level: 0,
-            original_size: 20,
-            compressed_size: 10,
-            original_content: "b1".to_string(),
-            archived_events: Some("events".to_string()),
-        };
-
-        storage.create_issue_snapshot(&snap_a).unwrap();
-        storage.create_issue_snapshot(&snap_b).unwrap();
-
-        let list_a = storage.list_issue_snapshots("issue-a").unwrap();
-        assert_eq!(list_a.len(), 1);
-        assert_eq!(list_a[0].issue_id, "issue-a");
-
-        let list_b = storage.list_issue_snapshots("issue-b").unwrap();
-        assert_eq!(list_b.len(), 1);
-        assert_eq!(list_b[0].issue_id, "issue-b");
-        assert_eq!(list_b[0].archived_events.as_deref(), Some("events"));
-    }
-
-    #[test]
-    fn issue_snapshot_delete_removes_row() {
-        let storage = SqliteStorage::open_memory().unwrap();
-        let snap = IssueSnapshot {
-            id: 0,
-            issue_id: "del-test".to_string(),
-            snapshot_time: Utc::now(),
-            compaction_level: 0,
-            original_size: 0,
-            compressed_size: 0,
-            original_content: "".to_string(),
-            archived_events: None,
-        };
-        let id = storage.create_issue_snapshot(&snap).unwrap();
-        storage.delete_issue_snapshot(id).unwrap();
-        let got = storage.get_issue_snapshot(id).unwrap();
-        assert!(got.is_none());
-    }
-
-    // ---- Compaction Snapshot tests (Issue #38) ----------------------------
-
-    #[test]
-    fn compaction_snapshot_create_and_get() {
-        let storage = SqliteStorage::open_memory().unwrap();
-        let snap = CompactionSnapshot {
-            id: 0,
-            issue_id: "comp-test".to_string(),
-            compaction_level: 2,
-            snapshot_json: b"{\"key\":\"value\"}".to_vec(),
-            created_at: Utc::now(),
-        };
-        let id = storage.create_compaction_snapshot(&snap).unwrap();
-        assert!(id > 0);
-
-        let got = storage.get_compaction_snapshot(id).unwrap().expect("exists");
-        assert_eq!(got.issue_id, "comp-test");
-        assert_eq!(got.compaction_level, 2);
-        assert_eq!(got.snapshot_json, b"{\"key\":\"value\"}");
-    }
-
-    #[test]
-    fn compaction_snapshot_get_nonexistent_returns_none() {
-        let storage = SqliteStorage::open_memory().unwrap();
-        let got = storage.get_compaction_snapshot(8888).unwrap();
-        assert!(got.is_none());
-    }
-
-    #[test]
-    fn compaction_snapshot_delete_removes_row() {
-        let storage = SqliteStorage::open_memory().unwrap();
-        let snap = CompactionSnapshot {
-            id: 0,
-            issue_id: "del-comp".to_string(),
-            compaction_level: 0,
-            snapshot_json: vec![],
-            created_at: Utc::now(),
-        };
-        let id = storage.create_compaction_snapshot(&snap).unwrap();
-        storage.delete_compaction_snapshot(id).unwrap();
-        let got = storage.get_compaction_snapshot(id).unwrap();
-        assert!(got.is_none());
-    }
-
     // ---- Route tests (Issue #36) ----------------------------------------
 
     #[test]
@@ -24323,12 +24093,14 @@ mod tests {
     fn route_list() {
         let storage = SqliteStorage::open_memory().unwrap();
         for i in 0..3 {
-            storage.create_route(&Route {
-                prefix: format!("r{i}"),
-                path: format!("/path/{i}"),
-                created_at: "2026-06-30T12:00:00Z".to_string(),
-                updated_at: "2026-06-30T12:00:00Z".to_string(),
-            }).unwrap();
+            storage
+                .create_route(&Route {
+                    prefix: format!("r{i}"),
+                    path: format!("/path/{i}"),
+                    created_at: "2026-06-30T12:00:00Z".to_string(),
+                    updated_at: "2026-06-30T12:00:00Z".to_string(),
+                })
+                .unwrap();
         }
         let routes = storage.list_routes().unwrap();
         assert_eq!(routes.len(), 3);
@@ -24337,12 +24109,14 @@ mod tests {
     #[test]
     fn route_delete() {
         let storage = SqliteStorage::open_memory().unwrap();
-        storage.create_route(&Route {
-            prefix: "del".to_string(),
-            path: "/del".to_string(),
-            created_at: "2026-06-30T12:00:00Z".to_string(),
-            updated_at: "2026-06-30T12:00:00Z".to_string(),
-        }).unwrap();
+        storage
+            .create_route(&Route {
+                prefix: "del".to_string(),
+                path: "/del".to_string(),
+                created_at: "2026-06-30T12:00:00Z".to_string(),
+                updated_at: "2026-06-30T12:00:00Z".to_string(),
+            })
+            .unwrap();
         storage.delete_route("del").unwrap();
         let got = storage.get_route("del").unwrap();
         assert!(got.is_none());
@@ -24430,12 +24204,40 @@ mod tests {
     fn interaction_list_by_issue() {
         let storage = SqliteStorage::open_memory().unwrap();
         for i in 0..3 {
-            storage.create_interaction(&Interaction {
-                id: format!("int-{i}"),
-                kind: "test".to_string(),
-                created_at: format!("2026-06-30T12:00:0{i}Z"),
+            storage
+                .create_interaction(&Interaction {
+                    id: format!("int-{i}"),
+                    kind: "test".to_string(),
+                    created_at: format!("2026-06-30T12:00:0{i}Z"),
+                    actor: None,
+                    issue_id: Some("proj-X".to_string()),
+                    model: None,
+                    prompt: None,
+                    response: None,
+                    error: None,
+                    tool_name: None,
+                    exit_code: None,
+                    parent_id: None,
+                    label: None,
+                    reason: None,
+                    extra: None,
+                })
+                .unwrap();
+        }
+        let list = storage.list_interactions_by_issue("proj-X").unwrap();
+        assert_eq!(list.len(), 3);
+    }
+
+    #[test]
+    fn interaction_list_by_kind() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        storage
+            .create_interaction(&Interaction {
+                id: "int-a".to_string(),
+                kind: "query".to_string(),
+                created_at: "2026-06-30T12:00:00Z".to_string(),
                 actor: None,
-                issue_id: Some("proj-X".to_string()),
+                issue_id: None,
                 model: None,
                 prompt: None,
                 response: None,
@@ -24446,31 +24248,27 @@ mod tests {
                 label: None,
                 reason: None,
                 extra: None,
-            }).unwrap();
-        }
-        let list = storage.list_interactions_by_issue("proj-X").unwrap();
-        assert_eq!(list.len(), 3);
-    }
-
-    #[test]
-    fn interaction_list_by_kind() {
-        let storage = SqliteStorage::open_memory().unwrap();
-        storage.create_interaction(&Interaction {
-            id: "int-a".to_string(),
-            kind: "query".to_string(),
-            created_at: "2026-06-30T12:00:00Z".to_string(),
-            actor: None, issue_id: None, model: None, prompt: None,
-            response: None, error: None, tool_name: None, exit_code: None,
-            parent_id: None, label: None, reason: None, extra: None,
-        }).unwrap();
-        storage.create_interaction(&Interaction {
-            id: "int-b".to_string(),
-            kind: "command".to_string(),
-            created_at: "2026-06-30T12:00:01Z".to_string(),
-            actor: None, issue_id: None, model: None, prompt: None,
-            response: None, error: None, tool_name: None, exit_code: None,
-            parent_id: None, label: None, reason: None, extra: None,
-        }).unwrap();
+            })
+            .unwrap();
+        storage
+            .create_interaction(&Interaction {
+                id: "int-b".to_string(),
+                kind: "command".to_string(),
+                created_at: "2026-06-30T12:00:01Z".to_string(),
+                actor: None,
+                issue_id: None,
+                model: None,
+                prompt: None,
+                response: None,
+                error: None,
+                tool_name: None,
+                exit_code: None,
+                parent_id: None,
+                label: None,
+                reason: None,
+                extra: None,
+            })
+            .unwrap();
         let queries = storage.list_interactions_by_kind("query").unwrap();
         assert_eq!(queries.len(), 1);
         let commands = storage.list_interactions_by_kind("command").unwrap();
@@ -24480,14 +24278,25 @@ mod tests {
     #[test]
     fn interaction_delete() {
         let storage = SqliteStorage::open_memory().unwrap();
-        storage.create_interaction(&Interaction {
-            id: "int-del".to_string(),
-            kind: "test".to_string(),
-            created_at: "2026-06-30T12:00:00Z".to_string(),
-            actor: None, issue_id: None, model: None, prompt: None,
-            response: None, error: None, tool_name: None, exit_code: None,
-            parent_id: None, label: None, reason: None, extra: None,
-        }).unwrap();
+        storage
+            .create_interaction(&Interaction {
+                id: "int-del".to_string(),
+                kind: "test".to_string(),
+                created_at: "2026-06-30T12:00:00Z".to_string(),
+                actor: None,
+                issue_id: None,
+                model: None,
+                prompt: None,
+                response: None,
+                error: None,
+                tool_name: None,
+                exit_code: None,
+                parent_id: None,
+                label: None,
+                reason: None,
+                extra: None,
+            })
+            .unwrap();
         storage.delete_interaction("int-del").unwrap();
         let got = storage.get_interaction("int-del").unwrap();
         assert!(got.is_none());
@@ -24528,15 +24337,18 @@ mod tests {
     fn federation_peer_list() {
         let storage = SqliteStorage::open_memory().unwrap();
         for i in 0..3 {
-            storage.create_federation_peer(&FederationPeer {
-                name: format!("p{i}"),
-                remote_url: format!("https://peer{i}.example.com"),
-                username: None, password_encrypted: None,
-                sovereignty: "full".to_string(),
-                last_sync: None,
-                created_at: "2026-06-30T12:00:00Z".to_string(),
-                updated_at: "2026-06-30T12:00:00Z".to_string(),
-            }).unwrap();
+            storage
+                .create_federation_peer(&FederationPeer {
+                    name: format!("p{i}"),
+                    remote_url: format!("https://peer{i}.example.com"),
+                    username: None,
+                    password_encrypted: None,
+                    sovereignty: "full".to_string(),
+                    last_sync: None,
+                    created_at: "2026-06-30T12:00:00Z".to_string(),
+                    updated_at: "2026-06-30T12:00:00Z".to_string(),
+                })
+                .unwrap();
         }
         let peers = storage.list_federation_peers().unwrap();
         assert_eq!(peers.len(), 3);
@@ -24545,16 +24357,21 @@ mod tests {
     #[test]
     fn federation_peer_update_last_sync() {
         let storage = SqliteStorage::open_memory().unwrap();
-        storage.create_federation_peer(&FederationPeer {
-            name: "sync-test".to_string(),
-            remote_url: "https://sync.example.com".to_string(),
-            username: None, password_encrypted: None,
-            sovereignty: "full".to_string(),
-            last_sync: None,
-            created_at: "2026-06-30T12:00:00Z".to_string(),
-            updated_at: "2026-06-30T12:00:00Z".to_string(),
-        }).unwrap();
-        storage.update_federation_peer_last_sync("sync-test", "2026-07-01T00:00:00Z").unwrap();
+        storage
+            .create_federation_peer(&FederationPeer {
+                name: "sync-test".to_string(),
+                remote_url: "https://sync.example.com".to_string(),
+                username: None,
+                password_encrypted: None,
+                sovereignty: "full".to_string(),
+                last_sync: None,
+                created_at: "2026-06-30T12:00:00Z".to_string(),
+                updated_at: "2026-06-30T12:00:00Z".to_string(),
+            })
+            .unwrap();
+        storage
+            .update_federation_peer_last_sync("sync-test", "2026-07-01T00:00:00Z")
+            .unwrap();
         let got = storage.get_federation_peer("sync-test").unwrap().unwrap();
         assert_eq!(got.last_sync.unwrap(), "2026-07-01T00:00:00Z");
     }
@@ -24562,15 +24379,18 @@ mod tests {
     #[test]
     fn federation_peer_delete() {
         let storage = SqliteStorage::open_memory().unwrap();
-        storage.create_federation_peer(&FederationPeer {
-            name: "del-peer".to_string(),
-            remote_url: "https://del.example.com".to_string(),
-            username: None, password_encrypted: None,
-            sovereignty: "full".to_string(),
-            last_sync: None,
-            created_at: "2026-06-30T12:00:00Z".to_string(),
-            updated_at: "2026-06-30T12:00:00Z".to_string(),
-        }).unwrap();
+        storage
+            .create_federation_peer(&FederationPeer {
+                name: "del-peer".to_string(),
+                remote_url: "https://del.example.com".to_string(),
+                username: None,
+                password_encrypted: None,
+                sovereignty: "full".to_string(),
+                last_sync: None,
+                created_at: "2026-06-30T12:00:00Z".to_string(),
+                updated_at: "2026-06-30T12:00:00Z".to_string(),
+            })
+            .unwrap();
         storage.delete_federation_peer("del-peer").unwrap();
         let got = storage.get_federation_peer("del-peer").unwrap();
         assert!(got.is_none());
@@ -24630,7 +24450,11 @@ mod tests {
             ..Default::default()
         };
         let results2 = storage.list_issues(&filters2).unwrap();
-        assert_eq!(results2.len(), 0, "non-matching wildcard should return nothing");
+        assert_eq!(
+            results2.len(),
+            0,
+            "non-matching wildcard should return nothing"
+        );
     }
 
     #[test]
@@ -24639,10 +24463,20 @@ mod tests {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let now = Utc::now();
         let mut issue = make_issue("br-md1", "Metadata test", Status::Open, 2, None, now, None);
-        issue.metadata = Some(serde_json::json!({"env": "prod", "region": "us-east-1"}).to_string());
+        issue.metadata =
+            Some(serde_json::json!({"env": "prod", "region": "us-east-1"}).to_string());
         storage.create_issue(&issue, "tester").unwrap();
-        let mut issue2 = make_issue("br-md2", "Metadata test 2", Status::Open, 2, None, now, None);
-        issue2.metadata = Some(serde_json::json!({"env": "staging", "region": "eu-west-1"}).to_string());
+        let mut issue2 = make_issue(
+            "br-md2",
+            "Metadata test 2",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        issue2.metadata =
+            Some(serde_json::json!({"env": "staging", "region": "eu-west-1"}).to_string());
         storage.create_issue(&issue2, "tester").unwrap();
 
         // Filter by env=prod

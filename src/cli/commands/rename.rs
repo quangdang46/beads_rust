@@ -27,10 +27,20 @@ pub fn execute(args: &RenameArgs, cli: &config::CliOverrides, ctx: &OutputContex
 
     if old_id == new_id {
         if ctx.is_json() {
-            let result = RenameResult { old_id: old_id.clone(), new_id: new_id.clone(), title: String::new(), updated_at: String::new() };
+            let result = RenameResult {
+                old_id: old_id.clone(),
+                new_id: new_id.clone(),
+                title: String::new(),
+                updated_at: String::new(),
+            };
             ctx.json_pretty(&result);
         } else if ctx.is_toon() {
-            let result = RenameResult { old_id: old_id.clone(), new_id: new_id.clone(), title: String::new(), updated_at: String::new() };
+            let result = RenameResult {
+                old_id: old_id.clone(),
+                new_id: new_id.clone(),
+                title: String::new(),
+                updated_at: String::new(),
+            };
             ctx.toon(&result);
         } else if ctx.is_quiet() {
             return Ok(());
@@ -60,10 +70,20 @@ pub fn execute(args: &RenameArgs, cli: &config::CliOverrides, ctx: &OutputContex
     storage_ctx.flush_no_db_if_dirty()?;
 
     if ctx.is_json() {
-        let result = RenameResult { old_id: old_id.clone(), new_id: new_id.clone(), title: renamed.title, updated_at: renamed.updated_at.to_rfc3339() };
+        let result = RenameResult {
+            old_id: old_id.clone(),
+            new_id: new_id.clone(),
+            title: renamed.title,
+            updated_at: renamed.updated_at.to_rfc3339(),
+        };
         ctx.json_pretty(&result);
     } else if ctx.is_toon() {
-        let result = RenameResult { old_id: old_id.clone(), new_id: new_id.clone(), title: renamed.title, updated_at: renamed.updated_at.to_rfc3339() };
+        let result = RenameResult {
+            old_id: old_id.clone(),
+            new_id: new_id.clone(),
+            title: renamed.title,
+            updated_at: renamed.updated_at.to_rfc3339(),
+        };
         ctx.toon(&result);
     } else if ctx.is_quiet() {
         return Ok(());

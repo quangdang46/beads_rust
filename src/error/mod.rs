@@ -123,7 +123,9 @@ pub enum BeadsError {
     // === Schema Skew Errors ===
     /// Database schema version is ahead of the binary's known version
     /// (forward drift). The binary is too old to safely read this DB.
-    #[error("Schema skew: database is at v{db_version}, binary knows up to v{binary_version}. Rebuild or set BR_IGNORE_SCHEMA_SKEW=1 to proceed (some queries may fail).")]
+    #[error(
+        "Schema skew: database is at v{db_version}, binary knows up to v{binary_version}. Rebuild or set BR_IGNORE_SCHEMA_SKEW=1 to proceed (some queries may fail)."
+    )]
     SchemaSkewForward {
         db_version: i32,
         binary_version: i32,
@@ -131,7 +133,9 @@ pub enum BeadsError {
     /// Database schema version is behind the binary's known version and
     /// the connection is read-only (cannot migrate). Run a write command
     /// in this workspace to migrate.
-    #[error("Schema skew: database is at v{db_version}, binary expects v{binary_version}, and the read-only open cannot migrate it. Run a write command in this workspace, or set BR_IGNORE_SCHEMA_SKEW=1 to proceed (some queries may fail).")]
+    #[error(
+        "Schema skew: database is at v{db_version}, binary expects v{binary_version}, and the read-only open cannot migrate it. Run a write command in this workspace, or set BR_IGNORE_SCHEMA_SKEW=1 to proceed (some queries may fail)."
+    )]
     SchemaSkewBehind {
         db_version: i32,
         binary_version: i32,

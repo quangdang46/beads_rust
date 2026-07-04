@@ -669,9 +669,8 @@ fn value_type_name(v: &Value) -> &'static str {
 /// These are tracked as known differences for documentation purposes.
 /// When br implements these, remove them from this list.
 const KNOWN_BD_ONLY_TABLES: &[&str] = &[
-    "compaction_snapshots", // Used for compaction history tracking
-    "issue_snapshots",      // Used for issue history/versioning
-    "repo_mtimes",          // Used for repo modification time tracking
+    "issue_snapshots", // Used for issue history/versioning
+    "repo_mtimes",     // Used for repo modification time tracking
 ];
 
 /// Columns in the issues table that bd has but br intentionally doesn't implement.
@@ -721,7 +720,6 @@ const KNOWN_BR_ONLY_COLUMNS: &[&str] = &[
 const KNOWN_TYPE_DIFFERENCES: &[&str] = &[
     // br uses TEXT for timestamps (ISO8601 strings), bd uses DATETIME (still TEXT internally)
     "closed_at",
-    "compacted_at",
     "created_at",
     "defer_until",
     "deleted_at",
@@ -1056,47 +1054,6 @@ fn conformance_jsonl_field_parity() {
         "JSONL field parity check failed: {:?}",
         result.err()
     );
-}
-
-#[test]
-fn conformance_jsonl_compaction_level_serialization() {
-    skip_if_no_binaries!();
-    common::init_test_logging();
-    info!("Starting conformance_jsonl_compaction_level_serialization test");
-
-    let workspace = SchemaWorkspace::new();
-    workspace.init_both();
-
-    // Create and close an issue to test compaction_level
-    let br_create = workspace.run_br(&["create", "Test compaction", "--json"]);
-    assert!(br_create.success, "br create failed: {}", br_create.stderr);
-
-    let br_json: Value = serde_json::from_str(&br_create.stdout).unwrap_or_default();
-    let br_id = br_json
-        .get("id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-
-    // Close the issue
-    let _ = workspace.run_br(&["close", br_id, "--reason", "Testing"]);
-    let _ = workspace.run_br(&["sync", "--flush-only"]);
-
-    // Read JSONL and check compaction_level serialization
-    let br_jsonl = workspace.br_jsonl_path();
-    let content = fs::read_to_string(&br_jsonl).expect("read br jsonl");
-
-    for line in content.lines() {
-        if let Ok(issue) = serde_json::from_str::<Value>(line) {
-            // compaction_level should be serialized as integer (0 when None)
-            if let Some(level) = issue.get("compaction_level") {
-                assert!(
-                    level.is_number(),
-                    "compaction_level should be a number, got: {:?}",
-                    level
-                );
-            }
-        }
-    }
 }
 
 /// Known schema differences in tables other than issues.

@@ -1,85 +1,75 @@
 [
   {
-    "id": "bd-2cr",
-    "title": "Critical bug in authentication",
-    "description": "Users cannot login with valid credentials",
-    "status": "open",
-    "priority": 0,
-    "issue_type": "bug",
     "created_at": "2026-01-19T22:12:48.942352085Z",
     "created_by": "ubuntu",
-    "updated_at": "2026-01-19T22:12:49.050007668Z",
-    "compaction_level": 0,
-    "original_size": 0,
+    "dependency_count": 1,
+    "dependent_count": 1,
+    "description": "Users cannot login with valid credentials",
+    "id": "bd-2cr",
+    "issue_type": "bug",
     "labels": [
       "auth"
     ],
-    "dependency_count": 1,
-    "dependent_count": 1
+    "priority": 0,
+    "status": "open",
+    "title": "Critical bug in authentication",
+    "updated_at": "2026-01-19T22:12:49.050007668Z"
   },
   {
-    "id": "bd-2h0",
-    "title": "Test task with priority 1",
-    "status": "open",
-    "priority": 1,
-    "issue_type": "task",
     "created_at": "2026-01-19T22:12:48.936907133Z",
     "created_by": "ubuntu",
-    "updated_at": "2026-01-19T22:12:49.022237331Z",
-    "compaction_level": 0,
-    "original_size": 0,
+    "dependency_count": 0,
+    "dependent_count": 1,
+    "id": "bd-2h0",
+    "issue_type": "task",
     "labels": [
       "critical"
     ],
-    "dependency_count": 0,
-    "dependent_count": 1
+    "priority": 1,
+    "status": "open",
+    "title": "Test task with priority 1",
+    "updated_at": "2026-01-19T22:12:49.022237331Z"
   },
   {
-    "id": "bd-2ja",
-    "title": "New feature: dark mode",
-    "description": "Add dark mode support to the application",
-    "status": "open",
-    "priority": 2,
-    "issue_type": "feature",
     "created_at": "2026-01-19T22:12:48.947742183Z",
     "created_by": "ubuntu",
-    "updated_at": "2026-01-19T22:12:49.031608121Z",
-    "compaction_level": 0,
-    "original_size": 0,
+    "dependency_count": 1,
+    "dependent_count": 0,
+    "description": "Add dark mode support to the application",
+    "id": "bd-2ja",
+    "issue_type": "feature",
     "labels": [
       "ux"
     ],
-    "dependency_count": 1,
-    "dependent_count": 0
+    "priority": 2,
+    "status": "open",
+    "title": "New feature: dark mode",
+    "updated_at": "2026-01-19T22:12:49.031608121Z"
   },
   {
-    "id": "bd-1xz",
-    "title": "Chore: update dependencies",
-    "status": "open",
-    "priority": 3,
-    "issue_type": "chore",
     "created_at": "2026-01-19T22:12:48.953548907Z",
     "created_by": "ubuntu",
-    "updated_at": "2026-01-19T22:12:48.953548907Z",
-    "compaction_level": 0,
-    "original_size": 0,
     "dependency_count": 0,
-    "dependent_count": 0
+    "dependent_count": 0,
+    "id": "bd-1xz",
+    "issue_type": "chore",
+    "priority": 3,
+    "status": "open",
+    "title": "Chore: update dependencies",
+    "updated_at": "2026-01-19T22:12:48.953548907Z"
   },
   {
-    "id": "bd-448",
-    "title": "Low priority documentation",
-    "status": "closed",
-    "priority": 4,
-    "issue_type": "task",
+    "close_reason": "Completed documentation updates",
+    "closed_at": "2026-01-19T22:12:49.055951160Z",
     "created_at": "2026-01-19T22:12:48.959270510Z",
     "created_by": "ubuntu",
-    "updated_at": "2026-01-19T22:12:49.055990193Z",
-    "closed_at": "2026-01-19T22:12:49.055951160Z",
-    "close_reason": "Completed documentation updates",
-    "compaction_level": 0,
-    "original_size": 0,
     "dependency_count": 0,
-    "dependent_count": 0
+    "dependent_count": 0,
+    "id": "bd-448",
+    "issue_type": "task",
+    "priority": 4,
+    "status": "closed",
+    "title": "Low priority documentation",
+    "updated_at": "2026-01-19T22:12:49.055990193Z"
   }
 ]

@@ -506,10 +506,11 @@ fn main() {
             })
         }
         Commands::Federation(command) => {
-            commands::federation::run(&command, &output_ctx)
-                .map_err(|e| beads_rust::error::BeadsError::Internal {
+            commands::federation::run(&command, &output_ctx).map_err(|e| {
+                beads_rust::error::BeadsError::Internal {
                     message: e.to_string(),
-                })
+                }
+            })
         }
         Commands::Version(args) => commands::version::execute(&args, &output_ctx),
 
@@ -550,15 +551,11 @@ fn main() {
         Commands::Undefer(args) => {
             commands::defer::execute_undefer(&args, cli.json || args.robot, &overrides, &output_ctx)
         }
-        Commands::Wisp { command } => {
-            commands::wisp::execute(&command, &overrides, &output_ctx)
-        }
+        Commands::Wisp { command } => commands::wisp::execute(&command, &overrides, &output_ctx),
         Commands::Memory { command } => {
             commands::memory::execute(&command, cli.json, &overrides, &output_ctx)
         }
-        Commands::Prime(args) => {
-            commands::prime::execute(&args, cli.json, &overrides, &output_ctx)
-        }
+        Commands::Prime(args) => commands::prime::execute(&args, cli.json, &overrides, &output_ctx),
         Commands::CustomStatus { command } => {
             commands::custom_status::execute_status(&command, cli.json, &overrides, &output_ctx)
         }
@@ -975,21 +972,21 @@ const fn needs_write_lock(cmd: &Commands) -> bool {
         | Commands::Dep { .. }
         | Commands::Label { .. }
         | Commands::Epic { .. }
- | Commands::Query { .. }
- | Commands::Orphans(_)
- | Commands::Audit { .. }
- | Commands::Info(_)
- | Commands::Import(_)
- | Commands::Where
- | Commands::Sync(_)
- | Commands::Init { .. }
- | Commands::Doctor(_)
- | Commands::Template { .. }
- | Commands::Admin { .. }
- | Commands::Memory { .. }
- | Commands::Prime(_)
- | Commands::Sql(_) => true,
- Commands::Config { command } => !matches!(
+        | Commands::Query { .. }
+        | Commands::Orphans(_)
+        | Commands::Audit { .. }
+        | Commands::Info(_)
+        | Commands::Import(_)
+        | Commands::Where
+        | Commands::Sync(_)
+        | Commands::Init { .. }
+        | Commands::Doctor(_)
+        | Commands::Template { .. }
+        | Commands::Admin { .. }
+        | Commands::Memory { .. }
+        | Commands::Prime(_)
+        | Commands::Sql(_) => true,
+        Commands::Config { command } => !matches!(
             command,
             beads_rust::cli::ConfigCommands::Path | beads_rust::cli::ConfigCommands::Edit
         ),
@@ -1104,8 +1101,7 @@ const fn supports_read_only_fast_open(cmd: &Commands) -> bool {
         } => true,
         Commands::Template {
             command:
-                beads_rust::cli::TemplateCommands::List(_)
-                | beads_rust::cli::TemplateCommands::Show(_),
+                beads_rust::cli::TemplateCommands::List(_) | beads_rust::cli::TemplateCommands::Show(_),
         } => true,
         Commands::Dep { command } => is_read_only_dep_command(command),
         Commands::Label { command } => is_read_only_label_listing(command),
@@ -1138,8 +1134,7 @@ const fn supports_auto_import_read_only_probe(cmd: &Commands) -> bool {
         } => true,
         Commands::Template {
             command:
-                beads_rust::cli::TemplateCommands::List(_)
-                | beads_rust::cli::TemplateCommands::Show(_),
+                beads_rust::cli::TemplateCommands::List(_) | beads_rust::cli::TemplateCommands::Show(_),
         } => true,
         Commands::Lint(args) => args.ids.is_empty(),
         Commands::Label { command } => is_read_only_label_listing(command),

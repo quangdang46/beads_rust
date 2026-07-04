@@ -13,10 +13,10 @@
 //! expr        ::= comparison (AND|OR comparison)*
 //! ```
 
-mod lexer;
 mod ast;
-mod parser;
 mod evaluator;
+mod lexer;
+mod parser;
 
 pub use ast::{ComparisonOp, QueryNode};
 pub use evaluator::{QueryError, QueryResult, evaluate};

@@ -11,20 +11,15 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Dispatch a [`crate::cli::MergeSlotCommand`].
-pub fn execute(
-    command: &crate::cli::MergeSlotCommand,
-    ctx: &OutputContext,
-) -> Result<()> {
+pub fn execute(command: &crate::cli::MergeSlotCommand, ctx: &OutputContext) -> Result<()> {
     let actor = std::env::var("BR_ACTOR")
         .or_else(|_| std::env::var("USER"))
         .unwrap_or_else(|_| "merge-slot".to_string());
     let db_path = std::env::var("BR_DATABASE_PATH")
         .or_else(|_| std::env::var("BEADS_DATABASE_PATH"))
         .unwrap_or_else(|_| ".beads/beads.db".to_string());
-    let mut storage =
-        SqliteStorage::open(Path::new(&db_path)).with_context(|| {
-            format!("merge-slot: open database {db_path}")
-        })?;
+    let mut storage = SqliteStorage::open(Path::new(&db_path))
+        .with_context(|| format!("merge-slot: open database {db_path}"))?;
 
     let prefix = storage
         .get_config("issue_prefix")
@@ -40,9 +35,7 @@ pub fn execute(
         crate::cli::MergeSlotCommand::Wait(args) => {
             cmd_wait(&mut storage, &actor, &prefix, args, ctx)
         }
-        crate::cli::MergeSlotCommand::Release => {
-            cmd_release(&mut storage, &actor, &prefix, ctx)
-        }
+        crate::cli::MergeSlotCommand::Release => cmd_release(&mut storage, &actor, &prefix, ctx),
     }
 }
 

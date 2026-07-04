@@ -158,7 +158,7 @@ Bug issues should include:
 | Aspect | br (Rust) | bd (Go) |
 |--------|-----------|---------|
 | Git operations | **Never** (explicit sync) | Auto-commit, hooks |
-| Storage | SQLite + JSONL | Dolt/SQLite |
+| Storage | SQLite + JSONL | SQLite |
 | Background daemon | **No** | Yes |
 | Hook installation | **Manual** | Automatic |
 | Complexity | Focused | Feature-rich |
@@ -168,7 +168,6 @@ Bug issues should include:
 - Automatic git commits
 - Git hook installation
 - Background daemon/RPC
-- Dolt backend
 - Linear/Jira sync
 - Web UI (use bv for TUI)
 - Multi-repo sync

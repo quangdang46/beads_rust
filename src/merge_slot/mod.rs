@@ -121,10 +121,6 @@ impl SqliteStorage {
             deleted_by: None,
             delete_reason: None,
             original_type: None,
-            compaction_level: None,
-            compacted_at: None,
-            compacted_at_commit: None,
-            original_size: None,
             dependencies: vec![],
             comments: vec![],
             labels: vec![],
@@ -234,12 +230,8 @@ impl SqliteStorage {
                         message: format!("merge slot: JSON encode error: {e}"),
                     })?;
 
-                match self.merge_slot_update_status(
-                    &slot_id,
-                    Status::InProgress,
-                    &meta_json,
-                    actor,
-                ) {
+                match self.merge_slot_update_status(&slot_id, Status::InProgress, &meta_json, actor)
+                {
                     Ok(()) => {
                         result.acquired = true;
                         result.holder = holder.to_string();
@@ -270,10 +262,9 @@ impl SqliteStorage {
                 holder: meta.holder,
                 waiters: new_waiters,
             };
-            let meta_json =
-                serde_json::to_string(&new_meta).map_err(|e| BeadsError::Internal {
-                    message: format!("merge slot: JSON encode error: {e}"),
-                })?;
+            let meta_json = serde_json::to_string(&new_meta).map_err(|e| BeadsError::Internal {
+                message: format!("merge slot: JSON encode error: {e}"),
+            })?;
 
             match self.merge_slot_update_status(
                 &slot_id,
@@ -287,9 +278,8 @@ impl SqliteStorage {
                     return Ok(result);
                 }
                 Err(BeadsError::Internal { .. }) => {
-                    let _ = std::thread::sleep(Duration::from_millis(
-                        (10_u64 << attempts).min(500),
-                    ));
+                    let _ =
+                        std::thread::sleep(Duration::from_millis((10_u64 << attempts).min(500)));
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -301,12 +291,7 @@ impl SqliteStorage {
     ///
     /// Clears the holder field. If there are waiters, the first waiter
     /// becomes the new holder.
-    pub fn merge_slot_release(
-        &mut self,
-        holder: &str,
-        actor: &str,
-        prefix: &str,
-    ) -> Result<()> {
+    pub fn merge_slot_release(&mut self, holder: &str, actor: &str, prefix: &str) -> Result<()> {
         let slot_id = merge_slot_id(prefix);
 
         let mut attempts = 0;
@@ -353,17 +338,15 @@ impl SqliteStorage {
                 holder: new_holder,
                 waiters: new_waiters.into_iter().skip(1).collect(),
             };
-            let meta_json =
-                serde_json::to_string(&new_meta).map_err(|e| BeadsError::Internal {
-                    message: format!("merge slot: JSON encode error: {e}"),
-                })?;
+            let meta_json = serde_json::to_string(&new_meta).map_err(|e| BeadsError::Internal {
+                message: format!("merge slot: JSON encode error: {e}"),
+            })?;
 
             match self.merge_slot_update_status(&slot_id, new_status, &meta_json, actor) {
                 Ok(()) => return Ok(()),
                 Err(BeadsError::Internal { .. }) => {
-                    let _ = std::thread::sleep(Duration::from_millis(
-                        (10_u64 << attempts).min(500),
-                    ));
+                    let _ =
+                        std::thread::sleep(Duration::from_millis((10_u64 << attempts).min(500)));
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -431,11 +414,9 @@ impl SqliteStorage {
 
         match self.update_issue(slot_id, &updates, actor) {
             Ok(_) => Ok(()),
-            Err(BeadsError::IssueNotFound { .. }) => {
-                Err(BeadsError::Internal {
-                    message: format!("merge slot {slot_id} not found"),
-                })
-            }
+            Err(BeadsError::IssueNotFound { .. }) => Err(BeadsError::Internal {
+                message: format!("merge slot {slot_id} not found"),
+            }),
             Err(e) => Err(e),
         }
     }

@@ -245,7 +245,7 @@ git/VCS handoff, and no background services installed behind your back.
 | Aspect | br (Rust) | beads (Go) |
 |--------|-----------|------------|
 | Git operations | **No automatic commits/pushes/pulls**; reporting commands can inspect git history | Auto-commit, hooks |
-| Storage | SQLite + JSONL | Dolt/SQLite |
+| Storage | SQLite + JSONL | SQLite |
 | Background daemon | **No** | Yes |
 | Hook installation | **Manual** | Automatic |
 | Binary size | ~5-8 MB | ~30+ MB |
@@ -779,7 +779,7 @@ br intentionally does **not** support:
 | **Automatic git commits** | Non-invasive philosophy |
 | **Git hook installation** | User-controlled, add manually if desired |
 | **Background daemon** | Simple CLI, no processes to manage |
-| **Dolt backend** | SQLite + JSONL only |
+| **Dolt/VC backend** | SQLite + JSONL only |
 | **Linear/Jira sync** | Focused scope |
 | **Web UI** | CLI-first (see beads_viewer for TUI) |
 | **Automatic multi-repo sync** | Route-aware commands can target configured workspaces, but git/VCS sync remains explicit per repo |
