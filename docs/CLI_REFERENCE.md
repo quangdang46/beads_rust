@@ -1881,6 +1881,90 @@ br formula expand workflow.formula.json --var component=auth
 br formula expand workflow.formula.json --robot
 ```
 
+### codex-hook
+
+Internal Codex CLI lifecycle hook (hidden, called by .codex/hooks.json).
+
+```bash
+br codex-hook <EVENT>
+```
+
+Events: `SessionStart`, `PreCompact`, `PostCompact`, `UserPromptSubmit`.
+
+---
+
+### mol
+
+Molecule commands for agent workflow templates.
+
+```bash
+br mol <COMMAND>
+```
+
+Subcommands: `bond`, `pour`, `swarm validate`, `swarm create`.
+
+---
+
+### export
+
+Export issues to JSONL, JSON, CSV, or Obsidian Markdown.
+
+```bash
+br export [OPTIONS]
+```
+
+---
+
+### rename-prefix
+
+Rename the issue ID prefix across all issues.
+
+```bash
+br rename-prefix <NEW_PREFIX>
+```
+
+---
+
+### memory
+
+Persistent agent memory (remember, memories, recall, forget).
+
+```bash
+br memory <COMMAND>
+```
+
+---
+
+### prime
+
+AI session context with persistent memory injection.
+
+```bash
+br prime [OPTIONS]
+```
+
+---
+
+### federation
+
+Manage federation peers for P2P sync.
+
+```bash
+br federation <COMMAND>
+```
+
+---
+
+### sql
+
+Execute a read-only SQL query against the database.
+
+```bash
+br sql <QUERY>
+```
+
+---
+
 ---
 
 ## Exit Codes

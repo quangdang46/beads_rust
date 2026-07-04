@@ -951,6 +951,7 @@ mod tests {
             "export_hashes".to_string(),
             "federation_peers".to_string(),
             "gate_results".to_string(),
+            "gate_waiters".to_string(),
             "interactions".to_string(),
             "issue_counter".to_string(),
             "issues".to_string(),
@@ -958,6 +959,7 @@ mod tests {
             "metadata".to_string(),
             "repo_mtimes".to_string(),
             "routes".to_string(),
+            "schema_migration_hashes".to_string(),
         ];
         assert_eq!(
             output

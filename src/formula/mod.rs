@@ -44,7 +44,8 @@ pub fn match_glob(pattern: &str, step_id: &str) -> bool {
 
     // *.suffix pattern (e.g., "*.implement")
     if let Some(suffix) = pattern.strip_prefix("*.") {
-        return step_id.ends_with(suffix);
+        let dot_suffix = format!(".{suffix}");
+        return step_id.ends_with(&dot_suffix);
     }
 
     // prefix.* pattern (e.g., "shiny.*")
