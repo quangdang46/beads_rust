@@ -31,7 +31,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537
         with:
-          toolchain: nightly-2026-06-20
+          toolchain: nightly
           components: rustfmt, clippy
 
       - name: Cache cargo
@@ -79,7 +79,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537
         with:
-          toolchain: nightly-2026-06-20
+          toolchain: nightly
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2.9.1
@@ -106,7 +106,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537
         with:
-          toolchain: nightly-2026-06-20
+          toolchain: nightly
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2.9.1
@@ -162,7 +162,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537
         with:
-          toolchain: nightly-2026-06-20
+          toolchain: nightly
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2.9.1
@@ -220,7 +220,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537
         with:
-          toolchain: nightly-2026-06-20
+          toolchain: nightly
           components: llvm-tools-preview
 
       - name: Cache cargo
@@ -278,7 +278,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537
         with:
-          toolchain: nightly-2026-06-20
+          toolchain: nightly
           targets: ${{ matrix.target }}
 
       - name: Cache cargo
@@ -323,7 +323,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537
         with:
-          toolchain: nightly-2026-06-20
+          toolchain: nightly
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2.9.1
@@ -457,7 +457,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537
         with:
-          toolchain: nightly-2026-06-20
+          toolchain: nightly
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2.9.1
