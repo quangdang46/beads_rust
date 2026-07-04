@@ -262,6 +262,7 @@ proptest! {
             issue.design.as_deref(),
             issue.acceptance_criteria.as_deref(),
             issue.notes.as_deref(),
+            issue.spec_id.as_deref(),
             &issue.status,
             &issue.priority,
             &issue.issue_type,
@@ -271,7 +272,19 @@ proptest! {
             issue.external_ref.as_deref(),
             issue.source_system.as_deref(),
             issue.pinned,
+            issue.metadata.as_deref(),
             issue.is_template,
+            &issue.bonded_from,
+            issue.await_type.as_deref(),
+            issue.await_id.as_deref(),
+            issue.timeout_seconds,
+            &issue.waiters,
+            &issue.mol_type,
+            &issue.work_type,
+            None,  // event_kind
+            None,  // actor
+            None,  // target
+            None,  // payload
         );
 
         prop_assert_eq!(direct, from_parts, "Direct and from_parts should match");

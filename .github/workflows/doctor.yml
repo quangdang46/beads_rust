@@ -28,6 +28,7 @@ env:
   RUST_BACKTRACE: 1
   RUST_LOG: error
   BR_NO_AUTOFLUSH: 1
+  RUSTC_BOOTSTRAP: 1
 
 permissions:
   contents: read

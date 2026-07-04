@@ -187,6 +187,13 @@ pub fn execute_with_storage(
         crate::util::set_last_touched_id(&last_touched_dir, &created_id);
     }
 
+    // Read-back verification (issue #102): non-fatal check that the write
+    // actually persisted.  Logs a warning (not an error) on mismatch so
+    // pipelines are never disrupted by a verification failure.
+    if !args.dry_run {
+        super::verify_write(&storage_ctx.storage, &created_id, Some(&issue));
+    }
+
     // Output
     if args.silent {
         println!("{}", issue.id);
@@ -544,6 +551,13 @@ pub fn create_issue_impl(
 }
 
 /// Generate a new ID, supporting both hierarchical and hash-based formats.
+///
+/// **Cross-namespace uniqueness** — since all issues (regular and wisp) live
+/// in the same `issues` table, `storage.id_exists()` already detects whether
+/// *any* issue already holds a candidate ID, irrespective of the ID's prefix.
+/// This ensures that:
+/// - A regular-issue ID never collides with an existing wisp ID.
+/// - A wisp ID (wsp- prefix) never collides with an existing regular-issue ID.
 ///
 /// When `slug` is `Some(non-empty)` and the issue is non-hierarchical, the
 /// resulting ID embeds the normalized slug between the prefix and the hash:

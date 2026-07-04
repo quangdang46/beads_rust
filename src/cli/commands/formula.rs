@@ -8,12 +8,15 @@
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::formula::Parser;
+use crate::formula::types::FormulaType;
 use crate::model::{Issue, IssueType, Priority, Status};
 use crate::output::OutputContext;
 use crate::validation::IssueValidator;
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fs;
 use std::path::PathBuf;
+use std::vec::Vec;
 
 // ---------------------------------------------------------------------------
 // FormulaCommands — clap args for `br formula` subcommand group
@@ -28,6 +31,12 @@ pub enum FormulaCommands {
     Expand(FormulaExpandArgs),
     /// Create issues from a formula (apply)
     Apply(FormulaApplyArgs),
+    /// List available formulas from search paths
+    List(FormulaListArgs),
+    /// Show formula details, steps, and composition rules
+    Show(FormulaShowArgs),
+    /// Convert formula from JSON to TOML format
+    Convert(FormulaConvertArgs),
 }
 
 /// Arguments for `br formula validate <file>`
@@ -66,6 +75,64 @@ pub struct FormulaExpandArgs {
     /// Output format (text, json)
     #[arg(long, short)]
     pub format: Option<crate::cli::OutputFormatBasic>,
+
+    /// Output raw JSON
+    #[arg(long)]
+    pub json: bool,
+
+    /// Output machine-readable JSON
+    #[arg(long)]
+    pub robot: bool,
+}
+
+/// Arguments for `br formula list`
+#[derive(clap::Args, Debug)]
+pub struct FormulaListArgs {
+    /// Filter by type (workflow, expansion, aspect, convoy)
+    #[arg(long)]
+    pub r#type: Option<String>,
+
+    /// Output raw JSON
+    #[arg(long)]
+    pub json: bool,
+
+    /// Output machine-readable JSON
+    #[arg(long)]
+    pub robot: bool,
+}
+
+/// Arguments for `br formula show <name>`
+#[derive(clap::Args, Debug)]
+pub struct FormulaShowArgs {
+    /// Formula name to show
+    pub name: String,
+
+    /// Output raw JSON
+    #[arg(long)]
+    pub json: bool,
+
+    /// Output machine-readable JSON
+    #[arg(long)]
+    pub robot: bool,
+}
+
+/// Arguments for `br formula convert <file>`
+#[derive(clap::Args, Debug)]
+pub struct FormulaConvertArgs {
+    /// Formula name or file path to convert
+    pub target: Option<String>,
+
+    /// Convert all JSON formulas found in search paths
+    #[arg(long)]
+    pub all: bool,
+
+    /// Print TOML to stdout instead of writing a file
+    #[arg(long)]
+    pub stdout: bool,
+
+    /// Delete the JSON file after successful conversion
+    #[arg(long)]
+    pub delete: bool,
 
     /// Output raw JSON
     #[arg(long)]
@@ -118,6 +185,9 @@ pub fn execute(
         FormulaCommands::Validate(args) => execute_validate(args, output_ctx),
         FormulaCommands::Expand(args) => execute_expand(args, output_ctx),
         FormulaCommands::Apply(args) => execute_apply(args, overrides, output_ctx),
+        FormulaCommands::List(args) => execute_list(args, output_ctx),
+        FormulaCommands::Show(args) => execute_show(args, output_ctx),
+        FormulaCommands::Convert(args) => execute_convert(args, output_ctx),
     }
 }
 
@@ -521,6 +591,527 @@ fn execute_apply(
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// list
+// ---------------------------------------------------------------------------
+
+/// List available formulas from search paths.
+fn execute_list(args: &FormulaListArgs, output_ctx: &OutputContext) -> crate::Result<()> {
+    let use_json = args.json || args.robot || output_ctx.is_json();
+    let search_paths = Parser::default_search_paths();
+
+    #[derive(serde::Serialize)]
+    struct ListEntry {
+        name: String,
+        r#type: String,
+        description: String,
+        source: String,
+        steps: usize,
+        vars: usize,
+    }
+
+    let mut seen: HashMap<String, bool> = HashMap::new();
+    let mut entries: Vec<ListEntry> = Vec::new();
+
+    for dir in &search_paths {
+        if !dir.exists() {
+            continue;
+        }
+        let dir_entries = match fs::read_dir(dir) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        for entry in dir_entries.flatten() {
+            let path = entry.path();
+            let fname = entry.file_name().to_string_lossy().to_string();
+
+            if !fname.ends_with(".formula.toml") && !fname.ends_with(".formula.json") {
+                continue;
+            }
+
+            // Derive formula name from filename (strip extension prefixes)
+            let formula_name = fname
+                .strip_suffix(".formula.toml")
+                .or_else(|| fname.strip_suffix(".formula.json"))
+                .unwrap_or(&fname)
+                .to_string();
+
+            if seen.contains_key(&formula_name) {
+                continue; // Earlier paths shadow later ones
+            }
+            seen.insert(formula_name.clone(), true);
+
+            // Parse the formula
+            let mut parser = Parser::new(search_paths.clone());
+            let formula = match parser.parse_file(&path) {
+                Ok(f) => f,
+                Err(_) => continue, // Skip invalid formulas
+            };
+
+            // Filter by type if specified
+            if let Some(ref type_filter) = args.r#type {
+                let ft: FormulaType = match type_filter.as_str() {
+                    "workflow" => FormulaType::Workflow,
+                    "expansion" => FormulaType::Expansion,
+                    "aspect" => FormulaType::Aspect,
+                    "convoy" => FormulaType::Convoy,
+                    _ => {
+                        return Err(BeadsError::Config(format!(
+                            "Invalid type filter {:?}: must be workflow, expansion, aspect, or convoy",
+                            type_filter
+                        )));
+                    }
+                };
+                if formula.r#type != ft {
+                    continue;
+                }
+            }
+
+            let type_str = format!("{:?}", formula.r#type).to_lowercase();
+            let step_count = count_steps(formula.steps.as_deref().unwrap_or_default());
+            let var_count = formula.vars.as_ref().map_or(0, |v| v.len());
+
+            entries.push(ListEntry {
+                name: formula_name,
+                r#type: type_str,
+                description: truncate_description(formula.description.as_deref().unwrap_or(""), 60),
+                source: formula.source.unwrap_or_default(),
+                steps: step_count,
+                vars: var_count,
+            });
+        }
+    }
+
+    // Sort by name
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+
+    if use_json {
+        output_ctx.print(&serde_json::to_string_pretty(&entries).unwrap_or_default());
+        return Ok(());
+    }
+
+    if entries.is_empty() {
+        output_ctx.print("No formulas found.");
+        output_ctx.print("Search paths:");
+        for p in &search_paths {
+            output_ctx.print(&format!("  {}", p.display()));
+        }
+        return Ok(());
+    }
+
+    output_ctx.print(&format!("Formulas ({} found)", entries.len()));
+
+    // Group by type
+    let mut by_type: HashMap<String, Vec<&ListEntry>> = HashMap::new();
+    for e in &entries {
+        by_type.entry(e.r#type.clone()).or_default().push(e);
+    }
+
+    let type_order = ["workflow", "expansion", "aspect", "convoy"];
+    for t in &type_order {
+        let Some(type_entries) = by_type.get(*t) else {
+            continue;
+        };
+        output_ctx.print(&format!("  {}:", t));
+        for e in type_entries {
+            let var_info = if e.vars > 0 {
+                format!(" ({} vars)", e.vars)
+            } else {
+                String::new()
+            };
+            output_ctx.print(&format!("    {:<25} {}{}", e.name, e.description, var_info));
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// show
+// ---------------------------------------------------------------------------
+
+/// Show formula details.
+fn execute_show(args: &FormulaShowArgs, output_ctx: &OutputContext) -> crate::Result<()> {
+    let use_json = args.json || args.robot || output_ctx.is_json();
+    let search_paths = Parser::default_search_paths();
+    let mut parser = Parser::new(search_paths.clone());
+
+    let formula = parser
+        .load_by_name(&args.name)
+        .map_err(|e| BeadsError::Config(format!("Formula {:?} not found: {}", args.name, e)))?;
+
+    if use_json {
+        output_ctx.print(&serde_json::to_string_pretty(&formula).unwrap_or_default());
+        return Ok(());
+    }
+
+    output_ctx.print(&format!("Formula: {}", formula.formula));
+    output_ctx.print(&format!("  Type: {:?}", formula.r#type));
+    if let Some(ref desc) = formula.description {
+        output_ctx.print(&format!("  Description: {}", desc));
+    }
+    if let Some(ref source) = formula.source {
+        output_ctx.print(&format!("  Source: {}", source));
+    }
+
+    // Print extends
+    if !formula.extends.is_empty() {
+        output_ctx.print("  Extends:");
+        for ext in &formula.extends {
+            output_ctx.print(&format!("    - {}", ext));
+        }
+    }
+
+    // Print variables
+    if let Some(vars) = &formula.vars {
+        if !vars.is_empty() {
+            output_ctx.print("  Variables:");
+            for v in vars {
+                let mut attrs: Vec<String> = Vec::new();
+                if v.required {
+                    attrs.push("required".to_string());
+                }
+                if let Some(ref default) = v.default {
+                    attrs.push(format!("default={:?}", default));
+                }
+                if !v.r#enum.is_empty() {
+                    attrs.push(format!("enum=[{}]", v.r#enum.join(",")));
+                }
+                let attr_str = if attrs.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", attrs.join(", "))
+                };
+                let desc = v
+                    .description
+                    .as_ref()
+                    .map(|d| format!(": {}", d))
+                    .unwrap_or_default();
+                output_ctx.print(&format!("    {{{{{}}}}}{}{}", v.name, desc, attr_str));
+            }
+        }
+    }
+
+    // Print steps
+    if let Some(steps) = &formula.steps {
+        if !steps.is_empty() {
+            let count = count_steps(steps);
+            output_ctx.print(&format!("  Steps ({}):", count));
+            print_steps_tree(steps, "    ", output_ctx);
+        }
+    }
+
+    // Print template (for expansion formulas)
+    if let Some(template) = &formula.template {
+        if !template.is_empty() {
+            output_ctx.print(&format!("  Template ({} steps):", template.len()));
+            print_steps_tree(template, "    ", output_ctx);
+        }
+    }
+
+    // Print compose rules
+    if let Some(ref compose) = formula.compose {
+        let has_rules = compose.expand.as_ref().map_or(false, |e| !e.is_empty())
+            || compose.r#map.as_ref().map_or(false, |m| !m.is_empty())
+            || compose
+                .bond_points
+                .as_ref()
+                .map_or(false, |b| !b.is_empty())
+            || compose.aspects.as_ref().map_or(false, |a| !a.is_empty());
+
+        if has_rules {
+            output_ctx.print("  Composition:");
+
+            if let Some(bond_points) = &compose.bond_points {
+                if !bond_points.is_empty() {
+                    output_ctx.print("    Bond Points:");
+                    for bp in bond_points {
+                        let loc = if let Some(ref after) = bp.after_step {
+                            format!("after {}", after)
+                        } else if let Some(ref before) = bp.before_step {
+                            format!("before {}", before)
+                        } else {
+                            "standalone".to_string()
+                        };
+                        output_ctx.print(&format!("      - {} ({})", bp.id, loc));
+                    }
+                }
+            }
+
+            if let Some(expand_rules) = &compose.expand {
+                if !expand_rules.is_empty() {
+                    output_ctx.print("    Expansions:");
+                    for e in expand_rules {
+                        output_ctx.print(&format!("      - {} -> {}", e.target, e.with));
+                    }
+                }
+            }
+
+            if let Some(map_rules) = &compose.r#map {
+                if !map_rules.is_empty() {
+                    output_ctx.print("    Maps:");
+                    for m in map_rules {
+                        output_ctx.print(&format!("      - {} -> {}", m.select, m.with));
+                    }
+                }
+            }
+
+            if let Some(aspects) = &compose.aspects {
+                if !aspects.is_empty() {
+                    output_ctx.print(&format!("    Aspects: {}", aspects.join(", ")));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// convert
+// ---------------------------------------------------------------------------
+
+/// Convert formula from JSON to TOML format.
+fn execute_convert(args: &FormulaConvertArgs, output_ctx: &OutputContext) -> crate::Result<()> {
+    let use_json = args.json || args.robot || output_ctx.is_json();
+
+    if args.all {
+        return convert_all_formulas(output_ctx, use_json);
+    }
+
+    let target = args
+        .target
+        .as_deref()
+        .ok_or_else(|| BeadsError::Config("formula name or path required".to_string()))?;
+
+    // Determine the JSON path
+    let json_path: PathBuf;
+    if target.ends_with(".formula.json") {
+        json_path = PathBuf::from(target);
+    } else if target.ends_with(".formula.toml") {
+        return Err(BeadsError::Config(format!(
+            "{:?} is already a TOML file",
+            target
+        )));
+    } else {
+        // Search for the JSON file by name
+        let search_paths = Parser::default_search_paths();
+        let found = search_paths.iter().find_map(|dir| {
+            let path = dir.join(format!("{}.formula.json", target));
+            if path.exists() { Some(path) } else { None }
+        });
+        json_path = found.ok_or_else(|| {
+            BeadsError::Config(format!(
+                "JSON formula {:?} not found in search paths",
+                target
+            ))
+        })?;
+    }
+
+    let search_paths = Parser::default_search_paths();
+    let mut parser = Parser::new(search_paths);
+
+    let formula = parser
+        .parse_file(&json_path)
+        .map_err(|e| BeadsError::Config(format!("parsing {}: {}", json_path.display(), e)))?;
+
+    // Convert to TOML
+    let toml_string = toml::to_string_pretty(&formula)
+        .map_err(|e| BeadsError::Config(format!("converting to TOML: {}", e)))?;
+
+    if args.stdout {
+        output_ctx.print(&toml_string);
+        return Ok(());
+    }
+
+    let toml_path = json_path.with_extension("formula.toml");
+    fs::write(&toml_path, &toml_string)
+        .map_err(|e| BeadsError::Config(format!("writing {}: {}", toml_path.display(), e)))?;
+
+    if use_json {
+        let output = serde_json::json!({
+            "converted": true,
+            "from": json_path.to_string_lossy(),
+            "to": toml_path.to_string_lossy(),
+        });
+        output_ctx.print(&serde_json::to_string_pretty(&output).unwrap_or_default());
+    } else {
+        output_ctx.print(&format!("Converted: {}", toml_path.display()));
+    }
+
+    if args.delete {
+        fs::remove_file(&json_path)
+            .map_err(|e| BeadsError::Config(format!("deleting {}: {}", json_path.display(), e)))?;
+        if !use_json {
+            output_ctx.print(&format!("Deleted: {}", json_path.display()));
+        }
+    }
+
+    Ok(())
+}
+
+/// Convert all JSON formulas in search paths to TOML.
+fn convert_all_formulas(output_ctx: &OutputContext, use_json: bool) -> crate::Result<()> {
+    let search_paths = Parser::default_search_paths();
+    let mut converted = 0u32;
+    let mut errors = 0u32;
+
+    for dir in &search_paths {
+        if !dir.exists() {
+            continue;
+        }
+        let dir_entries = match fs::read_dir(dir) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        for entry in dir_entries.flatten() {
+            let path = entry.path();
+            let fname = entry.file_name().to_string_lossy().to_string();
+
+            if !fname.ends_with(".formula.json") {
+                continue;
+            }
+
+            let toml_path = path.with_extension("formula.toml");
+            if toml_path.exists() {
+                if !use_json {
+                    output_ctx.print(&format!("Skipped (TOML exists): {}", fname));
+                }
+                continue;
+            }
+
+            let mut parser = Parser::new(search_paths.clone());
+            let formula = match parser.parse_file(&path) {
+                Ok(f) => f,
+                Err(e) => {
+                    if !use_json {
+                        output_ctx.print(&format!("Error parsing {}: {}", fname, e));
+                    }
+                    errors += 1;
+                    continue;
+                }
+            };
+
+            let toml_string = match toml::to_string_pretty(&formula) {
+                Ok(s) => s,
+                Err(e) => {
+                    if !use_json {
+                        output_ctx.print(&format!("Error converting {}: {}", fname, e));
+                    }
+                    errors += 1;
+                    continue;
+                }
+            };
+
+            if let Err(e) = fs::write(&toml_path, &toml_string) {
+                if !use_json {
+                    output_ctx.print(&format!("Error writing {}: {}", toml_path.display(), e));
+                }
+                errors += 1;
+                continue;
+            }
+
+            if !use_json {
+                output_ctx.print(&format!("Converted: {}", toml_path.display()));
+            }
+            converted += 1;
+        }
+    }
+
+    if use_json {
+        let output = serde_json::json!({
+            "converted": converted,
+            "errors": errors,
+        });
+        output_ctx.print(&serde_json::to_string_pretty(&output).unwrap_or_default());
+    } else {
+        output_ctx.print(&format!("Converted {} formulas", converted));
+        if errors > 0 {
+            output_ctx.print(&format!(" ({} errors)", errors));
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+/// Count steps recursively including children.
+fn count_steps(steps: &[crate::formula::Step]) -> usize {
+    let mut count = steps.len();
+    for s in steps {
+        if let Some(ref children) = s.children {
+            count += count_steps(children);
+        }
+    }
+    count
+}
+
+/// Truncate a description to max_len characters.
+fn truncate_description(desc: &str, max_len: usize) -> String {
+    let desc = desc.lines().next().unwrap_or(desc);
+    if desc.len() > max_len {
+        format!("{}...", &desc[..max_len.saturating_sub(3)])
+    } else {
+        desc.to_string()
+    }
+}
+
+/// Print steps in a tree format.
+fn print_steps_tree(steps: &[crate::formula::Step], indent: &str, output_ctx: &OutputContext) {
+    for (i, step) in steps.iter().enumerate() {
+        let connector = if i == steps.len() - 1 {
+            "└──"
+        } else {
+            "├──"
+        };
+
+        // Collect dependency info
+        let mut dep_parts: Vec<String> = Vec::new();
+        if !step.depends_on.is_empty() {
+            dep_parts.push(format!("depends: {}", step.depends_on.join(", ")));
+        }
+        if !step.needs.is_empty() {
+            dep_parts.push(format!("needs: {}", step.needs.join(", ")));
+        }
+        let dep_str = if dep_parts.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", dep_parts.join(", "))
+        };
+
+        let type_str = if step.r#type.as_deref().map_or(true, |t| t == "task") {
+            String::new()
+        } else {
+            format!(" ({})", step.r#type.as_deref().unwrap_or("task"))
+        };
+
+        output_ctx.print(&format!(
+            "{}{} {}: {}{}{}",
+            indent,
+            connector,
+            step.id,
+            step.title.as_deref().unwrap_or("(untitled)"),
+            type_str,
+            dep_str
+        ));
+
+        // Print children
+        if let Some(ref children) = step.children {
+            let child_indent = if i == steps.len() - 1 {
+                format!("{}    ", indent)
+            } else {
+                format!("{}│   ", indent)
+            };
+            print_steps_tree(children, &child_indent, output_ctx);
+        }
+    }
 }
 
 /// Parse a duration shorthand like "1h", "30m", "2d" into seconds.

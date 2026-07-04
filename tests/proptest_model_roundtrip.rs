@@ -9,7 +9,7 @@ use proptest::prelude::*;
 use beads_rust::model::{DependencyType, Issue, IssueType, Priority, Status};
 use beads_rust::storage::SqliteStorage;
 use beads_rust::sync::{ExportConfig, ImportConfig, export_to_jsonl, import_from_jsonl};
-use beads_rust::util::{content_hash, content_hash_from_parts};
+use beads_rust::util::{content_hash, content_hash_from_parts_v15};
 use chrono::{TimeZone, Utc};
 use std::fs;
 use tempfile::TempDir;
@@ -242,7 +242,7 @@ proptest! {
         (canonical, expected) in arb_status_name(),
         title in "[a-z]{1,20}",
     ) {
-        let reference_hash = content_hash_from_parts(
+        let reference_hash = content_hash_from_parts_v15(
             &title, None, None, None, None,
             &expected, &beads_rust::model::Priority::MEDIUM,
             &IssueType::Task, None, None, None, None, None, false, false,
@@ -250,7 +250,7 @@ proptest! {
         for variant in case_variants(canonical) {
             let json = format!("\"{}\"", variant);
             let status: Status = serde_json::from_str(&json).unwrap();
-            let hash = content_hash_from_parts(
+            let hash = content_hash_from_parts_v15(
                 &title, None, None, None, None,
                 &status, &beads_rust::model::Priority::MEDIUM,
                 &IssueType::Task, None, None, None, None, None, false, false,
@@ -268,7 +268,7 @@ proptest! {
         (canonical, expected) in arb_issue_type_name(),
         title in "[a-z]{1,20}",
     ) {
-        let reference_hash = content_hash_from_parts(
+        let reference_hash = content_hash_from_parts_v15(
             &title, None, None, None, None,
             &Status::Open, &beads_rust::model::Priority::MEDIUM,
             &expected, None, None, None, None, None, false, false,
@@ -276,7 +276,7 @@ proptest! {
         for variant in case_variants(canonical) {
             let json = format!("\"{}\"", variant);
             let issue_type: IssueType = serde_json::from_str(&json).unwrap();
-            let hash = content_hash_from_parts(
+            let hash = content_hash_from_parts_v15(
                 &title, None, None, None, None,
                 &Status::Open, &beads_rust::model::Priority::MEDIUM,
                 &issue_type, None, None, None, None, None, false, false,

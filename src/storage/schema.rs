@@ -294,6 +294,16 @@ pub const SCHEMA_SQL: &str = r"
     );
     CREATE INDEX IF NOT EXISTS idx_gate_results_issue ON gate_results(issue_id);
 
+    -- Gate waiters (issue #76): agents registered to receive notifications
+    -- when a gate resolves.  One row per (issue_id, waiter).
+    CREATE TABLE IF NOT EXISTS gate_waiters (
+        issue_id TEXT NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+        waiter TEXT NOT NULL,
+        registered_at TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (issue_id, waiter)
+    );
+    CREATE INDEX IF NOT EXISTS idx_gate_waiters_issue ON gate_waiters(issue_id);
+
     -- Custom statuses for runtime-enumerable workflow configuration (Issue #5)
     CREATE TABLE IF NOT EXISTS custom_statuses (
         name VARCHAR(64) PRIMARY KEY,
@@ -2153,12 +2163,25 @@ fn rebuild_content_hashes_for_go_parity(conn: &Connection) -> Result<usize> {
             let issue_type = issue_type_raw
                 .parse::<IssueType>()
                 .unwrap_or_else(|_| IssueType::Custom(issue_type_raw.clone()));
+            // New fields (spec_id, metadata, bonded_from, gate, event, etc.)
+            // are passed as None/defaults when not selected by the query — this
+            // is a legacy DB migration path; new records use Issue::compute_content_hash().
+            let spec_id = row_optional_text(row, 16);
+            let metadata = row_optional_text(row, 17);
+            let mol_type_raw: Option<String> = None; // could add in a future migration
+            let work_type_raw: Option<String> = None;
+            let bonded_from: Vec<crate::model::BondRef> = Vec::new();
+            let waiters: Vec<String> = Vec::new();
+
+            let mol_type = crate::model::MolType::default();
+            let work_type = crate::model::WorkType::default();
             let content_hash = content_hash_from_parts(
                 &title,
                 description.as_deref(),
                 design.as_deref(),
                 acceptance_criteria.as_deref(),
                 notes.as_deref(),
+                spec_id.as_deref(),
                 &status,
                 &priority,
                 &issue_type,
@@ -2168,7 +2191,19 @@ fn rebuild_content_hashes_for_go_parity(conn: &Connection) -> Result<usize> {
                 external_ref.as_deref(),
                 source_system.as_deref(),
                 pinned,
+                metadata.as_deref(),
                 is_template,
+                &bonded_from,
+                None, // await_type
+                None, // await_id
+                None, // timeout_seconds
+                &waiters,
+                &mol_type,
+                &work_type,
+                None, // event_kind
+                None, // actor
+                None, // target
+                None, // payload
             );
 
             conn.execute_with_params(

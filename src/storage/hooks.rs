@@ -40,6 +40,7 @@ use crate::model::Issue;
 use crate::model::Status;
 use crate::storage::sqlite::{IssueUpdate, ListFilters, SqliteStorage};
 use std::path::Path;
+use std::sync::Arc;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -76,6 +77,33 @@ impl HookFiringStore {
             on_update_hook: None,
             on_close_hook: None,
         }
+    }
+
+    /// Register shell hook scripts from `.beads/hooks/{event}`.
+    ///
+    /// This is a builder method that registers `fire_hook_scripts` for
+    /// `on_create`, `on_update`, and `on_close` events. Shell scripts live
+    /// in `beads_dir/hooks/on_create`, `on_update`, `on_close`. Each must
+    /// be executable.
+    ///
+    /// # Panics
+    ///
+    /// Does not panic.
+    #[must_use]
+    pub fn with_shell_hooks(mut self, beads_dir: &Path) -> Self {
+        let dir = Arc::new(beads_dir.to_path_buf());
+        let d = Arc::clone(&dir);
+        self.on_create(Box::new(move |id, actor| {
+            fire_hook_scripts(&*d, "on_create", id, actor);
+        }));
+        let d = Arc::clone(&dir);
+        self.on_update(Box::new(move |id, actor| {
+            fire_hook_scripts(&*d, "on_update", id, actor);
+        }));
+        self.on_close(Box::new(move |id, actor| {
+            fire_hook_scripts(&*dir, "on_close", id, actor);
+        }));
+        self
     }
 
     /// Register a hook fired after every successful `create_issue`.

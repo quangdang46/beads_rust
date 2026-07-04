@@ -982,6 +982,73 @@ fn id_exists_returns_false_for_nonexistent() {
     assert!(!storage.id_exists("nonexistent-id").unwrap());
 }
 
+#[test]
+fn id_exists_catches_wisp_when_querying_issue_id() {
+    let mut storage = test_db();
+
+    // Create a wisp (ephemeral issue with wsp- prefix) — its ID lives in the
+    // same `issues` table as regular issues, so `id_exists` must find it.
+    let mut wisp = fixtures::issue("wisp-collision");
+    wisp.id = "wsp-abc123".to_string();
+    wisp.ephemeral = true;
+    storage.create_issue(&wisp, "tester").unwrap();
+
+    // A regular-issue ID generator would emit e.g. "bd-…", but the point is
+    // that this particular ID *is* taken across namespaces.
+    assert!(storage.id_exists("wsp-abc123").unwrap());
+}
+
+#[test]
+fn id_exists_catches_regular_issue_when_querying_wisp_id() {
+    let mut storage = test_db();
+
+    let mut issue = fixtures::issue("regular-collision");
+    issue.id = "bd-xyz789".to_string();
+    storage.create_issue(&issue, "tester").unwrap();
+
+    // A wisp generator checking this exact ID should see it as taken.
+    assert!(storage.id_exists("bd-xyz789").unwrap());
+}
+
+#[test]
+fn check_id_uniqueness_ok_for_unused_id() {
+    let storage = test_db();
+
+    let result = storage.check_id_uniqueness("bd-unused-42");
+    assert!(result.is_ok(), "unused ID should pass uniqueness check");
+}
+
+#[test]
+fn check_id_uniqueness_err_for_existing_issue() {
+    let mut storage = test_db();
+    let mut issue = fixtures::issue("unique-check");
+    issue.id = "bd-taken".to_string();
+    storage.create_issue(&issue, "tester").unwrap();
+
+    let err = storage.check_id_uniqueness("bd-taken").unwrap_err();
+    assert!(
+        matches!(&err, beads_rust::BeadsError::IdCollision { id } if id == "bd-taken"),
+        "expected IdCollision, got {err:?}"
+    );
+}
+
+#[test]
+fn check_id_uniqueness_err_for_existing_wisp() {
+    let mut storage = test_db();
+    let mut wisp = fixtures::issue("wisp-unique-check");
+    wisp.id = "wsp-taken".to_string();
+    wisp.ephemeral = true;
+    storage.create_issue(&wisp, "tester").unwrap();
+
+    // Regular-issue create path (searching for issue IDs) must reject
+    // an ID that's held by a wisp.
+    let err = storage.check_id_uniqueness("wsp-taken").unwrap_err();
+    assert!(
+        matches!(&err, beads_rust::BeadsError::IdCollision { id } if id == "wsp-taken"),
+        "expected IdCollision for wisp-held ID, got {err:?}"
+    );
+}
+
 // ============================================================================
 // COUNT TESTS
 // ============================================================================

@@ -545,6 +545,8 @@ pub struct ImportConfig {
     pub allow_external_jsonl: bool,
     /// Show progress indicators for long-running operations.
     pub show_progress: bool,
+    /// Strict mode: abort on first invalid entry instead of skipping.
+    pub strict: bool,
 }
 
 impl Default for ImportConfig {
@@ -558,6 +560,7 @@ impl Default for ImportConfig {
             beads_dir: None,
             allow_external_jsonl: false,
             show_progress: false,
+            strict: false,
         }
     }
 }

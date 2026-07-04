@@ -444,6 +444,49 @@ pub fn is_external_id(issue_id: &str, local_prefix: &str) -> bool {
     extract_prefix(issue_id).is_some_and(|prefix| !prefix.eq_ignore_ascii_case(local_prefix))
 }
 
+// ------------------------------------------------------------------
+// Safe-boundary role detection (beads_rust#89, SEC-003)
+// ------------------------------------------------------------------
+
+/// Represents the user's relationship to a repository.
+///
+/// Used to determine appropriate behaviors for fork contributors vs maintainers.
+/// When BEADS_DIR redirect is active, the user is a contributor automatically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoRole {
+    /// The user is contributing to a fork (not the maintainer).
+    /// BEADS_DIR redirection implies contributor role automatically.
+    Contributor,
+    /// The user owns/maintains the repository.
+    Maintainer,
+}
+
+/// Detect the user's role based on whether a redirect file exists.
+///
+/// When `.beads/redirect` exists, the user is operating on a redirected/forked
+/// beads directory, which implies contributor-level access. Without a redirect,
+/// the user is the maintainer of the repository.
+///
+/// This mirrors the upstream Go logic in `internal/beads/context.go` where
+/// `UserRole` is determined by checking whether BEADS_DIR has been redirected.
+#[must_use]
+pub fn detect_role(beads_dir: &Path) -> RepoRole {
+    let redirect_path = beads_dir.join("redirect");
+    if redirect_path.is_file() {
+        RepoRole::Contributor
+    } else {
+        RepoRole::Maintainer
+    }
+}
+
+/// Returns `true` when the redirect file exists, indicating contributor mode.
+///
+/// Convenience wrapper around [`detect_role`].
+#[must_use]
+pub fn is_contributor_mode(beads_dir: &Path) -> bool {
+    detect_role(beads_dir) == RepoRole::Contributor
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

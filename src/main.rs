@@ -490,6 +490,8 @@ fn main() {
         Commands::Doctor(args) => commands::doctor::execute(&args, &overrides, &output_ctx),
         Commands::Admin { command } => commands::admin::execute(&command, &overrides, &output_ctx),
         Commands::Info(args) => commands::info::execute(&args, &overrides, &output_ctx),
+        Commands::Export(args) => commands::export::execute(&args, &overrides, &output_ctx),
+        Commands::CodexHook(args) => commands::codex_hook::execute(&args, &overrides, &output_ctx),
         Commands::Import(args) => commands::import::execute(&args, &overrides, &output_ctx),
         Commands::Schema(args) => commands::schema::execute(&args, &overrides, &output_ctx),
         Commands::Where => commands::r#where::execute(&overrides, &output_ctx),
@@ -516,10 +518,14 @@ fn main() {
 
         #[cfg(feature = "mcp")]
         Commands::Serve(args) => beads_rust::mcp::run_serve(&args, &overrides),
+
+        #[cfg(feature = "self_update")]
+        Commands::Upgrade(args) => commands::upgrade::execute(&args, &output_ctx),
         Commands::Completions(args) => commands::completions::execute(&args, &output_ctx),
         Commands::Formula { command } => {
             commands::formula::execute(&command, &overrides, &output_ctx)
         }
+        Commands::Mol { command } => commands::mol::execute(&command, &overrides, &output_ctx),
         Commands::Audit { command } => {
             commands::audit::execute(&command, cli.json, &overrides, &output_ctx)
         }
@@ -1028,11 +1034,14 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Label { .. }
         | Commands::Epic { .. }
         | Commands::Gate { .. }
+        | Commands::Mol { .. }
         | Commands::Query { .. }
         | Commands::Template { .. }
-        | Commands::RenamePrefix(_) => true,
+        | Commands::RenamePrefix(_)
+        | Commands::Export(_) => true,
 
-        Commands::Init { .. }
+        Commands::Mol { .. }
+        | Commands::Init { .. }
         | Commands::Sync(_)
         | Commands::Doctor(_)
         | Commands::Info(_)
@@ -1051,6 +1060,7 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::CustomStatus { .. }
         | Commands::CustomType { .. }
         | Commands::Agents(_)
+        | Commands::CodexHook(_)
         | Commands::Quickstart(_)
         | Commands::Admin { .. }
         | Commands::Import(_)
@@ -1065,6 +1075,9 @@ const fn should_auto_import(cmd: &Commands) -> bool {
 
         #[cfg(feature = "mcp")]
         Commands::Serve(_) => false,
+
+        #[cfg(feature = "self_update")]
+        Commands::Upgrade(_) => false,
     }
 }
 

@@ -543,54 +543,71 @@ fn execute_prepared_route(
             route_has_mutated = true;
         }
 
-        // Apply labels
-        for label in &prepared.add_labels {
-            let add_label_result = retry_mutation_with_jsonl_recovery(
-                &mut prepared.storage_ctx,
-                !route_has_mutated,
-                "update label add",
-                Some(id.as_str()),
-                |storage| storage.add_label(id, label, &prepared.actor),
-            );
-            preserve_blocked_cache_on_error(
-                &mut prepared.storage_ctx.storage,
-                blocked_cache_dirty,
-                "update",
-                add_label_result,
-            )?;
+        // Apply labels — atomic transaction when both add and remove are present
+        // (issue #100: prevent partial label updates on failure).
+        if !prepared.add_labels.is_empty() && !prepared.remove_labels.is_empty() {
+            prepared.storage_ctx.storage.with_write_transaction(|s| {
+                for label in &prepared.add_labels {
+                    s.add_label(id, label, &prepared.actor)?;
+                }
+                for label in &prepared.remove_labels {
+                    s.remove_label(id, label, &prepared.actor)?;
+                }
+                if prepared.set_labels {
+                    s.set_labels(id, &prepared.valid_set_labels, &prepared.actor)?;
+                }
+                Ok(())
+            })?;
             route_has_mutated = true;
-        }
-        for label in &prepared.remove_labels {
-            let remove_label_result = retry_mutation_with_jsonl_recovery(
-                &mut prepared.storage_ctx,
-                !route_has_mutated,
-                "update label remove",
-                Some(id.as_str()),
-                |storage| storage.remove_label(id, label, &prepared.actor),
-            );
-            preserve_blocked_cache_on_error(
-                &mut prepared.storage_ctx.storage,
-                blocked_cache_dirty,
-                "update",
-                remove_label_result,
-            )?;
-            route_has_mutated = true;
-        }
-        if prepared.set_labels {
-            let set_labels_result = retry_mutation_with_jsonl_recovery(
-                &mut prepared.storage_ctx,
-                !route_has_mutated,
-                "update label set",
-                Some(id.as_str()),
-                |storage| storage.set_labels(id, &prepared.valid_set_labels, &prepared.actor),
-            );
-            preserve_blocked_cache_on_error(
-                &mut prepared.storage_ctx.storage,
-                blocked_cache_dirty,
-                "update",
-                set_labels_result,
-            )?;
-            route_has_mutated = true;
+        } else {
+            for label in &prepared.add_labels {
+                let add_label_result = retry_mutation_with_jsonl_recovery(
+                    &mut prepared.storage_ctx,
+                    !route_has_mutated,
+                    "update label add",
+                    Some(id.as_str()),
+                    |storage| storage.add_label(id, label, &prepared.actor),
+                );
+                preserve_blocked_cache_on_error(
+                    &mut prepared.storage_ctx.storage,
+                    blocked_cache_dirty,
+                    "update",
+                    add_label_result,
+                )?;
+                route_has_mutated = true;
+            }
+            for label in &prepared.remove_labels {
+                let remove_label_result = retry_mutation_with_jsonl_recovery(
+                    &mut prepared.storage_ctx,
+                    !route_has_mutated,
+                    "update label remove",
+                    Some(id.as_str()),
+                    |storage| storage.remove_label(id, label, &prepared.actor),
+                );
+                preserve_blocked_cache_on_error(
+                    &mut prepared.storage_ctx.storage,
+                    blocked_cache_dirty,
+                    "update",
+                    remove_label_result,
+                )?;
+                route_has_mutated = true;
+            }
+            if prepared.set_labels {
+                let set_labels_result = retry_mutation_with_jsonl_recovery(
+                    &mut prepared.storage_ctx,
+                    !route_has_mutated,
+                    "update label set",
+                    Some(id.as_str()),
+                    |storage| storage.set_labels(id, &prepared.valid_set_labels, &prepared.actor),
+                );
+                preserve_blocked_cache_on_error(
+                    &mut prepared.storage_ctx.storage,
+                    blocked_cache_dirty,
+                    "update",
+                    set_labels_result,
+                )?;
+                route_has_mutated = true;
+            }
         }
 
         // Apply parent
@@ -625,6 +642,25 @@ fn execute_prepared_route(
             "update",
             issue_after_result,
         )?;
+
+        // Read-back verification (issue #102): non-fatal check that the
+        // update persisted durably.  Uses the post-mutation read so we can
+        // compare key fields against the caller's update.
+        if let Some(ref after) = issue_after {
+            let mut expected = after.clone();
+            expected.title = prepared
+                .update
+                .title
+                .clone()
+                .unwrap_or_else(|| expected.title.clone());
+            if let Some(ref s) = prepared.update.status {
+                expected.status = s.clone();
+            }
+            if let Some(p) = prepared.update.priority {
+                expected.priority = p;
+            }
+            super::verify_write(&prepared.storage_ctx.storage, id, Some(&expected));
+        }
 
         if use_machine_output {
             if let Some(ref issue) = issue_after {

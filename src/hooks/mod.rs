@@ -592,6 +592,7 @@ pub fn run_hook(hook_name: &str) -> Result<()> {
                     beads_dir: Some(beads_dir),
                     allow_external_jsonl: false,
                     show_progress: false,
+                    strict: false,
                 };
                 sync::import_from_jsonl(
                     &mut storage_ctx.storage,

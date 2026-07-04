@@ -398,7 +398,7 @@ fn sha256_hex(input: &str) -> String {
 fn conformance_content_hash_matches_go_bd_fixture() {
     use beads_rust::model::{IssueType, Priority, Status};
 
-    let hash = beads_rust::util::content_hash_from_parts(
+    let hash = beads_rust::util::content_hash_from_parts_v15(
         "Fix authentication bug",
         Some("Users are getting logged out unexpectedly"),
         Some("Use token refresh"),

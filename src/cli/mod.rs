@@ -761,6 +761,10 @@ pub enum Commands {
     /// List blocked issues
     Blocked(BlockedArgs),
 
+    /// Internal Codex CLI lifecycle hook (hidden, called by .codex/hooks.json)
+    #[command(hide = true)]
+    CodexHook(commands::codex_hook::CodexHookArgs),
+
     /// Describe br's machine-readable contracts and safety guarantees
     Capabilities(CapabilitiesArgs),
 
@@ -830,11 +834,20 @@ pub enum Commands {
         command: EpicCommands,
     },
 
+    /// Molecule commands (work templates for agent workflows)
+    Mol {
+        #[command(subcommand)]
+        command: commands::mol::MolCommands,
+    },
+
     /// Workflow gate engine: record and inspect gate results (issue #312)
     Gate {
         #[command(subcommand)]
         command: GateCommands,
     },
+
+    /// Export issues to JSONL, JSON, CSV, or Obsidian Markdown
+    Export(commands::export::ExportArgs),
 
     /// Visualize dependency graph
     Graph(GraphArgs),
@@ -1045,6 +1058,10 @@ EXAMPLES:
     /// This is an alternative to shelling out to the br CLI.
     #[cfg(feature = "mcp")]
     Serve(crate::mcp::ServeArgs),
+
+    /// Upgrade br to the latest version
+    #[cfg(feature = "self_update")]
+    Upgrade(UpgradeArgs),
 
     /// Show version information
     Version(VersionArgs),
@@ -1612,6 +1629,10 @@ pub struct ImportArgs {
     /// Force import even on conflict
     #[arg(short = 'F', long)]
     pub force: bool,
+
+    /// Strict mode: abort on first invalid entry instead of skipping
+    #[arg(long)]
+    pub strict: bool,
 }
 
 /// Git hooks management commands.
@@ -1947,6 +1968,9 @@ pub const fn command_requests_robot_json(cmd: &Commands) -> bool {
         Commands::Gate { command } => match command {
             GateCommands::Report(args) => args.robot,
             GateCommands::List(args) => args.robot,
+            GateCommands::AddWaiter(args) => args.robot,
+            GateCommands::RemoveWaiter(args) => args.robot,
+            GateCommands::ListWaiters(args) => args.robot,
         },
         _ => false,
     }
@@ -2260,6 +2284,12 @@ pub enum GateCommands {
     Report(GateReportArgs),
     /// List recorded gate results and required-gate status for an issue
     List(GateListArgs),
+    /// Register an agent/process to be notified when a gate resolves
+    AddWaiter(GateAddWaiterArgs),
+    /// Remove a waiter from a gate
+    RemoveWaiter(GateRemoveWaiterArgs),
+    /// List waiters registered on a gate
+    ListWaiters(GateListWaitersArgs),
 }
 
 /// Status reported for a gate result.
@@ -2306,6 +2336,43 @@ pub struct GateListArgs {
     #[arg(add = ArgValueCompleter::new(issue_id_completer))]
     pub id: String,
 
+    /// Emit machine-readable JSON
+    #[arg(long)]
+    pub robot: bool,
+}
+
+/// Arguments for `br gate add-waiter`.
+#[derive(Args, Debug, Clone)]
+pub struct GateAddWaiterArgs {
+    /// Gate issue ID to register against
+    #[arg(add = ArgValueCompleter::new(issue_id_completer))]
+    pub id: String,
+    /// Agent/process address to notify when the gate resolves
+    pub waiter: String,
+    /// Emit machine-readable JSON
+    #[arg(long)]
+    pub robot: bool,
+}
+
+/// Arguments for `br gate remove-waiter`.
+#[derive(Args, Debug, Clone)]
+pub struct GateRemoveWaiterArgs {
+    /// Gate issue ID
+    #[arg(add = ArgValueCompleter::new(issue_id_completer))]
+    pub id: String,
+    /// Agent/process address to remove
+    pub waiter: String,
+    /// Emit machine-readable JSON
+    #[arg(long)]
+    pub robot: bool,
+}
+
+/// Arguments for `br gate list-waiters`.
+#[derive(Args, Debug, Clone)]
+pub struct GateListWaitersArgs {
+    /// Gate issue ID whose waiters to show
+    #[arg(add = ArgValueCompleter::new(issue_id_completer))]
+    pub id: String,
     /// Emit machine-readable JSON
     #[arg(long)]
     pub robot: bool,
@@ -3533,7 +3600,26 @@ pub struct AdminResetArgs {
     #[arg(long)]
     pub force: bool,
 }
-// UpgradeArgs was removed in v0.2.16+ (RUSTSEC-2026-0194/0195).
+/// Arguments for the upgrade command.
+#[cfg(feature = "self_update")]
+#[derive(Args, Debug, Clone, Default)]
+pub struct UpgradeArgs {
+    /// Check only, don't install
+    #[arg(long)]
+    pub check: bool,
+
+    /// Force reinstall current version
+    #[arg(long)]
+    pub force: bool,
+
+    /// Install specific version (e.g., "0.2.0")
+    #[arg(long)]
+    pub version: Option<String>,
+
+    /// Show what would happen without making changes
+    #[arg(long)]
+    pub dry_run: bool,
+}
 
 /// Arguments for the orphans command.
 #[derive(Args, Debug, Clone, Default)]

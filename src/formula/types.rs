@@ -118,7 +118,7 @@ const fn default_version() -> i32 {
 // ---------------------------------------------------------------------------
 
 /// Defines a template variable with optional validation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VarDef {
     /// Variable name. Present in array format; captured from map key in map format.
     #[serde(default)]
@@ -269,7 +269,7 @@ pub struct Gate {
 // ---------------------------------------------------------------------------
 
 /// Defines iteration over a body of steps.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LoopSpec {
     /// Fixed number of iterations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -328,7 +328,7 @@ pub struct OnCompleteSpec {
 // ---------------------------------------------------------------------------
 
 /// Defines how formulas can be bonded together.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ComposeRules {
     /// Named locations where other formulas can attach.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -449,7 +449,7 @@ pub struct MapRule {
 // ---------------------------------------------------------------------------
 
 /// Defines parallel execution paths that rejoin (fork-join pattern).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BranchRule {
     /// Step ID that precedes the parallel paths.
     pub from: String,

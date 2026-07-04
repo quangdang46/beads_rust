@@ -4,14 +4,15 @@
 //! Supports optional filename output (default stdout) and the same
 //! filter flags as `br list`.
 
-use crate::cli::{ExportFormat, ListArgs};
 use crate::cli::commands::list::{build_filters, validate_list_args};
+use crate::cli::{ExportFormat, ListArgs};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::csv;
 use crate::model::Issue;
 use crate::output::OutputContext;
-use crate::sync::{self, ExportConfig, ExportErrorPolicy, HistoryConfig};
+use crate::sync::history::HistoryConfig;
+use crate::sync::{self, ExportConfig, ExportErrorPolicy};
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
@@ -88,7 +89,7 @@ fn execute_inner(
 
     // Build list filters from the flattened ListArgs
     // Use limit=0 (unlimited) for export so we get all matching issues
-    let mut filters = build_filters(&args.filters)?;
+    let (mut filters, _predicate) = build_filters(&args.filters)?;
     filters.limit = Some(0);
     filters.offset = Some(0);
 
@@ -247,9 +248,9 @@ fn write_obsidian_export(issues: &[Issue], output: &Option<PathBuf>) -> Result<(
 
         lines.push(format!("\n## {section_name}\n"));
         for issue in section_issues {
-            let checkbox = checkbox_for(&issue.status);
-            let priority = priority_emoji(issue.priority);
-            let type_tag_str = type_tag(&issue.issue_type).unwrap_or("");
+            let checkbox = checkbox_for(issue.status.as_str());
+            let priority = priority_emoji(issue.priority.0);
+            let type_tag_str = type_tag(issue.issue_type.as_str()).unwrap_or("");
             let label_tags: String = issue
                 .labels
                 .iter()
@@ -276,7 +277,7 @@ fn write_obsidian_export(issues: &[Issue], output: &Option<PathBuf>) -> Result<(
 
     let content = lines.join("");
 
-    if let Some(ref output_path) = output {
+    if let Some(output_path) = output {
         if let Some(parent) = output_path.parent() {
             std::fs::create_dir_all(parent)?;
         }

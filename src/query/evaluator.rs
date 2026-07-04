@@ -350,6 +350,86 @@ fn apply_comparison(
             filters.owner = Some(value.to_string());
             Ok(())
         }
+        "description" | "desc" => {
+            if op != ComparisonOp::Eq {
+                return Err(QueryError::InvalidOperator(
+                    "description only supports = (substring match)".into(),
+                ));
+            }
+            // No SQL-side filter; use predicate path
+            Err(QueryError::ComplexQuery(
+                "description filtering requires predicate (no SQL-side filter)".into(),
+            ))
+        }
+        "notes" => {
+            if op != ComparisonOp::Eq {
+                return Err(QueryError::InvalidOperator(
+                    "notes only supports = (substring match)".into(),
+                ));
+            }
+            // No SQL-side filter; use predicate path
+            Err(QueryError::ComplexQuery(
+                "notes filtering requires predicate (no SQL-side filter)".into(),
+            ))
+        }
+        "closed" | "closed_at" => {
+            // SQL filtering for closed_at not yet implemented; use predicate path
+            return Err(QueryError::ComplexQuery(
+                "closed_at filtering requires predicate (no SQL-side filter)".into(),
+            ));
+        }
+        "started" | "started_at" => {
+            // SQL filtering for started_at not yet implemented; use predicate path
+            return Err(QueryError::ComplexQuery(
+                "started_at filtering requires predicate (no SQL-side filter)".into(),
+            ));
+        }
+        "spec" | "spec_id" => {
+            if op != ComparisonOp::Eq {
+                return Err(QueryError::InvalidOperator("spec only supports =".into()));
+            }
+            return Err(QueryError::ComplexQuery(
+                "spec filtering requires predicate (no SQL-side filter)".into(),
+            ));
+        }
+        "parent" => {
+            if op != ComparisonOp::Eq {
+                return Err(QueryError::InvalidOperator("parent only supports =".into()));
+            }
+            return Err(QueryError::ComplexQuery(
+                "parent filtering requires predicate (no SQL-side filter)".into(),
+            ));
+        }
+        "ephemeral" => {
+            if op != ComparisonOp::Eq {
+                return Err(QueryError::InvalidOperator(
+                    "ephemeral only supports =".into(),
+                ));
+            }
+            Err(QueryError::ComplexQuery(
+                "ephemeral filtering requires predicate".into(),
+            ))
+        }
+        "template" | "is_template" => {
+            if op != ComparisonOp::Eq {
+                return Err(QueryError::InvalidOperator(
+                    "template only supports =".into(),
+                ));
+            }
+            Err(QueryError::ComplexQuery(
+                "template filtering requires predicate".into(),
+            ))
+        }
+        "has_metadata_key" => {
+            if op != ComparisonOp::Eq {
+                return Err(QueryError::InvalidOperator(
+                    "has_metadata_key only supports =".into(),
+                ));
+            }
+            return Err(QueryError::ComplexQuery(
+                "has_metadata_key filtering requires predicate (no SQL-side filter)".into(),
+            ));
+        }
         f if f.starts_with("metadata.") => {
             let key = &f["metadata.".len()..];
             if op != ComparisonOp::Eq {
@@ -476,6 +556,95 @@ fn evaluate_predicate_on_issue(
             ComparisonOp::NotEq => !issue.labels.iter().any(|l| l.eq_ignore_ascii_case(value)),
             _ => false,
         },
+        "description" | "desc" => {
+            let desc = issue.description.as_deref().unwrap_or("");
+            let issue_desc = desc.to_lowercase();
+            let search = value.to_lowercase();
+            match op {
+                ComparisonOp::Eq => issue_desc.contains(&search),
+                ComparisonOp::NotEq => !issue_desc.contains(&search),
+                _ => false,
+            }
+        }
+        "notes" => {
+            let n = issue.notes.as_deref().unwrap_or("");
+            let issue_notes = n.to_lowercase();
+            let search = value.to_lowercase();
+            match op {
+                ComparisonOp::Eq => issue_notes.contains(&search),
+                ComparisonOp::NotEq => !issue_notes.contains(&search),
+                _ => false,
+            }
+        }
+        "closed" | "closed_at" => {
+            let ts = match parse_timestamp_value(value) {
+                Ok(t) => t,
+                Err(_) => return false,
+            };
+            let issue_ts = match issue.closed_at {
+                Some(t) => t,
+                None => return false,
+            };
+            match op {
+                ComparisonOp::Eq => issue_ts.date_naive() == ts.date_naive(),
+                ComparisonOp::NotEq => issue_ts.date_naive() != ts.date_naive(),
+                ComparisonOp::Less => issue_ts < ts,
+                ComparisonOp::LessEq => issue_ts <= ts,
+                ComparisonOp::Greater => issue_ts > ts,
+                ComparisonOp::GreaterEq => issue_ts >= ts,
+                _ => false,
+            }
+        }
+        "started" | "started_at" => {
+            let ts = match parse_timestamp_value(value) {
+                Ok(t) => t,
+                Err(_) => return false,
+            };
+            let issue_ts = match issue.started_at {
+                Some(t) => t,
+                None => return false,
+            };
+            match op {
+                ComparisonOp::Eq => issue_ts.date_naive() == ts.date_naive(),
+                ComparisonOp::NotEq => issue_ts.date_naive() != ts.date_naive(),
+                ComparisonOp::Less => issue_ts < ts,
+                ComparisonOp::LessEq => issue_ts <= ts,
+                ComparisonOp::Greater => issue_ts > ts,
+                ComparisonOp::GreaterEq => issue_ts >= ts,
+                _ => false,
+            }
+        }
+        "spec" | "spec_id" => {
+            let s = issue.spec_id.as_deref().unwrap_or("");
+            apply_str_op(s, value)
+        }
+        "parent" => {
+            // parent-child dep check would need to look at the dependency graph;
+            // for now, treat as unknown field (no match) in predicate path
+            false
+        }
+        "ephemeral" => match op {
+            ComparisonOp::Eq if value == "true" || value == "1" => issue.ephemeral,
+            ComparisonOp::Eq => !issue.ephemeral,
+            ComparisonOp::NotEq if value == "true" || value == "1" => !issue.ephemeral,
+            ComparisonOp::NotEq => issue.ephemeral,
+            _ => false,
+        },
+        "template" | "is_template" => match op {
+            ComparisonOp::Eq if value == "true" || value == "1" => issue.is_template,
+            ComparisonOp::Eq => !issue.is_template,
+            ComparisonOp::NotEq if value == "true" || value == "1" => !issue.is_template,
+            ComparisonOp::NotEq => issue.is_template,
+            _ => false,
+        },
+        "has_metadata_key" => {
+            let key = value;
+            issue
+                .metadata
+                .as_deref()
+                .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+                .map_or(false, |v| v.get(key).is_some())
+        }
         _ if field.starts_with("metadata.") => {
             let key = &field["metadata.".len()..];
             let issue_val: String = issue
@@ -498,12 +667,21 @@ pub fn evaluate(node: &QueryNode) -> Result<QueryResult, QueryError> {
     let mut filters = ListFilters::default();
 
     if can_use_filter_only(node) {
-        build_filters(node, &mut filters)?;
-        return Ok(QueryResult {
-            filters,
-            requires_predicate: false,
-            predicate: None,
-        });
+        // Try filter-only path; fall back to predicate path on ComplexQuery
+        // (some fields like description/notes are predicate-only).
+        match build_filters(node, &mut filters) {
+            Ok(()) => {
+                return Ok(QueryResult {
+                    filters,
+                    requires_predicate: false,
+                    predicate: None,
+                });
+            }
+            Err(QueryError::ComplexQuery(_)) => {
+                // Fall through to predicate path
+            }
+            Err(e) => return Err(e),
+        }
     }
 
     // Complex query: build base filters (best-effort), build predicate
@@ -618,9 +796,11 @@ mod tests {
     }
 
     #[test]
-    fn test_priority_range_error() {
-        let err = parse_and_evaluate("priority>2").unwrap_err();
-        assert!(matches!(err, QueryError::ComplexQuery(_)));
+    fn test_priority_range_predicate() {
+        // priority range queries now use the predicate path
+        let result = parse_and_evaluate("priority>2").unwrap();
+        assert!(result.requires_predicate);
+        assert!(result.predicate.is_some());
     }
 
     #[test]
@@ -724,5 +904,128 @@ mod tests {
     fn test_invalid_timestamp_value() {
         let err = parse_and_evaluate("created>not-a-date").unwrap_err();
         assert!(matches!(err, QueryError::InvalidValue(_)));
+    }
+
+    // ---- New query DSL field tests ----
+
+    #[test]
+    fn test_description_field_requires_predicate() {
+        let result = parse_and_evaluate("description=hello").unwrap();
+        assert!(result.requires_predicate);
+    }
+
+    #[test]
+    fn test_notes_field_requires_predicate() {
+        let result = parse_and_evaluate("notes=something").unwrap();
+        assert!(result.requires_predicate);
+    }
+
+    #[test]
+    fn test_closed_at_field_requires_predicate() {
+        let result = parse_and_evaluate("closed_at>7d").unwrap();
+        assert!(result.requires_predicate);
+    }
+
+    #[test]
+    fn test_started_at_field_requires_predicate() {
+        let result = parse_and_evaluate("started>3d").unwrap();
+        assert!(result.requires_predicate);
+    }
+
+    #[test]
+    fn test_spec_field_requires_predicate() {
+        let result = parse_and_evaluate("spec=abc-123").unwrap();
+        assert!(result.requires_predicate);
+    }
+
+    #[test]
+    fn test_parent_field_requires_predicate() {
+        let result = parse_and_evaluate("parent=br-abc123").unwrap();
+        assert!(result.requires_predicate);
+    }
+
+    #[test]
+    fn test_ephemeral_field_requires_predicate() {
+        let result = parse_and_evaluate("ephemeral=true").unwrap();
+        assert!(result.requires_predicate);
+    }
+
+    #[test]
+    fn test_template_field_requires_predicate() {
+        let result = parse_and_evaluate("template=false").unwrap();
+        assert!(result.requires_predicate);
+    }
+
+    #[test]
+    fn test_has_metadata_key_requires_predicate() {
+        let result = parse_and_evaluate("has_metadata_key=component").unwrap();
+        assert!(result.requires_predicate);
+    }
+
+    fn make_eval_test_issue() -> crate::model::Issue {
+        crate::model::Issue {
+            id: "test-001".to_string(),
+            title: "Test Issue".to_string(),
+            description: Some("A test description".to_string()),
+            status: crate::model::Status::Open,
+            priority: crate::model::Priority::MEDIUM,
+            issue_type: crate::model::IssueType::Task,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            ..crate::model::Issue::default()
+        }
+    }
+
+    #[test]
+    fn test_description_predicate_matches() {
+        let mut issue = make_eval_test_issue();
+        issue.description = Some("The quick brown fox".to_string());
+        let pred_fn = build_predicate_for_test("description=quick").unwrap();
+        assert!(pred_fn(&issue));
+        let pred_fn2 = build_predicate_for_test("description=nonexistent").unwrap();
+        assert!(!pred_fn2(&issue));
+    }
+
+    #[test]
+    fn test_closed_at_predicate() {
+        let mut issue = make_eval_test_issue();
+        issue.closed_at = Some(chrono::Utc::now());
+        let pred_fn = build_predicate_for_test("closed_at<+1d").unwrap();
+        assert!(pred_fn(&issue));
+    }
+
+    #[test]
+    fn test_spec_id_predicate() {
+        let mut issue = make_eval_test_issue();
+        issue.spec_id = Some("SPEC-001".to_string());
+        let pred_fn = build_predicate_for_test("spec_id=SPEC-001").unwrap();
+        assert!(pred_fn(&issue));
+        let pred_fn2 = build_predicate_for_test("spec_id=SPEC-002").unwrap();
+        assert!(!pred_fn2(&issue));
+    }
+
+    #[test]
+    fn test_ephemeral_predicate() {
+        let mut issue = make_eval_test_issue();
+        issue.ephemeral = true;
+        let pred_fn = build_predicate_for_test("ephemeral=true").unwrap();
+        assert!(pred_fn(&issue));
+    }
+
+    #[test]
+    fn test_template_predicate() {
+        let mut issue = make_eval_test_issue();
+        issue.is_template = true;
+        let pred_fn = build_predicate_for_test("template=true").unwrap();
+        assert!(pred_fn(&issue));
+    }
+
+    /// Helper: parse a query string and return the predicate function.
+    /// Panics on parse/eval errors.
+    fn build_predicate_for_test(
+        query: &str,
+    ) -> Option<Box<dyn Fn(&crate::model::Issue) -> bool + Send>> {
+        let result = parse_and_evaluate(query).unwrap();
+        result.predicate
     }
 }
