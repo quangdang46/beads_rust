@@ -366,7 +366,10 @@ fn bench_update_issue(c: &mut Criterion) {
         let bench_start = log_bench_start(bench_name);
         b.iter(|| {
             let id = format!("bench-{:06}", counter % 100);
-            let update = IssueUpdate { points: None, metadata: None, is_template: None,
+            let update = IssueUpdate {
+                points: None,
+                metadata: None,
+                is_template: None,
                 title: Some(format!("Updated title {counter}")),
                 priority: Some(Priority(((counter % 4) + 1) as i32)),
                 status: None,
@@ -432,7 +435,10 @@ fn bench_close_issue_with_reason(c: &mut Criterion) {
         let bench_start = log_bench_start(bench_name);
         b.iter(|| {
             let id = format!("bench-{:06}", counter % 100);
-            let update = IssueUpdate { points: None, metadata: None, is_template: None,
+            let update = IssueUpdate {
+                points: None,
+                metadata: None,
+                is_template: None,
                 status: Some(Status::Closed),
                 closed_at: Some(Some(Utc::now())),
                 close_reason: Some(Some("benchmark close".to_string())),
@@ -756,7 +762,10 @@ fn bench_dirty_tracking_mark(c: &mut Criterion) {
         let bench_start = log_bench_start(bench_name);
         b.iter(|| {
             let id = format!("bench-{:06}", counter % 100);
-            let update = IssueUpdate { points: None, metadata: None, is_template: None,
+            let update = IssueUpdate {
+                points: None,
+                metadata: None,
+                is_template: None,
                 notes: Some(Some(format!("dirty-note-{counter}"))),
                 ..IssueUpdate::default()
             };
@@ -793,7 +802,10 @@ fn bench_dirty_tracking_query(c: &mut Criterion) {
 
     for i in 0..100 {
         let id = format!("bench-{i:06}");
-        let update = IssueUpdate { points: None, metadata: None, is_template: None,
+        let update = IssueUpdate {
+            points: None,
+            metadata: None,
+            is_template: None,
             notes: Some(Some(format!("dirty-note-{i}"))),
             ..IssueUpdate::default()
         };
