@@ -8,82 +8,91 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    name: Build (${{ matrix.target }})
-    strategy:
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-            suffix: linux-x64
-          - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
-            suffix: linux-arm64
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            suffix: macos-x64
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            suffix: macos-arm64
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            suffix: windows-x64
-    runs-on: ${{ matrix.os }}
+  linux-x64:
+    name: linux-x64
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cross --git https://github.com/cross-rs/cross
+      - run: cross build --release --target x86_64-unknown-linux-musl
+        env:
+          RUSTC_BOOTSTRAP: 1
+      - run: cd target/x86_64-unknown-linux-musl/release && tar czf ../../../br-linux-x64.tar.gz br && cd - && sha256sum br-linux-x64.tar.gz > br-linux-x64.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: br-linux-x64
+          path: br-linux-x64.*
+          if-no-files-found: error
+
+  linux-arm64:
+    name: linux-arm64
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: aarch64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cross --git https://github.com/cross-rs/cross
+      - run: cross build --release --target aarch64-unknown-linux-musl
+        env:
+          RUSTC_BOOTSTRAP: 1
+      - run: cd target/aarch64-unknown-linux-musl/release && tar czf ../../../br-linux-arm64.tar.gz br && cd - && sha256sum br-linux-arm64.tar.gz > br-linux-arm64.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: br-linux-arm64
+          path: br-linux-arm64.*
+          if-no-files-found: error
+
+  macos-arm64:
+    name: macos-arm64
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --target aarch64-apple-darwin
+        env:
+          RUSTC_BOOTSTRAP: 1
+      - run: cd target/aarch64-apple-darwin/release && tar czf ../../../br-macos-arm64.tar.gz br && cd - && shasum -a 256 br-macos-arm64.tar.gz > br-macos-arm64.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: br-macos-arm64
+          path: br-macos-arm64.*
+          if-no-files-found: error
+
+  macos-x64:
+    name: macos-x64
+    runs-on: macos-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@nightly
         with:
-          targets: ${{ matrix.target }}
-
+          targets: x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-
-      - name: Install cross (Linux musl)
-        if: contains(matrix.target, 'linux-musl')
-        run: cargo install cross --git https://github.com/cross-rs/cross
-
-      - name: Build (Linux musl)
-        if: contains(matrix.target, 'linux-musl')
-        run: cross build --release --target ${{ matrix.target }}
+      - run: cargo build --release --target x86_64-apple-darwin
         env:
           RUSTC_BOOTSTRAP: 1
-
-      - name: Build (native)
-        if: "!contains(matrix.target, 'linux-musl')"
-        run: cargo build --release --target ${{ matrix.target }}
-        env:
-          RUSTC_BOOTSTRAP: 1
-
-      - name: Package (Unix)
-        if: matrix.os != 'windows-latest'
-        run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../br-${{ matrix.suffix }}.tar.gz br
-          cd -
-          sha256sum br-${{ matrix.suffix }}.tar.gz > br-${{ matrix.suffix }}.tar.gz.sha256
-
-      - name: Package (Windows)
-        if: matrix.os == 'windows-latest'
-        run: |
-          cd target/${{ matrix.target }}/release
-          7z a ../../../br-${{ matrix.suffix }}.zip br.exe
-          cd -
-          certutil -hashfile br-${{ matrix.suffix }}.zip SHA256 > br-${{ matrix.suffix }}.zip.sha256
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+      - run: cd target/x86_64-apple-darwin/release && tar czf ../../../br-macos-x64.tar.gz br && cd - && shasum -a 256 br-macos-x64.tar.gz > br-macos-x64.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
         with:
-          name: br-${{ matrix.suffix }}
-          path: |
-            br-${{ matrix.suffix }}.*
+          name: br-macos-x64
+          path: br-macos-x64.*
           if-no-files-found: error
 
   release:
     name: Create Release
-    needs: build
+    needs: [linux-x64, linux-arm64, macos-arm64, macos-x64]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -95,7 +104,7 @@ jobs:
           echo "## br v${GITHUB_REF_NAME#v}" >> release.md
           echo "" >> release.md
           echo "### Downloads" >> release.md
-          for f in br-*.tar.gz br-*.zip br-*.sha256; do
+          for f in br-*.tar.gz br-*.sha256; do
             [ -f "$f" ] && echo "- $f" >> release.md
           done
 
@@ -106,5 +115,4 @@ jobs:
           generate_release_notes: true
           files: |
             br-*.tar.gz
-            br-*.zip
             br-*.sha256
