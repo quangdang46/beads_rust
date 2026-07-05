@@ -710,7 +710,8 @@ function Main {
         # Download and install
         $binPath = Download-Release -Platform $platform
         if (-not $binPath) {
-            Write-Error "Failed to download release binary. Ensure version $($Script:Version) exists."
+            Write-Warn "No pre-built binary available for ${platform} (Windows builds are paused)."
+            Write-Warn "Install WSL and use: curl -fsSL https://raw.githubusercontent.com/quangdang46/beads_rust/main/install.sh | bash"
         }
 
         $destPath = Join-Path $InstallDir $Script:BinaryName

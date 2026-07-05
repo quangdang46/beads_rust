@@ -555,7 +555,9 @@ check("blocked --limit 5", rc5 == 0, err5[:100])
 section("WISP")
 rc, out, err = run("wisp", "create", "Temp wisp 1")
 check("wisp create", rc == 0, err[:100])
-wisp_id = extract_id(out)
+# wisp output: "Created wisp: wsp-se1"
+wisp_m = re.search(r'wisp:\s*(\S+)', out)
+wisp_id = wisp_m.group(1) if wisp_m else None
 check(f"wisp ID: {wisp_id}", bool(wisp_id), out[:100])
 
 rc2, out2, err2 = run("wisp", "list")
@@ -755,7 +757,7 @@ cmds = [
     ("audit", "--help"), ("agents", "--help"), ("config", "--help"),
     ("formula", "--help"), ("gate", "--help"), ("epic", "--help"),
     ("mol", "--help"), ("scheduler", "--help"), ("query", "--help"),
-    ("custom-status", "--help"), ("custom-type", "--help"), ("lint", ""),
+    ("custom-status", "--help"), ("custom-type", "--help"), ("lint", "--help"),
     ("history", "--help"), ("coordination", "--help"),
     ("federation", "--help"), ("merge-slot", "--help"), ("worktree", "--help"),
     ("capabilities", ""), ("recipes", "--help"), ("schema", "--help"),
