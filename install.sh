@@ -576,15 +576,14 @@ detect_platform() {
 
     case "$(uname -s)" in
         Linux*)  os="linux" ;;
-        Darwin*) os="darwin" ;;
+        Darwin*) os="macos" ;;
         MINGW*|MSYS*|CYGWIN*) os="windows" ;;
         *) die "Unsupported OS: $(uname -s)" ;;
     esac
 
     case "$(uname -m)" in
-        x86_64|amd64) arch="amd64" ;;
+        x86_64|amd64) arch="x64" ;;
         aarch64|arm64) arch="arm64" ;;
-        armv7*) arch="armv7" ;;
         *) die "Unsupported architecture: $(uname -m)" ;;
     esac
 
