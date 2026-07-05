@@ -228,9 +228,16 @@ function Do-Uninstall {
 # Platform detection
 # ============================================================================
 function Get-Platform {
-    $arch = "amd64"
-    $os = "windows"
-    return "${os}_${arch}"
+    if ($IsLinux) { $os = "linux" }
+    elseif ($IsMacOS) { $os = "macos" }
+    else { $os = "windows" }
+
+    $envArch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+    if ($envArch -eq [System.Runtime.InteropServices.Architecture]::Arm64) { $arch = "arm64" }
+    elseif ($envArch -eq [System.Runtime.InteropServices.Architecture]::X64) { $arch = "x64" }
+    else { $arch = "x64" }
+
+    return "${os}-${arch}"
 }
 
 # ============================================================================
@@ -352,8 +359,7 @@ function Install-BinaryAtomic {
 function Download-Release {
     param([string]$Platform)
 
-    $assetVersion = $Script:Version -replace '^v', ''
-    $archiveName = "br-${assetVersion}-${Platform}.zip"
+    $archiveName = "br-${Platform}.zip"
     $url = "https://github.com/$($Script:Owner)/$($Script:Repo)/releases/download/$($Script:Version)/${archiveName}"
     $archivePath = Join-Path $Script:TempDir $archiveName
 
@@ -655,7 +661,7 @@ function Install-Skills {
     if ($filesInstalled -gt 0) {
         Write-Success "Installed skill: $skillName ($filesInstalled files)"
     } else {
-        Write-Warn "Skill $skillName: no files could be downloaded"
+        Write-Warn "Skill ${skillName}: no files could be downloaded"
     }
 }
 
