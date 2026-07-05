@@ -43,6 +43,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 #[cfg(unix)]
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 /// Signature for a lifecycle hook callback.

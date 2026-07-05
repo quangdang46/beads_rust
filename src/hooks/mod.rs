@@ -14,6 +14,7 @@
 
 use crate::error::{BeadsError, Result};
 use serde::Serialize;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -310,10 +311,13 @@ pub fn install_hook(hook_name: &str, git_info: &GitInfo) -> Result<PathBuf> {
 
     std::fs::write(&hook_path, &new_content)?;
 
-    // Make executable
-    let mut perms = std::fs::metadata(&hook_path)?.permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&hook_path, perms)?;
+    // Make executable (Unix-only)
+    #[cfg(unix)]
+    {
+        let mut perms = std::fs::metadata(&hook_path)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&hook_path, perms)?;
+    }
 
     Ok(hook_path)
 }

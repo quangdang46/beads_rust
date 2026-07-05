@@ -13,6 +13,7 @@ mod tools;
 
 use std::fs;
 #[cfg(unix)]
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
