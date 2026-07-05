@@ -56,9 +56,6 @@ pub struct MolPourArgs {
 pub struct MolSwarmValidateArgs {
     /// Epic ID to validate
     pub epic_id: String,
-    /// Include detailed issue graph in output
-    #[arg(long)]
-    pub verbose: bool,
 }
 
 /// Create a swarm molecule from an epic.
@@ -419,7 +416,7 @@ fn execute_swarm_validate(
         });
     }
 
-    let analysis = analyze_epic_for_swarm(storage, &epic, args.verbose)?;
+    let analysis = analyze_epic_for_swarm(storage, &epic, true)?;
 
     if ctx.is_json() || ctx.is_toon() {
         ctx.json_pretty(&analysis);
