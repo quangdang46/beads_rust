@@ -373,7 +373,17 @@ function Download-Release {
     $checksumPath = Join-Path $Script:TempDir "checksum.sha256"
     $expected = ""
     if (Download-File -Url $checksumUrl -DestPath $checksumPath) {
-        $expected = (Get-Content $checksumPath).Split(' ')[0]
+        $content = Get-Content $checksumPath
+        if ($content[0] -and $content[0] -match '^[0-9a-f]{64}') {
+            $expected = $content[0].Split(' ')[0]
+        } else {
+            foreach ($line in $content) {
+                if ($line -and $line -match '^[0-9a-f]{64}') {
+                    $expected = $line.Split(' ')[0]
+                    break
+                }
+            }
+        }
     }
 
     if (-not (Verify-Checksum -ArchivePath $archivePath -ArchiveName $archiveName -Expected $expected)) {
