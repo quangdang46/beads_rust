@@ -727,7 +727,8 @@ function Main {
         $destPath = Join-Path $InstallDir $Script:BinaryName
         Install-BinaryAtomic -SourcePath $binPath -DestPath $destPath
 
-        # Post-install
+        # Post-install (auto-add to PATH)
+        $EasyMode = $true
         Update-Path
         Configure-AllMcpProviders -BinaryPath $destPath
         Install-Skills
