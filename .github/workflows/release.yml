@@ -90,9 +90,33 @@ jobs:
           path: br-macos-x64.*
           if-no-files-found: error
 
+  windows-x64:
+    name: windows-x64
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --target x86_64-pc-windows-msvc
+        env:
+          RUSTC_BOOTSTRAP: 1
+      - run: |
+          cd target/x86_64-pc-windows-msvc/release
+          7z a ../../../br-windows-x64.zip br.exe
+          cd -
+          certutil -hashfile br-windows-x64.zip SHA256 > br-windows-x64.zip.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: br-windows-x64
+          path: br-windows-x64.*
+          if-no-files-found: error
+
   release:
     name: Create Release
-    needs: [linux-x64, linux-arm64, macos-arm64, macos-x64]
+    needs: [linux-x64, linux-arm64, macos-arm64, macos-x64, windows-x64]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -104,7 +128,7 @@ jobs:
           echo "## br v${GITHUB_REF_NAME#v}" >> release.md
           echo "" >> release.md
           echo "### Downloads" >> release.md
-          for f in br-*.tar.gz br-*.sha256; do
+          for f in br-*.tar.gz br-*.sha256 br-*.zip; do
             [ -f "$f" ] && echo "- $f" >> release.md
           done
 
@@ -116,3 +140,4 @@ jobs:
           files: |
             br-*.tar.gz
             br-*.sha256
+            br-*.zip
