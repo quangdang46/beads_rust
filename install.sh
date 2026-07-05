@@ -1194,16 +1194,6 @@ build_from_source() {
         die "Failed to clone repository"
     fi
 
-    # Clone frankensqlite next to beads_rust — Cargo.toml [patch.crates-io]
-    # overrides fsqlite crates with path deps at ../frankensqlite/crates/*
-    local franken_dir="$TMP/frankensqlite"
-    run_with_spinner "Cloning frankensqlite dependency..." \
-        git clone --depth 1 "https://github.com/${OWNER}/frankensqlite.git" "$franken_dir"
-
-    if [ ! -d "$franken_dir" ]; then
-        die "Failed to clone frankensqlite (required path dependency)"
-    fi
-
     log_step "Building with Cargo (this may take a few minutes)..."
 
     # Build with explicit target dir to avoid conflicts
