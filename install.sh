@@ -617,18 +617,15 @@ detect_platform() {
                 *[Mm]usl*) libc="musl" ;;
             esac
         fi
-        # Only musl_arm64 and musl_amd64 are published; armv7 keeps gnu (no musl
-        # artifact yet). If we somehow detected musl on armv7, fall back to gnu
-        # rather than fabricating an artifact name that does not exist.
-        if [ "$libc" = "musl" ] && [ "$arch" != "amd64" ] && [ "$arch" != "arm64" ]; then
+        if [ "$libc" = "musl" ] && [ "$arch" != "x64" ] && [ "$arch" != "arm64" ]; then
             libc=""
         fi
     fi
 
     if [ -n "$libc" ]; then
-        echo "${os}_${libc}_${arch}"
+        echo "${os}-${libc}-${arch}"
     else
-        echo "${os}_${arch}"
+        echo "${os}-${arch}"
     fi
 }
 
