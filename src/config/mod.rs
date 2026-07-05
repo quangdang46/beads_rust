@@ -3053,7 +3053,7 @@ pub fn no_auto_flush_from_layer(layer: &ConfigLayer) -> Option<bool> {
 /// caller can keep the default-enabled behavior unchanged.
 ///
 /// This is the storage-policy switch requested in
-/// <https://github.com/Dicklesworthstone/beads_rust/issues/293> — operators who
+/// <https://github.com/quangdang46/beads_rust/issues/293> — operators who
 /// want `issues.jsonl` to be the single durable state file can flip this and
 /// stop the `.br_history/` directory from being created.
 /// Resolve an override for the `.br_history` snapshot throttle (#313) from the

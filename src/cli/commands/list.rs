@@ -503,7 +503,7 @@ pub(crate) fn parse_metadata_filters(filters: &[String]) -> Result<Vec<(String, 
 }
 
 /// Convert CLI args to storage filter.
-fn build_filters(
+pub(crate) fn build_filters(
     args: &ListArgs,
 ) -> Result<(
     ListFilters,

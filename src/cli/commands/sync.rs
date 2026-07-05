@@ -2208,6 +2208,7 @@ fn execute_import(
         beads_dir: Some(path_policy.beads_dir.clone()),
         allow_external_jsonl: path_policy.allow_external_jsonl,
         show_progress,
+        strict: false,
     };
 
     // For force/rebuild imports we read the JSONL twice before

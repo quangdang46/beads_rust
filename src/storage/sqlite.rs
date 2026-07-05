@@ -2098,6 +2098,109 @@ impl SqliteStorage {
             .collect())
     }
 
+    /// Check that an ID is unique across all issue-like entities (issues, wisps).
+    ///
+    /// Returns `Ok(())` if the ID is available. Returns `Err(IdCollision { id })`
+    /// if an issue or wisp with that ID already exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns `IdCollision` if the ID is taken.
+    pub fn check_id_uniqueness(&self, id: &str) -> Result<()> {
+        if let Some(existing) = self.get_issue(id)? {
+            return Err(BeadsError::IdCollision {
+                id: existing.id.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------
+    // Gate waiters (issue #76)
+    // ---------------------------------------------------------------
+
+    /// Register a waiter on a gate issue.
+    ///
+    /// Waiters are agents/processes that should be notified when the gate
+    /// resolves. The waiter string is typically a worker address or agent name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database write fails or the issue doesn't exist.
+    pub fn record_gate_waiter(&self, issue_id: &str, waiter: &str) -> Result<()> {
+        self.conn.execute_with_params(
+            "INSERT OR IGNORE INTO gate_waiters (issue_id, waiter) VALUES (?1, ?2)",
+            &[SqliteValue::from(issue_id), SqliteValue::from(waiter)],
+        )?;
+        Ok(())
+    }
+
+    /// Read all waiters registered on a gate issue.
+    ///
+    /// Returns an empty vec when the `gate_waiters` table doesn't exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_gate_waiters(&self, issue_id: &str) -> Result<Vec<String>> {
+        if !crate::storage::schema::table_exists(&self.conn, "gate_waiters") {
+            return Ok(Vec::new());
+        }
+        let rows = self.conn.query_with_params(
+            "SELECT waiter FROM gate_waiters WHERE issue_id = ?1 ORDER BY waiter",
+            &[SqliteValue::from(issue_id)],
+        )?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(String::from))
+            .collect())
+    }
+
+    /// Remove a waiter from a gate issue.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database write fails.
+    pub fn remove_gate_waiter(&self, issue_id: &str, waiter: &str) -> Result<()> {
+        self.conn.execute_with_params(
+            "DELETE FROM gate_waiters WHERE issue_id = ?1 AND waiter = ?2",
+            &[SqliteValue::from(issue_id), SqliteValue::from(waiter)],
+        )?;
+        Ok(())
+    }
+
+    /// Get all gate issues that have waiters registered.
+    ///
+    /// Returns a map of issue_id -> Vec<waiter> for all gates with waiters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_all_gates_with_waiters(
+        &self,
+    ) -> Result<std::collections::HashMap<String, Vec<String>>> {
+        if !crate::storage::schema::table_exists(&self.conn, "gate_waiters") {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows = self
+            .conn
+            .query("SELECT issue_id, waiter FROM gate_waiters ORDER BY issue_id, waiter")?;
+        let mut result: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for row in &rows {
+            if let (Some(issue_id), Some(waiter)) = (
+                row.get(0).and_then(SqliteValue::as_text),
+                row.get(1).and_then(SqliteValue::as_text),
+            ) {
+                result
+                    .entry(issue_id.to_string())
+                    .or_default()
+                    .push(waiter.to_string());
+            }
+        }
+        Ok(result)
+    }
+
     /// Stage Tier 1 attribution for the next mutation (issue #312, Layer 3
     /// capture-only). The values are stamped onto every audit event produced by
     /// the immediately following `create`/`update`/status-mutating call, then

@@ -250,9 +250,9 @@ Examples:
 #### Downstream `--slug` integration
 
 Three commits made `--slug` end-to-end:
-- [`5c0af3d4`](https://github.com/Dicklesworthstone/beads_rust/commit/5c0af3d4) `feat(create): --slug for human-readable issue IDs (#283)` — the feature itself.
-- [`f454486f`](https://github.com/Dicklesworthstone/beads_rust/commit/f454486f) `fix(sync): accept slugged IDs in prefix guard` — sync's prefix guard now tolerates slugged IDs during import/export.
-- [`52ff1722`](https://github.com/Dicklesworthstone/beads_rust/commit/52ff1722) `feat(orphans): scan all candidate-issue prefixes when finding commit refs` — `br orphans` finds commit references to slugged IDs.
+- [`5c0af3d4`](https://github.com/quangdang46/beads_rust/commit/5c0af3d4) `feat(create): --slug for human-readable issue IDs (#283)` — the feature itself.
+- [`f454486f`](https://github.com/quangdang46/beads_rust/commit/f454486f) `fix(sync): accept slugged IDs in prefix guard` — sync's prefix guard now tolerates slugged IDs during import/export.
+- [`52ff1722`](https://github.com/quangdang46/beads_rust/commit/52ff1722) `feat(orphans): scan all candidate-issue prefixes when finding commit refs` — `br orphans` finds commit references to slugged IDs.
 
 The full lifecycle round-trip (create with slug → show → update → close → orphans references) is verified by `tests/e2e_scripts/slug_round_trip.sh` (added by `beads_rust-l6xl`).
 
@@ -1338,7 +1338,7 @@ br serve [OPTIONS]
 
 ```bash
 cargo build --release --features mcp
-cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --features mcp
+cargo install --git https://github.com/quangdang46/beads_rust.git --features mcp
 ```
 
 **Options:**
@@ -1880,6 +1880,90 @@ br formula expand workflow.formula.json --var component=auth
 # Machine-readable JSON output
 br formula expand workflow.formula.json --robot
 ```
+
+### codex-hook
+
+Internal Codex CLI lifecycle hook (hidden, called by .codex/hooks.json).
+
+```bash
+br codex-hook <EVENT>
+```
+
+Events: `SessionStart`, `PreCompact`, `PostCompact`, `UserPromptSubmit`.
+
+---
+
+### mol
+
+Molecule commands for agent workflow templates.
+
+```bash
+br mol <COMMAND>
+```
+
+Subcommands: `bond`, `pour`, `swarm validate`, `swarm create`.
+
+---
+
+### export
+
+Export issues to JSONL, JSON, CSV, or Obsidian Markdown.
+
+```bash
+br export [OPTIONS]
+```
+
+---
+
+### rename-prefix
+
+Rename the issue ID prefix across all issues.
+
+```bash
+br rename-prefix <NEW_PREFIX>
+```
+
+---
+
+### memory
+
+Persistent agent memory (remember, memories, recall, forget).
+
+```bash
+br memory <COMMAND>
+```
+
+---
+
+### prime
+
+AI session context with persistent memory injection.
+
+```bash
+br prime [OPTIONS]
+```
+
+---
+
+### federation
+
+Manage federation peers for P2P sync.
+
+```bash
+br federation <COMMAND>
+```
+
+---
+
+### sql
+
+Execute a read-only SQL query against the database.
+
+```bash
+br sql <QUERY>
+```
+
+---
 
 ---
 

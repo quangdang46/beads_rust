@@ -1,5 +1,0 @@
-[advisories]
-ignore = [
-  "RUSTSEC-2026-0195",  # quick-xml unbounded namespace allocation -- blocked by self_update v0.44
-  "RUSTSEC-2026-0194",  # quick-xml quadratic runtime -- blocked by self_update v0.44
-]

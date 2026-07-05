@@ -1,11 +1,12 @@
 //! Content hashing for issue deduplication and sync.
 //!
 //! Uses SHA256 over stable ordered fields with null separators.
-//! Matches classic Go bd behavior for export/import compatibility.
+//! Matches Go `bd` `ComputeContentHash` (`internal/types/types.go`)
+//! byte-for-byte for cross-tool deduplication.
 
 use sha2::{Digest, Sha256};
 
-use crate::model::{Issue, IssueType, Priority, Status};
+use crate::model::{BondRef, Issue, IssueType, MolType, Priority, Status, WorkType};
 
 /// Lowercase hex encoding for digest outputs (sha2 0.11 no longer impls `LowerHex`
 /// on `Array<u8, _>`, so we format bytes directly).
@@ -31,23 +32,47 @@ impl ContentHashable for Issue {
     }
 }
 
-/// Compute SHA256 content hash for an issue.
+/// Compute SHA256 content hash for an issue, matching Go `bd` field order.
 ///
-/// Fields included (stable order with null separators):
-/// - title, description, design, `acceptance_criteria`, notes
-/// - status, priority, `issue_type`
-/// - assignee, owner, `created_by`
-/// - `external_ref`, `source_system`
-/// - pinned, `is_template`
-/// - empty/default placeholders for Go bd fields not represented in Rust
+/// Fields included in order (each followed by a null separator):
+/// 1.  Title
+/// 2.  Description
+/// 3.  Design
+/// 4.  AcceptanceCriteria
+/// 5.  Notes
+/// 6.  SpecID
+/// 7.  Status (string)
+/// 8.  Priority (int, formatted as decimal)
+/// 9.  IssueType (string)
+/// 10. Assignee
+/// 11. Owner
+/// 12. CreatedBy
+/// 13. ExternalRef (strPtr — nil writes just the null byte)
+/// 14. SourceSystem
+/// 15. Pinned (flag: label "pinned" when true, empty string when false)
+/// 16. Metadata (raw JSON string)
+/// 17. IsTemplate (flag: label "template" when true, empty string when false)
+/// 18. BondedFrom (for each BondRef: SourceID, BondType, BondPoint)
+/// 19. AwaitType
+/// 20. AwaitID
+/// 21. Timeout (duration in nanoseconds, formatted as decimal)
+/// 22. Waiters (for each waiter: string + null byte)
+/// 23. MolType (string)
+/// 24. WorkType (string)
+/// 25. EventKind
+/// 26. Actor
+/// 27. Target
+/// 28. Payload
 ///
 /// Fields excluded:
-/// - id, `content_hash` (circular)
+/// - id, content_hash (circular)
 /// - labels, dependencies, comments, events (separate entities)
-/// - timestamps (`created_at`, `updated_at`, `closed_at`, etc.)
-/// - tombstone fields (`deleted_at`, `deleted_by`, `delete_reason`)
-/// - `estimated_minutes`, `due_at`, `defer_until`
-/// - `close_reason`, `closed_by_session`
+/// - timestamps (created_at, updated_at, closed_at, started_at, etc.)
+/// - tombstone fields (deleted_at, deleted_by, delete_reason)
+/// - estimated_minutes, due_at, defer_until
+/// - close_reason, closed_by_session
+/// - quality_score, crystallizes
+/// - holder, hook_bead, role_bead, agent_state, role_type, rig
 #[must_use]
 pub fn content_hash(issue: &Issue) -> String {
     content_hash_from_parts(
@@ -56,6 +81,7 @@ pub fn content_hash(issue: &Issue) -> String {
         issue.design.as_deref(),
         issue.acceptance_criteria.as_deref(),
         issue.notes.as_deref(),
+        issue.spec_id.as_deref(),
         &issue.status,
         &issue.priority,
         &issue.issue_type,
@@ -65,14 +91,27 @@ pub fn content_hash(issue: &Issue) -> String {
         issue.external_ref.as_deref(),
         issue.source_system.as_deref(),
         issue.pinned,
+        issue.metadata.as_deref(),
         issue.is_template,
+        &issue.bonded_from,
+        issue.await_type.as_deref(),
+        issue.await_id.as_deref(),
+        issue.timeout_seconds,
+        &issue.waiters,
+        &issue.mol_type,
+        &issue.work_type,
+        issue.event_kind.as_deref(),
+        None, // actor field not on Rust Issue (on Event struct)
+        issue.target.as_deref(),
+        issue.payload.as_deref(),
     )
 }
 
-/// Create a content hash from raw components (for import/validation).
+/// Create a content hash from raw components (for import/validation with defaults for newer fields).
+/// Convenience wrapper with the classic 15-param signature.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
-pub fn content_hash_from_parts(
+pub fn content_hash_from_parts_v15(
     title: &str,
     description: Option<&str>,
     design: Option<&str>,
@@ -89,46 +128,138 @@ pub fn content_hash_from_parts(
     pinned: bool,
     is_template: bool,
 ) -> String {
+    content_hash_from_parts(
+        title,
+        description,
+        design,
+        acceptance_criteria,
+        notes,
+        None, // spec_id
+        status,
+        priority,
+        issue_type,
+        assignee,
+        owner,
+        created_by,
+        external_ref,
+        source_system,
+        pinned,
+        None, // metadata
+        is_template,
+        &[], // bonded_from
+        None,
+        None,
+        None, // await_type, await_id, timeout_seconds
+        &[],  // waiters
+        &MolType::default(),
+        &WorkType::default(),
+        None,
+        None,
+        None,
+        None, // event_kind, actor, target, payload
+    )
+}
+
+/// Create a content hash from raw components (for import/validation).
+/// Matches Go `ComputeContentHash` field order exactly.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn content_hash_from_parts(
+    title: &str,
+    description: Option<&str>,
+    design: Option<&str>,
+    acceptance_criteria: Option<&str>,
+    notes: Option<&str>,
+    spec_id: Option<&str>,
+    status: &Status,
+    priority: &Priority,
+    issue_type: &IssueType,
+    assignee: Option<&str>,
+    owner: Option<&str>,
+    created_by: Option<&str>,
+    external_ref: Option<&str>,
+    source_system: Option<&str>,
+    pinned: bool,
+    metadata: Option<&str>,
+    is_template: bool,
+    bonded_from: &[BondRef],
+    await_type: Option<&str>,
+    await_id: Option<&str>,
+    timeout_seconds: Option<i64>,
+    waiters: &[String],
+    mol_type: &MolType,
+    work_type: &WorkType,
+    event_kind: Option<&str>,
+    actor: Option<&str>,
+    target: Option<&str>,
+    payload: Option<&str>,
+) -> String {
     let mut writer = HashFieldWriter::new();
 
+    // ===== Core fields =====
     writer.field(title);
     writer.field_opt(description);
     writer.field_opt(design);
     writer.field_opt(acceptance_criteria);
     writer.field_opt(notes);
+    writer.field_opt(spec_id); // Go: w.str(i.SpecID)
     writer.field(status.as_str());
     writer.field(&priority.0.to_string());
     writer.field(issue_type.as_str());
     writer.field_opt(assignee);
     writer.field_opt(owner);
     writer.field_opt(created_by);
-    writer.field_opt(external_ref);
+    writer.field_strptr(external_ref); // Go: w.strPtr(i.ExternalRef)
     writer.field_opt(source_system);
-    writer.field_flag(pinned, "pinned");
-    writer.field_flag(is_template, "template");
+    writer.field_flag(pinned, "pinned"); // Go: w.flag(i.Pinned, "pinned")
+    writer.field_opt(metadata); // Go: w.str(string(i.Metadata))
+    writer.field_flag(is_template, "template"); // Go: w.flag(i.IsTemplate, "template")
 
-    // Go bd hashes several newer fields that Rust does not model yet. Hash
-    // their Go zero values so Rust remains byte-for-byte compatible for every
-    // field in the shared schema.
-    writer.field(""); // quality_score nil
-    writer.field_flag(false, "crystallizes");
-    writer.field(""); // await_type
-    writer.field(""); // await_id
-    writer.field("0"); // timeout duration
-    writer.field(""); // holder
-    writer.field(""); // hook_bead
-    writer.field(""); // role_bead
-    writer.field(""); // agent_state
-    writer.field(""); // role_type
-    writer.field(""); // rig
-    writer.field(""); // mol_type
-    writer.field(""); // work_type
-    writer.field(""); // event_kind
-    writer.field(""); // actor
-    writer.field(""); // target
-    writer.field(""); // payload
+    // ===== BondedFrom (compound molecule lineage) =====
+    // Go: for _, br := range i.BondedFrom { w.str(br.SourceID) ... }
+    for br in bonded_from {
+        writer.field(&br.source_id);
+        writer.field(&br.bond_type);
+        // BondPoint is Option<String> in Rust; Go stores it as plain string
+        writer.field_opt(br.bond_point.as_deref());
+    }
+
+    // ===== Gate fields (async coordination) =====
+    writer.field_opt(await_type); // Go: w.str(i.AwaitType)
+    writer.field_opt(await_id); // Go: w.str(i.AwaitID)
+    // Go: w.duration(i.Timeout) — duration is int64 nanoseconds
+    writer.field(&timeout_to_nanos_string(timeout_seconds));
+    // Go: for _, waiter := range i.Waiters { w.str(waiter) }
+    for waiter in waiters {
+        writer.field(waiter);
+    }
+
+    // ===== Molecule type =====
+    writer.field(mol_type.as_str()); // Go: w.str(string(i.MolType))
+
+    // ===== Work type =====
+    writer.field(work_type.as_str()); // Go: w.str(string(i.WorkType))
+
+    // ===== Event fields =====
+    writer.field_opt(event_kind); // Go: w.str(i.EventKind)
+    writer.field_opt(actor); // Go: w.str(i.Actor)
+    writer.field_opt(target); // Go: w.str(i.Target)
+    writer.field_opt(payload); // Go: w.str(i.Payload)
 
     writer.finalize()
+}
+
+/// Convert optional timeout_seconds (Rust) to a Go-compatible nanosecond string.
+/// Go's `time.Duration` is nanoseconds. When the value is zero/NULL Go writes "0".
+fn timeout_to_nanos_string(timeout_seconds: Option<i64>) -> String {
+    match timeout_seconds {
+        Some(secs) => {
+            // Saturating mul to avoid overflow on absurdly large values
+            let nanos = secs.saturating_mul(1_000_000_000);
+            nanos.to_string()
+        }
+        None => "0".to_string(),
+    }
 }
 
 struct HashFieldWriter {
@@ -149,6 +280,15 @@ impl HashFieldWriter {
 
     fn field_opt(&mut self, value: Option<&str>) {
         self.field(value.unwrap_or(""));
+    }
+
+    /// Like `field_opt` but matches Go `strPtr`: write the pointer value (or
+    /// nothing for nil/None) then always write the null separator.
+    fn field_strptr(&mut self, value: Option<&str>) {
+        if let Some(s) = value {
+            self.hasher.update(s.as_bytes());
+        }
+        self.hasher.update(b"\x00");
     }
 
     fn field_flag(&mut self, value: bool, label: &str) {
@@ -260,6 +400,7 @@ mod tests {
             issue.design.as_deref(),
             issue.acceptance_criteria.as_deref(),
             issue.notes.as_deref(),
+            issue.spec_id.as_deref(),
             &issue.status,
             &issue.priority,
             &issue.issue_type,
@@ -269,7 +410,19 @@ mod tests {
             issue.external_ref.as_deref(),
             issue.source_system.as_deref(),
             issue.pinned,
+            issue.metadata.as_deref(),
             issue.is_template,
+            &issue.bonded_from,
+            issue.await_type.as_deref(),
+            issue.await_id.as_deref(),
+            issue.timeout_seconds,
+            &issue.waiters,
+            &issue.mol_type,
+            &issue.work_type,
+            issue.event_kind.as_deref(),
+            None, // actor field not on Rust Issue (on Event struct)
+            issue.target.as_deref(),
+            issue.payload.as_deref(),
         );
         assert_eq!(direct, from_parts);
     }

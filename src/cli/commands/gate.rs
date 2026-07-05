@@ -13,7 +13,10 @@
 use super::{
     acquire_routed_workspace_write_lock, auto_import_storage_ctx_if_stale, resolve_issue_id,
 };
-use crate::cli::{GateCommands, GateListArgs, GateReportArgs, GateStatus};
+use crate::cli::{
+    GateAddWaiterArgs, GateCommands, GateListArgs, GateListWaitersArgs, GateRemoveWaiterArgs,
+    GateReportArgs, GateStatus,
+};
 use crate::close_policy::{self, GateResult, Workflow};
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -79,6 +82,9 @@ pub fn execute(
     match command {
         GateCommands::Report(args) => execute_report(args, cli, ctx, &beads_dir),
         GateCommands::List(args) => execute_list(args, cli, ctx, &beads_dir),
+        GateCommands::AddWaiter(args) => execute_add_waiter(args, cli, ctx, &beads_dir),
+        GateCommands::RemoveWaiter(args) => execute_remove_waiter(args, cli, ctx, &beads_dir),
+        GateCommands::ListWaiters(args) => execute_list_waiters(args, cli, ctx, &beads_dir),
     }
 }
 
@@ -305,6 +311,153 @@ fn print_gate_list_human(ctx: &OutputContext, output: &GateListOutput) {
 fn build_resolver(config_layer: &config::ConfigLayer) -> IdResolver {
     let id_config = config::id_config_from_layer(config_layer);
     IdResolver::new(ResolverConfig::with_prefix(id_config.prefix))
+}
+
+// ------------------------------------------------------------------
+// Gate waiter commands (issue #76)
+// ------------------------------------------------------------------
+
+/// JSON payload for `br gate add-waiter`.
+#[derive(Debug, Serialize)]
+struct GateAddWaiterOutput {
+    issue_id: String,
+    waiter: String,
+}
+
+/// JSON payload for `br gate remove-waiter`.
+#[derive(Debug, Serialize)]
+struct GateRemoveWaiterOutput {
+    issue_id: String,
+    waiter: String,
+}
+
+/// JSON payload for `br gate list-waiters`.
+#[derive(Debug, Serialize)]
+struct GateListWaitersOutput {
+    issue_id: String,
+    waiters: Vec<String>,
+}
+
+/// Register a waiter on a gate issue.
+///
+/// Waiter is an agent/process address that should be notified when the
+/// gate resolves. The gate must be a non-closed gate-type issue.
+fn execute_add_waiter(
+    args: &GateAddWaiterArgs,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    beads_dir: &Path,
+) -> Result<()> {
+    let waiter = args.waiter.trim();
+    if waiter.is_empty() {
+        return Err(BeadsError::validation("waiter", "waiter must not be empty"));
+    }
+
+    let _lock = acquire_routed_workspace_write_lock(beads_dir, false, cli.lock_timeout)?;
+    let mut storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
+    auto_import_storage_ctx_if_stale(&mut storage_ctx, cli)?;
+
+    let config_layer = storage_ctx.load_config(cli)?;
+    let resolver = build_resolver(&config_layer);
+    let issue_id = resolve_issue_id(&storage_ctx.storage, &resolver, &args.id)?;
+
+    storage_ctx.storage.record_gate_waiter(&issue_id, waiter)?;
+
+    let output = GateAddWaiterOutput {
+        issue_id: issue_id.clone(),
+        waiter: waiter.to_string(),
+    };
+
+    if ctx.is_toon() {
+        ctx.toon(&output);
+    } else if args.robot || ctx.is_json() {
+        ctx.json_pretty(&output);
+    } else {
+        ctx.success(&format!(
+            "Registered waiter '{waiter}' on gate {issue_id}",
+            waiter = sanitize_terminal_inline(waiter),
+            issue_id = sanitize_terminal_inline(&issue_id),
+        ));
+    }
+    Ok(())
+}
+
+/// Remove a waiter from a gate issue.
+fn execute_remove_waiter(
+    args: &GateRemoveWaiterArgs,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    beads_dir: &Path,
+) -> Result<()> {
+    let waiter = args.waiter.trim();
+    if waiter.is_empty() {
+        return Err(BeadsError::validation("waiter", "waiter must not be empty"));
+    }
+
+    let _lock = acquire_routed_workspace_write_lock(beads_dir, false, cli.lock_timeout)?;
+    let mut storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
+    auto_import_storage_ctx_if_stale(&mut storage_ctx, cli)?;
+
+    let config_layer = storage_ctx.load_config(cli)?;
+    let resolver = build_resolver(&config_layer);
+    let issue_id = resolve_issue_id(&storage_ctx.storage, &resolver, &args.id)?;
+
+    storage_ctx.storage.remove_gate_waiter(&issue_id, waiter)?;
+
+    let output = GateRemoveWaiterOutput {
+        issue_id: issue_id.clone(),
+        waiter: waiter.to_string(),
+    };
+
+    if ctx.is_toon() {
+        ctx.toon(&output);
+    } else if args.robot || ctx.is_json() {
+        ctx.json_pretty(&output);
+    } else {
+        ctx.success(&format!(
+            "Removed waiter '{waiter}' from gate {issue_id}",
+            waiter = sanitize_terminal_inline(waiter),
+            issue_id = sanitize_terminal_inline(&issue_id),
+        ));
+    }
+    Ok(())
+}
+
+/// List waiters registered on a gate issue.
+fn execute_list_waiters(
+    args: &GateListWaitersArgs,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    beads_dir: &Path,
+) -> Result<()> {
+    let storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
+    let config_layer = storage_ctx.load_config(cli)?;
+    let resolver = build_resolver(&config_layer);
+    let issue_id = resolve_issue_id(&storage_ctx.storage, &resolver, &args.id)?;
+
+    let waiters = storage_ctx.storage.get_gate_waiters(&issue_id)?;
+
+    let output = GateListWaitersOutput {
+        issue_id: issue_id.clone(),
+        waiters: waiters.clone(),
+    };
+
+    if ctx.is_toon() {
+        ctx.toon(&output);
+    } else if args.robot || ctx.is_json() {
+        ctx.json_pretty(&output);
+    } else {
+        let id = sanitize_terminal_inline(&issue_id);
+        if waiters.is_empty() {
+            ctx.info(&format!("No waiters registered on gate {id}."));
+        } else {
+            ctx.print_line(&format!("Waiters on gate {id}:"));
+            for w in &waiters {
+                ctx.print_line(&format!("  - {}", sanitize_terminal_inline(w)));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

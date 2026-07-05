@@ -78,6 +78,7 @@ fn execute_inner(
                 beads_dir: Some(storage_ctx.paths.beads_dir.clone()),
                 allow_external_jsonl: true,
                 show_progress: false,
+                strict: args.strict,
             };
 
             let result = crate::sync::import_from_jsonl(
@@ -117,18 +118,18 @@ fn execute_inner(
             let issues: Vec<Issue> = serde_json::from_str(&content).map_err(|e| {
                 BeadsError::Config(format!("Invalid JSON in '{}': {e}", input_path.display()))
             })?;
-            let imported = import_issues(storage, &issues)?;
-            report_count(imported, &input_path, ctx);
+            let (imported, skipped) = import_issues(storage, &issues, args.strict)?;
+            report_count(imported, skipped, issues.len(), &input_path, ctx);
         }
         ExportFormat::Csv => {
             let issues = read_issues_from_csv(&input_path)?;
-            let imported = import_issues(storage, &issues)?;
-            report_count(imported, &input_path, ctx);
+            let (imported, skipped) = import_issues(storage, &issues, args.strict)?;
+            report_count(imported, skipped, issues.len(), &input_path, ctx);
         }
         ExportFormat::Obsidian => {
             let issues = read_issues_from_markdown(&input_path)?;
-            let imported = import_issues(storage, &issues)?;
-            report_count(imported, &input_path, ctx);
+            let (imported, skipped) = import_issues(storage, &issues, args.strict)?;
+            report_count(imported, skipped, issues.len(), &input_path, ctx);
         }
     }
 
@@ -139,30 +140,66 @@ fn execute_inner(
 }
 
 /// Print import count results.
-fn report_count(imported: usize, input_path: &Path, ctx: &OutputContext) {
+fn report_count(
+    imported: usize,
+    skipped: usize,
+    total: usize,
+    input_path: &Path,
+    ctx: &OutputContext,
+) {
     if ctx.is_json() {
-        ctx.json_pretty(&serde_json::json!({ "imported": imported }));
+        ctx.json_pretty(&serde_json::json!({
+            "imported": imported,
+            "skipped": skipped,
+            "total": total,
+        }));
     } else if ctx.is_toon() {
-        ctx.toon(&serde_json::json!({ "imported": imported }));
+        ctx.toon(&serde_json::json!({
+            "imported": imported,
+            "skipped": skipped,
+        }));
     } else if ctx.is_quiet() {
         return;
     } else {
-        println!("Imported {imported} issues from {}", input_path.display());
+        if skipped > 0 {
+            println!(
+                "Imported {imported} / {total} issues from {} ({} skipped)",
+                input_path.display(),
+                skipped
+            );
+        } else {
+            println!("Imported {imported} issues from {}", input_path.display());
+        }
     }
 }
 
 /// Import issues into storage, trying create then update on conflict.
-fn import_issues(storage: &mut crate::storage::SqliteStorage, issues: &[Issue]) -> Result<usize> {
-    let mut count = 0;
+///
+/// Returns `(imported, skipped)` counts.
+/// When `strict` is true, aborts on the first failure instead of skipping.
+fn import_issues(
+    storage: &mut crate::storage::SqliteStorage,
+    issues: &[Issue],
+    strict: bool,
+) -> Result<(usize, usize)> {
+    let mut imported = 0usize;
+    let mut skipped = 0usize;
     for issue in issues {
         match storage.create_issue(issue, "br-import") {
-            Ok(()) => count += 1,
+            Ok(()) => imported += 1,
             Err(e) => {
+                if strict {
+                    return Err(BeadsError::Config(format!(
+                        "Could not import issue {}: {e}",
+                        issue.id
+                    )));
+                }
                 eprintln!("Warning: could not import issue {}: {e}", issue.id);
+                skipped += 1;
             }
         }
     }
-    Ok(count)
+    Ok((imported, skipped))
 }
 
 /// Read issues from a CSV file.

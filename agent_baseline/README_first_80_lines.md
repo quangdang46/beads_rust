@@ -6,7 +6,7 @@
 
 <div align="center">
 
-[![CI](https://github.com/Dicklesworthstone/beads_rust/actions/workflows/ci.yml/badge.svg)](https://github.com/Dicklesworthstone/beads_rust/actions/workflows/ci.yml)
+[![CI](https://github.com/quangdang46/beads_rust/actions/workflows/ci.yml/badge.svg)](https://github.com/quangdang46/beads_rust/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-nightly-orange.svg)](https://www.rust-lang.org/)
 [![SQLite](https://img.shields.io/badge/storage-SQLite-green.svg)](https://www.sqlite.org/)
@@ -21,7 +21,7 @@ A Rust port of Steve Yegge's [beads](https://github.com/steveyegge/beads), froze
 <h3>Quick Install</h3>
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/beads_rust/main/install.sh?$(date +%s)" | bash
+curl -fsSL "https://raw.githubusercontent.com/quangdang46/beads_rust/main/install.sh?$(date +%s)" | bash
 ```
 
 <p><em>Works on Linux, macOS, and Windows (WSL). Auto-detects your platform and downloads the right binary.</em></p>
@@ -31,7 +31,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/beads_rust/main/
 
 ## Why This Project Exists
 
-I (Jeffrey Emanuel) LOVE [Steve Yegge's Beads project](https://github.com/steveyegge/beads). Discovering it and seeing how well it worked together with my [MCP Agent Mail](https://github.com/Dicklesworthstone/mcp-agent-mail) was a truly transformative moment in my development workflows and professional life. This quickly also led to [beads_viewer (bv)](https://github.com/Dicklesworthstone/beads_viewer), which added another layer of analysis to beads that gives swarms of agents the insight into what beads they should work on next to de-bottleneck the development process and increase velocity. I'm very grateful for finding beads when I did and to Steve for making it.
+I (Jeffrey Emanuel) LOVE [Steve Yegge's Beads project](https://github.com/steveyegge/beads). Discovering it and seeing how well it worked together with my [MCP Agent Mail](https://github.com/quangdang46/mcp-agent-mail) was a truly transformative moment in my development workflows and professional life. This quickly also led to [beads_viewer (bv)](https://github.com/quangdang46/beads_viewer), which added another layer of analysis to beads that gives swarms of agents the insight into what beads they should work on next to de-bottleneck the development process and increase velocity. I'm very grateful for finding beads when I did and to Steve for making it.
 
 At this point, my [Agent Flywheel](http://agent-flywheel.com/tldr) System is built around beads operating in a specific way. As Steve continues evolving beads toward [GasTown](https://github.com/steveyegge/gastown) and beyond, our use cases have naturally diverged. The hybrid SQLite + JSONL-git architecture that I built my tooling around (and independently mirrored in MCP Agent Mail) is being replaced with approaches better suited to Steve's vision.
 

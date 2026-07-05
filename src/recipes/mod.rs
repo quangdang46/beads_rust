@@ -26,7 +26,6 @@ pub enum RecipeType {
 
 impl RecipeType {
     /// Parse a recipe type from a string.
-    #[must_use]
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "file" => Some(Self::File),
@@ -153,7 +152,7 @@ const BUILTIN_RECIPES: &[Recipe] = &[
             ),
             (
                 ".github/copilot-instructions.md",
-                r"# GitHub Copilot Instructions
+                r#"# GitHub Copilot Instructions
 
 This repository uses **Beads (br)** for issue tracking.
 
@@ -165,7 +164,7 @@ This repository uses **Beads (br)** for issue tracking.
 - Use `br close <id>` when work is complete
 - Run `br sync --flush-only` before session end
 - Do not commit, push, or run git operations on .beads/ unless explicitly authorized
-",
+"#,
             ),
         ],
     },
@@ -314,7 +313,7 @@ description: Use Beads (br) for durable issue tracking, dependencies, memory, an
 
 # Beads Issue Tracking
 
-This project uses [beads_rust](https://github.com/Dicklesworthstone/beads_rust) (`br`/`bd`) for issue tracking. Issues are stored in `.beads/` and tracked in git.
+This project uses [beads_rust](https://github.com/quangdang46/beads_rust) (`br`/`bd`) for issue tracking. Issues are stored in `.beads/` and tracked in git.
 
 ## Essential Commands
 
@@ -397,14 +396,20 @@ pub fn find_recipe(name: &str) -> Option<&'static Recipe> {
             || first_word == lower
             || matches!(
                 (r_lower.as_str(), lower.as_str()),
-                ("sourcegraph cody", "cody" | "sourcegraph")
-                    | ("github copilot cli", "copilot" | "copilotcli")
-                    | ("cursor ide mcp", "cursor-mcp" | "cursor_mcp")
-                    | ("windsurf mcp", "windsurf-mcp" | "windsurf_mcp")
-                    | ("github copilot mcp", "copilot-mcp" | "copilot_mcp")
+                ("sourcegraph cody", "cody")
+                    | ("sourcegraph cody", "sourcegraph")
+                    | ("github copilot cli", "copilot")
+                    | ("github copilot cli", "copilotcli")
+                    | ("cursor ide mcp", "cursor-mcp")
+                    | ("cursor ide mcp", "cursor_mcp")
+                    | ("windsurf mcp", "windsurf-mcp")
+                    | ("windsurf mcp", "windsurf_mcp")
+                    | ("github copilot mcp", "copilot-mcp")
+                    | ("github copilot mcp", "copilot_mcp")
                     | ("goose", "goose")
                     | ("crush", "crush")
-                    | ("codex cli", "codex-hook" | "codex_hook")
+                    | ("codex cli", "codex-hook")
+                    | ("codex cli", "codex_hook")
             )
     })
 }
@@ -435,10 +440,10 @@ pub fn install_recipe(recipe: &Recipe, project_dir: &Path) -> Result<Vec<PathBuf
     // If `raw` starts with `~/`, expand `~` to HOME (absolute, ignore project_dir).
     // Otherwise join with project_dir.
     let resolve_path = |raw: &str| -> PathBuf {
-        if let Some(stripped) = raw.strip_prefix("~/")
-            && let Ok(home) = std::env::var("HOME")
-        {
-            return Path::new(&home).join(stripped);
+        if let Some(stripped) = raw.strip_prefix("~/") {
+            if let Ok(home) = std::env::var("HOME") {
+                return Path::new(&home).join(stripped);
+            }
         }
         project_dir.join(raw)
     };

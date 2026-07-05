@@ -18,7 +18,7 @@
 | `## Issue Tracking with bd (beads)` | `## Issue Tracking with br (beads_rust)` |
 | `## Beads (bd)` | `## Beads (br)` |
 | `## Beads (bd) — Dependency-Aware Issue Tracking` | `## Beads (br) — Dependency-Aware Issue Tracking` |
-| `[beads_viewer](https://...)` | `[beads_rust](https://github.com/Dicklesworthstone/beads_rust)` |
+| `[beads_viewer](https://...)` | `[beads_rust](https://github.com/quangdang46/beads_rust)` |
 
 ---
 

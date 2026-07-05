@@ -15,7 +15,7 @@ use beads_rust::model::{Issue, IssueType, Priority, Status};
 use beads_rust::util::id::{
     IdConfig, IdGenerator, compute_id_hash, generate_id_seed, is_valid_id_format, parse_id,
 };
-use beads_rust::util::{ContentHashable, content_hash, content_hash_from_parts};
+use beads_rust::util::{ContentHashable, content_hash, content_hash_from_parts_v15};
 
 // =============================================================================
 // ID GENERATION FIXTURES
@@ -253,7 +253,7 @@ fn id_parsing_fixtures() {
 /// Test content hash determinism with known inputs.
 #[test]
 fn content_hash_deterministic_fixture() {
-    let hash1 = content_hash_from_parts(
+    let hash1 = content_hash_from_parts_v15(
         "Fix authentication bug",
         Some("Users are getting logged out unexpectedly"),
         None,
@@ -271,7 +271,7 @@ fn content_hash_deterministic_fixture() {
         false,
     );
 
-    let hash2 = content_hash_from_parts(
+    let hash2 = content_hash_from_parts_v15(
         "Fix authentication bug",
         Some("Users are getting logged out unexpectedly"),
         None,
@@ -304,7 +304,7 @@ fn content_hash_deterministic_fixture() {
 /// Test content hash changes with title.
 #[test]
 fn content_hash_title_sensitivity() {
-    let hash1 = content_hash_from_parts(
+    let hash1 = content_hash_from_parts_v15(
         "Title One",
         None,
         None,
@@ -322,7 +322,7 @@ fn content_hash_title_sensitivity() {
         false,
     );
 
-    let hash2 = content_hash_from_parts(
+    let hash2 = content_hash_from_parts_v15(
         "Title Two",
         None,
         None,
@@ -366,7 +366,7 @@ fn content_hash_status_sensitivity() {
         false,
     );
 
-    let hash_open = content_hash_from_parts(
+    let hash_open = content_hash_from_parts_v15(
         base_args.0,
         base_args.1,
         base_args.2,
@@ -384,7 +384,7 @@ fn content_hash_status_sensitivity() {
         base_args.13,
     );
 
-    let hash_closed = content_hash_from_parts(
+    let hash_closed = content_hash_from_parts_v15(
         base_args.0,
         base_args.1,
         base_args.2,
@@ -411,7 +411,7 @@ fn content_hash_status_sensitivity() {
 /// Test content hash changes with priority.
 #[test]
 fn content_hash_priority_sensitivity() {
-    let hash_p1 = content_hash_from_parts(
+    let hash_p1 = content_hash_from_parts_v15(
         "Test",
         None,
         None,
@@ -429,7 +429,7 @@ fn content_hash_priority_sensitivity() {
         false,
     );
 
-    let hash_p3 = content_hash_from_parts(
+    let hash_p3 = content_hash_from_parts_v15(
         "Test",
         None,
         None,
@@ -456,7 +456,7 @@ fn content_hash_priority_sensitivity() {
 /// Test content hash changes with issue type.
 #[test]
 fn content_hash_type_sensitivity() {
-    let hash_bug = content_hash_from_parts(
+    let hash_bug = content_hash_from_parts_v15(
         "Test",
         None,
         None,
@@ -474,7 +474,7 @@ fn content_hash_type_sensitivity() {
         false,
     );
 
-    let hash_feature = content_hash_from_parts(
+    let hash_feature = content_hash_from_parts_v15(
         "Test",
         None,
         None,
@@ -501,7 +501,7 @@ fn content_hash_type_sensitivity() {
 /// Test content hash includes boolean flags.
 #[test]
 fn content_hash_boolean_sensitivity() {
-    let hash_default = content_hash_from_parts(
+    let hash_default = content_hash_from_parts_v15(
         "Test",
         None,
         None,
@@ -519,7 +519,7 @@ fn content_hash_boolean_sensitivity() {
         false,
     );
 
-    let hash_pinned = content_hash_from_parts(
+    let hash_pinned = content_hash_from_parts_v15(
         "Test",
         None,
         None,
@@ -537,7 +537,7 @@ fn content_hash_boolean_sensitivity() {
         false, // pinned=true
     );
 
-    let hash_template = content_hash_from_parts(
+    let hash_template = content_hash_from_parts_v15(
         "Test",
         None,
         None,
@@ -666,7 +666,7 @@ fn content_hash_trait_implementation() {
 #[test]
 fn content_hash_optional_fields() {
     // Base hash with no optional fields
-    let hash_none = content_hash_from_parts(
+    let hash_none = content_hash_from_parts_v15(
         "Test",
         None,
         None,
@@ -685,7 +685,7 @@ fn content_hash_optional_fields() {
     );
 
     // With description
-    let hash_desc = content_hash_from_parts(
+    let hash_desc = content_hash_from_parts_v15(
         "Test",
         Some("Description"),
         None,
@@ -704,7 +704,7 @@ fn content_hash_optional_fields() {
     );
 
     // With design
-    let hash_design = content_hash_from_parts(
+    let hash_design = content_hash_from_parts_v15(
         "Test",
         None,
         Some("Design notes"),
@@ -723,7 +723,7 @@ fn content_hash_optional_fields() {
     );
 
     // With external_ref
-    let hash_ext = content_hash_from_parts(
+    let hash_ext = content_hash_from_parts_v15(
         "Test",
         None,
         None,

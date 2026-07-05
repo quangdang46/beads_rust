@@ -10,6 +10,53 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
+pub(crate) fn verify_write(storage: &SqliteStorage, id: &str, expected: Option<&Issue>) {
+    let stored = match storage.get_issue(id) {
+        Ok(Some(issue)) => issue,
+        Ok(None) => {
+            eprintln!("Warning: issue '{id}' was not found immediately after write mutation");
+            tracing::warn!(issue_id = %id, "Write verification: issue not found after mutation");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(
+                issue_id = %id,
+                error = %e,
+                "Write verification: read-back query failed (non-fatal)"
+            );
+            return;
+        }
+    };
+
+    // Basic sanity: the row should at least have a non-empty title.
+    if stored.title.trim().is_empty() {
+        eprintln!("Warning: issue '{id}' has empty title after write");
+    }
+
+    // Compare against caller-supplied expected values when provided.
+    if let Some(expected_issue) = expected {
+        if stored.title != expected_issue.title {
+            eprintln!(
+                "Warning: issue '{id}' title mismatch after write (expected '{}', got '{}')",
+                expected_issue.title, stored.title
+            );
+        }
+        if stored.status != expected_issue.status {
+            eprintln!(
+                "Warning: issue '{id}' status mismatch after write (expected '{}', got '{}')",
+                expected_issue.status.as_str(),
+                stored.status.as_str()
+            );
+        }
+        if stored.priority != expected_issue.priority {
+            eprintln!(
+                "Warning: issue '{id}' priority mismatch after write (expected P{}, got P{})",
+                expected_issue.priority.0, stored.priority.0
+            );
+        }
+    }
+}
+
 pub mod admin;
 pub mod agents;
 pub mod audit;
@@ -17,6 +64,7 @@ pub mod blocked;
 pub mod capabilities;
 pub mod changelog;
 pub mod close;
+pub mod codex_hook;
 pub mod comments;
 pub mod completions;
 pub mod config;
@@ -30,6 +78,7 @@ pub mod dep;
 pub mod doctor;
 pub mod doctor_subsystems;
 pub mod epic;
+pub mod export;
 pub mod formula;
 pub mod gate;
 pub mod graph;
@@ -43,6 +92,7 @@ pub mod lint;
 pub mod list;
 pub mod memory;
 pub mod merge_slot;
+pub mod mol;
 pub mod orphans;
 pub mod prime;
 pub mod q;
@@ -70,10 +120,7 @@ pub mod worktree;
 
 pub mod federation;
 pub mod sql_cmd;
-#[cfg(feature = "self_update")]
-pub mod upgrade;
-
-pub(crate) const GITHUB_REPO_OWNER: &str = "Dicklesworthstone";
+pub(crate) const GITHUB_REPO_OWNER: &str = "quangdang46";
 pub(crate) const GITHUB_REPO_NAME: &str = "beads_rust";
 
 #[must_use]

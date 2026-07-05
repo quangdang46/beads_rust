@@ -86,10 +86,4 @@ mod tests {
         assert_eq!(structured.code, ErrorCode::IssueNotFound);
         assert_eq!(structured.code.exit_code(), 3);
     }
-
-    #[cfg(feature = "self_update")]
-    #[test]
-    fn upgrade_module_is_available_when_feature_enabled() {
-        let _ = crate::cli::commands::upgrade::execute;
-    }
 }

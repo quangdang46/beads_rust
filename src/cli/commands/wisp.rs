@@ -199,6 +199,10 @@ fn execute_create(args: &WispCreateArgs, store: &mut SqliteStorage, actor: &str)
     let now = Utc::now();
 
     // Generate a wsp-prefixed ID
+    // NOTE: store.id_exists() checks the shared `issues` table, so it
+    // naturally catches collisions with regular issues too (cross-namespace
+    // uniqueness). See SqliteStorage::check_id_uniqueness for the documented
+    // wrapper around this guarantee.
     let issue_count = store.count_issues()?;
     let id_gen = crate::util::id::IdGenerator::new(crate::util::id::IdConfig::with_prefix("wsp"));
     let id = id_gen.generate(

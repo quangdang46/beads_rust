@@ -43,7 +43,7 @@ impl Parser {
     }
 
     /// Get the default formula search paths.
-    fn default_search_paths() -> Vec<PathBuf> {
+    pub fn default_search_paths() -> Vec<PathBuf> {
         let mut paths = Vec::new();
         // Project-level: .beads/formulas/
         if let Ok(cwd) = std::env::current_dir() {

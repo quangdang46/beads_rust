@@ -965,6 +965,15 @@ fn execute_route(
             update_result,
         )?;
         cache_dirty = true;
+
+        // Read-back verification (issue #102): non-fatal check that the close
+        // persisted durably.  We build a minimal expected-Issue snapshot from
+        // the pre-close issue + the close update so field-level mismatch
+        // warnings can fire.
+        let mut expected_after_close = issue.clone();
+        expected_after_close.status = Status::Closed;
+        expected_after_close.closed_at = Some(now);
+        super::verify_write(&storage_ctx.storage, id, Some(&expected_after_close));
         tracing::info!(id = %id, reason = ?args.reason, "Issue closed");
 
         if policy_active {

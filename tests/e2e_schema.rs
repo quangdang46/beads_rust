@@ -7,11 +7,9 @@ mod common;
 
 use common::cli::{BrWorkspace, extract_json_payload, parse_created_id, run_br, run_br_with_env};
 use serde_json::Value;
-#[cfg(feature = "self_update")]
 use std::{fs, path::PathBuf};
 use toon_rust::try_decode as parse_toon;
 
-#[cfg(feature = "self_update")]
 const UPDATE_AGENT_BASELINE_ENV: &str = "UPDATE_AGENT_BASELINE";
 
 #[test]
@@ -866,7 +864,6 @@ fn e2e_robot_docs_guide_json_no_workspace() {
     );
 }
 
-#[cfg(feature = "self_update")]
 #[test]
 fn agent_baseline_snapshots_match_current_binary() {
     let _log = common::test_log("agent_baseline_snapshots_match_current_binary");
@@ -879,7 +876,6 @@ fn agent_baseline_snapshots_match_current_binary() {
     compare_agent_baseline_error(&workspace);
 }
 
-#[cfg(feature = "self_update")]
 fn compare_agent_baseline_help(workspace: &BrWorkspace) {
     compare_text_baseline(
         "help/br_help.txt",
@@ -895,7 +891,6 @@ fn compare_agent_baseline_help(workspace: &BrWorkspace) {
     );
 }
 
-#[cfg(feature = "self_update")]
 fn compare_agent_baseline_schemas(workspace: &BrWorkspace) {
     compare_json_baseline(
         "schemas/schema_all.json",
@@ -926,7 +921,6 @@ fn compare_agent_baseline_schemas(workspace: &BrWorkspace) {
     );
 }
 
-#[cfg(feature = "self_update")]
 fn seed_agent_baseline_workspace(workspace: &BrWorkspace) -> String {
     let init = run_br(workspace, ["init", "--prefix", "bd"], "baseline_init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
@@ -973,7 +967,6 @@ fn seed_agent_baseline_workspace(workspace: &BrWorkspace) -> String {
     id_two
 }
 
-#[cfg(feature = "self_update")]
 fn compare_agent_baseline_examples(workspace: &BrWorkspace, id_two: &str) {
     compare_json_baseline(
         "examples/list_limit3.json",
@@ -1033,7 +1026,6 @@ fn compare_agent_baseline_examples(workspace: &BrWorkspace, id_two: &str) {
     );
 }
 
-#[cfg(feature = "self_update")]
 fn compare_agent_baseline_error(workspace: &BrWorkspace) {
     let missing = run_br(
         workspace,
@@ -1052,7 +1044,6 @@ fn compare_agent_baseline_error(workspace: &BrWorkspace) {
     );
 }
 
-#[cfg(feature = "self_update")]
 fn run_success<const N: usize>(workspace: &BrWorkspace, args: [&str; N], label: &str) -> String {
     let run = run_br(workspace, args, label);
     assert!(
@@ -1064,7 +1055,6 @@ fn run_success<const N: usize>(workspace: &BrWorkspace, args: [&str; N], label: 
     run.stdout
 }
 
-#[cfg(feature = "self_update")]
 fn compare_text_baseline(relative_path: &str, actual: &str) {
     let path = baseline_path(relative_path);
     let actual = normalize_text_snapshot(actual);
@@ -1081,7 +1071,6 @@ fn compare_text_baseline(relative_path: &str, actual: &str) {
     );
 }
 
-#[cfg(feature = "self_update")]
 fn compare_json_baseline(relative_path: &str, actual: &str, normalize: fn(&mut Value)) {
     let path = baseline_path(relative_path);
     let actual_payload = extract_json_payload(actual);
@@ -1108,7 +1097,6 @@ fn compare_json_baseline(relative_path: &str, actual: &str, normalize: fn(&mut V
     );
 }
 
-#[cfg(feature = "self_update")]
 fn compare_toon_baseline(relative_path: &str, actual: &str) {
     let path = baseline_path(relative_path);
     let actual = with_trailing_newline(actual.trim_end());
@@ -1131,24 +1119,20 @@ fn compare_toon_baseline(relative_path: &str, actual: &str) {
     );
 }
 
-#[cfg(feature = "self_update")]
 fn baseline_path(relative_path: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("agent_baseline")
         .join(relative_path)
 }
 
-#[cfg(feature = "self_update")]
 fn should_update_agent_baseline() -> bool {
     std::env::var_os(UPDATE_AGENT_BASELINE_ENV).is_some()
 }
 
-#[cfg(feature = "self_update")]
 fn with_trailing_newline(text: &str) -> String {
     format!("{text}\n")
 }
 
-#[cfg(feature = "self_update")]
 fn normalize_text_snapshot(text: &str) -> String {
     let mut normalized = text
         .lines()
@@ -1159,7 +1143,6 @@ fn normalize_text_snapshot(text: &str) -> String {
     normalized
 }
 
-#[cfg(feature = "self_update")]
 fn normalize_schema_snapshot(value: &mut Value) {
     if let Some(object) = value.as_object_mut() {
         object.insert(
@@ -1169,7 +1152,6 @@ fn normalize_schema_snapshot(value: &mut Value) {
     }
 }
 
-#[cfg(feature = "self_update")]
 fn normalize_version_snapshot(value: &mut Value) {
     if let Some(object) = value.as_object_mut() {
         object.remove("branch");
@@ -1182,7 +1164,6 @@ fn normalize_version_snapshot(value: &mut Value) {
     }
 }
 
-#[cfg(feature = "self_update")]
 fn normalize_issue_example_snapshot(value: &mut Value) {
     match value {
         Value::Array(items) => {
@@ -1213,5 +1194,4 @@ fn normalize_issue_example_snapshot(value: &mut Value) {
     }
 }
 
-#[cfg(feature = "self_update")]
 fn normalize_noop(_: &mut Value) {}
