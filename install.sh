@@ -1405,7 +1405,7 @@ download_release() {
         case "$platform" in
             windows_*) archive_ext="zip" ;;
         esac
-        archive_name="br-${asset_version}-${platform}.${archive_ext}"
+        archive_name="br-${platform}.${archive_ext}"
         url="https://github.com/${OWNER}/${REPO}/releases/download/${release_tag}/${archive_name}"
     fi
 
