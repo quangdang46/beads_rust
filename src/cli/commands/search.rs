@@ -33,14 +33,6 @@ pub fn execute(
     cli: &config::CliOverrides,
     outer_ctx: &OutputContext,
 ) -> Result<()> {
-    let query = args.query.trim();
-    if query.is_empty() {
-        return Err(BeadsError::Validation {
-            field: "query".to_string(),
-            reason: "search query cannot be empty".to_string(),
-        });
-    }
-
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
     execute_with_storage_ctx(args, cli, outer_ctx, &storage_ctx)
@@ -58,7 +50,7 @@ pub fn execute_with_storage_ctx(
     outer_ctx: &OutputContext,
     storage_ctx: &config::OpenStorageResult,
 ) -> Result<()> {
-    let query = validate_query(args)?;
+    let query = validate_query(args);
     let storage = &storage_ctx.storage;
     let output_format = resolve_output_format_with_outer_mode(
         args.filters.format,
@@ -77,15 +69,8 @@ pub fn execute_with_storage_ctx(
     )
 }
 
-fn validate_query(args: &SearchArgs) -> Result<&str> {
-    let query = args.query.trim();
-    if query.is_empty() {
-        return Err(BeadsError::Validation {
-            field: "query".to_string(),
-            reason: "search query cannot be empty".to_string(),
-        });
-    }
-    Ok(query)
+fn validate_query(args: &SearchArgs) -> &str {
+    args.query.as_deref().unwrap_or("").trim()
 }
 
 #[cfg(test)]
@@ -130,7 +115,12 @@ fn collect_search_results_with_projection(
         filters.reverse = false;
     }
 
-    let issues = if use_text_projection && !client_filters {
+    // When the search query is empty but filters (like --title-contains or --label)
+    // are provided, use list_issues instead of text search.
+    let use_list = query.is_empty();
+    let issues = if use_list {
+        storage.list_issues(&filters)?
+    } else if use_text_projection && !client_filters {
         storage.search_issues_for_command_output(query, &filters)?
     } else {
         storage.search_issues(query, &filters)?
@@ -233,14 +223,23 @@ fn render_search_results(
             context: show_context,
             ..Default::default()
         };
-        let mut table = IssueTable::new(&issues, ctx.theme())
-            .columns(columns)
-            .title(format!(
+        let title = if query.is_empty() {
+            format!(
+                "Search - {} result{}",
+                issues.len(),
+                if issues.len() == 1 { "" } else { "s" }
+            )
+        } else {
+            format!(
                 "Search: \"{}\" - {} result{}",
                 query,
                 issues.len(),
                 if issues.len() == 1 { "" } else { "s" }
-            ))
+            )
+        };
+        let mut table = IssueTable::new(&issues, ctx.theme())
+            .columns(columns)
+            .title(title)
             .highlight_query(query)
             .wrap(list_args.wrap);
         if list_args.wrap {
@@ -253,11 +252,15 @@ fn render_search_results(
         return Ok(());
     }
 
-    ctx.info(&format!(
-        "Found {} issue(s) matching '{}'",
-        issues.len(),
-        query
-    ));
+    if query.is_empty() {
+        ctx.info(&format!("Found {} issue(s)", issues.len()));
+    } else {
+        ctx.info(&format!(
+            "Found {} issue(s) matching '{}'",
+            issues.len(),
+            query
+        ));
+    }
     for issue in &issues {
         let line = format_issue_line_with(issue, format_options);
         ctx.print_line(&line);

@@ -917,10 +917,15 @@ pub enum Commands {
         command: RecipesCommands,
     },
 
-    /// Rename an issue (alias for `br update <id> --title <new-title>`)
+    /// Rename an issue's ID (alias for `rename-id`). For title changes use `br update <id> --title <new-title>`.
+    #[command(visible_alias = "rename-id")]
     Rename(RenameArgs),
 
-    /// Rename the issue ID prefix across all issues (e.g., `br-*` -> `bd-*`)
+    /// Rename the issue ID prefix across all issues
+    ///
+    /// Example: `br rename-prefix bd` rewrites `br-abc123` → `bd-abc123`
+    /// and updates the stored prefix. Use `--dry-run` to preview first.
+    /// This renames IDs only — for title changes use `br update <id> --title`.
     RenamePrefix(RenamePrefixArgs),
 
     /// Reopen an issue
@@ -1224,8 +1229,8 @@ pub struct CreateArgs {
     #[arg(long, add = ArgValueCompleter::new(owner_completer))]
     pub owner: Option<String>,
 
-    /// Labels (comma-separated)
-    #[arg(long, short = 'l', value_delimiter = ',', add = ArgValueCompleter::new(label_completer_delimited))]
+    /// Labels (comma-separated). Use `--label` (singular) — same as other label flags.
+    #[arg(long = "label", alias = "labels", short = 'l', value_delimiter = ',', add = ArgValueCompleter::new(label_completer_delimited))]
     pub labels: Vec<String>,
 
     /// Parent issue ID (creates parent-child dep)
@@ -2205,8 +2210,8 @@ pub struct ListArgs {
 /// Arguments for the search command.
 #[derive(Args, Debug, Default)]
 pub struct SearchArgs {
-    /// Search query
-    pub query: String,
+    /// Search query (optional when using filter flags like --title-contains or --label)
+    pub query: Option<String>,
 
     #[command(flatten)]
     pub filters: ListArgs,
@@ -2764,6 +2769,12 @@ pub struct LintArgs {
     /// Filter by status (default: open, use 'all' for all)
     #[arg(long, short = 's', add = ArgValueCompleter::new(status_or_all_completer))]
     pub status: Option<String>,
+
+    /// Exit 0 even when template warnings are found (default: exit 1 on
+    /// warnings, matching `bd lint`). Useful for CI that treats missing
+    /// template sections as advisory rather than blocking.
+    #[arg(long)]
+    pub allow_warnings: bool,
 }
 
 /// Arguments for the defer command.
@@ -3071,7 +3082,9 @@ pub struct RenameArgs {
     #[arg(add = ArgValueCompleter::new(issue_id_completer))]
     pub old_id: String,
 
-    /// New issue ID (the ID to rename to)
+    /// New issue ID in prefix-suffix form (e.g. `br-auth`, `bd-dolt`).
+    /// This renames the ID, not the title — use `br update <id> --title`
+    /// to change the title.
     #[arg(value_name = "NEW_ID")]
     pub new_id: String,
 }
@@ -3081,9 +3094,15 @@ pub struct RenameArgs {
 /// Renames the issue ID prefix across all issues in the database and updates
 /// the stored prefix configuration. For example, changing `br` to `bd` would
 /// rename `br-abc123` to `bd-abc123`.
+///
+/// Usage:
+///   br rename-prefix <NEW_PREFIX>
+///   br rename-prefix <NEW_PREFIX> --dry-run
 #[derive(Args, Debug, Clone, Default)]
 pub struct RenamePrefixArgs {
-    /// New prefix for issue IDs (e.g., `bd`, `gt`, `myproj`)
+    /// New prefix for issue IDs (e.g., `bd`, `gt`, `myproj`). Must be a bare
+    /// prefix without the trailing hyphen — `bd`, not `bd-`.
+    #[arg(value_name = "NEW_PREFIX")]
     pub new_prefix: String,
 
     /// Preview the rename without applying changes
@@ -3429,6 +3448,13 @@ pub struct DoctorArgs {
     /// Always read-only; ignored under `--repair`.
     #[arg(long)]
     pub quick: bool,
+
+    /// Exit 0 when findings are only warnings (no Errors). Useful for CI
+    /// pipelines that treat doctor warnings as advisory rather than
+    /// blocking. Default behavior still exits 1 on any non-OK check so
+    /// agents and scripts keep the existing contract.
+    #[arg(long)]
+    pub allow_warnings: bool,
 
     /// Pass-5 cycle 1: with `--repair`, only run fixers whose FM
     /// identifier matches one of the supplied values. Accepts

@@ -1833,11 +1833,7 @@ fn inspect_database_sidecars(db_path: &Path) -> Result<SidecarInspection> {
     if !db_kind.is_regular_file() {
         let has_dangling_sidecars = database_sidecar_paths(db_path)
             .into_iter()
-            .any(|(path, _)| {
-                classify_path_kind(&path)
-                    .ok()
-                    .is_some_and(FilesystemPathKind::exists)
-            });
+            .any(|(path, _)| classify_path_kind(&path).is_ok_and(FilesystemPathKind::exists));
         if has_dangling_sidecars {
             inspection.findings.push(format!(
                 "Database sidecars exist even though the primary database at {} is a {}",
@@ -8725,6 +8721,109 @@ fn fix_base_jsonl_stale_if_warned(
     }
 }
 
+/// Clears an orphaned `.write.lock` finding when `--repair` is used.
+///
+/// The detector (`fm-concurrency_primitives-orphaned-write-lock`) emits a
+/// Warn when the file exists and its mtime exceeds the staleness threshold.
+/// An unheld leftover lock file is harmless (flock succeeds on it) but
+/// noisy; with `--repair` we clean it up.
+///
+/// Safety:
+/// - If no process holds the lock (including us), rename the file aside.
+/// - If the lock is held (common under `--repair`, because doctor itself
+///   holds it), do **not** rename — that would leave the rest of the
+///   repair without a path-visible lock file while the FD still holds the
+///   inode lock. Instead, refresh the mtime so the re-scan clears the warn.
+fn fix_orphaned_write_lock_if_warned(
+    beads_dir: &Path,
+    report: &DoctorReport,
+    ctx: &OutputContext,
+    session: Option<&mut DoctorRepairSession>,
+) -> bool {
+    let has_warning = report
+        .checks
+        .iter()
+        .any(|c| c.name == "write_lock" && matches!(c.status, CheckStatus::Warn));
+    if !has_warning {
+        return false;
+    }
+    let Some(session) = session else {
+        if !ctx.is_json() {
+            ctx.warning("Skipping orphaned write-lock cleanup: no doctor repair session");
+        }
+        return false;
+    };
+
+    let lock_path = beads_dir.join(".write.lock");
+    if !lock_path.exists() {
+        return false;
+    }
+
+    session.set_fixer("doctor.fix_orphaned_write_lock");
+
+    // Try a 0-ms acquire. Success means no holder (including us on another
+    // FD) — safe to rename the path aside. Failure means someone holds it;
+    // under --repair that is usually our own startup write lock, so only
+    // refresh mtime.
+    match crate::sync::blocking_write_lock_with_timeout(beads_dir, Some(0)) {
+        Ok(lock_file) => {
+            drop(lock_file);
+            session
+                .ctx
+                .capabilities
+                .write_scopes
+                .push(lock_path.clone());
+            let stale_suffix = format!(
+                "write.lock.stale.{}",
+                chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
+            );
+            let backup_path = beads_dir.join(&stale_suffix);
+            match chokepoint::mutate(
+                &session.ctx,
+                &lock_path,
+                chokepoint::Op::Rename { to: backup_path },
+            ) {
+                Ok(result) if result.ok => {
+                    if !ctx.is_json() {
+                        ctx.success(&format!(
+                            "Removed stale .write.lock (backed up as {stale_suffix})"
+                        ));
+                    }
+                    true
+                }
+                _ => false,
+            }
+        }
+        Err(_) => {
+            // Held — refresh mtime so the re-scan no longer flags it as
+            // orphaned. Do not rename while a live lock FD is open.
+            match OpenOptions::new()
+                .write(true)
+                .open(&lock_path)
+                .and_then(|file| {
+                    file.set_times(
+                        std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()),
+                    )
+                }) {
+                Ok(()) => {
+                    if !ctx.is_json() {
+                        ctx.success(
+                            "Refreshed mtime on held .write.lock (clears stale-orphan warning)",
+                        );
+                    }
+                    true
+                }
+                Err(err) => {
+                    if !ctx.is_json() {
+                        ctx.warning(&format!("Cannot clear stale .write.lock warning: {err}"));
+                    }
+                    false
+                }
+            }
+        }
+    }
+}
+
 /// Pass-5 cycle 16: quarantine fixer for
 /// `fm-state_files-orphan-tmp-files`.
 ///
@@ -8916,9 +9015,7 @@ fn discover_jsonl(beads_dir: &Path) -> Option<PathBuf> {
 }
 
 fn should_fallback_to_workspace_jsonl(beads_dir: &Path, paths: &config::ConfigPaths) -> bool {
-    let has_env_override = std::env::var("BEADS_JSONL")
-        .ok()
-        .is_some_and(|value| !value.trim().is_empty());
+    let has_env_override = std::env::var("BEADS_JSONL").is_ok_and(|value| !value.trim().is_empty());
 
     !has_env_override
         && paths.metadata.jsonl_export == "issues.jsonl"
@@ -11115,6 +11212,24 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         };
     let _ = dependencies_orphans_repaired;
 
+    // Pass-5 cycle 36.5: clean up orphaned .write.lock when --repair is used.
+    // The stale lock detector emits a Warn; with operator consent via --repair
+    // we can safely remove it. See the detector's docstring for why the check
+    // path is detect-only.
+    let orphaned_write_lock_repaired = if args.repair
+        && fixer_filter.allows("fm-concurrency_primitives-orphaned-write-lock")
+    {
+        let repaired =
+            fix_orphaned_write_lock_if_warned(&beads_dir, &initial.report, ctx, session.as_mut());
+        if repaired {
+            initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+        }
+        repaired
+    } else {
+        false
+    };
+    let _ = orphaned_write_lock_repaired;
+
     // Pass-5 cycle 37: PRAGMA wal_checkpoint(TRUNCATE) when the WAL is oversized.
     let wal_checkpoint_repaired =
         if args.repair && fixer_filter.allows("fm-state_files-wal-oversized") {
@@ -11260,9 +11375,19 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         // we wanted them to fail. Recompute unconditionally so the JSON
         // `ok` field and the exit code agree on the same predicate
         // (`!has_non_ok`). See #292.
+        //
+        // `--allow-warnings` is an opt-in for CI that wants advisory
+        // warnings without failing the gate: exit 1 only when Error
+        // checks are present. The JSON `ok` field still reflects the
+        // full non-OK predicate so agents can see warnings exist.
         initial.report.ok = !has_non_ok(&initial.report.checks);
         print_report(&initial.report, ctx)?;
-        if !initial.report.ok {
+        let should_fail = if args.allow_warnings {
+            has_error(&initial.report.checks)
+        } else {
+            !initial.report.ok
+        };
+        if should_fail {
             std::process::exit(DoctorExitCode::FindingsPresent.as_i32());
         }
         return Ok(());
@@ -20124,6 +20249,8 @@ version = "2026-05-11-abc123"
             skip: Vec::new(),
             unsafe_auto_fix: false,
             subcommand: None,
+
+            allow_warnings: false,
         };
         let ctx = OutputContext::from_flags(false, true, true);
         let cli = crate::config::CliOverrides::default();
@@ -20203,6 +20330,8 @@ version = "2026-05-11-abc123"
             skip: Vec::new(),
             unsafe_auto_fix: false,
             subcommand: None,
+
+            allow_warnings: false,
         };
         let ctx = OutputContext::from_flags(false, true, true);
         let cli = crate::config::CliOverrides::default();
@@ -20489,6 +20618,8 @@ version = "2026-05-11-abc123"
             skip: Vec::new(),
             unsafe_auto_fix: false,
             subcommand: None,
+
+            allow_warnings: false,
         };
         let ctx = OutputContext::from_flags(false, true, true);
 
@@ -20543,6 +20674,8 @@ version = "2026-05-11-abc123"
             skip: Vec::new(),
             unsafe_auto_fix: false,
             subcommand: None,
+
+            allow_warnings: false,
         };
         let ctx = OutputContext::from_flags(false, true, true);
         let cli = crate::config::CliOverrides::default();
@@ -20598,6 +20731,8 @@ version = "2026-05-11-abc123"
             skip: Vec::new(),
             unsafe_auto_fix: false,
             subcommand: None,
+
+            allow_warnings: false,
         };
         let ctx = OutputContext::from_flags(false, true, true);
         let cli = crate::config::CliOverrides::default();

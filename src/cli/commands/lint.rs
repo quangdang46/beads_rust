@@ -53,8 +53,14 @@ struct LintSummary {
 }
 
 impl LintSummary {
-    const fn exit_code(&self, structured: bool) -> i32 {
-        if structured || self.warnings == 0 {
+    /// Exit code for human-mode output.
+    ///
+    /// Default: exit 1 when warnings are present (bd parity). Pass
+    /// `allow_warnings = true` (via `--allow-warnings`) to treat findings
+    /// as advisory. Structured modes (JSON/TOON) always exit 0 so agents
+    /// can parse the payload regardless of findings.
+    const fn exit_code(&self, structured: bool, allow_warnings: bool) -> i32 {
+        if structured || self.warnings == 0 || allow_warnings {
             0
         } else {
             1
@@ -135,7 +141,7 @@ pub fn execute(
         resolve_issues(&beads_dir, args, cli)?
     };
 
-    render_lint_output(lint_issues(&issues), ctx);
+    render_lint_output(lint_issues(&issues), ctx, args.allow_warnings);
     Ok(())
 }
 
@@ -156,7 +162,7 @@ pub fn execute_with_storage_ctx(
     }
 
     let issues = lint_issues_with_storage(args, &storage_ctx.storage)?;
-    render_lint_output(lint_issues(&issues), ctx);
+    render_lint_output(lint_issues(&issues), ctx, args.allow_warnings);
     Ok(true)
 }
 
@@ -165,7 +171,7 @@ fn lint_issues_with_storage(args: &LintArgs, storage: &SqliteStorage) -> Result<
     storage.list_lint_issues_for_command_output(&filters)
 }
 
-fn render_lint_output(summary: LintSummary, ctx: &OutputContext) {
+fn render_lint_output(summary: LintSummary, ctx: &OutputContext, allow_warnings: bool) {
     if ctx.is_toon() {
         let output = LintOutput {
             total: summary.warnings,
@@ -190,7 +196,7 @@ fn render_lint_output(summary: LintSummary, ctx: &OutputContext) {
         if summary.results.is_empty() {
             return;
         }
-        std::process::exit(summary.exit_code(false));
+        std::process::exit(summary.exit_code(false, allow_warnings));
     }
 
     if ctx.is_rich() {
@@ -223,7 +229,7 @@ fn render_lint_output(summary: LintSummary, ctx: &OutputContext) {
         }
     }
 
-    std::process::exit(summary.exit_code(false));
+    std::process::exit(summary.exit_code(false, allow_warnings));
 }
 
 fn render_lint_rich(summary: &LintSummary, ctx: &OutputContext) {
@@ -692,7 +698,12 @@ mod tests {
     fn test_exit_code_behavior() {
         let issue = make_issue(IssueType::Task, Some("No criteria"));
         let summary = lint_issues(&[issue]);
-        assert_eq!(summary.exit_code(true), 0);
-        assert_eq!(summary.exit_code(false), 1);
+        // Structured output always exits 0.
+        assert_eq!(summary.exit_code(true, false), 0);
+        assert_eq!(summary.exit_code(true, true), 0);
+        // Human mode exits 1 on warnings by default (bd parity).
+        assert_eq!(summary.exit_code(false, false), 1);
+        // --allow-warnings makes findings advisory.
+        assert_eq!(summary.exit_code(false, true), 0);
     }
 }
