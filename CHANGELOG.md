@@ -15,6 +15,37 @@ This changelog is organized by capability rather than diff order. Each version s
 
 ---
 
+## v0.1.1 -- 2026-07-13 (Release)
+
+Bug-fix release for the Windows testing session report
+([#106](https://github.com/quangdang46/beads_rust/issues/106)).
+
+### Fixes
+
+- **`br rename` help** now correctly describes ID rename (not title change),
+  with a `rename-id` alias. Title changes remain `br update <id> --title`.
+- **`br search`** no longer requires a positional `QUERY` when filter flags
+  like `--title-contains` or `--label` are provided.
+- **`br create --label`** is now the primary flag (matches `label add/remove`);
+  `--labels` remains as an alias for compatibility.
+- **`br doctor --repair`** clears orphaned `.write.lock` warnings
+  (`fm-concurrency_primitives-orphaned-write-lock`).
+- **`br rename-prefix` help** documents usage, dry-run, and that it renames
+  IDs only.
+
+### Features
+
+- **`br doctor --allow-warnings`** — exit 0 when findings are only warnings
+  (default still exits 1 for CI/agent contracts).
+- **`br lint --allow-warnings`** — advisory mode that exits 0 even when
+  template sections are missing (default still exits 1 for bd parity).
+
+### Commits
+
+- [`6bd82772`](https://github.com/quangdang46/beads_rust/commit/6bd82772) fix(cli): resolve br 0.1.0 bug report #106
+
+---
+
 ## v0.2.11 -- 2026-05-21 (Release)
 
 This version stops the ephemeral "in-memory" storage path from leaking
