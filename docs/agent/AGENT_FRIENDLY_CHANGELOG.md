@@ -2,6 +2,12 @@
 
 This file tracks agent-facing changes (docs, robot output surfaces, schemas, safety behavior).
 
+## 2026-07-16
+
+- Added `br reflect` — read-only agent instruction emitter to reconcile open beads with git/code since the last `.beads/issues.jsonl` change (prime-style; no issue mutations).
+- Surfaces: human markdown, `--json` (`br.reflect.v1`), `--mcp`, `--since <rev>`, `--export`, optional `.beads/REFLECT.md` protocol override.
+- Wired into `br capabilities`, `br robot-docs guide`, README, CLI_REFERENCE, and AGENT_INTEGRATION.
+
 ## 2026-01-25
 
 - Added agent-first doc entrypoints under `docs/agent/`.

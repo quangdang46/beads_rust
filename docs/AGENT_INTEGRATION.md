@@ -47,6 +47,9 @@ This guide covers how AI coding agents can effectively use `br` (beads_rust) for
 # Initialize (if needed)
 br init
 
+# Session start context
+br prime
+
 # Find work
 br ready --json --limit 5
 
@@ -58,9 +61,20 @@ br close br-123 --reason "Implemented feature X" --json
 # Create discovered work
 br create "Found bug during implementation" -t bug -p 1 --deps discovered-from:br-123 --json
 
-# Session end: mutations auto-flush by default, but this is an idempotent final check
+# Mid/end session: reconcile beads with what actually shipped
+br reflect --json
+# follow instructions: close stale opens, create missing beads, then:
 br sync --flush-only
 ```
+
+### `br reflect` (beads ↔ codebase)
+
+Use when open issues may have drifted from git/code (work shipped without bead IDs, or beads still open after merge).
+
+- **Read-only instructions** — never auto-closes or creates issues
+- Default anchor = last commit that modified `.beads/issues.jsonl`
+- `--json` emits a `br.reflect.v1` envelope agents can parse
+- Override protocol text with `.beads/REFLECT.md` if needed
 
 ---
 

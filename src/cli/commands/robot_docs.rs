@@ -23,9 +23,14 @@ Machine-output defaults:
 
 Start of session:
   br capabilities --format json
+  br prime
   br ready --json
   br coordination status --json
   br show <id> --json
+
+Mid/end session (sync beads ↔ code):
+  br reflect --json
+  # then create/close/update issues per instructions; br sync --flush-only
 
 Finding work:
   br ready --json is the single work-discovery entrypoint: it returns
@@ -81,8 +86,16 @@ const CANONICAL_COMMANDS: &[CanonicalCommand] = &[
         command: "br capabilities --format json",
     },
     CanonicalCommand {
+        task: "session start context",
+        command: "br prime",
+    },
+    CanonicalCommand {
         task: "find ready work",
         command: "br ready --json",
+    },
+    CanonicalCommand {
+        task: "sync beads with codebase",
+        command: "br reflect --json",
     },
     CanonicalCommand {
         task: "diagnose stale claims",

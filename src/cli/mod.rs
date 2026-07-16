@@ -1048,6 +1048,9 @@ EXAMPLES:
     /// AI session context with persistent memory injection
     Prime(commands::prime::PrimeArgs),
 
+    /// Agent instructions to sync beads with the current codebase (prime-style)
+    Reflect(commands::reflect::ReflectArgs),
+
     /// Issue tracking template commands
     Template {
         #[command(subcommand)]

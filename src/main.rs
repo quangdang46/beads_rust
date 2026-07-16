@@ -559,6 +559,9 @@ fn main() {
             commands::memory::execute(&command, cli.json, &overrides, &output_ctx)
         }
         Commands::Prime(args) => commands::prime::execute(&args, cli.json, &overrides, &output_ctx),
+        Commands::Reflect(args) => {
+            commands::reflect::execute(&args, cli.json, &overrides, &output_ctx)
+        }
         Commands::CustomStatus { command } => {
             commands::custom_status::execute_status(&command, cli.json, &overrides, &output_ctx)
         }
@@ -988,6 +991,7 @@ const fn needs_write_lock(cmd: &Commands) -> bool {
         | Commands::Admin { .. }
         | Commands::Memory { .. }
         | Commands::Prime(_)
+        | Commands::Reflect(_)
         | Commands::Sql(_) => true,
         Commands::Config { command } => !matches!(
             command,
@@ -1071,6 +1075,7 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Federation(_)
         | Commands::Memory { .. }
         | Commands::Prime(_)
+        | Commands::Reflect(_)
         | Commands::Sql(_) => false,
 
         #[cfg(feature = "mcp")]
@@ -1114,6 +1119,7 @@ const fn supports_read_only_fast_open(cmd: &Commands) -> bool {
         Commands::Label { command } => is_read_only_label_listing(command),
         Commands::Query { command } => is_read_only_query_command(command),
         Commands::Sql(_) => true,
+        Commands::Reflect(_) => true,
         _ => false,
     }
 }
@@ -1131,6 +1137,7 @@ const fn supports_auto_import_read_only_probe(cmd: &Commands) -> bool {
         | Commands::Stale(_)
         | Commands::Changelog(_)
         | Commands::Graph(_)
+        | Commands::Reflect(_)
         | Commands::Orphans(beads_rust::cli::OrphansArgs { fix: false, .. })
         | Commands::Comments(beads_rust::cli::CommentsArgs {
             command: None | Some(beads_rust::cli::CommentCommands::List(_)),

@@ -1945,6 +1945,25 @@ br prime [OPTIONS]
 
 ---
 
+### reflect
+
+Agent instructions to reconcile open beads with the current codebase and git history since the last `.beads/issues.jsonl` change. **Instructions only** — does not mutate issues (agent runs `br create` / `br close` / `br update` afterward).
+
+```bash
+br reflect [OPTIONS]
+```
+
+| Flag | Description |
+|------|-------------|
+| `--json` | Machine envelope (`br.reflect.v1`) with anchor, HEAD, commits, open issues, orphans, instructions |
+| `--mcp` | Compact token-light output |
+| `--since <REV>` | Override auto anchor (default: last commit touching `.beads/issues.jsonl`) |
+| `--export` | Dump default `REFLECT.md` template |
+
+Optional project override: `.beads/REFLECT.md` replaces the agent protocol section.
+
+---
+
 ### federation
 
 Manage federation peers for P2P sync.
