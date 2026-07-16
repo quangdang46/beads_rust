@@ -8,6 +8,8 @@ permissions:
   contents: write
 
 jobs:
+  # Native musl builds — avoid `cargo install cross` which currently fails to
+  # compile on latest nightly (eyre::bail trailing-semicolon hard errors).
   linux-x64:
     name: linux-x64
     runs-on: ubuntu-latest
@@ -18,8 +20,9 @@ jobs:
         with:
           targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
-      - run: cargo install cross --git https://github.com/cross-rs/cross
-      - run: cross build --release --target x86_64-unknown-linux-musl
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --target x86_64-unknown-linux-musl
         env:
           RUSTC_BOOTSTRAP: 1
       - run: cd target/x86_64-unknown-linux-musl/release && tar czf ../../../br-linux-x64.tar.gz br && cd - && sha256sum br-linux-x64.tar.gz > br-linux-x64.tar.gz.sha256
@@ -31,7 +34,8 @@ jobs:
 
   linux-arm64:
     name: linux-arm64
-    runs-on: ubuntu-latest
+    # Native ARM runner — no cross-compilation / no cross crate.
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -39,8 +43,9 @@ jobs:
         with:
           targets: aarch64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
-      - run: cargo install cross --git https://github.com/cross-rs/cross
-      - run: cross build --release --target aarch64-unknown-linux-musl
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --target aarch64-unknown-linux-musl
         env:
           RUSTC_BOOTSTRAP: 1
       - run: cd target/aarch64-unknown-linux-musl/release && tar czf ../../../br-linux-arm64.tar.gz br && cd - && sha256sum br-linux-arm64.tar.gz > br-linux-arm64.tar.gz.sha256
@@ -119,18 +124,31 @@ jobs:
     needs: [linux-x64, linux-arm64, macos-arm64, macos-x64, windows-x64]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
 
       - name: Generate release notes
         run: |
-          echo "## br v${GITHUB_REF_NAME#v}" >> release.md
-          echo "" >> release.md
-          echo "### Downloads" >> release.md
-          for f in br-*.tar.gz br-*.sha256 br-*.zip; do
-            [ -f "$f" ] && echo "- $f" >> release.md
-          done
+          {
+            echo "## br v${GITHUB_REF_NAME#v}"
+            echo ""
+            if [ -f CHANGELOG.md ]; then
+              # Extract the section for this version from CHANGELOG.md
+              awk -v ver="${GITHUB_REF_NAME}" '
+                $0 ~ "^## " ver " " {grab=1; next}
+                grab && /^## / {exit}
+                grab {print}
+              ' CHANGELOG.md
+              echo ""
+            fi
+            echo "### Downloads"
+            for f in br-*.tar.gz br-*.sha256 br-*.zip; do
+              [ -f "$f" ] && echo "- \`$f\`"
+            done
+          } > release.md
 
       - uses: softprops/action-gh-release@v2
         with:
