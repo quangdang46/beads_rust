@@ -15,6 +15,39 @@ This changelog is organized by capability rather than diff order. Each version s
 
 ---
 
+## v0.1.2 -- 2026-07-16 (Release)
+
+Feature + bug-fix release: agent-facing `br reflect`, export reliability,
+and doctor hygiene for fresh workspaces.
+
+### Features
+
+- **`br reflect`** — read-only agent instruction emitter (prime-style) that
+  reconciles open beads with git/code since the last `.beads/issues.jsonl`
+  change. Supports human markdown, `--json` (`br.reflect.v1`), `--mcp`,
+  `--since <rev>`, `--export`, and optional `.beads/REFLECT.md` protocol
+  override. Does not mutate issues.
+  ([#107](https://github.com/quangdang46/beads_rust/issues/107))
+
+### Fixes
+
+- **`br export`** no longer panics on startup: export payload `--format`
+  (jsonl/json/csv/obsidian) no longer collides with flattened list
+  presentation `--format` under clap debug asserts.
+- **`br init`** writes an explicit `.write.lock` entry in `.beads/.gitignore`
+  so doctor does not warn about a missing expected pattern.
+- **`br sync --flush-only` / auto-flush** refresh `beads.base.jsonl` after a
+  successful export so doctor does not warn
+  `base_jsonl.missing_post_flush` when `last_export_time` is set.
+
+### Commits
+
+- [`56ded5b3`](https://github.com/quangdang46/beads_rust/commit/56ded5b3) feat(cli): add br reflect — agent instructions to sync beads with codebase (#107)
+- [`223b6a34`](https://github.com/quangdang46/beads_rust/commit/223b6a34) fix(cli): repair export clap panic, init gitignore, and base.jsonl flush
+- [`d410cacf`](https://github.com/quangdang46/beads_rust/commit/d410cacf) style: cargo fmt for reflect/export/capabilities (CI fmt check)
+
+---
+
 ## v0.1.1 -- 2026-07-13 (Release)
 
 Bug-fix release for the Windows testing session report
