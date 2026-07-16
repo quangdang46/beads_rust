@@ -5,7 +5,7 @@
 //! filter flags as `br list`.
 
 use crate::cli::commands::list::{build_filters, validate_list_args};
-use crate::cli::{ExportFormat, ListArgs};
+use crate::cli::{ExportFilterArgs, ExportFormat};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::csv;
@@ -19,10 +19,15 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 /// Arguments for the export command.
+///
+/// NOTE: filters intentionally use [`ExportFilterArgs`] (not full [`crate::cli::ListArgs`]).
+/// `ListArgs` also defines `--format` for presentation (json/toon/csv/text), which collides
+/// with this command's export `--format` (jsonl/json/csv/obsidian) under clap's debug
+/// asserts and panics the process before any handler runs.
 #[derive(clap::Args, Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct ExportArgs {
-    /// Output format: jsonl (default), csv, json
+    /// Export payload format: jsonl (default), csv, json, obsidian
     #[arg(long, short = 'f', default_value = "jsonl")]
     pub format: String,
 
@@ -30,9 +35,9 @@ pub struct ExportArgs {
     #[arg(long, short = 'o')]
     pub output: Option<PathBuf>,
 
-    /// Reuse all filter flags from `br list` (status, type, label, etc.)
+    /// Issue selection filters (same filter flags as `br list`, without presentation `--format`)
     #[command(flatten)]
-    pub filters: ListArgs,
+    pub filters: ExportFilterArgs,
 }
 
 /// Execute the export command.
@@ -84,12 +89,14 @@ fn execute_inner(
         ))
     })?;
 
-    // Validate list args before building filters
-    validate_list_args(&args.filters)?;
+    // Validate selection filters before building the storage query.
+    // Convert to ListArgs so we reuse list's filter validation/builder.
+    let list_args = args.filters.to_list_args();
+    validate_list_args(&list_args)?;
 
-    // Build list filters from the flattened ListArgs
-    // Use limit=0 (unlimited) for export so we get all matching issues
-    let (mut filters, _predicate) = build_filters(&args.filters)?;
+    // Build list filters from the export selection flags.
+    // Use limit=0 (unlimited) for export so we get all matching issues.
+    let (mut filters, _predicate) = build_filters(&list_args)?;
     filters.limit = Some(0);
     filters.offset = Some(0);
 
@@ -287,4 +294,57 @@ fn write_obsidian_export(issues: &[Issue], output: &Option<PathBuf>) -> Result<(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+    use crate::cli::{Cli, ExportFilterArgs};
+
+    /// Regression: clap used to panic because ExportArgs and flattened ListArgs
+    /// both defined `--format`. ExportFilterArgs must not reintroduce that.
+    #[test]
+    fn export_command_clap_debug_asserts_pass() {
+        // Building the full CLI exercises clap's debug asserts for every
+        // subcommand, including `export`.
+        let _ = Cli::command();
+    }
+
+    #[test]
+    fn export_filter_args_to_list_args_clears_presentation_flags() {
+        let filters = ExportFilterArgs {
+            status: vec!["open".to_string()],
+            priority: vec!["1".to_string()],
+            fields: Some("id,title".to_string()),
+            all: true,
+            ..Default::default()
+        };
+        let list = filters.to_list_args();
+        assert_eq!(list.status, vec!["open".to_string()]);
+        assert_eq!(list.priority, vec!["1".to_string()]);
+        assert_eq!(list.fields.as_deref(), Some("id,title"));
+        assert!(list.all);
+        assert!(list.format.is_none());
+        assert!(!list.long);
+        assert!(!list.pretty);
+        assert!(!list.wrap);
+        assert!(!list.stats);
+    }
+
+    #[test]
+    fn export_format_parses_known_values() {
+        assert_eq!(
+            ExportFormat::from_str("jsonl").unwrap(),
+            ExportFormat::Jsonl
+        );
+        assert_eq!(ExportFormat::from_str("JSON").unwrap(), ExportFormat::Json);
+        assert_eq!(ExportFormat::from_str("csv").unwrap(), ExportFormat::Csv);
+        assert_eq!(
+            ExportFormat::from_str("obsidian").unwrap(),
+            ExportFormat::Obsidian
+        );
+        assert_eq!(ExportFormat::from_str("md").unwrap(), ExportFormat::Obsidian);
+        assert!(ExportFormat::from_str("yaml").is_err());
+    }
 }

@@ -2210,6 +2210,199 @@ pub struct ListArgs {
     pub filter: Option<String>,
 }
 
+/// Issue selection filters shared by export (and similar bulk writers).
+///
+/// This is intentionally a subset of [`ListArgs`]: it keeps the filter flags
+/// (`--status`, `--type`, labels, priorities, date ranges, etc.) and the CSV
+/// field picker (`--fields`) but **omits presentation flags** such as
+/// `--format` / `--long` / `--pretty` / `--wrap` / `--stats`.
+///
+/// Export defines its own `--format` for the payload codec (jsonl/json/csv/
+/// obsidian). Flattening full `ListArgs` would re-introduce a second
+/// `--format` and panic clap's debug asserts (see export command fix).
+#[derive(Args, Debug, Default, Clone)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct ExportFilterArgs {
+    /// Filter by status (can be repeated)
+    #[arg(long, short = 's', add = ArgValueCompleter::new(status_completer))]
+    pub status: Vec<String>,
+
+    /// Filter by issue type (can be repeated)
+    #[arg(long = "type", short = 't', add = ArgValueCompleter::new(issue_type_completer))]
+    pub type_: Vec<String>,
+
+    /// Filter by assignee
+    #[arg(long, add = ArgValueCompleter::new(assignee_completer))]
+    pub assignee: Option<String>,
+
+    /// Filter for unassigned issues only
+    #[arg(long)]
+    pub unassigned: bool,
+
+    /// Filter by owner
+    #[arg(long, add = ArgValueCompleter::new(owner_completer))]
+    pub owner: Option<String>,
+
+    /// Filter for pinned issues only
+    #[arg(long)]
+    pub pinned: bool,
+
+    /// Filter by molecule type (swarm, patrol, work)
+    #[arg(long = "mol-type", value_name = "TYPE")]
+    pub mol_type: Option<String>,
+
+    /// Filter by specific IDs (can be repeated)
+    #[arg(long, add = ArgValueCompleter::new(issue_id_completer))]
+    pub id: Vec<String>,
+
+    /// Filter by label (AND logic, can be repeated)
+    #[arg(long, short = 'l', add = ArgValueCompleter::new(label_completer))]
+    pub label: Vec<String>,
+
+    /// Filter by label (OR logic, can be repeated)
+    #[arg(long, add = ArgValueCompleter::new(label_completer))]
+    pub label_any: Vec<String>,
+
+    /// Filter by priority (can be repeated)
+    #[arg(long, short = 'p', add = ArgValueCompleter::new(priority_completer))]
+    pub priority: Vec<String>,
+
+    /// Filter by minimum priority (0=critical, 4=backlog)
+    #[arg(long, add = ArgValueCompleter::new(priority_numeric_completer))]
+    pub priority_min: Option<u8>,
+
+    /// Filter by maximum priority
+    #[arg(long, add = ArgValueCompleter::new(priority_numeric_completer))]
+    pub priority_max: Option<u8>,
+
+    /// Title contains substring
+    #[arg(long)]
+    pub title_contains: Option<String>,
+
+    /// Description contains substring
+    #[arg(long)]
+    pub desc_contains: Option<String>,
+
+    /// Notes contains substring
+    #[arg(long)]
+    pub notes_contains: Option<String>,
+
+    /// Include closed issues (default excludes closed)
+    #[arg(long, short = 'a')]
+    pub all: bool,
+
+    /// Maximum number of results (0 = unlimited; default: unlimited)
+    #[arg(long)]
+    pub limit: Option<usize>,
+
+    /// Number of results to skip (for pagination, default: 0)
+    #[arg(long)]
+    pub offset: Option<usize>,
+
+    /// Sort field (`priority`, `created_at`, `updated_at`, `title`)
+    #[arg(long, add = ArgValueCompleter::new(sort_key_completer))]
+    pub sort: Option<String>,
+
+    /// Reverse sort order
+    #[arg(long, short = 'r')]
+    pub reverse: bool,
+
+    /// Include deferred issues
+    #[arg(long)]
+    pub deferred: bool,
+
+    /// Filter for overdue issues
+    #[arg(long)]
+    pub overdue: bool,
+
+    /// Filter by external reference
+    #[arg(long)]
+    pub external_ref: Option<String>,
+
+    /// Filter by metadata key=value (can be repeated, AND logic)
+    #[arg(long, value_name = "KEY=VALUE")]
+    pub metadata: Vec<String>,
+
+    /// Filter by `created_at` <= timestamp (or duration shorthand like "7d", "24h", "2w", "1mo", "1y")
+    #[arg(long)]
+    pub created_before: Option<String>,
+
+    /// Filter by `created_at` >= timestamp (or duration shorthand like "7d", "24h", "2w", "1mo", "1y")
+    #[arg(long)]
+    pub created_after: Option<String>,
+
+    /// Filter by `updated_at` <= timestamp (or duration shorthand like "7d", "24h", "2w", "1mo", "1y")
+    #[arg(long)]
+    pub updated_before: Option<String>,
+
+    /// Filter by `updated_at` >= timestamp (or duration shorthand like "7d", "24h", "2w", "1mo", "1y")
+    #[arg(long)]
+    pub updated_after: Option<String>,
+
+    /// CSV fields to include when exporting CSV (comma-separated)
+    ///
+    /// Available: id, title, description, status, priority, `issue_type`,
+    /// assignee, owner, `created_at`, `updated_at`, `closed_at`, `due_at`,
+    /// `defer_until`, notes, `external_ref`
+    ///
+    /// Default: id, title, status, priority, `issue_type`, assignee, `created_at`, `updated_at`
+    #[arg(long, value_name = "FIELDS", add = ArgValueCompleter::new(csv_fields_completer))]
+    pub fields: Option<String>,
+
+    /// Query DSL filter expression (e.g. "status=open AND priority>1")
+    #[arg(long, short = 'F')]
+    pub filter: Option<String>,
+}
+
+impl ExportFilterArgs {
+    /// Convert selection filters into a [`ListArgs`] with presentation flags cleared.
+    ///
+    /// Used so export can reuse list's filter validation/builder without owning
+    /// a second clap `--format` flag.
+    #[must_use]
+    pub fn to_list_args(&self) -> ListArgs {
+        ListArgs {
+            status: self.status.clone(),
+            type_: self.type_.clone(),
+            assignee: self.assignee.clone(),
+            unassigned: self.unassigned,
+            owner: self.owner.clone(),
+            pinned: self.pinned,
+            mol_type: self.mol_type.clone(),
+            id: self.id.clone(),
+            label: self.label.clone(),
+            label_any: self.label_any.clone(),
+            priority: self.priority.clone(),
+            priority_min: self.priority_min,
+            priority_max: self.priority_max,
+            title_contains: self.title_contains.clone(),
+            desc_contains: self.desc_contains.clone(),
+            notes_contains: self.notes_contains.clone(),
+            all: self.all,
+            limit: self.limit,
+            offset: self.offset,
+            sort: self.sort.clone(),
+            reverse: self.reverse,
+            deferred: self.deferred,
+            overdue: self.overdue,
+            // Presentation flags intentionally defaulted — export owns `--format`.
+            long: false,
+            pretty: false,
+            wrap: false,
+            format: None,
+            stats: false,
+            external_ref: self.external_ref.clone(),
+            metadata: self.metadata.clone(),
+            created_before: self.created_before.clone(),
+            created_after: self.created_after.clone(),
+            updated_before: self.updated_before.clone(),
+            updated_after: self.updated_after.clone(),
+            fields: self.fields.clone(),
+            filter: self.filter.clone(),
+        }
+    }
+}
+
 /// Arguments for the search command.
 #[derive(Args, Debug, Default)]
 pub struct SearchArgs {

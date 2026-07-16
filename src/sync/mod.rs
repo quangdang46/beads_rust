@@ -3090,6 +3090,20 @@ fn finalize_incremental_auto_flush(
         Ok(())
     })?;
 
+    // When we actually advanced last_export_time, refresh the merge-anchor
+    // snapshot so doctor does not flag base_jsonl.missing_post_flush.
+    if let (Some(_), Some(jsonl_path)) = (content_hash, jsonl_path) {
+        if let Some(beads_dir) = jsonl_path.parent() {
+            if let Err(err) = save_base_snapshot_from_jsonl(jsonl_path, beads_dir) {
+                tracing::warn!(
+                    error = %err,
+                    path = %jsonl_path.display(),
+                    "Failed to refresh beads.base.jsonl after incremental auto-flush"
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -3681,6 +3695,15 @@ pub fn auto_flush(
         Some(&export_result.issue_hashes),
         jsonl_path,
     )?;
+    // Mirror the explicit flush path: keep beads.base.jsonl current so
+    // doctor.base_jsonl.missing_post_flush stays quiet after auto-flush.
+    if let Err(err) = save_base_snapshot_from_jsonl(jsonl_path, beads_dir) {
+        tracing::warn!(
+            error = %err,
+            path = %jsonl_path.display(),
+            "Failed to refresh beads.base.jsonl after auto-flush; export itself succeeded"
+        );
+    }
 
     tracing::info!(
         exported = export_result.exported_count,

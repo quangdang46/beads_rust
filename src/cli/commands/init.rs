@@ -204,6 +204,8 @@ pub fn execute(
 
 # Lock files
 *.lock
+# Explicit workspace write lock (doctor expects this exact pattern)
+.write.lock
 
 # Temporary
 last-touched
@@ -652,6 +654,10 @@ mod tests {
         assert!(content.contains("*.db-wal"));
         assert!(content.contains("*.db-shm"));
         assert!(content.contains("*.lock"));
+        // Doctor's gitignore.beads_inner_present check looks for these exact
+        // patterns (not just the broader `*.lock` / generic tmp globs).
+        assert!(content.contains(".write.lock"));
+        assert!(content.contains("*.tmp"));
         info!("test_gitignore_excludes_db_files: assertions passed");
     }
 }

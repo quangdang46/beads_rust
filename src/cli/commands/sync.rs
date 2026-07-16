@@ -1481,6 +1481,16 @@ fn execute_flush(
         Some(&export_result.issue_hashes),
         jsonl_path,
     )?;
+    // Keep the merge-anchor snapshot in lockstep with every successful flush so
+    // doctor does not warn about a missing beads.base.jsonl after last_export_time
+    // is written. Best-effort: a snapshot failure must not undo a completed export.
+    if let Err(err) = save_base_snapshot_from_jsonl(jsonl_path, &path_policy.beads_dir) {
+        tracing::warn!(
+            error = %err,
+            path = %jsonl_path.display(),
+            "Failed to refresh beads.base.jsonl after flush; export itself succeeded"
+        );
+    }
     info!("Export complete, cleared dirty flags");
 
     // Write manifest if requested (atomic: temp + fsync + durable_rename)
