@@ -240,7 +240,8 @@ fn gather_facts(
     storage: &SqliteStorage,
     since_override: Option<&str>,
 ) -> Result<ReflectFacts> {
-    let (anchor_sha, anchor_path) = resolve_anchor(repo_root, beads_dir, jsonl_path, since_override)?;
+    let (anchor_sha, anchor_path) =
+        resolve_anchor(repo_root, beads_dir, jsonl_path, since_override)?;
     let anchor_date = git_commit_date(repo_root, &anchor_sha).unwrap_or_else(|| "unknown".into());
     let head_sha = git_rev_parse(repo_root, "HEAD").ok_or_else(|| {
         BeadsError::Config("failed to resolve HEAD in git repository".to_string())
@@ -256,10 +257,7 @@ fn gather_facts(
 
     let open_issues = load_open_issues(storage)?;
     let stats_summary = ReflectStatsSummary {
-        open: open_issues
-            .iter()
-            .filter(|i| i.status == "open")
-            .count(),
+        open: open_issues.iter().filter(|i| i.status == "open").count(),
         in_progress: open_issues
             .iter()
             .filter(|i| i.status == "in_progress")
@@ -303,10 +301,7 @@ fn resolve_anchor(
 ) -> Result<(String, String)> {
     if let Some(rev) = since_override {
         let sha = git_rev_parse(repo_root, rev).ok_or_else(|| {
-            BeadsError::validation(
-                "since",
-                format!("cannot resolve git revision '{rev}'"),
-            )
+            BeadsError::validation("since", format!("cannot resolve git revision '{rev}'"))
         })?;
         return Ok((sha, format!("--since {rev}")));
     }
@@ -315,15 +310,12 @@ fn resolve_anchor(
     let rel_jsonl = path_relative_to(jsonl_path, repo_root)
         .unwrap_or_else(|| PathBuf::from(".beads/issues.jsonl"));
     if let Some(sha) = git_log_last_touching(repo_root, &rel_jsonl) {
-        return Ok((
-            sha,
-            rel_jsonl.to_string_lossy().into_owned(),
-        ));
+        return Ok((sha, rel_jsonl.to_string_lossy().into_owned()));
     }
 
     // Fallback: last commit under .beads/
-    let rel_beads = path_relative_to(beads_dir, repo_root)
-        .unwrap_or_else(|| PathBuf::from(".beads"));
+    let rel_beads =
+        path_relative_to(beads_dir, repo_root).unwrap_or_else(|| PathBuf::from(".beads"));
     if let Some(sha) = git_log_last_touching(repo_root, &rel_beads) {
         return Ok((sha, format!("{}/**", rel_beads.to_string_lossy())));
     }
@@ -355,11 +347,7 @@ fn load_open_issues(storage: &SqliteStorage) -> Result<Vec<ReflectOpenIssue>> {
         })
         .collect();
     // Stable secondary sort by id for determinism.
-    out.sort_by(|a, b| {
-        a.priority
-            .cmp(&b.priority)
-            .then_with(|| a.id.cmp(&b.id))
-    });
+    out.sort_by(|a, b| a.priority.cmp(&b.priority).then_with(|| a.id.cmp(&b.id)));
     if out.len() > OPEN_ISSUES_CAP {
         out.truncate(OPEN_ISSUES_CAP);
     }
@@ -429,15 +417,10 @@ fn format_full_output(facts: &ReflectFacts, protocol_override: Option<&str>) -> 
 
     out.push_str(&format!(
         "## Stats\n\n- open: {}\n- in_progress: {}\n- listed: {}\n\n",
-        facts.stats_summary.open,
-        facts.stats_summary.in_progress,
-        facts.stats_summary.total_listed
+        facts.stats_summary.open, facts.stats_summary.in_progress, facts.stats_summary.total_listed
     ));
 
-    out.push_str(&format!(
-        "## Open issues ({})\n\n",
-        facts.open_issues.len()
-    ));
+    out.push_str(&format!("## Open issues ({})\n\n", facts.open_issues.len()));
     if facts.open_issues.is_empty() {
         out.push_str("_none_\n\n");
     } else {
@@ -641,10 +624,7 @@ fn git_rev_list_count(repo_root: &Path, range_spec: &str) -> Option<usize> {
     if !output.status.success() {
         return None;
     }
-    String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse()
-        .ok()
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 
 fn git_log_oneline(repo_root: &Path, range_spec: &str, cap: usize) -> Option<Vec<String>> {
@@ -769,13 +749,17 @@ mod tests {
 
     #[test]
     fn count_diff_stat_files_parses_summary() {
-        let sample = " src/a.rs | 2 +-\n src/b.rs | 1 +\n 2 files changed, 2 insertions(+), 1 deletion(-)\n";
+        let sample =
+            " src/a.rs | 2 +-\n src/b.rs | 1 +\n 2 files changed, 2 insertions(+), 1 deletion(-)\n";
         assert_eq!(count_diff_stat_files(sample), 2);
     }
 
     #[test]
     fn truncate_lines_caps() {
-        let text = (0..10).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+        let text = (0..10)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let out = truncate_lines(&text, 3);
         assert!(out.contains("line0"));
         assert!(out.contains("line2"));
@@ -917,8 +901,8 @@ mod tests {
         let jsonl = beads.join("issues.jsonl");
         fs::write(&jsonl, "").unwrap();
 
-        let err = resolve_anchor(root, &beads, &jsonl, Some("no-such-rev-xyz"))
-            .expect_err("bad rev");
+        let err =
+            resolve_anchor(root, &beads, &jsonl, Some("no-such-rev-xyz")).expect_err("bad rev");
         let msg = err.to_string();
         assert!(
             msg.contains("since") || msg.contains("no-such") || msg.contains("resolve"),

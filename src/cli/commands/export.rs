@@ -299,8 +299,8 @@ fn write_obsidian_export(issues: &[Issue], output: &Option<PathBuf>) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::CommandFactory;
     use crate::cli::{Cli, ExportFilterArgs};
+    use clap::CommandFactory;
 
     /// Regression: clap used to panic because ExportArgs and flattened ListArgs
     /// both defined `--format`. ExportFilterArgs must not reintroduce that.
@@ -344,7 +344,10 @@ mod tests {
             ExportFormat::from_str("obsidian").unwrap(),
             ExportFormat::Obsidian
         );
-        assert_eq!(ExportFormat::from_str("md").unwrap(), ExportFormat::Obsidian);
+        assert_eq!(
+            ExportFormat::from_str("md").unwrap(),
+            ExportFormat::Obsidian
+        );
         assert!(ExportFormat::from_str("yaml").is_err());
     }
 }
