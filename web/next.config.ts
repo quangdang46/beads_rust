@@ -21,7 +21,6 @@ const nextConfig: NextConfig = {
   distDir: "out",
   images: { unoptimized: true },
   typescript: { ignoreBuildErrors: true },
-  eslint: { ignoreDuringBuilds: true },
   env: {
     NEXT_PUBLIC_BUILD_NUMBER: BUILD_NUMBER,
     NEXT_PUBLIC_BUILD_SHA: BUILD_SHA,
