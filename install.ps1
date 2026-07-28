@@ -18,6 +18,12 @@
 .PARAMETER EasyMode
     Auto-update PATH in user environment
 
+.PARAMETER SkipSkills
+    Don't install any Claude Code / Codex skills
+
+.PARAMETER WithMigrationSkill
+    Install the bd-to-br-migration skill (opt-in)
+
 .PARAMETER Verify
     Run self-test after install
 
@@ -49,6 +55,8 @@ param(
     [string]$InstallDir = "",
     [switch]$System = $false,
     [switch]$EasyMode = $false,
+    [switch]$SkipSkills = $false,
+    [switch]$WithMigrationSkill = $false,
     [switch]$Verify = $false,
     [switch]$Quiet = $false,
     [switch]$Uninstall = $false,
@@ -93,6 +101,8 @@ OPTIONS:
   --install-dir DIR      Install to directory (default: ~\AppData\Local\Programs\br)
   --system               Install to Program Files (requires admin)
   --easy-mode            Auto-update PATH in user environment
+  --skip-skills          Don't install any Claude Code / Codex skills
+  --with-migration-skill Install the bd-to-br-migration skill (opt-in)
   --verify               Run self-test after install
   --quiet                Suppress non-error output
   --uninstall            Remove br and clean up
@@ -424,6 +434,70 @@ function Update-Path {
 }
 
 # ============================================================================
+# Install Claude Code / Codex skills
+# ============================================================================
+function Install-Skills {
+    if ($SkipSkills) {
+        Write-Info "Skipping skills installation (--skip-skills)"
+        return
+    }
+
+    Write-Info "Installing Claude Code / Codex skills..."
+
+    $skillsBaseUrl = "https://raw.githubusercontent.com/$($Script:Owner)/$($Script:Repo)/main/skills"
+    $claudeSkillsDir = "$env:USERPROFILE\.claude\skills"
+    $codexSkillsDir = "$env:USERPROFILE\.codex\skills"
+
+    $skillName = "bd-to-br-migration"
+    $files = @(
+        "SKILL.md",
+        "SELF-TEST.md",
+        "references/TRANSFORMS.md",
+        "references/BULK.md",
+        "references/PITFALLS.md",
+        "scripts/find-bd-refs.sh",
+        "scripts/verify-migration.sh",
+        "subagents/batch-migrator.md"
+    )
+
+    if (-not $WithMigrationSkill) {
+        Write-Info "Skipping skill: $skillName (opt-in via --with-migration-skill)"
+        return
+    }
+
+    $filesInstalled = 0
+    foreach ($file in $files) {
+        $url = "$skillsBaseUrl/$skillName/$file"
+        $claudeDest = "$claudeSkillsDir\$skillName\$file"
+
+        # Ensure directory exists
+        $destDir = Split-Path $claudeDest -Parent
+        if (-not (Test-Path $destDir)) {
+            New-Item -Path $destDir -ItemType Directory -Force | Out-Null
+        }
+
+        if (Download-File -Url $url -DestPath $claudeDest) {
+            $filesInstalled++
+            Write-Step "Downloaded $file"
+
+            # Copy to Codex skills
+            $codexDest = "$codexSkillsDir\$skillName\$file"
+            $codexDestDir = Split-Path $codexDest -Parent
+            if (-not (Test-Path $codexDestDir)) {
+                New-Item -Path $codexDestDir -ItemType Directory -Force | Out-Null
+            }
+            Copy-Item -Path $claudeDest -Destination $codexDest -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    if ($filesInstalled -gt 0) {
+        Write-Success "Installed skill: $skillName ($filesInstalled files)"
+    } else {
+        Write-Warn "Skill ${skillName}: no files could be downloaded"
+    }
+}
+
+# ============================================================================
 # Print summary
 # ============================================================================
 function Print-Summary {
@@ -478,6 +552,8 @@ function Main {
         # Post-install (auto-add to PATH)
         $EasyMode = $true
         Update-Path
+
+        Install-Skills
 
         # Verify
         if ($Verify) {
