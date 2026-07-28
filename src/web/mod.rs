@@ -108,6 +108,7 @@ pub fn run_server(args: &WebArgs, overrides: &config::CliOverrides) -> Result<()
     // Bind with auto port-pick: default 3000, try +1 +2 … if busy.
     let requested = args.port.unwrap_or(3000);
     let listener = bind_first_free(&args.host, requested, args.strict_port)?;
+    listener.set_nonblocking(true).map_err(|e| BeadsError::Config(format!("nonblock: {e}")))?;
     let actual = listener.local_addr().map_err(|e| BeadsError::Config(format!("addr: {e}")))?;
 
     eprintln!(
