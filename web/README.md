@@ -1,0 +1,225 @@
+<div align="center">
+
+<h1>🛸 Bead Me Up, Scotty</h1>
+
+<p>
+  <b>The free, open-source visual UI for <a href="https://github.com/gastownhall/beads">Beads</a></b> — Steve Yegge's
+  graph-based issue tracker for AI coding agents.<br/>
+  <i>Brainstorm, create, and organize work in the same place your AI agent does.</i>
+</p>
+
+<p>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-6d5ef0?style=flat-square" alt="MIT License"></a>
+  <img src="https://img.shields.io/badge/Next.js-16-black?style=flat-square&logo=next.js&logoColor=white" alt="Next.js 16">
+  <img src="https://img.shields.io/badge/Run_anywhere-scotty-22c55e?style=flat-square" alt="Global CLI: scotty">
+  <a href="https://github.com/brendan-appstart/bead-me-up-scotty/stargazers"><img src="https://img.shields.io/github/stars/brendan-appstart/bead-me-up-scotty?style=flat-square&color=eab308" alt="GitHub stars"></a>
+</p>
+
+<a href="https://youtu.be/0zpg_FRX-wE" title="Watch the 2-minute demo">
+  <img src=".github/screens/board.png" alt="Bead Me Up, Scotty — click to watch the demo" width="860">
+</a>
+
+<p><b>▶️ <a href="https://youtu.be/0zpg_FRX-wE">Watch the 2-minute demo</a></b></p>
+
+<p>
+  <a href="https://beadmeupscotty.com"><b>🌐 Website</b></a> ·
+  <a href="https://youtu.be/0zpg_FRX-wE"><b>▶️ Demo video</b></a> ·
+  <a href="https://github.com/brendan-appstart/bead-me-up-scotty"><b>⭐ Star the repo</b></a> ·
+  <a href="https://github.com/gastownhall/beads"><b>🧵 Beads</b></a>
+</p>
+
+<table>
+  <tr>
+    <td width="50%" align="center"><img src=".github/screens/detail.png" alt="Detail drawer with inline editing"><br/><sub><b>Detail drawer — inline edit, deps & comments</b></sub></td>
+    <td width="50%" align="center"><img src=".github/screens/graph.png" alt="Interactive dependency graph"><br/><sub><b>Live dependency graph</b></sub></td>
+  </tr>
+</table>
+
+</div>
+
+---
+
+A local, single-user web UI for **[beads](https://github.com/gastownhall/beads)**
+(`bd`) — Steve Yegge's distributed graph issue tracker. beads ships a powerful CLI
+but no interactive visualizer that also lets you *create* work. This app is that
+visualizer: a fast, graph-aware task board for humans, on top of a tracker built
+for AI agents.
+
+## Features
+
+- **Board** — a five-column view (Backlog · Ready · In Progress · Blocked · Done)
+  with dense cards showing id, type, priority, assignee, dep/comment counts, and an
+  origin badge. Filter by type / priority / origin, full-text search, and a
+  show/hide-archived toggle. Keyboard: `n` new, `/` search, `Esc` close.
+- **Backlog ↔ Ready drag-and-drop** — drag cards between columns to change status
+  (Backlog = `deferred`, Done = `bd close`); updates are optimistic.
+- **Create / edit** — add tasks and epics (type, priority, description, assignee,
+  labels, parent epic, start-in-backlog) and edit status/priority inline.
+- **Epics & progress** — epics with live `closed ÷ children` progress bars and
+  expandable child lists; add a child straight into an epic.
+- **Dependencies & graph** — view/add/remove typed dependencies in the detail
+  drawer, plus an interactive React Flow dependency graph (drag node→node to link).
+- **Comments** — author-stamped comment threads with a composer on every bead.
+- **Archive & delete** — archive (reversible `bd close` + `archived` label) or
+  delete (`bd delete`, behind a confirm).
+- **Human-vs-agent attribution** — every bead and comment shows 👤 (human) or 🤖
+  (agent), derived from a configurable human allowlist.
+- **Settings** — repo path, human actor + allowlist, poll interval, and light/dark
+  theme. Live polling keeps the board fresh when agents change data underneath you.
+
+## How it works
+
+- **beads has no HTTP API**, so the app shells out to the `bd` CLI
+  (`bd … --json`, `BD_JSON_ENVELOPE=1`). `bd` stays the single source of truth —
+  the app adds **zero** new persisted schema. The only adapter is
+  [`lib/bd.ts`](lib/bd.ts); see the spec in [`design/design.md`](design/design.md).
+- The UI was designed in **Claude Design** and rebuilt faithfully here with
+  Next.js + shadcn/Tailwind. The original export and a screen/token map live in
+  [`design/ui-export/`](design/ui-export/).
+
+### Backlog & attribution (design decisions)
+- **Backlog** maps to beads' built-in `deferred` status; **Ready** = open &
+  unblocked. Dragging between columns runs `bd update --status` / `bd close`.
+- beads has no human-vs-agent flag, so the UI stamps its own writes with a
+  configured **human actor** (`BEADS_ACTOR`); anyone in the human allowlist renders
+  as 👤, everyone else as 🤖. **Archive** = `bd close` + an `archived` label
+  (reversible); **Delete** = `bd delete`.
+
+## Run it
+
+**Prerequisites:** Node 20+ and npm. For live mode you also need the
+[`bd`](https://github.com/gastownhall/beads) binary on your `PATH` and a `.beads`
+repo (`bd init`). No `bd`? The app falls back to demo mode automatically.
+
+```bash
+npm install
+npm run dev            # http://localhost:3000
+```
+
+- **With real data:** run from (or point Settings at) a directory containing a
+  `.beads` repo, with `bd` on your `PATH`. Override the repo with
+  `BEADS_REPO=/path/to/project` and the binary with `BD_BIN=/path/to/bd`.
+- **Demo mode:** if `bd` isn't installed (or you set `BEADS_DEMO=1`), the app runs
+  against an in-memory dataset seeded from the design export — so you can explore
+  every feature without beads. The sidebar shows which mode is active.
+
+Set the human actor / allowlist, repo path, and theme in **Settings** (stored
+under your OS config dir, not in beads).
+
+### Docker
+
+```bash
+docker build -t bead-me-up-scotty .
+docker run -p 3000:3000 bead-me-up-scotty      # → http://localhost:3000
+```
+
+> The build runs `npm ci`, which needs the committed `package-lock.json` for
+> reproducible installs. The lockfile is tracked in the repo (a `.gitignore`
+> negation keeps it that way even if your global gitignore excludes lockfiles),
+> so a clean clone builds without a prior `npm install`.
+
+The image includes the `bd` CLI, so real data works out of the box — just
+mount your project directory and point `BEADS_REPO` at it:
+
+```bash
+BEADS_REPO=/path/to/project
+docker run -d -p 3000:3000 \
+  --name beads_ui \
+  -v $BEADS_REPO:/data \
+  -e BEADS_REPO=/data \
+  bead-me-up-scotty
+```
+
+The container runs as a non-root `nextjs` user with `HOME=/home/nextjs` and
+`XDG_CONFIG_HOME=/home/nextjs/.config`, so `bd` and app settings have a valid
+runtime config directory. On Linux, if `bd` fails with permission errors writing
+to the mounted `.beads` directory, run as your host user: `--user $(id -u):$(id -g)`
+(the config dirs are world-writable, so settings keep working). Settings live
+inside the container, so they are lost when it is recreated — bind-mount the
+config dir to keep them:
+
+```bash
+-v "$HOME/.config/bead-me-up-scotty:/home/nextjs/.config/bead-me-up-scotty"
+```
+
+Container limitations:
+
+- The image has no `git`, so Dolt remote sync (`refs/dolt/data`) and `bd init`
+  don't work inside it — run those on the host. UI edits (create/update/close)
+  work fine; they just won't auto-push until you sync from the host.
+- **Refine with AI** shells out to the Claude Code CLI, which isn't bundled;
+  the button shows an error in the container.
+- The bundled `bd` version is pinned in the Dockerfile (`ARG BD_VERSION`);
+  override with `--build-arg BD_VERSION=<version>` to match your host.
+
+## Install globally
+
+Install once from a clone, then run `scotty` (or `bead-me-up-scotty`) from **any**
+directory. It starts the production server on a free port (default 3000) and opens
+your browser. Run it from a folder that has a `.beads` repo to jump straight to
+that project; otherwise you get the project picker. Requires Node 20+.
+
+Flags: `-p, --port <n>` · `--no-open` · `--help`.
+
+**Recommended — `npm link` (keep the clone):**
+
+```bash
+git clone <repo-url> bead-me-up-scotty
+cd bead-me-up-scotty
+npm install
+npm run build
+npm link
+scotty                 # from anywhere
+```
+
+The global command is a symlink to the clone, so keep it on disk and re-run
+`npm run build` after pulling changes. Uninstall: `npm rm -g bead-me-up-scotty`.
+
+**Alternative — global copy (clone is deletable):**
+
+```bash
+git clone <repo-url> bead-me-up-scotty
+cd bead-me-up-scotty
+npm install
+rm -rf .next           # ensure a clean build (only the prod build is shipped)
+npm run build
+npm install -g .
+scotty                 # from anywhere; the clone can now be deleted
+```
+
+To update, rebuild and re-run `npm install -g .`. If `npm install -g .` hits a
+permissions error, use a user-owned npm prefix:
+`npm config set prefix ~/.npm-global` and add `~/.npm-global/bin` to your `PATH`.
+
+## Stack
+
+Next.js 16 (App Router) · React 19 · TypeScript · Tailwind v4 · shadcn/ui ·
+TanStack Query (polling + optimistic DnD) · dnd-kit (board) · @xyflow/react
+(dependency graph) · Zod (validates `bd` output *and* forms).
+
+## Project layout
+
+```
+app/                  # pages + API route handlers (the only server entry points)
+  api/beads/**        # GET list, POST create, [id] PATCH/DELETE, status, comments, deps, archive
+  api/doctor, config  # bd preflight + local config
+lib/
+  bd.ts               # the ONLY bd CLI bridge (execFile, JSON envelope, write mutex)
+  demo-store.ts       # in-memory fallback seeded from the export
+  store.ts            # picks bd vs demo
+  schema.ts           # Zod schemas + types (bd data model)
+  beads-view.ts       # pure view-model helpers (status/priority colors, blocked, epic progress)
+  attribution.ts      # human-vs-agent origin
+components/           # sidebar, board (dnd), detail drawer, create modal, epics, graph, settings
+```
+
+## Verify
+
+```bash
+npm run build         # typecheck + production build
+npm run lint          # eslint
+```
+
+## License
+
+[MIT](LICENSE) © Brendan

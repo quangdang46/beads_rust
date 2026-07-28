@@ -1067,6 +1067,11 @@ EXAMPLES:
     #[cfg(feature = "mcp")]
     Serve(crate::mcp::ServeArgs),
 
+    /// Start the embedded web UI server
+    #[cfg(feature = "web")]
+    #[command(alias = "ui")]
+    Web(WebArgs),
+
     /// Upgrade br to the latest version
     #[cfg(feature = "self_update")]
     Upgrade(UpgradeArgs),
@@ -3841,6 +3846,42 @@ pub struct UpgradeArgs {
     /// Show what would happen without making changes
     #[arg(long)]
     pub dry_run: bool,
+}
+
+/// Arguments for the `br web` command.
+#[cfg(feature = "web")]
+#[derive(Args, Debug, Clone)]
+pub struct WebArgs {
+    /// Port to listen on (default: 3000)
+    #[arg(long, short = 'p', default_value = "3000")]
+    pub port: u16,
+
+    /// Host to bind (default: 127.0.0.1)
+    #[arg(long, default_value = "127.0.0.1")]
+    pub host: String,
+
+    /// Don't open a browser
+    #[arg(long)]
+    pub no_open: bool,
+
+    /// Database path (auto-discover .beads/*.db if not set)
+    #[arg(long)]
+    pub db: Option<std::path::PathBuf>,
+}
+
+/// WebArgs requires a manual Default impl because #[derive(Default)] can't
+/// be used with clap's `default_value` attribute in all versions (the attribute
+/// sets the default for the *parser*, not for the struct field).
+#[cfg(feature = "web")]
+impl Default for WebArgs {
+    fn default() -> Self {
+        Self {
+            port: 3000,
+            host: "127.0.0.1".into(),
+            no_open: false,
+            db: None,
+        }
+    }
 }
 
 /// Arguments for the orphans command.

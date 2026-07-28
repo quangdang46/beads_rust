@@ -110,6 +110,12 @@ semver = "1.0.27"
 # MCP server (optional; gated behind the `mcp` feature)
 fastmcp-rust = { version = "0.3.1", optional = true }
 
+# Embedded web UI server (optional; gated behind the `web` feature)
+axum = { version = "0.8", optional = true, features = ["macros"] }
+tokio = { version = "1", optional = true, features = ["rt-multi-thread", "macros", "signal"] }
+tower-http = { version = "0.6", optional = true, features = ["cors"] }
+rust-embed = { version = "8", optional = true }
+
 # Self-update removed for RUSTSEC-2026-0194/0195. Users install via install.sh
 # (https://github.com/quangdang46/beads_rust#installation).
 
@@ -158,6 +164,7 @@ opt-level = 1
 [features]
 default = []
 mcp = ["dep:fastmcp-rust"]
+web = ["dep:axum", "dep:tokio", "dep:tower-http", "dep:rust-embed"]
 
 # NOTE: no `[patch.crates-io]` here.
 #

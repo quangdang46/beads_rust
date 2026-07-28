@@ -1,0 +1,438 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+  --font-heading: var(--font-geist-sans);
+
+  /* shadcn semantic tokens */
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+
+  /* Bead Me Up brand + surface/text scale (from the design export) */
+  --color-brand: var(--brand);
+  --color-brand-2: var(--brand-2);
+  --color-brand-weak: var(--brand-weak);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-surface-3: var(--surface-3);
+  --color-border-strong: var(--border-strong);
+  --color-text: var(--text);
+  --color-text-2: var(--text-2);
+  --color-text-3: var(--text-3);
+
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+}
+
+:root {
+  --radius: 0.7rem;
+
+  /* raw palette — light */
+  --bg: #f6f6f8;
+  --surface: #ffffff;
+  --surface-2: #f1f1f4;
+  --surface-3: #ebebef;
+  --border: #e7e7ec;
+  --border-strong: #d6d6dd;
+  --text: #16161a;
+  --text-2: #62626d;
+  --text-3: #9a9aa5;
+  --brand: #6d5ef0;
+  --brand-2: #5546e0;
+  --brand-weak: #efedfd;
+  --shadow: 0 1px 2px rgba(20, 20, 30, 0.05), 0 1px 1px rgba(20, 20, 30, 0.04);
+  --shadow-lg: 0 12px 32px -8px rgba(20, 20, 40, 0.18), 0 4px 12px -4px rgba(20, 20, 40, 0.1);
+  --drawer: #ffffff;
+
+  /* shadcn semantic → mapped to our palette */
+  --background: var(--bg);
+  --foreground: var(--text);
+  --card: var(--surface);
+  --card-foreground: var(--text);
+  --popover: var(--surface);
+  --popover-foreground: var(--text);
+  --primary: var(--brand);
+  --primary-foreground: #ffffff;
+  --secondary: var(--surface-2);
+  --secondary-foreground: var(--text);
+  --muted: var(--surface-2);
+  --muted-foreground: var(--text-2);
+  --accent: var(--surface-2);
+  --accent-foreground: var(--text);
+  --destructive: #ef4444;
+  --border: #e7e7ec;
+  --input: #e7e7ec;
+  --ring: var(--brand);
+  --sidebar: var(--surface);
+  --sidebar-foreground: var(--text-2);
+  --sidebar-primary: var(--brand);
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: var(--brand-weak);
+  --sidebar-accent-foreground: var(--brand);
+  --sidebar-border: var(--border);
+  --sidebar-ring: var(--brand);
+}
+
+.dark {
+  /* raw palette — dark */
+  --bg: #0c0c0f;
+  --surface: #161619;
+  --surface-2: #1d1d22;
+  --surface-3: #26262d;
+  --border: #26262d;
+  --border-strong: #34343d;
+  --text: #f2f2f5;
+  --text-2: #a2a2ad;
+  --text-3: #6c6c77;
+  --brand: #8b7cf8;
+  --brand-2: #9c8ffa;
+  --brand-weak: #211d3a;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 16px 40px -8px rgba(0, 0, 0, 0.6);
+  --drawer: #141417;
+
+  --background: var(--bg);
+  --foreground: var(--text);
+  --card: var(--surface);
+  --card-foreground: var(--text);
+  --popover: var(--surface);
+  --popover-foreground: var(--text);
+  --primary: var(--brand);
+  --primary-foreground: #0c0c0f;
+  --secondary: var(--surface-2);
+  --secondary-foreground: var(--text);
+  --muted: var(--surface-2);
+  --muted-foreground: var(--text-2);
+  --accent: var(--surface-2);
+  --accent-foreground: var(--text);
+  --destructive: #ef4444;
+  --border: #26262d;
+  --input: #2c2c34;
+  --ring: var(--brand);
+  --sidebar: var(--surface);
+  --sidebar-foreground: var(--text-2);
+  --sidebar-primary: var(--brand);
+  --sidebar-primary-foreground: #0c0c0f;
+  --sidebar-accent: var(--brand-weak);
+  --sidebar-accent-foreground: var(--brand);
+  --sidebar-border: var(--border);
+  --sidebar-ring: var(--brand);
+}
+
+/* ------------------------------------------------------------------ */
+/* Named themes (bead-me-up-scotty-81k). Each overrides only the raw   */
+/* palette vars; shadcn semantic tokens derive from them via var().    */
+/* All are dark-mode, so the .dark class is also applied by the         */
+/* provider and supplies shadow + dark semantic literals; these blocks  */
+/* outrank .dark on specificity (html[data-theme] = 0,1,1 > .dark).     */
+/* ------------------------------------------------------------------ */
+
+html[data-theme="dracula"] {
+  --bg: #282a36;
+  --surface: #2d2f3d;
+  --surface-2: #343746;
+  --surface-3: #3c3f52;
+  --border: #44475a;
+  --border-strong: #565972;
+  --text: #f8f8f2;
+  --text-2: #b9bcd0;
+  --text-3: #6272a4;
+  --brand: #bd93f9;
+  --brand-2: #caa9fa;
+  --brand-weak: #343352;
+  --drawer: #21222c;
+  --primary-foreground: #282a36;
+  --input: #44475a;
+}
+
+html[data-theme="nord"] {
+  --bg: #2e3440;
+  --surface: #353c4a;
+  --surface-2: #3b4252;
+  --surface-3: #434c5e;
+  --border: #434c5e;
+  --border-strong: #4c566a;
+  --text: #eceff4;
+  --text-2: #d8dee9;
+  --text-3: #7b8493;
+  --brand: #88c0d0;
+  --brand-2: #8fbcbb;
+  --brand-weak: #2f3b41;
+  --drawer: #2b303b;
+  --primary-foreground: #2e3440;
+  --input: #3b4252;
+}
+
+html[data-theme="solarized-dark"] {
+  --bg: #002b36;
+  --surface: #073642;
+  --surface-2: #0a4150;
+  --surface-3: #0e4d5e;
+  --border: #0e4d5e;
+  --border-strong: #586e75;
+  --text: #93a1a1;
+  --text-2: #839496;
+  --text-3: #586e75;
+  --brand: #268bd2;
+  --brand-2: #2aa198;
+  --brand-weak: #073642;
+  --drawer: #002129;
+  --primary-foreground: #002b36;
+  --input: #0e4d5e;
+}
+
+html[data-theme="gruvbox-dark"] {
+  --bg: #282828;
+  --surface: #32302f;
+  --surface-2: #3c3836;
+  --surface-3: #504945;
+  --border: #504945;
+  --border-strong: #665c54;
+  --text: #ebdbb2;
+  --text-2: #d5c4a1;
+  --text-3: #a89984;
+  --brand: #fabd2f;
+  --brand-2: #fe8019;
+  --brand-weak: #3c3530;
+  --drawer: #1d2021;
+  --primary-foreground: #282828;
+  --input: #504945;
+}
+
+html[data-theme="tokyo-night"] {
+  --bg: #1a1b26;
+  --surface: #1f2335;
+  --surface-2: #24283b;
+  --surface-3: #292e42;
+  --border: #292e42;
+  --border-strong: #3b4261;
+  --text: #c0caf5;
+  --text-2: #a9b1d6;
+  --text-3: #565f89;
+  --brand: #7aa2f7;
+  --brand-2: #bb9af7;
+  --brand-weak: #24283b;
+  --drawer: #16161e;
+  --primary-foreground: #1a1b26;
+  --input: #292e42;
+}
+
+html[data-theme="catppuccin-mocha"] {
+  --bg: #1e1e2e;
+  --surface: #282839;
+  --surface-2: #313244;
+  --surface-3: #45475a;
+  --border: #313244;
+  --border-strong: #45475a;
+  --text: #cdd6f4;
+  --text-2: #bac2de;
+  --text-3: #6c7086;
+  --brand: #cba6f7;
+  --brand-2: #b4befe;
+  --brand-weak: #2b2640;
+  --drawer: #181825;
+  --primary-foreground: #1e1e2e;
+  --input: #313244;
+}
+
+html[data-theme="rose-pine"] {
+  --bg: #191724;
+  --surface: #1f1d2e;
+  --surface-2: #26233a;
+  --surface-3: #2f2b43;
+  --border: #26233a;
+  --border-strong: #403d52;
+  --text: #e0def4;
+  --text-2: #908caa;
+  --text-3: #6e6a86;
+  --brand: #c4a7e7;
+  --brand-2: #ebbcba;
+  --brand-weak: #2a2440;
+  --drawer: #16141f;
+  --primary-foreground: #191724;
+  --input: #26233a;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  html {
+    @apply font-sans;
+  }
+}
+
+/* custom scrollbars + animations from the design export */
+.bd-scroll::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+.bd-scroll::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 8px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+.bd-scroll::-webkit-scrollbar-thumb:hover {
+  background: var(--text-3);
+  background-clip: content-box;
+}
+.bd-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@keyframes bdFade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes bdPop {
+  from { transform: scale(0.9); opacity: 0; }
+  to { transform: scale(1); opacity: 1; }
+}
+
+/* Compact markdown prose for bead descriptions (components/description-content). */
+.bd-md > :first-child { margin-top: 0; }
+.bd-md > :last-child { margin-bottom: 0; }
+.bd-md p { margin: 0.5em 0; }
+.bd-md h1, .bd-md h2, .bd-md h3, .bd-md h4 { margin: 0.8em 0 0.4em; font-weight: 650; line-height: 1.25; }
+.bd-md h1 { font-size: 1.3em; }
+.bd-md h2 { font-size: 1.15em; }
+.bd-md h3 { font-size: 1.05em; }
+.bd-md ul, .bd-md ol { margin: 0.4em 0; padding-left: 1.4em; }
+.bd-md ul { list-style: disc; }
+.bd-md ol { list-style: decimal; }
+.bd-md li { margin: 0.15em 0; }
+/* GFM task lists render as a list item with a checkbox; drop the bullet. */
+.bd-md li:has(> input[type="checkbox"]) { list-style: none; margin-left: -1.2em; }
+.bd-md a { word-break: break-word; }
+.bd-md code {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.9em;
+  background: var(--surface-3);
+  padding: 0.1em 0.35em;
+  border-radius: 5px;
+}
+.bd-md pre {
+  margin: 0.6em 0;
+  padding: 10px 12px;
+  background: var(--surface-3);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow-x: auto;
+}
+.bd-md pre code { background: none; padding: 0; font-size: 0.86em; }
+.bd-md blockquote {
+  margin: 0.6em 0;
+  padding-left: 0.9em;
+  border-left: 3px solid var(--border-strong);
+  color: var(--text-3);
+}
+.bd-md table { border-collapse: collapse; margin: 0.6em 0; font-size: 0.95em; }
+.bd-md th, .bd-md td { border: 1px solid var(--border); padding: 4px 8px; text-align: left; }
+.bd-md hr { margin: 0.9em 0; border: none; border-top: 1px solid var(--border); }
+
+/* Syntax highlighting for fenced code blocks (rehype-highlight / highlight.js),
+   scoped to bead markdown. Token colors are theme-aware: a GitHub-light palette
+   by default, swapped to GitHub-dark whenever the `.dark` class is active (which
+   covers every custom dark theme too). Bead 5ov. */
+.bd-md {
+  --hl-comment: #6a737d;
+  --hl-keyword: #d73a49;
+  --hl-string: #032f62;
+  --hl-title: #6f42c1;
+  --hl-number: #005cc5;
+  --hl-attr: #e36209;
+  --hl-tag: #22863a;
+}
+.dark .bd-md {
+  --hl-comment: #8b949e;
+  --hl-keyword: #ff7b72;
+  --hl-string: #a5d6ff;
+  --hl-title: #d2a8ff;
+  --hl-number: #79c0ff;
+  --hl-attr: #ffa657;
+  --hl-tag: #7ee787;
+}
+.bd-md .hljs-comment, .bd-md .hljs-quote { color: var(--hl-comment); font-style: italic; }
+.bd-md .hljs-keyword, .bd-md .hljs-selector-tag, .bd-md .hljs-built_in,
+.bd-md .hljs-literal, .bd-md .hljs-doctag { color: var(--hl-keyword); }
+.bd-md .hljs-string, .bd-md .hljs-regexp, .bd-md .hljs-meta .hljs-string { color: var(--hl-string); }
+.bd-md .hljs-title, .bd-md .hljs-title.class_, .bd-md .hljs-title.function_,
+.bd-md .hljs-section { color: var(--hl-title); }
+.bd-md .hljs-number, .bd-md .hljs-variable, .bd-md .hljs-template-variable,
+.bd-md .hljs-symbol, .bd-md .hljs-bullet { color: var(--hl-number); }
+.bd-md .hljs-attr, .bd-md .hljs-attribute, .bd-md .hljs-type,
+.bd-md .hljs-params, .bd-md .hljs-meta { color: var(--hl-attr); }
+.bd-md .hljs-tag, .bd-md .hljs-name, .bd-md .hljs-selector-id,
+.bd-md .hljs-selector-class { color: var(--hl-tag); }
+.bd-md .hljs-emphasis { font-style: italic; }
+.bd-md .hljs-strong { font-weight: 600; }
+
+/* Brief highlight when jumping to an epic from a bead's detail drawer (bead 55b). */
+@keyframes epicFlash {
+  0% { box-shadow: 0 0 0 3px var(--brand); }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+.epic-flash { animation: epicFlash 1.5s ease-out; }
+
+/* React Flow zoom/fit/interactivity controls (bead bzl / gh-5).
+   The library's default control bar is light-on-white and becomes invisible on
+   dark themes. Re-skin it with the same theme tokens the graph already uses so
+   it stays legible in every theme. The `.react-flow` prefix outranks React
+   Flow's single-class defaults regardless of stylesheet import order, and the
+   tokens auto-switch between :root (light) and .dark. */
+.react-flow .react-flow__controls {
+  box-shadow: var(--shadow);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  overflow: hidden;
+}
+.react-flow .react-flow__controls-button {
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  color: var(--text-2);
+}
+.react-flow .react-flow__controls-button:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+.react-flow .react-flow__controls-button:last-child {
+  border-bottom: none;
+}
+.react-flow .react-flow__controls-button svg {
+  fill: currentColor;
+}

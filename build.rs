@@ -7,6 +7,16 @@ use std::{env, process::Command};
 use vergen_gix::{BuildBuilder, CargoBuilder, Emitter, RustcBuilder};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Warn if the `web` feature is enabled but the static assets haven't been
+    // built. The build-web.sh script must be run before cargo build in CI.
+    if std::env::var("CARGO_FEATURE_WEB").is_ok()
+        && !std::path::Path::new("src/web/static/index.html").exists()
+    {
+        println!("cargo:warning=Web UI assets not found (src/web/static/ is empty or missing).");
+        println!("cargo:warning=Run `bash scripts/build-web.sh` first, or omit `--features web`.");
+        println!("cargo:warning=The `br web` command will not work without these assets.");
+    }
+
     let build = BuildBuilder::default().build_timestamp(true).build()?;
     let cargo = CargoBuilder::default().target_triple(true).build()?;
     let rustc = RustcBuilder::default().semver(true).build()?;

@@ -1,0 +1,160 @@
+import "server-only";
+import { beadSchema, type Bead, type CreateInput, type UpdateInput, type DepType, type Dependency } from "./schema";
+import type { BeadsStore, DoctorInfo } from "./store";
+import { demoBeads } from "./demo-data";
+
+/**
+ * In-memory store backed by the demo dataset in `lib/demo-data.ts`. Used when bd
+ * isn't installed or when demo mode is forced (BEADS_DEMO env var / Settings
+ * toggle). Mutations persist for the life of the dev-server process.
+ */
+
+let beads: Bead[] = demoBeads();
+const nowIso = () => new Date().toISOString();
+
+function find(id: string): Bead {
+  const b = beads.find((x) => x.id === id);
+  if (!b) throw new Error(`bead not found: ${id}`);
+  return b;
+}
+
+export const demoStore: BeadsStore = {
+  kind: "demo",
+  async list() {
+    return beads.map((b) => ({ ...b }));
+  },
+  async get(id) {
+    return beads.find((b) => b.id === id) ?? null;
+  },
+  async create(input: CreateInput, actor: string) {
+    const id = "bd-" + Math.random().toString(16).slice(2, 6);
+    const dependencies: Dependency[] = [];
+    if (input.parent) dependencies.push({ issue_id: id, depends_on_id: input.parent, type: "parent-child" });
+    const bead = beadSchema.parse({
+      id,
+      title: input.title.trim(),
+      issue_type: input.issue_type,
+      status: input.backlog ? "deferred" : "open",
+      priority: input.priority,
+      assignee: input.assignee || "",
+      created_by: actor,
+      description: input.description ?? "",
+      created_at: nowIso(),
+      updated_at: nowIso(),
+      closed_at: null,
+      labels: input.labels ?? [],
+      dependencies,
+      comments: [],
+      parent: input.parent || null,
+    });
+    beads = [...beads, bead];
+    return bead;
+  },
+  async update(id, patch: UpdateInput) {
+    const b = find(id);
+    Object.assign(b, patch, { updated_at: nowIso() });
+    if (patch.status === "closed" && !b.closed_at) b.closed_at = nowIso();
+    // Reparenting: mirror bd's semantics (absent = leave alone, "" = detach)
+    // and keep the parent-child EDGE in sync with the field. The rest of the UI
+    // derives hierarchy from the edge — `bd export --json` never emits a
+    // `parent` field — so updating only `b.parent` would look correct in the
+    // drawer and silently do nothing on the board and list.
+    if (patch.parent !== undefined) {
+      b.parent = patch.parent || null;
+      b.dependencies = (b.dependencies ?? []).filter((d) => d.type !== "parent-child");
+      if (patch.parent) {
+        b.dependencies.push({
+          issue_id: b.id,
+          depends_on_id: patch.parent,
+          type: "parent-child",
+        });
+      }
+    }
+    return { ...b };
+  },
+  async setStatus(id, status, actor, reason) {
+    const b = find(id);
+    b.status = status;
+    b.updated_at = nowIso();
+    if (status === "in_progress" && !b.started_at) b.started_at = nowIso();
+    if (status === "closed") {
+      b.closed_at = nowIso();
+      // Mirror bd: closing with no reason still records the literal "Closed".
+      if (!b.close_reason) b.close_reason = reason?.trim() || "Closed";
+    } else {
+      // Mirror `bd reopen` / `bd update -s <open>`, which clear both fields.
+      b.closed_at = null;
+      b.close_reason = null;
+    }
+    return { ...b };
+  },
+  async remove(id) {
+    beads = beads.filter((b) => b.id !== id);
+  },
+  async addComment(id, text, actor) {
+    const b = find(id);
+    b.comments = [...(b.comments ?? []), { author: actor, text, created_at: nowIso() }];
+    b.updated_at = nowIso();
+    return { ...b };
+  },
+  async addDep(id, dependsOnId, type: DepType) {
+    const b = find(id);
+    b.dependencies = [...(b.dependencies ?? []), { issue_id: id, depends_on_id: dependsOnId, type }];
+    b.updated_at = nowIso();
+    return { ...b };
+  },
+  async removeDep(id, dependsOnId) {
+    const b = find(id);
+    b.dependencies = (b.dependencies ?? []).filter((d) => d.depends_on_id !== dependsOnId);
+    b.updated_at = nowIso();
+    return { ...b };
+  },
+  async createGate(blocks, reason, actor) {
+    const target = find(blocks);
+    const id = "gate-" + Math.random().toString(16).slice(2, 6);
+    const gate = beadSchema.parse({
+      id,
+      title: "Gate: human",
+      issue_type: "gate",
+      await_type: "human",
+      status: "open",
+      priority: 2,
+      created_by: actor,
+      description: `Ad-hoc gate blocking ${blocks}${reason ? `\n\nReason: ${reason}` : ""}`,
+      created_at: nowIso(),
+      updated_at: nowIso(),
+      closed_at: null,
+      labels: [],
+      dependencies: [],
+      comments: [],
+    });
+    beads = [...beads, gate];
+    // The target now waits on the gate; isBlocked() derives blocked-ness from
+    // this dep, and clears once the gate is closed (approved).
+    target.dependencies = [...(target.dependencies ?? []), { issue_id: blocks, depends_on_id: id, type: "blocks" }];
+    target.updated_at = nowIso();
+    return { ...gate };
+  },
+  async removeLabel(id, label) {
+    const b = find(id);
+    b.labels = (b.labels ?? []).filter((l) => l !== label);
+    b.updated_at = nowIso();
+    return { ...b };
+  },
+  async archive(id) {
+    const b = find(id);
+    b.status = "closed";
+    b.closed_at = nowIso();
+    if (!(b.labels ?? []).includes("archived")) b.labels = [...(b.labels ?? []), "archived"];
+    b.updated_at = nowIso();
+    return { ...b };
+  },
+  async doctor(): Promise<DoctorInfo> {
+    return {
+      kind: "demo",
+      ok: true,
+      repoPath: "(in-memory demo)",
+      message: "Demo mode — in-memory data seeded from the design export. Install bd and point Settings at a .beads repo to use real data.",
+    };
+  },
+};
