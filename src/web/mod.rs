@@ -20,10 +20,8 @@ use std::sync::Arc;
 /// Storage is NOT shared — each handler opens its own connection in a
 /// blocking task (SqliteStorage is !Send due to fsqlite's Rc internals).
 pub struct AppState {
-    /// Discovered beads directory path. Empty if no workspace found.
+    /// Discovered beads directory path.
     pub beads_dir: PathBuf,
-    /// Whether a valid beads workspace was found and storage opened.
-    pub has_workspace: bool,
     /// CLI overrides (db path, etc.).
     pub overrides: config::CliOverrides,
 }
@@ -38,36 +36,23 @@ pub struct AppState {
 /// Returns an error if storage can't be opened or the server fails to bind.
 #[allow(clippy::module_name_repetitions)]
 pub fn run_server(args: &WebArgs, overrides: &config::CliOverrides) -> Result<()> {
-    // Discover the beads workspace. If none is found, start with an empty
-    // state — the SPA and project picker still work; storage-backed API
-    // routes return appropriate errors.
-    let (beads_dir, has_workspace) = match config::discover_beads_dir_with_cli(overrides) {
-        Ok(dir) => {
-            match config::open_storage_with_cli(&dir, overrides) {
-                Ok(_) => (dir, true),
-                Err(e) => {
-                    eprintln!("{}", console_banner_no_workspace());
-                    eprintln!("  (storage: {e})");
-                    (dir, false)
-                }
-            }
-        }
-        Err(_) => {
-            eprintln!("{}", console_banner_no_workspace());
-            // Use a fallback path so AppState is valid.
-            (std::path::PathBuf::new(), false)
-        }
-    };
+    // Discover the beads workspace. br web requires an existing .beads/ dir.
+    let beads_dir = config::discover_beads_dir_with_cli(overrides).map_err(|_| {
+        let banner = console_banner_no_workspace();
+        BeadsError::Config(banner.to_string())
+    })?;
+    // Pre-flight: verify storage is accessible.
+    let _storage_ctx = config::open_storage_with_cli(&beads_dir, overrides)
+        .map_err(|e| BeadsError::Config(format!("Cannot open storage: {e}")))?;
 
     let state = Arc::new(AppState {
         beads_dir,
-        has_workspace,
         overrides: overrides.clone(),
     });
 
-    // Build the router with all API routes and static file fallback.
+    // Build the router with all API routes and static file serving.
     let app = Router::new()
-        .route("/", axum::routing::get(api::root_handler))
+        .route("/", axum::routing::get(|| async { axum::response::Redirect::temporary("/p/default") }))
         .route("/api/p/{project_id}/beads", axum::routing::get(api::list_beads).post(api::create_bead))
         .route(
             "/api/p/{project_id}/beads/{id}",

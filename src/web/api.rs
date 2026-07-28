@@ -11,7 +11,7 @@ use crate::storage::sqlite::{IssueUpdate, ListFilters};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    response::{IntoResponse, Redirect},
+    response::IntoResponse,
     Json,
 };
 use serde_json::{json, Value};
@@ -21,17 +21,6 @@ use std::sync::Arc;
 use tokio::task::spawn_blocking;
 
 use super::AppState;
-
-/// `GET /` — redirect to `/p/default` when a workspace is found.
-pub async fn root_handler(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
-    if state.has_workspace {
-        Redirect::temporary("/p/default").into_response()
-    } else {
-        (StatusCode::NOT_FOUND, "no workspace").into_response()
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -600,20 +589,6 @@ pub async fn archive_bead(
 pub async fn list_projects(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    let demo_project = json!({
-        "id": "demo",
-        "name": "Demo Project",
-        "path": null,
-        "hasBeads": false,
-    });
-
-    if !state.has_workspace || state.beads_dir.as_os_str().is_empty() {
-        return (
-            StatusCode::OK,
-            Json(json!({ "projects": [demo_project] })),
-        );
-    }
-
     let dir_name = state.beads_dir
         .parent()
         .and_then(|p| p.file_name())
@@ -627,7 +602,7 @@ pub async fn list_projects(
         "hasBeads": true,
     });
 
-    (StatusCode::OK, Json(json!({ "projects": [demo_project, project] })))
+    (StatusCode::OK, Json(json!({ "projects": [project] })))
 }
 
 // ---------------------------------------------------------------------------
