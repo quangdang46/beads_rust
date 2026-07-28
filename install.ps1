@@ -4,8 +4,7 @@
 
 .DESCRIPTION
     Installs the br CLI tool on Windows. Downloads the release binary from GitHub,
-    extracts it, and optionally configures MCP servers for 10 AI coding providers.
-    Mirrors the functionality of install.sh for Unix.
+    extracts it. Mirrors the functionality of install.sh for Unix.
 
 .PARAMETER Version
     Specific version to install (default: latest), e.g. v0.2.15
@@ -24,12 +23,6 @@
 
 .PARAMETER Quiet
     Suppress non-error output
-
-.PARAMETER SkipSkills
-    Don't install any Claude Code / Codex skills
-
-.PARAMETER WithMigrationSkill
-    Install the bd-to-br-migration skill (opt-in)
 
 .PARAMETER Uninstall
     Remove br and clean up
@@ -58,8 +51,6 @@ param(
     [switch]$EasyMode = $false,
     [switch]$Verify = $false,
     [switch]$Quiet = $false,
-    [switch]$SkipSkills = $false,
-    [switch]$WithMigrationSkill = $false,
     [switch]$Uninstall = $false,
     [switch]$Help = $false
 )
@@ -104,8 +95,6 @@ OPTIONS:
   --easy-mode            Auto-update PATH in user environment
   --verify               Run self-test after install
   --quiet                Suppress non-error output
-  --skip-skills          Don't install any Claude Code / Codex skills
-  --with-migration-skill Install the bd-to-br-migration skill (opt-in)
   --uninstall            Remove br and clean up
   --help                 Show this help
 
@@ -216,9 +205,6 @@ function Do-Uninstall {
         [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
         Write-Info "Cleaned PATH (user)"
     }
-
-    # Remove MCP configs from all providers
-    Remove-McpConfigs
 
     Write-Success "br uninstalled successfully"
     exit 0
@@ -438,244 +424,6 @@ function Update-Path {
 }
 
 # ============================================================================
-# JSON merge helper
-# ============================================================================
-function Merge-JsonIntoFile {
-    param([string]$FilePath, [string]$Key, [hashtable]$Value)
-
-    $dir = Split-Path $FilePath -Parent
-    if (-not (Test-Path $dir)) {
-        New-Item -Path $dir -ItemType Directory -Force | Out-Null
-    }
-
-    $data = @{}
-    if (Test-Path $FilePath) {
-        try {
-            $content = Get-Content -Path $FilePath -Raw -ErrorAction Stop
-            if ($content) {
-                $data = $content | ConvertFrom-Json -AsHashtable
-            }
-        } catch {
-            Write-Step "Could not parse $FilePath, creating new"
-        }
-    }
-
-    if (-not $data.ContainsKey($Key)) { $data[$Key] = @{} }
-    foreach ($k in $Value.Keys) {
-        $data[$Key][$k] = $Value[$k]
-    }
-
-    $json = $data | ConvertTo-Json -Depth 10
-    Set-Content -Path $FilePath -Value $json -Encoding UTF8
-    Write-Step "Updated $FilePath"
-}
-
-function Remove-JsonKey {
-    param([string]$FilePath, [string]$ParentKey, [string]$ServerKey)
-
-    if (-not (Test-Path $FilePath)) { return }
-    try {
-        $data = Get-Content -Path $FilePath -Raw | ConvertFrom-Json -AsHashtable
-        if ($data.ContainsKey($ParentKey) -and $data[$ParentKey].ContainsKey($ServerKey)) {
-            $data[$ParentKey].Remove($ServerKey)
-            $json = $data | ConvertTo-Json -Depth 10
-            Set-Content -Path $FilePath -Value $json -Encoding UTF8
-            Write-Step "Removed $ServerKey from $FilePath"
-        }
-    } catch { }
-}
-
-# ============================================================================
-# MCP Provider Auto-Configuration
-# ============================================================================
-function Get-McpEntry {
-    param([string]$BinaryPath)
-    return @{
-        "$(Split-Path $BinaryPath -Leaf)" = @{
-            command = $BinaryPath
-            args = @()
-            env = @{}
-        }
-    }
-}
-
-function Configure-AllMcpProviders {
-    param([string]$BinaryPath)
-    Write-Info "Configuring MCP for AI coding providers..."
-
-    # 1. Claude Code — ~\.claude.json
-    $claudeJsonPath = Join-Path $env:USERPROFILE ".claude.json"
-    Merge-JsonIntoFile -FilePath $claudeJsonPath -Key "mcpServers" -Value (Get-McpEntry -BinaryPath $BinaryPath)
-
-    # 2. Cursor — ~\.cursor\mcp.json
-    $cursorDir = Join-Path $env:USERPROFILE ".cursor"
-    $cursorMcpPath = Join-Path $cursorDir "mcp.json"
-    Merge-JsonIntoFile -FilePath $cursorMcpPath -Key "mcpServers" -Value (Get-McpEntry -BinaryPath $BinaryPath)
-
-    # 3. Cline — %APPDATA%\Code\User\globalStorage\saoudrizwan.claude-dev\settings\cline_mcp_settings.json
-    $clineDir = Join-Path $env:APPDATA "Code\User\globalStorage\saoudrizwan.claude-dev\settings"
-    if (Test-Path $clineDir) {
-        $clinePath = Join-Path $clineDir "cline_mcp_settings.json"
-        Merge-JsonIntoFile -FilePath $clinePath -Key "mcpServers" -Value (Get-McpEntry -BinaryPath $BinaryPath)
-    }
-
-    # 4. Windsurf — ~\.codeium\windsurf\mcp_config.json
-    $windsurfDir = Join-Path $env:USERPROFILE ".codeium\windsurf"
-    $windsurfPath = Join-Path $windsurfDir "mcp_config.json"
-    Merge-JsonIntoFile -FilePath $windsurfPath -Key "mcpServers" -Value (Get-McpEntry -BinaryPath $BinaryPath)
-
-    # 5. VS Code Copilot — ~\.vscode\mcp.json with "servers" key
-    $vscodeDir = Join-Path $env:USERPROFILE ".vscode"
-    $vscodeMcpPath = Join-Path $vscodeDir "mcp.json"
-    Merge-JsonIntoFile -FilePath $vscodeMcpPath -Key "servers" -Value (Get-McpEntry -BinaryPath $BinaryPath)
-
-    # 6. OpenCode — ~\.opencode.json (env as array)
-    $opencodePath = Join-Path $env:USERPROFILE ".opencode.json"
-    if (Test-Path $opencodePath) {
-        $opencodeEntry = @{
-            "$(Split-Path $BinaryPath -Leaf)" = @{
-                type = "stdio"
-                command = $BinaryPath
-                args = @()
-                env = @()
-            }
-        }
-        Merge-JsonIntoFile -FilePath $opencodePath -Key "mcpServers" -Value $opencodeEntry
-    }
-
-    # 7. Gemini CLI — ~\.gemini\settings.json
-    $geminiDir = Join-Path $env:USERPROFILE ".gemini"
-    if (Test-Path $geminiDir) {
-        $geminiPath = Join-Path $geminiDir "settings.json"
-        Merge-JsonIntoFile -FilePath $geminiPath -Key "mcpServers" -Value (Get-McpEntry -BinaryPath $BinaryPath)
-    }
-
-    # 8. Amazon Q — both mcp.json and default.json
-    $amazonqDir = Join-Path $env:USERPROFILE ".aws\amazonq"
-    if (Test-Path $amazonqDir) {
-        Merge-JsonIntoFile -FilePath (Join-Path $amazonqDir "mcp.json") -Key "mcpServers" -Value (Get-McpEntry -BinaryPath $BinaryPath)
-        Merge-JsonIntoFile -FilePath (Join-Path $amazonqDir "default.json") -Key "mcpServers" -Value (Get-McpEntry -BinaryPath $BinaryPath)
-    }
-
-    # 9. Warp — .warp\.mcp.json (project-scoped)
-    $warpPath = ".warp\.mcp.json"
-    if (Test-Path ".warp") {
-        Merge-JsonIntoFile -FilePath $warpPath -Key "mcpServers" -Value (Get-McpEntry -BinaryPath $BinaryPath)
-    }
-
-    # 10. Codex CLI — ~\.codex\config.toml
-    $codexDir = Join-Path $env:USERPROFILE ".codex"
-    $codexConfig = Join-Path $codexDir "config.toml"
-    if (Test-Path $codexDir) {
-        $serverName = Split-Path $BinaryPath -Leaf
-        $tomlEntry = @"
-
-[mcp_servers.${serverName}]
-type = "stdio"
-command = "$BinaryPath"
-args = []
-"@
-        if (-not (Test-Path $codexConfig)) {
-            Set-Content -Path $codexConfig -Value "" -Encoding UTF8
-        }
-        Add-Content -Path $codexConfig -Value $tomlEntry -Encoding UTF8
-        Write-Step "Updated $codexConfig"
-    }
-
-    Write-Success "MCP configuration complete (10 providers)"
-}
-
-function Remove-McpConfigs {
-    # Remove from all provider config files
-    Remove-JsonKey -FilePath (Join-Path $env:USERPROFILE ".claude.json") -ParentKey "mcpServers" -ServerKey "br"
-    Remove-JsonKey -FilePath (Join-Path $env:USERPROFILE ".cursor\mcp.json") -ParentKey "mcpServers" -ServerKey "br"
-
-    $clineDir = Join-Path $env:APPDATA "Code\User\globalStorage\saoudrizwan.claude-dev\settings"
-    Remove-JsonKey -FilePath (Join-Path $clineDir "cline_mcp_settings.json") -ParentKey "mcpServers" -ServerKey "br"
-
-    Remove-JsonKey -FilePath (Join-Path $env:USERPROFILE ".codeium\windsurf\mcp_config.json") -ParentKey "mcpServers" -ServerKey "br"
-    Remove-JsonKey -FilePath (Join-Path $env:USERPROFILE ".vscode\mcp.json") -ParentKey "servers" -ServerKey "br"
-    Remove-JsonKey -FilePath (Join-Path $env:USERPROFILE ".opencode.json") -ParentKey "mcpServers" -ServerKey "br"
-    Remove-JsonKey -FilePath (Join-Path $env:USERPROFILE ".gemini\settings.json") -ParentKey "mcpServers" -ServerKey "br"
-
-    $amazonqDir = Join-Path $env:USERPROFILE ".aws\amazonq"
-    Remove-JsonKey -FilePath (Join-Path $amazonqDir "mcp.json") -ParentKey "mcpServers" -ServerKey "br"
-    Remove-JsonKey -FilePath (Join-Path $amazonqDir "default.json") -ParentKey "mcpServers" -ServerKey "br"
-
-    # Codex TOML
-    $codexConfig = Join-Path $env:USERPROFILE ".codex\config.toml"
-    if (Test-Path $codexConfig) {
-        $content = Get-Content $codexConfig -Raw
-        $content = $content -replace "(?s)\[mcp_servers\.[^\]]+\].*?(?=\[|$)", ""
-        Set-Content -Path $codexConfig -Value $content.Trim() -Encoding UTF8
-    }
-}
-
-# ============================================================================
-# Install skills
-# ============================================================================
-function Install-Skills {
-    if ($SkipSkills) {
-        Write-Info "Skipping skills installation (--skip-skills)"
-        return
-    }
-
-    Write-Info "Installing Claude Code / Codex skills..."
-
-    $skillsBaseUrl = "https://raw.githubusercontent.com/$($Script:Owner)/$($Script:Repo)/main/skills"
-    $claudeSkillsDir = "$env:USERPROFILE\.claude\skills"
-    $codexSkillsDir = "$env:USERPROFILE\.codex\skills"
-
-    $skillName = "bd-to-br-migration"
-    $files = @(
-        "SKILL.md",
-        "SELF-TEST.md",
-        "references/TRANSFORMS.md",
-        "references/BULK.md",
-        "references/PITFALLS.md",
-        "scripts/find-bd-refs.sh",
-        "scripts/verify-migration.sh",
-        "subagents/batch-migrator.md"
-    )
-
-    if (-not $WithMigrationSkill) {
-        Write-Info "Skipping skill: $skillName (opt-in via --with-migration-skill)"
-        return
-    }
-
-    $filesInstalled = 0
-    foreach ($file in $files) {
-        $url = "$skillsBaseUrl/$skillName/$file"
-        $claudeDest = "$claudeSkillsDir\$skillName\$file"
-
-        # Ensure directory exists
-        $destDir = Split-Path $claudeDest -Parent
-        if (-not (Test-Path $destDir)) {
-            New-Item -Path $destDir -ItemType Directory -Force | Out-Null
-        }
-
-        if (Download-File -Url $url -DestPath $claudeDest) {
-            $filesInstalled++
-            Write-Step "Downloaded $file"
-
-            # Copy to Codex skills
-            $codexDest = "$codexSkillsDir\$skillName\$file"
-            $codexDestDir = Split-Path $codexDest -Parent
-            if (-not (Test-Path $codexDestDir)) {
-                New-Item -Path $codexDestDir -ItemType Directory -Force | Out-Null
-            }
-            Copy-Item -Path $claudeDest -Destination $codexDest -Force -ErrorAction SilentlyContinue
-        }
-    }
-
-    if ($filesInstalled -gt 0) {
-        Write-Success "Installed skill: $skillName ($filesInstalled files)"
-    } else {
-        Write-Warn "Skill ${skillName}: no files could be downloaded"
-    }
-}
-
-# ============================================================================
 # Print summary
 # ============================================================================
 function Print-Summary {
@@ -730,8 +478,6 @@ function Main {
         # Post-install (auto-add to PATH)
         $EasyMode = $true
         Update-Path
-        Configure-AllMcpProviders -BinaryPath $destPath
-        Install-Skills
 
         # Verify
         if ($Verify) {
