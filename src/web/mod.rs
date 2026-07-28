@@ -1,0 +1,222 @@
+//! Embedded web UI server for `br`.
+//!
+//! Serves a static Next.js SPA and a REST API that maps to br's storage layer.
+//! Built only in CI via `scripts/build-web.sh`; the static files are embedded
+//! via `rust-embed` at compile time.
+
+mod api;
+mod assets;
+
+use crate::cli::WebArgs;
+use crate::config;
+use crate::error::{BeadsError, Result};
+use axum::Router;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+/// Shared application state available to all route handlers.
+///
+/// Storage is NOT shared — each handler opens its own connection in a
+/// blocking task (SqliteStorage is !Send due to fsqlite's Rc internals).
+pub struct AppState {
+    /// Discovered beads directory path.
+    pub beads_dir: PathBuf,
+    /// CLI overrides (db path, etc.).
+    pub overrides: config::CliOverrides,
+}
+
+/// Start the web UI server.
+///
+/// Discovers the beads workspace, builds the router, and binds the HTTP
+/// server. Opens a browser unless `--no-open` is set.
+///
+/// # Errors
+///
+/// Returns an error if storage can't be opened or the server fails to bind.
+#[allow(clippy::module_name_repetitions)]
+pub fn run_server(args: &WebArgs, overrides: &config::CliOverrides) -> Result<()> {
+    // br web only looks for .beads/ in the current directory — never walks up.
+    let beads_dir = if let Some(db_path) = overrides.db.as_ref() {
+        let dir = if db_path.is_dir() {
+            db_path.join(".beads")
+        } else {
+            db_path.parent().map(|p| p.join(".beads")).unwrap_or(db_path.join(".beads"))
+        };
+        if dir.is_dir() {
+            dir
+        } else {
+            return Err(BeadsError::Config(format!("no .beads/ at db path")));
+        }
+    } else {
+        let cwd = std::env::current_dir().map_err(|_| BeadsError::Config("cannot get current directory".into()))?;
+        let candidate = cwd.join(".beads");
+        if candidate.is_dir() {
+            candidate
+        } else {
+            let banner = console_banner_no_workspace();
+            return Err(BeadsError::Config(banner.to_string()));
+        }
+    };
+    // Pre-flight: verify storage is accessible.
+    let _storage_ctx = config::open_storage_with_cli(&beads_dir, overrides)
+        .map_err(|e| BeadsError::Config(format!("Cannot open storage: {e}")))?;
+
+    let state = Arc::new(AppState {
+        beads_dir,
+        overrides: overrides.clone(),
+    });
+
+    // Build the router with all API routes and static file serving.
+    let app = Router::new()
+        .route("/", axum::routing::get(|| async { axum::response::Redirect::temporary("/p/default") }))
+        // Beads CRUD
+        .route("/api/p/{project_id}/beads", axum::routing::get(api::list_beads).post(api::create_bead))
+        .route("/api/p/{project_id}/beads/{id}", axum::routing::get(api::get_bead).patch(api::update_bead).delete(api::delete_bead))
+        .route("/api/p/{project_id}/beads/{id}/status", axum::routing::post(api::set_status))
+        .route("/api/p/{project_id}/beads/{id}/comments", axum::routing::post(api::add_comment))
+        .route("/api/p/{project_id}/beads/{id}/deps", axum::routing::post(api::add_dep).delete(api::remove_dep))
+        .route("/api/p/{project_id}/beads/{id}/archive", axum::routing::post(api::archive_bead))
+        .route("/api/p/{project_id}/beads/{id}/gate", axum::routing::post(api::stub_created))
+        .route("/api/p/{project_id}/beads/{id}/assist", axum::routing::post(api::stub_assist))
+        .route("/api/p/{project_id}/beads/{id}/human", axum::routing::post(api::stub_created))
+        // Views
+        .route("/api/p/{project_id}/insights", axum::routing::get(api::stub_insights))
+        .route("/api/p/{project_id}/activity", axum::routing::get(api::stub_empty_activity))
+        .route("/api/p/{project_id}/gamification", axum::routing::get(api::stub_gamification))
+        // Attachments
+        .route("/api/p/{project_id}/attachments", axum::routing::post(api::stub_json))
+        .route("/api/p/{project_id}/attachments/{*path}", axum::routing::post(api::stub_json).put(api::stub_json))
+        // Board order
+        .route("/api/p/{project_id}/order", axum::routing::get(api::stub_empty_orders).put(api::stub_empty_orders))
+        // Publish / showcase
+        .route("/api/p/{project_id}/publish", axum::routing::post(api::stub_json))
+        // Projects
+        .route("/api/projects", axum::routing::get(api::list_projects))
+        .route("/api/projects/{id}", axum::routing::patch(api::stub_json).delete(api::stub_json))
+        // Config & diagnostics
+        .route("/api/p/{project_id}/doctor", axum::routing::get(api::doctor))
+        .route("/api/config", axum::routing::get(api::get_config).put(api::update_config))
+        .route("/api/fs", axum::routing::get(api::stub_fs))
+        // Self-update
+        .route("/api/update/check", axum::routing::get(api::stub_update_check))
+        .route("/api/update/run", axum::routing::post(api::stub_json))
+        .fallback_service(axum::routing::get(assets::serve_static))
+        .layer(tower_http::cors::CorsLayer::permissive())
+        .with_state(state);
+
+    // Bind with auto port-pick: default 3000, try +1 +2 … if busy.
+    let requested = args.port.unwrap_or(3000);
+    let listener = bind_first_free(&args.host, requested, args.strict_port)?;
+    listener.set_nonblocking(true).map_err(|e| BeadsError::Config(format!("nonblock: {e}")))?;
+    let actual = listener.local_addr().map_err(|e| BeadsError::Config(format!("addr: {e}")))?;
+
+    eprintln!(
+        "  br web → http://{}:{}/\n  (Ctrl+C to stop)",
+        actual.ip(),
+        actual.port()
+    );
+
+    if !args.no_open {
+        open_browser(&format!("http://{}:{}/", actual.ip(), actual.port()));
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| BeadsError::Config(format!("Failed to start runtime: {e}")))?;
+
+    rt.block_on(async {
+        let tokio_listener = tokio::net::TcpListener::from_std(listener)
+            .map_err(|e| BeadsError::Config(format!("listener: {e}")))?;
+
+        axum::serve(tokio_listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+            .map_err(|e| BeadsError::Config(format!("Server error: {e}")))?;
+
+        Ok::<(), BeadsError>(())
+    })?;
+
+    Ok(())
+}
+
+/// Bind to host:port. If busy and !strict, try port+1, port+2 … up to +50.
+fn bind_first_free(host: &str, port: u16, strict: bool) -> Result<std::net::TcpListener> {
+    let limit = if strict { 1 } else { 50 };
+    for offset in 0..limit {
+        let p = port + offset;
+        let addr: SocketAddr = format!("{host}:{p}")
+            .parse()
+            .map_err(|e| BeadsError::Config(format!("invalid addr: {e}")))?;
+        match std::net::TcpListener::bind(addr) {
+            Ok(l) => {
+                if offset > 0 {
+                    eprintln!("  Port {port} busy → using {p}");
+                }
+                return Ok(l);
+            }
+            Err(_) if offset < limit - 1 => continue,
+            Err(e) => {
+                if strict || limit == 1 {
+                    return Err(BeadsError::Config(format!("Failed to bind {host}:{port}: {e}")));
+                }
+                return Err(BeadsError::Config(format!(
+                    "Could not find a free port near {port} (tried {host}:{port}-{}): {e}",
+                    port + limit - 1
+                )));
+            }
+        }
+    }
+    Err(BeadsError::Config("unreachable".into()))
+}
+
+/// Open a browser to the given URL, best-effort per platform.
+fn open_browser(url: &str) {
+    #[cfg(target_os = "macos")]
+    { let _ = std::process::Command::new("open").arg(url).spawn(); }
+    #[cfg(target_os = "linux")]
+    { let _ = std::process::Command::new("xdg-open").arg(url).spawn(); }
+    #[cfg(target_os = "windows")]
+    { let _ = std::process::Command::new("cmd").args(["/c", "start", "", url]).spawn(); }
+}
+
+/// Wait for SIGINT/SIGTERM and initiate graceful shutdown.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    eprintln!("\n  Shutting down…");
+}
+
+const fn console_banner_no_workspace() -> &'static str {
+    concat!(
+        "╔═══════════════════════════════════════════════╗\n",
+        "║  No beads workspace found in this directory   ║\n",
+        "║                                               ║\n",
+        "║  Run `br init` to create one, then retry.     ║\n",
+        "║                                               ║\n",
+        "║  Or run from a directory that has a `.beads/` ║\n",
+        "║  folder, or pass --db /path/to/beads.db       ║\n",
+        "╚═══════════════════════════════════════════════╝"
+    )
+}
