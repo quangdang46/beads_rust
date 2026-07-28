@@ -408,7 +408,9 @@ usage() {
         gum style --faint "    --verify           Run self-test after install"
         gum style --faint "    --quiet            Suppress progress messages"
         gum style --faint "    --no-gum           Disable gum formatting"
-        gum style --faint "    --skip-skills      Don't install any Claude/Codex skills"
+        echo ""
+        gum style --foreground 39 "  Skills"
+        gum style --faint "    --skip-skills          Don't install any Claude/Codex skills"
         gum style --faint "    --with-migration-skill  Install the bd-to-br-migration skill (opt-in)"
         echo ""
         gum style --foreground 39 "  Maintenance"
@@ -1664,3 +1666,4 @@ main() {
 if [[ "${BASH_SOURCE[0]:-}" == "${0:-}" ]] || [[ -z "${BASH_SOURCE[0]:-}" ]]; then
     { main "$@"; }
 fi
+
