@@ -17,41 +17,31 @@ use rust_embed::RustEmbed;
 #[folder = "src/web/static/"]
 struct WebAssets;
 
-/// Serve a static file, or fall back to `index.html` for SPA routing.
+/// Serve a static file. Next.js static export maps each page route to
+/// `{path}.html` (e.g. `/p/default` → `p/default.html`).
+/// If the requested path has no file extension, try appending `.html`.
 pub async fn serve_static(req: Request) -> impl IntoResponse {
     let uri = req.uri().clone();
     let path = uri.path().trim_start_matches('/');
 
-    // If the path is empty, serve index.html.
     if path.is_empty() {
         return serve_file("index.html").await;
     }
 
-    // Try to serve the exact file.
+    // Exact file match first (CSS, JS, favicon, etc.)
     if let Some(resp) = try_serve_file(path).await {
         return resp;
     }
 
-    // Next.js static export generates HTML files for each route:
-    //   /p/default  →  p/default.html
-    // Try appending .html before falling back to index.html.
-    let html_path = format!("{path}.html");
-    if let Some(resp) = try_serve_file(&html_path).await {
-        return resp;
+    // Static export page route: /p/default → p/default.html
+    if !path.contains('.') {
+        let html_path = format!("{path}.html");
+        if let Some(resp) = try_serve_file(&html_path).await {
+            return resp;
+        }
     }
 
-    // If the path looks like a file (has an extension), return 404.
-    if path.contains('.') {
-        return (
-            StatusCode::NOT_FOUND,
-            [(header::CONTENT_TYPE, "text/plain")],
-            "Not found",
-        )
-            .into_response();
-    }
-
-    // Otherwise, it's a client-side route — serve index.html for SPA routing.
-    serve_file("index.html").await
+    (StatusCode::NOT_FOUND, [(header::CONTENT_TYPE, "text/plain")], "Not found").into_response()
 }
 
 async fn serve_file(path: &str) -> Response {
