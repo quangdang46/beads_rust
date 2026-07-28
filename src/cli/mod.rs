@@ -3852,9 +3852,13 @@ pub struct UpgradeArgs {
 #[cfg(feature = "web")]
 #[derive(Args, Debug, Clone)]
 pub struct WebArgs {
-    /// Port to listen on (default: 3000)
-    #[arg(long, short = 'p', default_value = "3000")]
-    pub port: u16,
+    /// Port to listen on (default: 3000, auto-picks next free if busy)
+    #[arg(long, short = 'p')]
+    pub port: Option<u16>,
+
+    /// No port auto-pick: fail if the requested port is busy
+    #[arg(long)]
+    pub strict_port: bool,
 
     /// Host to bind (default: 127.0.0.1)
     #[arg(long, default_value = "127.0.0.1")]
@@ -3876,7 +3880,8 @@ pub struct WebArgs {
 impl Default for WebArgs {
     fn default() -> Self {
         Self {
-            port: 3000,
+            port: None,
+            strict_port: false,
             host: "127.0.0.1".into(),
             no_open: false,
             db: None,

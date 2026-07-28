@@ -105,17 +105,19 @@ pub fn run_server(args: &WebArgs, overrides: &config::CliOverrides) -> Result<()
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(state);
 
-    let addr: SocketAddr = format!("{}:{}", args.host, args.port)
-        .parse()
-        .map_err(|e| BeadsError::Config(format!("Invalid address: {e}")))?;
+    // Bind with auto port-pick: default 3000, try +1 +2 … if busy.
+    let requested = args.port.unwrap_or(3000);
+    let listener = bind_first_free(&args.host, requested, args.strict_port)?;
+    let actual = listener.local_addr().map_err(|e| BeadsError::Config(format!("addr: {e}")))?;
 
     eprintln!(
         "  br web → http://{}:{}/\n  (Ctrl+C to stop)",
-        args.host, args.port
+        actual.ip(),
+        actual.port()
     );
 
     if !args.no_open {
-        open_browser(&format!("http://{}:{}/", args.host, args.port));
+        open_browser(&format!("http://{}:{}/", actual.ip(), actual.port()));
     }
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -124,11 +126,10 @@ pub fn run_server(args: &WebArgs, overrides: &config::CliOverrides) -> Result<()
         .map_err(|e| BeadsError::Config(format!("Failed to start runtime: {e}")))?;
 
     rt.block_on(async {
-        let listener = tokio::net::TcpListener::bind(addr)
-            .await
-            .map_err(|e| BeadsError::Config(format!("Failed to bind {addr}: {e}")))?;
+        let tokio_listener = tokio::net::TcpListener::from_std(listener)
+            .map_err(|e| BeadsError::Config(format!("listener: {e}")))?;
 
-        axum::serve(listener, app)
+        axum::serve(tokio_listener, app)
             .with_graceful_shutdown(shutdown_signal())
             .await
             .map_err(|e| BeadsError::Config(format!("Server error: {e}")))?;
@@ -137,6 +138,36 @@ pub fn run_server(args: &WebArgs, overrides: &config::CliOverrides) -> Result<()
     })?;
 
     Ok(())
+}
+
+/// Bind to host:port. If busy and !strict, try port+1, port+2 … up to +50.
+fn bind_first_free(host: &str, port: u16, strict: bool) -> Result<std::net::TcpListener> {
+    let limit = if strict { 1 } else { 50 };
+    for offset in 0..limit {
+        let p = port + offset;
+        let addr: SocketAddr = format!("{host}:{p}")
+            .parse()
+            .map_err(|e| BeadsError::Config(format!("invalid addr: {e}")))?;
+        match std::net::TcpListener::bind(addr) {
+            Ok(l) => {
+                if offset > 0 {
+                    eprintln!("  Port {port} busy → using {p}");
+                }
+                return Ok(l);
+            }
+            Err(_) if offset < limit - 1 => continue,
+            Err(e) => {
+                if strict || limit == 1 {
+                    return Err(BeadsError::Config(format!("Failed to bind {host}:{port}: {e}")));
+                }
+                return Err(BeadsError::Config(format!(
+                    "Could not find a free port near {port} (tried {host}:{port}-{}): {e}",
+                    port + limit - 1
+                )));
+            }
+        }
+    }
+    Err(BeadsError::Config("unreachable".into()))
 }
 
 /// Open a browser to the given URL, best-effort per platform.
