@@ -70,33 +70,37 @@ pub fn run_server(args: &WebArgs, overrides: &config::CliOverrides) -> Result<()
     // Build the router with all API routes and static file serving.
     let app = Router::new()
         .route("/", axum::routing::get(|| async { axum::response::Redirect::temporary("/p/default") }))
+        // Beads CRUD
         .route("/api/p/{project_id}/beads", axum::routing::get(api::list_beads).post(api::create_bead))
-        .route(
-            "/api/p/{project_id}/beads/{id}",
-            axum::routing::get(api::get_bead).patch(api::update_bead).delete(api::delete_bead),
-        )
-        .route(
-            "/api/p/{project_id}/beads/{id}/status",
-            axum::routing::post(api::set_status),
-        )
-        .route(
-            "/api/p/{project_id}/beads/{id}/comments",
-            axum::routing::post(api::add_comment),
-        )
-        .route(
-            "/api/p/{project_id}/beads/{id}/deps",
-            axum::routing::post(api::add_dep).delete(api::remove_dep),
-        )
-        .route(
-            "/api/p/{project_id}/beads/{id}/archive",
-            axum::routing::post(api::archive_bead),
-        )
+        .route("/api/p/{project_id}/beads/{id}", axum::routing::get(api::get_bead).patch(api::update_bead).delete(api::delete_bead))
+        .route("/api/p/{project_id}/beads/{id}/status", axum::routing::post(api::set_status))
+        .route("/api/p/{project_id}/beads/{id}/comments", axum::routing::post(api::add_comment))
+        .route("/api/p/{project_id}/beads/{id}/deps", axum::routing::post(api::add_dep).delete(api::remove_dep))
+        .route("/api/p/{project_id}/beads/{id}/archive", axum::routing::post(api::archive_bead))
+        .route("/api/p/{project_id}/beads/{id}/gate", axum::routing::post(api::stub_created))
+        .route("/api/p/{project_id}/beads/{id}/assist", axum::routing::post(api::stub_assist))
+        .route("/api/p/{project_id}/beads/{id}/human", axum::routing::post(api::stub_created))
+        // Views
+        .route("/api/p/{project_id}/insights", axum::routing::get(api::stub_insights))
+        .route("/api/p/{project_id}/activity", axum::routing::get(api::stub_empty_activity))
+        .route("/api/p/{project_id}/gamification", axum::routing::get(api::stub_gamification))
+        // Attachments
+        .route("/api/p/{project_id}/attachments", axum::routing::post(api::stub_json))
+        .route("/api/p/{project_id}/attachments/{*path}", axum::routing::post(api::stub_json).put(api::stub_json))
+        // Board order
+        .route("/api/p/{project_id}/order", axum::routing::get(api::stub_empty_orders).put(api::stub_empty_orders))
+        // Publish / showcase
+        .route("/api/p/{project_id}/publish", axum::routing::post(api::stub_json))
+        // Projects
         .route("/api/projects", axum::routing::get(api::list_projects))
-        .route(
-            "/api/p/{project_id}/doctor",
-            axum::routing::get(api::doctor),
-        )
+        .route("/api/projects/{id}", axum::routing::patch(api::stub_json).delete(api::stub_json))
+        // Config & diagnostics
+        .route("/api/p/{project_id}/doctor", axum::routing::get(api::doctor))
         .route("/api/config", axum::routing::get(api::get_config).put(api::update_config))
+        .route("/api/fs", axum::routing::get(api::stub_fs))
+        // Self-update
+        .route("/api/update/check", axum::routing::get(api::stub_update_check))
+        .route("/api/update/run", axum::routing::post(api::stub_json))
         .fallback_service(axum::routing::get(assets::serve_static))
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(state);

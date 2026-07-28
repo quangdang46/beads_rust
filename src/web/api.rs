@@ -631,6 +631,11 @@ pub async fn doctor(
             "id": "default",
             "name": project_name,
             "path": state.beads_dir.parent().and_then(|p| p.to_str()),
+        },
+        "config": {
+            "humanActor": "",
+            "humanAllowlist": [],
+            "pollIntervalMs": 5000
         }
     })))
 }
@@ -664,5 +669,60 @@ pub async fn update_config(
         "projects": [],
         "orders": {},
         "gamification": false,
+    })))
+}
+
+// ---- Stub handlers for all remaining API endpoints ----
+
+pub async fn stub_json() -> impl IntoResponse {
+    (StatusCode::OK, Json(json!({})))
+}
+
+pub async fn stub_created() -> impl IntoResponse {
+    (StatusCode::CREATED, Json(json!({})))
+}
+
+pub async fn stub_assist() -> impl IntoResponse {
+    (StatusCode::OK, Json(json!({
+        "description": "", "acceptance": "", "labels": [], "duplicates": []
+    })))
+}
+
+pub async fn stub_empty_activity() -> impl IntoResponse {
+    (StatusCode::OK, Json(json!({ "items": [] })))
+}
+
+pub async fn stub_empty_orders() -> impl IntoResponse {
+    (StatusCode::OK, Json(json!({ "orders": {} })))
+}
+
+pub async fn stub_insights() -> impl IntoResponse {
+    (StatusCode::OK, Json(json!({
+        "days": 30,
+        "throughput": [],
+        "createdClosed": [],
+        "cycle": { "overall": { "p50": 0, "p90": 0, "count": 0 }, "human": { "p50": 0, "p90": 0, "count": 0 }, "agent": { "p50": 0, "p90": 0, "count": 0 } },
+        "aging": [],
+        "columns": [],
+        "hasEvents": false
+    })))
+}
+
+pub async fn stub_gamification() -> impl IntoResponse {
+    (StatusCode::OK, Json(json!({
+        "actors": [], "totalXp": 0, "totalClosed": 0,
+        "you": { "actor": "", "origin": "human", "xp": 0, "closed": 0, "currentStreak": 0, "longestStreak": 0, "level": 0, "intoLevel": 0, "span": 0, "progress": 0, "badges": [] }
+    })))
+}
+
+pub async fn stub_fs() -> impl IntoResponse {
+    (StatusCode::OK, Json(json!({
+        "path": "", "parent": null, "home": "", "hasBeads": false, "entries": []
+    })))
+}
+
+pub async fn stub_update_check() -> impl IntoResponse {
+    (StatusCode::OK, Json(json!({
+        "isGitRepo": false, "supervised": false, "behind": 0, "localSha": "", "remoteSha": ""
     })))
 }
