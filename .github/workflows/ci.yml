@@ -25,8 +25,13 @@ jobs:
         with:
           components: rustfmt
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
       - run: cargo fmt --all -- --check
         if: matrix.os == 'ubuntu-latest'
+      - name: Build web UI assets
+        run: bash scripts/build-web.sh
       - run: cargo test --lib --all-features
         env:
           RUSTC_BOOTSTRAP: 1

@@ -134,6 +134,7 @@ fn status_from_str(s: &str) -> Status {
     else { Status::Custom(s.to_string()) }
 }
 
+#[allow(dead_code)]
 fn issue_type_from_str(s: &str) -> IssueType {
     IssueType::from_str(s).unwrap_or_else(|_| IssueType::Custom(s.to_string()))
 }

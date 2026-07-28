@@ -15,6 +15,75 @@ This changelog is organized by capability rather than diff order. Each version s
 
 ---
 
+## v0.2.0 -- 2026-07-28 (Release)
+
+Major feature release: web UI server (`br web`), workspace hardening,
+and install script cleanup.
+
+### Features
+
+- **`br web`** — new subcommand that serves a static web UI and REST API
+  over HTTP using an embedded axum server. Routes: `GET /api/p/{project_id}/beads`
+  (list beads), `POST /api/p/{project_id}/beads/issue` (create issue),
+  `GET /api/p/{project_id}/beads/ids` (list IDs), and more. No daemon
+  process needed — runs on demand. Gated behind the `web` feature flag.
+  ([#109](https://github.com/quangdang46/beads_rust/issues/109))
+- **Auto-pick free port** — `br web` tries port 3000 first; if busy, it
+  falls back to any available ephemeral port.
+  ([`7caa3235`](https://github.com/quangdang46/beads_rust/commit/7caa3235))
+- **Workspace auto-detection** — `br web` works from any directory inside
+  a `.beads` project. Single-project UI (no multi-project dashboard).
+
+### Fixes
+
+- **TcpListener non-blocking** — set the listener to non-blocking mode
+  before passing to `tokio::from_std` for correct async operation
+  ([`e0e60f3a`](https://github.com/quangdang46/beads_rust/commit/e0e60f3a)).
+- **Storage per-request pattern reverted** — keeps existing working state
+  context for stability
+  ([`f328602a`](https://github.com/quangdang46/beads_rust/commit/f328602a)).
+- **All API routes added** — completed the full set of REST endpoints
+  matching the upstream web API spec
+  ([`3f70a6d1`](https://github.com/quangdang46/beads_rust/commit/3f70a6d1)).
+- **Static export and SPA routing** — Next.js static export serves
+  directly with correct SPA fallback and routing
+  ([`33eb539b`](https://github.com/quangdang46/beads_rust/commit/33eb539b),
+  [`17326536`](https://github.com/quangdang46/beads_rust/commit/17326536)).
+- **`br upgrade`** MCP auto-install removed from `install.ps1`; skills
+  auto-install retained
+  ([`d84fbee9`](https://github.com/quangdang46/beads_rust/commit/d84fbee9)).
+
+### Chores
+
+- Remove `script installer` from release workflow
+  ([`245d8477`](https://github.com/quangdang46/beads_rust/commit/245d8477)).
+- Remove `src/web/static` from git (only built during CI)
+  ([`1066f850`](https://github.com/quangdang46/beads_rust/commit/1066f850)).
+- CI now builds web UI assets before running tests with `--features web`.
+- Benchmarks: updated `storage_perf.rs` to match current `Issue` and
+  `IssueUpdate` structs.
+
+### Commits
+
+- [`4388299d`](https://github.com/quangdang46/beads_rust/commit/4388299d) feat: add br web subcommand with embedded axum HTTP server
+- [`85ee32de`](https://github.com/quangdang46/beads_rust/commit/85ee32de) fix: static export build for br web frontend
+- [`b118b91c`](https://github.com/quangdang46/beads_rust/commit/b118b91c) feat: br web works from any directory, remove multi-project UI
+- [`17326536`](https://github.com/quangdang46/beads_rust/commit/17326536) fix: SPA routing for Next.js static export
+- [`33eb539b`](https://github.com/quangdang46/beads_rust/commit/33eb539b) fix: serve static export page routes directly, no SPA fallback
+- [`75d37459`](https://github.com/quangdang46/beads_rust/commit/75d37459) fix: redirect / to /p/default when workspace exists
+- [`d817d844`](https://github.com/quangdang46/beads_rust/commit/d817d844) fix: br web requires .beads workspace, exit if none found
+- [`c06e9f10`](https://github.com/quangdang46/beads_rust/commit/c06e9f10) fix: br web only checks current dir for .beads/, never walks up
+- [`3f70a6d1`](https://github.com/quangdang46/beads_rust/commit/3f70a6d1) fix: add all missing API routes from upstream spec
+- [`792fa4ef`](https://github.com/quangdang46/beads_rust/commit/792fa4ef) migrate: remove bd-specific lib files, adapt for br web
+- [`1066f850`](https://github.com/quangdang46/beads_rust/commit/1066f850) chore: remove src/web/static from git, only built during CI
+- [`7caa3235`](https://github.com/quangdang46/beads_rust/commit/7caa3235) feat: auto-pick free port if default 3000 is busy
+- [`f328602a`](https://github.com/quangdang46/beads_rust/commit/f328602a) fix: revert storage per-request pattern, keep working state
+- [`e0e60f3a`](https://github.com/quangdang46/beads_rust/commit/e0e60f3a) fix: set TcpListener to non-blocking for tokio::from_std
+- [`d84fbee9`](https://github.com/quangdang46/beads_rust/commit/d84fbee9) fix: keep skills auto-install, drop only MCP auto-install from install.ps1
+- [`245d8477`](https://github.com/quangdang46/beads_rust/commit/245d8477) chore: remove script installer
+
+---
+
 ## v0.1.2 -- 2026-07-16 (Release)
 
 Feature + bug-fix release: agent-facing `br reflect`, export reliability,

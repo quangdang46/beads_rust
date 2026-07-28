@@ -645,7 +645,7 @@ mod persistent_tests {
             r#"{"state":"open","failure_count":5,"success_count":0}"#,
         );
 
-        let count = clean_stale_circuit_files().unwrap_or(0);
+        let _count = clean_stale_circuit_files().unwrap_or(0);
         // File may already be gone; just check no crash
         let _ = std::fs::remove_file(&file);
     }
