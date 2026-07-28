@@ -1,7 +1,7 @@
 "use client";
 import * as React from "react";
 import { useRouter } from "next/navigation";
-import { FlaskConical, FolderGit2, Loader2 } from "lucide-react";
+import { FolderGit2, Loader2, Frown } from "lucide-react";
 import { Icon } from "@/components/icons";
 import { useTheme } from "@/components/theme-provider";
 import { useProjects } from "@/hooks/use-projects";
@@ -12,8 +12,15 @@ export function Launcher() {
   const { mode, toggle } = useTheme();
 
   const projects = data?.projects ?? [];
-  const demo = projects.find((p) => p.id === "demo");
   const real = projects.filter((p) => p.id !== "demo");
+
+  // Auto-redirect if there's exactly one real project.
+  const router = useRouter();
+  React.useEffect(() => {
+    if (real.length === 1) {
+      router.replace(`/p/${real[0].id}`);
+    }
+  }, [real, router]);
 
   return (
     <div className="flex h-full flex-col overflow-y-auto bg-background text-foreground">
@@ -27,7 +34,7 @@ export function Launcher() {
         <div className="flex-1 leading-[1.15]">
           <div className="text-[16px] font-[680] tracking-[-.01em]">br — Issue Tracker</div>
           <div className="text-[12px] text-[var(--text-3)]">
-            Select a project to view and manage
+            {real.length === 1 ? "Loading board..." : "No beads workspace found"}
           </div>
         </div>
         <button
@@ -40,17 +47,18 @@ export function Launcher() {
       </header>
 
       <div className="mx-auto w-full max-w-[860px] flex-1 p-[28px]">
-        <h2 className="mb-[14px] text-[13px] font-[650] uppercase tracking-[.03em] text-[var(--text-3)]">
-          Projects
-        </h2>
-
         {isLoading ? (
           <div className="flex h-[200px] items-center justify-center text-[var(--text-3)]">
             <Loader2 size={20} className="animate-spin" />
           </div>
+        ) : real.length === 0 ? (
+          <div className="flex h-[200px] flex-col items-center justify-center gap-3 text-[var(--text-3)]">
+            <Frown size={32} />
+            <p className="text-[14px] font-medium">No beads workspace found.</p>
+            <p className="text-[12px]">Run <code className="rounded bg-[var(--surface-2)] px-1.5 py-0.5 font-mono">br init</code> or launch <code className="rounded bg-[var(--surface-2)] px-1.5 py-0.5 font-mono">br web</code> from a project directory.</p>
+          </div>
         ) : (
           <div className="grid grid-cols-[repeat(auto-fill,minmax(248px,1fr))] gap-[14px]">
-            {demo && <DemoCard />}
             {real.map((p) => (
               <ProjectCard key={p.id} project={p} />
             ))}
@@ -83,26 +91,6 @@ function CardShell({
   );
 }
 
-function DemoCard() {
-  const router = useRouter();
-  return (
-    <CardShell onClick={() => router.push("/p/demo")}>
-      <div className="flex items-center gap-[10px]">
-        <div className="flex h-[30px] w-[30px] items-center justify-center rounded-[9px] bg-[#d9770618] text-[#d97706]">
-          <FlaskConical size={16} />
-        </div>
-        <div className="min-w-0 flex-1">
-          <div className="truncate text-[14px] font-[620]">Demo</div>
-          <div className="text-[11px] text-[var(--text-3)]">built-in</div>
-        </div>
-      </div>
-      <div className="text-[12px] text-[var(--text-3)]">
-        Explore the interface with sample data.
-      </div>
-    </CardShell>
-  );
-}
-
 function ProjectCard({ project }: { project: ProjectInfo }) {
   const router = useRouter();
   return (
@@ -114,11 +102,8 @@ function ProjectCard({ project }: { project: ProjectInfo }) {
         <div className="min-w-0 flex-1">
           <div className="truncate text-[14px] font-[620]">{project.name}</div>
           <div className="flex items-center gap-1.5 text-[11px] text-[var(--text-3)]">
-            <span
-              className="h-[6px] w-[6px] rounded-full"
-              style={{ background: project.hasBeads ? "#22c55e" : "#ef4444" }}
-            />
-            {project.hasBeads ? "bd repo" : "no .beads found"}
+            <span className="h-[6px] w-[6px] rounded-full bg-green-500" />
+            beads workspace
           </div>
         </div>
       </div>

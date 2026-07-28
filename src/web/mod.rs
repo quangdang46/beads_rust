@@ -67,6 +67,7 @@ pub fn run_server(args: &WebArgs, overrides: &config::CliOverrides) -> Result<()
 
     // Build the router with all API routes and static file fallback.
     let app = Router::new()
+        .route("/", axum::routing::get(api::root_handler))
         .route("/api/p/{project_id}/beads", axum::routing::get(api::list_beads).post(api::create_bead))
         .route(
             "/api/p/{project_id}/beads/{id}",

@@ -11,7 +11,7 @@ use crate::storage::sqlite::{IssueUpdate, ListFilters};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, Redirect},
     Json,
 };
 use serde_json::{json, Value};
@@ -21,6 +21,17 @@ use std::sync::Arc;
 use tokio::task::spawn_blocking;
 
 use super::AppState;
+
+/// `GET /` — redirect to `/p/default` when a workspace is found.
+pub async fn root_handler(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    if state.has_workspace {
+        Redirect::temporary("/p/default").into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "no workspace").into_response()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
