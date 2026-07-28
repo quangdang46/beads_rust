@@ -36,11 +36,28 @@ pub struct AppState {
 /// Returns an error if storage can't be opened or the server fails to bind.
 #[allow(clippy::module_name_repetitions)]
 pub fn run_server(args: &WebArgs, overrides: &config::CliOverrides) -> Result<()> {
-    // Discover the beads workspace. br web requires an existing .beads/ dir.
-    let beads_dir = config::discover_beads_dir_with_cli(overrides).map_err(|_| {
-        let banner = console_banner_no_workspace();
-        BeadsError::Config(banner.to_string())
-    })?;
+    // br web only looks for .beads/ in the current directory — never walks up.
+    let beads_dir = if let Some(db_path) = overrides.db.as_ref() {
+        let dir = if db_path.is_dir() {
+            db_path.join(".beads")
+        } else {
+            db_path.parent().map(|p| p.join(".beads")).unwrap_or(db_path.join(".beads"))
+        };
+        if dir.is_dir() {
+            dir
+        } else {
+            return Err(BeadsError::Config(format!("no .beads/ at db path")));
+        }
+    } else {
+        let cwd = std::env::current_dir().map_err(|_| BeadsError::Config("cannot get current directory".into()))?;
+        let candidate = cwd.join(".beads");
+        if candidate.is_dir() {
+            candidate
+        } else {
+            let banner = console_banner_no_workspace();
+            return Err(BeadsError::Config(banner.to_string()));
+        }
+    };
     // Pre-flight: verify storage is accessible.
     let _storage_ctx = config::open_storage_with_cli(&beads_dir, overrides)
         .map_err(|e| BeadsError::Config(format!("Cannot open storage: {e}")))?;
