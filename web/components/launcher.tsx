@@ -1,18 +1,14 @@
 "use client";
 import * as React from "react";
 import { useRouter } from "next/navigation";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { toast } from "sonner";
-import { Plus, Trash2, FlaskConical, FolderGit2, Loader2 } from "lucide-react";
+import { FlaskConical, FolderGit2, Loader2 } from "lucide-react";
 import { Icon } from "@/components/icons";
 import { useTheme } from "@/components/theme-provider";
 import { useProjects } from "@/hooks/use-projects";
-import { FolderBrowserModal } from "@/components/folder-browser-modal";
-import { api, type ProjectInfo } from "@/lib/api-client";
+import type { ProjectInfo } from "@/lib/api-client";
 
 export function Launcher() {
   const { data, isLoading } = useProjects();
-  const [addOpen, setAddOpen] = React.useState(false);
   const { mode, toggle } = useTheme();
 
   const projects = data?.projects ?? [];
@@ -29,9 +25,9 @@ export function Launcher() {
           <Icon name="logo" size={19} />
         </div>
         <div className="flex-1 leading-[1.15]">
-          <div className="text-[16px] font-[680] tracking-[-.01em]">Bead Me Up, Scotty</div>
+          <div className="text-[16px] font-[680] tracking-[-.01em]">br — Issue Tracker</div>
           <div className="text-[12px] text-[var(--text-3)]">
-            Choose a beads project to view and manage
+            Select a project to view and manage
           </div>
         </div>
         <button
@@ -44,19 +40,9 @@ export function Launcher() {
       </header>
 
       <div className="mx-auto w-full max-w-[860px] flex-1 p-[28px]">
-        <div className="mb-[14px] flex items-center justify-between">
-          <h2 className="text-[13px] font-[650] uppercase tracking-[.03em] text-[var(--text-3)]">
-            Projects
-          </h2>
-          <button
-            onClick={() => setAddOpen(true)}
-            className="flex h-[36px] items-center gap-[7px] rounded-[9px] px-[14px] text-[13px] font-semibold text-white"
-            style={{ background: "var(--brand)", boxShadow: "0 2px 8px -2px var(--brand)" }}
-          >
-            <Plus size={15} />
-            Add project
-          </button>
-        </div>
+        <h2 className="mb-[14px] text-[13px] font-[650] uppercase tracking-[.03em] text-[var(--text-3)]">
+          Projects
+        </h2>
 
         {isLoading ? (
           <div className="flex h-[200px] items-center justify-center text-[var(--text-3)]">
@@ -68,20 +54,9 @@ export function Launcher() {
             {real.map((p) => (
               <ProjectCard key={p.id} project={p} />
             ))}
-            {real.length === 0 && (
-              <button
-                onClick={() => setAddOpen(true)}
-                className="flex min-h-[112px] flex-col items-center justify-center gap-2 rounded-[13px] border border-dashed border-[var(--border-strong)] p-5 text-[var(--text-3)] hover:border-[var(--brand)] hover:text-[var(--brand)]"
-              >
-                <Plus size={20} />
-                <span className="text-[12.5px] font-[550]">Add your first project</span>
-              </button>
-            )}
           </div>
         )}
       </div>
-
-      <FolderBrowserModal open={addOpen} onOpenChange={setAddOpen} />
     </div>
   );
 }
@@ -122,7 +97,7 @@ function DemoCard() {
         </div>
       </div>
       <div className="text-[12px] text-[var(--text-3)]">
-        Seeded sample data — explore every view without bd installed.
+        Explore the interface with sample data.
       </div>
     </CardShell>
   );
@@ -130,16 +105,6 @@ function DemoCard() {
 
 function ProjectCard({ project }: { project: ProjectInfo }) {
   const router = useRouter();
-  const qc = useQueryClient();
-  const remove = useMutation({
-    mutationFn: () => api.projects.remove(project.id),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["projects"] });
-      toast.success(`Removed ${project.name}`);
-    },
-    onError: (e) => toast.error((e as Error).message),
-  });
-
   return (
     <CardShell onClick={() => router.push(`/p/${project.id}`)}>
       <div className="flex items-center gap-[10px]">
@@ -156,18 +121,6 @@ function ProjectCard({ project }: { project: ProjectInfo }) {
             {project.hasBeads ? "bd repo" : "no .beads found"}
           </div>
         </div>
-        <button
-          title="Remove from list"
-          onClick={(e) => {
-            e.stopPropagation();
-            if (confirm(`Remove "${project.name}" from the list? This does not delete any files.`)) {
-              remove.mutate();
-            }
-          }}
-          className="flex h-[26px] w-[26px] flex-shrink-0 items-center justify-center rounded-lg text-[var(--text-3)] opacity-0 transition-opacity hover:bg-[var(--surface-3)] hover:text-[#ef4444] group-hover:opacity-100"
-        >
-          <Trash2 size={14} />
-        </button>
       </div>
       <div className="truncate font-mono text-[11px] text-[var(--text-3)]" dir="rtl" title={project.path ?? ""}>
         {project.path}

@@ -20,8 +20,10 @@ use std::sync::Arc;
 /// Storage is NOT shared — each handler opens its own connection in a
 /// blocking task (SqliteStorage is !Send due to fsqlite's Rc internals).
 pub struct AppState {
-    /// Discovered beads directory path.
+    /// Discovered beads directory path. Empty if no workspace found.
     pub beads_dir: PathBuf,
+    /// Whether a valid beads workspace was found and storage opened.
+    pub has_workspace: bool,
     /// CLI overrides (db path, etc.).
     pub overrides: config::CliOverrides,
 }
@@ -36,21 +38,30 @@ pub struct AppState {
 /// Returns an error if storage can't be opened or the server fails to bind.
 #[allow(clippy::module_name_repetitions)]
 pub fn run_server(args: &WebArgs, overrides: &config::CliOverrides) -> Result<()> {
-    // Discover the beads workspace.
-    let beads_dir = match config::discover_beads_dir_with_cli(overrides) {
-        Ok(dir) => dir,
-        Err(e) => {
+    // Discover the beads workspace. If none is found, start with an empty
+    // state — the SPA and project picker still work; storage-backed API
+    // routes return appropriate errors.
+    let (beads_dir, has_workspace) = match config::discover_beads_dir_with_cli(overrides) {
+        Ok(dir) => {
+            match config::open_storage_with_cli(&dir, overrides) {
+                Ok(_) => (dir, true),
+                Err(e) => {
+                    eprintln!("{}", console_banner_no_workspace());
+                    eprintln!("  (storage: {e})");
+                    (dir, false)
+                }
+            }
+        }
+        Err(_) => {
             eprintln!("{}", console_banner_no_workspace());
-            return Err(e);
+            // Use a fallback path so AppState is valid.
+            (std::path::PathBuf::new(), false)
         }
     };
 
-    // Verify we can open storage before starting the server.
-    let _ = config::open_storage_with_cli(&beads_dir, overrides)
-        .map_err(|e| BeadsError::Config(format!("Cannot open storage: {e}")))?;
-
     let state = Arc::new(AppState {
         beads_dir,
+        has_workspace,
         overrides: overrides.clone(),
     });
 

@@ -589,6 +589,20 @@ pub async fn archive_bead(
 pub async fn list_projects(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
+    let demo_project = json!({
+        "id": "demo",
+        "name": "Demo Project",
+        "path": null,
+        "hasBeads": false,
+    });
+
+    if !state.has_workspace || state.beads_dir.as_os_str().is_empty() {
+        return (
+            StatusCode::OK,
+            Json(json!({ "projects": [demo_project] })),
+        );
+    }
+
     let dir_name = state.beads_dir
         .parent()
         .and_then(|p| p.file_name())
@@ -600,13 +614,6 @@ pub async fn list_projects(
         "name": dir_name,
         "path": state.beads_dir.parent().and_then(|p| p.to_str()),
         "hasBeads": true,
-    });
-
-    let demo_project = json!({
-        "id": "demo",
-        "name": "Demo Project",
-        "path": null,
-        "hasBeads": false,
     });
 
     (StatusCode::OK, Json(json!({ "projects": [demo_project, project] })))
