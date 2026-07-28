@@ -32,6 +32,14 @@ pub async fn serve_static(req: Request) -> impl IntoResponse {
         return resp;
     }
 
+    // Next.js static export generates HTML files for each route:
+    //   /p/default  →  p/default.html
+    // Try appending .html before falling back to index.html.
+    let html_path = format!("{path}.html");
+    if let Some(resp) = try_serve_file(&html_path).await {
+        return resp;
+    }
+
     // If the path looks like a file (has an extension), return 404.
     if path.contains('.') {
         return (
