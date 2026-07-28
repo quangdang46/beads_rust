@@ -1,9 +1,17 @@
-"use client";
+// Server component for static export.
+// generateStaticParams must be defined directly in the page file.
+export function generateStaticParams() {
+  return [{ projectId: "default" }];
+}
 
-import { useParams } from "next/navigation";
-import { AppShell } from "@/components/app-shell";
+// The AppShell is a client component. We import it via a thin client wrapper
+// that receives projectId from the server component params.
+import { AppShellClientWrapper } from "./client";
 
-export default function ProjectPage() {
-  const { projectId } = useParams<{ projectId: string }>();
-  return <AppShell projectId={projectId} />;
+export default function Page({
+  params,
+}: {
+  params: Promise<{ projectId: string }>;
+}) {
+  return <AppShellClientWrapper params={params} />;
 }
