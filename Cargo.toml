@@ -162,7 +162,7 @@ strip = false
 opt-level = 1
 
 [features]
-default = []
+default = ["web"]
 mcp = ["dep:fastmcp-rust"]
 web = ["dep:axum", "dep:tokio", "dep:tower-http", "dep:rust-embed"]
 
