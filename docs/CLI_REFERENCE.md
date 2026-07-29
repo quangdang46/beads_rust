@@ -1390,6 +1390,49 @@ script is simpler.
 
 ---
 
+### web
+
+Start the embedded web UI server.
+
+```bash
+br web [OPTIONS]
+br ui              # alias
+```
+
+`web` is only available in binaries built with the optional `web` feature:
+
+```bash
+cargo build --release --features web      # enabled by default
+cargo install --git https://github.com/quangdang46/beads_rust.git
+```
+
+The web server serves the issue tracker as a web application.
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `-p`, `--port <PORT>` | TCP port to listen on (default: `3000`) |
+| `--host <HOST>` | Host address to bind to (default: `127.0.0.1`) |
+| `--history <HISTORY>` | Path to history file for the embedded shell |
+| `--allow-cors` | Enable CORS headers for cross-origin requests |
+
+**Routes:**
+
+| Path | Description |
+|------|-------------|
+| `/` | Redirect to the default project page (`/p/default`) |
+| `/p/*path` | Project page for any `.beads` workspace (only the CWD workspace is web-served) |
+| `/api/*` | JSON API (issues, schema, labels, graph, etc.) |
+| `/api/*/ws` | WebSocket endpoint for server-sent events |
+
+`br web` serves a web interface for the local issue tracker. It finds the nearest
+`.beads/` directory from the current working directory and serves it as a single
+project. The web UI is a Next.js static export embedded in the binary at build
+time.
+
+---
+
 ## Diagnostics & Info
 
 ### agents
