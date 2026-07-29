@@ -7,7 +7,7 @@
 use axum::{
     body::Body,
     extract::Request,
-    http::{header, StatusCode, Uri},
+    http::{StatusCode, Uri, header},
     response::{IntoResponse, Response},
 };
 use rust_embed::RustEmbed;
@@ -41,7 +41,12 @@ pub async fn serve_static(req: Request) -> impl IntoResponse {
         }
     }
 
-    (StatusCode::NOT_FOUND, [(header::CONTENT_TYPE, "text/plain")], "Not found").into_response()
+    (
+        StatusCode::NOT_FOUND,
+        [(header::CONTENT_TYPE, "text/plain")],
+        "Not found",
+    )
+        .into_response()
 }
 
 async fn serve_file(path: &str) -> Response {
