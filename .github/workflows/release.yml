@@ -23,7 +23,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install musl toolchain
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - run: cargo build --release --target x86_64-unknown-linux-musl
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Build embedded web UI
+        run: bash scripts/build-web.sh
+      - run: cargo build --release --features web --target x86_64-unknown-linux-musl
         env:
           RUSTC_BOOTSTRAP: 1
       - run: cd target/x86_64-unknown-linux-musl/release && tar czf ../../../br-linux-x64.tar.gz br && cd - && sha256sum br-linux-x64.tar.gz > br-linux-x64.tar.gz.sha256
@@ -46,7 +51,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install musl toolchain
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - run: cargo build --release --target aarch64-unknown-linux-musl
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Build embedded web UI
+        run: bash scripts/build-web.sh
+      - run: cargo build --release --features web --target aarch64-unknown-linux-musl
         env:
           RUSTC_BOOTSTRAP: 1
       - run: cd target/aarch64-unknown-linux-musl/release && tar czf ../../../br-linux-arm64.tar.gz br && cd - && sha256sum br-linux-arm64.tar.gz > br-linux-arm64.tar.gz.sha256
@@ -66,7 +76,12 @@ jobs:
         with:
           targets: aarch64-apple-darwin
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --target aarch64-apple-darwin
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Build embedded web UI
+        run: bash scripts/build-web.sh
+      - run: cargo build --release --features web --target aarch64-apple-darwin
         env:
           RUSTC_BOOTSTRAP: 1
       - run: cd target/aarch64-apple-darwin/release && tar czf ../../../br-macos-arm64.tar.gz br && cd - && shasum -a 256 br-macos-arm64.tar.gz > br-macos-arm64.tar.gz.sha256
@@ -86,7 +101,12 @@ jobs:
         with:
           targets: x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --target x86_64-apple-darwin
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Build embedded web UI
+        run: bash scripts/build-web.sh
+      - run: cargo build --release --features web --target x86_64-apple-darwin
         env:
           RUSTC_BOOTSTRAP: 1
       - run: cd target/x86_64-apple-darwin/release && tar czf ../../../br-macos-x64.tar.gz br && cd - && shasum -a 256 br-macos-x64.tar.gz > br-macos-x64.tar.gz.sha256
@@ -106,7 +126,12 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --target x86_64-pc-windows-msvc
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Build embedded web UI
+        run: bash scripts/build-web.sh
+      - run: cargo build --release --features web --target x86_64-pc-windows-msvc
         env:
           RUSTC_BOOTSTRAP: 1
       - run: |
