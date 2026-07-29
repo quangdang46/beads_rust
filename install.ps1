@@ -131,10 +131,10 @@ if ($Help) { Show-Help }
 # Logging functions
 # ============================================================================
 function Write-Info {
-    if (-not $Quiet) { Write-Host "→ $($args[0])" -ForegroundColor Cyan }
+    if (-not $Quiet) { Write-Host "-> $($args[0])" -ForegroundColor Cyan }
 }
 function Write-Success {
-    if (-not $Quiet) { Write-Host "✓ $($args[0])" -ForegroundColor Green }
+    if (-not $Quiet) { Write-Host "[OK] $($args[0])" -ForegroundColor Green }
 }
 function Write-Warn {
     Write-Host "WARN: $($args[0])" -ForegroundColor Yellow
@@ -509,7 +509,7 @@ function Print-Summary {
 
     Write-Host @"
 
-✓ br installed successfully!
+[OK] br installed successfully!
 
   Version:  $version
   Location: $binPath
@@ -542,8 +542,11 @@ function Main {
         # Download and install
         $binPath = Download-Release -Platform $platform
         if (-not $binPath) {
-            Write-Warn "No pre-built binary available for ${platform} (Windows builds are paused)."
+            Write-Warn "No pre-built binary available for ${platform}."
             Write-Warn "Install WSL and use: curl -fsSL https://raw.githubusercontent.com/quangdang46/beads_rust/main/install.sh | bash"
+            Write-Host "ERROR: Installation failed: could not download release binary for ${platform}." -ForegroundColor Red
+            $Script:InstallFailed = $true
+            return
         }
 
         $destPath = Join-Path $InstallDir $Script:BinaryName
@@ -572,3 +575,4 @@ function Main {
 # Run main
 if ($Uninstall) { Do-Uninstall }
 Main
+if ($Script:InstallFailed) { exit 1 }
