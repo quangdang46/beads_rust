@@ -760,6 +760,7 @@ fn open_sqlite_storage_with_recovery_strategy(
     }
 
     quarantine_truncated_wal_sidecar(&paths.db_path, beads_dir);
+    quarantine_non_file_journal_sidecar(&paths.db_path, beads_dir);
 
     let prepare_fresh_storage = || -> Result<(SqliteStorage, RecoveryBackupSet)> {
         prepare_fresh_storage_for_deferred_import(&paths.db_path, beads_dir, lock_timeout)
@@ -853,6 +854,43 @@ fn open_when_db_file_is_missing(
                 false,
                 Some(cleanup_set),
             ))
+        }
+    }
+}
+
+/// Proactively quarantine non-file rollback journal sidecars before
+/// opening. If `beads.db-journal` exists as a directory (or another
+/// non-file type), SQLite's crash-recovery processing will attempt to
+/// open it as a journal file and fail with `IsADirectory`, which
+/// doesn't match any recoverable error pattern. Quarantining it first
+/// lets the normal open or JSONL-based recovery path proceed.
+fn quarantine_non_file_journal_sidecar(db_path: &Path, beads_dir: &Path) {
+    let journal_path = PathBuf::from(format!("{}-journal", db_path.to_string_lossy()));
+    let Ok(meta) = fs::metadata(&journal_path) else {
+        return;
+    };
+    if meta.is_file() {
+        return;
+    }
+    match quarantine_database_artifacts(
+        db_path,
+        beads_dir,
+        [journal_path.clone()],
+        "bak",
+    ) {
+        Ok(quarantined_paths) => {
+            tracing::warn!(
+                journal_path = %journal_path.display(),
+                quarantined_paths = ?quarantined_paths,
+                "quarantined non-file rollback journal sidecar before open"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                journal_path = %journal_path.display(),
+                error = %err,
+                "failed to quarantine non-file rollback journal sidecar before open"
+            );
         }
     }
 }

@@ -2275,14 +2275,9 @@ mod tests {
 
     #[test]
     fn test_apply_schema() {
-        let conn = Connection::open(
-            tempfile::NamedTempFile::new()
-                .unwrap()
-                .path()
-                .to_string_lossy()
-                .into_owned(),
-        )
-        .unwrap();
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
         apply_schema(&conn).expect("Failed to apply schema");
 
         // Verify a few tables exist
@@ -2725,14 +2720,9 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn test_schema_parity_conformance() {
-        let conn = Connection::open(
-            tempfile::NamedTempFile::new()
-                .unwrap()
-                .path()
-                .to_string_lossy()
-                .into_owned(),
-        )
-        .unwrap();
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
         apply_schema(&conn).expect("Failed to apply schema");
 
         // === ISSUES TABLE ===
@@ -3018,14 +3008,9 @@ mod tests {
     /// Test that migrations correctly upgrade old schemas.
     #[test]
     fn test_migration_blocked_cache_upgrade() {
-        let conn = Connection::open(
-            tempfile::NamedTempFile::new()
-                .unwrap()
-                .path()
-                .to_string_lossy()
-                .into_owned(),
-        )
-        .unwrap();
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
 
         // Create old-style blocked_issues_cache with blocked_by_json
         // Using a complete issues table schema so index migrations succeed
@@ -3105,14 +3090,9 @@ mod tests {
     /// Migration: drop old blocked_issues_cache missing issue_id column.
     #[test]
     fn test_migration_blocked_cache_missing_issue_id() {
-        let conn = Connection::open(
-            tempfile::NamedTempFile::new()
-                .unwrap()
-                .path()
-                .to_string_lossy()
-                .into_owned(),
-        )
-        .unwrap();
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
 
         // Old-style cache table with 'id' column instead of 'issue_id'
         // Using a complete issues table schema so index migrations succeed
@@ -3198,14 +3178,9 @@ mod tests {
     /// Migration: add missing issue columns for older schemas.
     #[test]
     fn test_migration_adds_missing_issue_columns() {
-        let conn = Connection::open(
-            tempfile::NamedTempFile::new()
-                .unwrap()
-                .path()
-                .to_string_lossy()
-                .into_owned(),
-        )
-        .unwrap();
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
 
         execute_batch(
             &conn,
@@ -3255,14 +3230,9 @@ mod tests {
 
     #[test]
     fn test_rebuild_issues_table_errors_when_canonical_columns_are_missing() {
-        let conn = Connection::open(
-            tempfile::NamedTempFile::new()
-                .unwrap()
-                .path()
-                .to_string_lossy()
-                .into_owned(),
-        )
-        .unwrap();
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
 
         execute_batch(
             &conn,
@@ -3311,14 +3281,9 @@ mod tests {
     /// Migration: add missing dependency type column for older schemas.
     #[test]
     fn test_migration_adds_missing_dependency_type() {
-        let conn = Connection::open(
-            tempfile::NamedTempFile::new()
-                .unwrap()
-                .path()
-                .to_string_lossy()
-                .into_owned(),
-        )
-        .unwrap();
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
 
         execute_batch(
             &conn,
@@ -3350,14 +3315,9 @@ mod tests {
 
     #[test]
     fn test_migration_rebuilds_legacy_config_metadata_primary_keys() {
-        let conn = Connection::open(
-            tempfile::NamedTempFile::new()
-                .unwrap()
-                .path()
-                .to_string_lossy()
-                .into_owned(),
-        )
-        .unwrap();
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
 
         execute_batch(
             &conn,
@@ -3454,14 +3414,9 @@ mod tests {
 
     #[test]
     fn test_active_list_query_plan_uses_composite_index() {
-        let conn = Connection::open(
-            tempfile::NamedTempFile::new()
-                .unwrap()
-                .path()
-                .to_string_lossy()
-                .into_owned(),
-        )
-        .unwrap();
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
         apply_schema(&conn).expect("schema");
 
         let plan_rows = conn
