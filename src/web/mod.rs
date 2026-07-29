@@ -41,7 +41,10 @@ pub fn run_server(args: &WebArgs, overrides: &config::CliOverrides) -> Result<()
         let dir = if db_path.is_dir() {
             db_path.join(".beads")
         } else {
-            db_path.parent().map(|p| p.join(".beads")).unwrap_or(db_path.join(".beads"))
+            db_path
+                .parent()
+                .map(|p| p.join(".beads"))
+                .unwrap_or(db_path.join(".beads"))
         };
         if dir.is_dir() {
             dir
@@ -49,7 +52,8 @@ pub fn run_server(args: &WebArgs, overrides: &config::CliOverrides) -> Result<()
             return Err(BeadsError::Config(format!("no .beads/ at db path")));
         }
     } else {
-        let cwd = std::env::current_dir().map_err(|_| BeadsError::Config("cannot get current directory".into()))?;
+        let cwd = std::env::current_dir()
+            .map_err(|_| BeadsError::Config("cannot get current directory".into()))?;
         let candidate = cwd.join(".beads");
         if candidate.is_dir() {
             candidate
@@ -69,37 +73,102 @@ pub fn run_server(args: &WebArgs, overrides: &config::CliOverrides) -> Result<()
 
     // Build the router with all API routes and static file serving.
     let app = Router::new()
-        .route("/", axum::routing::get(|| async { axum::response::Redirect::temporary("/p/default") }))
+        .route(
+            "/",
+            axum::routing::get(|| async { axum::response::Redirect::temporary("/p/default") }),
+        )
         // Beads CRUD
-        .route("/api/p/{project_id}/beads", axum::routing::get(api::list_beads).post(api::create_bead))
-        .route("/api/p/{project_id}/beads/{id}", axum::routing::get(api::get_bead).patch(api::update_bead).delete(api::delete_bead))
-        .route("/api/p/{project_id}/beads/{id}/status", axum::routing::post(api::set_status))
-        .route("/api/p/{project_id}/beads/{id}/comments", axum::routing::post(api::add_comment))
-        .route("/api/p/{project_id}/beads/{id}/deps", axum::routing::post(api::add_dep).delete(api::remove_dep))
-        .route("/api/p/{project_id}/beads/{id}/archive", axum::routing::post(api::archive_bead))
-        .route("/api/p/{project_id}/beads/{id}/gate", axum::routing::post(api::stub_created))
-        .route("/api/p/{project_id}/beads/{id}/assist", axum::routing::post(api::stub_assist))
-        .route("/api/p/{project_id}/beads/{id}/human", axum::routing::post(api::stub_created))
+        .route(
+            "/api/p/{project_id}/beads",
+            axum::routing::get(api::list_beads).post(api::create_bead),
+        )
+        .route(
+            "/api/p/{project_id}/beads/{id}",
+            axum::routing::get(api::get_bead)
+                .patch(api::update_bead)
+                .delete(api::delete_bead),
+        )
+        .route(
+            "/api/p/{project_id}/beads/{id}/status",
+            axum::routing::post(api::set_status),
+        )
+        .route(
+            "/api/p/{project_id}/beads/{id}/comments",
+            axum::routing::post(api::add_comment),
+        )
+        .route(
+            "/api/p/{project_id}/beads/{id}/deps",
+            axum::routing::post(api::add_dep).delete(api::remove_dep),
+        )
+        .route(
+            "/api/p/{project_id}/beads/{id}/archive",
+            axum::routing::post(api::archive_bead),
+        )
+        .route(
+            "/api/p/{project_id}/beads/{id}/gate",
+            axum::routing::post(api::stub_created),
+        )
+        .route(
+            "/api/p/{project_id}/beads/{id}/assist",
+            axum::routing::post(api::stub_assist),
+        )
+        .route(
+            "/api/p/{project_id}/beads/{id}/human",
+            axum::routing::post(api::stub_created),
+        )
         // Views
-        .route("/api/p/{project_id}/insights", axum::routing::get(api::stub_insights))
-        .route("/api/p/{project_id}/activity", axum::routing::get(api::stub_empty_activity))
-        .route("/api/p/{project_id}/gamification", axum::routing::get(api::stub_gamification))
+        .route(
+            "/api/p/{project_id}/insights",
+            axum::routing::get(api::stub_insights),
+        )
+        .route(
+            "/api/p/{project_id}/activity",
+            axum::routing::get(api::stub_empty_activity),
+        )
+        .route(
+            "/api/p/{project_id}/gamification",
+            axum::routing::get(api::stub_gamification),
+        )
         // Attachments
-        .route("/api/p/{project_id}/attachments", axum::routing::post(api::stub_json))
-        .route("/api/p/{project_id}/attachments/{*path}", axum::routing::post(api::stub_json).put(api::stub_json))
+        .route(
+            "/api/p/{project_id}/attachments",
+            axum::routing::post(api::stub_json),
+        )
+        .route(
+            "/api/p/{project_id}/attachments/{*path}",
+            axum::routing::post(api::stub_json).put(api::stub_json),
+        )
         // Board order
-        .route("/api/p/{project_id}/order", axum::routing::get(api::stub_empty_orders).put(api::stub_empty_orders))
+        .route(
+            "/api/p/{project_id}/order",
+            axum::routing::get(api::stub_empty_orders).put(api::stub_empty_orders),
+        )
         // Publish / showcase
-        .route("/api/p/{project_id}/publish", axum::routing::post(api::stub_json))
+        .route(
+            "/api/p/{project_id}/publish",
+            axum::routing::post(api::stub_json),
+        )
         // Projects
         .route("/api/projects", axum::routing::get(api::list_projects))
-        .route("/api/projects/{id}", axum::routing::patch(api::stub_json).delete(api::stub_json))
+        .route(
+            "/api/projects/{id}",
+            axum::routing::patch(api::stub_json).delete(api::stub_json),
+        )
         // Config & diagnostics
-        .route("/api/p/{project_id}/doctor", axum::routing::get(api::doctor))
-        .route("/api/config", axum::routing::get(api::get_config).put(api::update_config))
+        .route(
+            "/api/p/{project_id}/doctor",
+            axum::routing::get(api::doctor),
+        )
+        .route(
+            "/api/config",
+            axum::routing::get(api::get_config).put(api::update_config),
+        )
         .route("/api/fs", axum::routing::get(api::stub_fs))
         // Self-update
-        .route("/api/update/check", axum::routing::get(api::stub_update_check))
+        .route(
+            "/api/update/check",
+            axum::routing::get(api::stub_update_check),
+        )
         .route("/api/update/run", axum::routing::post(api::stub_json))
         .fallback_service(axum::routing::get(assets::serve_static))
         .layer(tower_http::cors::CorsLayer::permissive())
@@ -108,8 +177,12 @@ pub fn run_server(args: &WebArgs, overrides: &config::CliOverrides) -> Result<()
     // Bind with auto port-pick: default 3000, try +1 +2 … if busy.
     let requested = args.port.unwrap_or(3000);
     let listener = bind_first_free(&args.host, requested, args.strict_port)?;
-    listener.set_nonblocking(true).map_err(|e| BeadsError::Config(format!("nonblock: {e}")))?;
-    let actual = listener.local_addr().map_err(|e| BeadsError::Config(format!("addr: {e}")))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| BeadsError::Config(format!("nonblock: {e}")))?;
+    let actual = listener
+        .local_addr()
+        .map_err(|e| BeadsError::Config(format!("addr: {e}")))?;
 
     eprintln!(
         "  br web → http://{}:{}/\n  (Ctrl+C to stop)",
@@ -159,7 +232,9 @@ fn bind_first_free(host: &str, port: u16, strict: bool) -> Result<std::net::TcpL
             Err(_) if offset < limit - 1 => continue,
             Err(e) => {
                 if strict || limit == 1 {
-                    return Err(BeadsError::Config(format!("Failed to bind {host}:{port}: {e}")));
+                    return Err(BeadsError::Config(format!(
+                        "Failed to bind {host}:{port}: {e}"
+                    )));
                 }
                 return Err(BeadsError::Config(format!(
                     "Could not find a free port near {port} (tried {host}:{port}-{}): {e}",
@@ -174,11 +249,19 @@ fn bind_first_free(host: &str, port: u16, strict: bool) -> Result<std::net::TcpL
 /// Open a browser to the given URL, best-effort per platform.
 fn open_browser(url: &str) {
     #[cfg(target_os = "macos")]
-    { let _ = std::process::Command::new("open").arg(url).spawn(); }
+    {
+        let _ = std::process::Command::new("open").arg(url).spawn();
+    }
     #[cfg(target_os = "linux")]
-    { let _ = std::process::Command::new("xdg-open").arg(url).spawn(); }
+    {
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    }
     #[cfg(target_os = "windows")]
-    { let _ = std::process::Command::new("cmd").args(["/c", "start", "", url]).spawn(); }
+    {
+        let _ = std::process::Command::new("cmd")
+            .args(["/c", "start", "", url])
+            .spawn();
+    }
 }
 
 /// Wait for SIGINT/SIGTERM and initiate graceful shutdown.
