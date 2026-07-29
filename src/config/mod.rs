@@ -872,12 +872,7 @@ fn quarantine_non_file_journal_sidecar(db_path: &Path, beads_dir: &Path) {
     if meta.is_file() {
         return;
     }
-    match quarantine_database_artifacts(
-        db_path,
-        beads_dir,
-        [journal_path.clone()],
-        "bak",
-    ) {
+    match quarantine_database_artifacts(db_path, beads_dir, [journal_path.clone()], "bak") {
         Ok(quarantined_paths) => {
             tracing::warn!(
                 journal_path = %journal_path.display(),
