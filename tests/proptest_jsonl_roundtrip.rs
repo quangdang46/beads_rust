@@ -322,11 +322,13 @@ fn jsonl_import_normalizes_mixed_case_known_status_and_issue_type() {
 
 #[test]
 fn jsonl_import_preserves_custom_status_and_issue_type_case() {
+    // Custom values are normalized to lowercase on deserialize (EXP-001/EXP-002),
+    // so mixed-case custom input canonicalizes to lowercase.
     assert_mixed_case_known_value_round_trip(
         "QaReview",
         "Odd_Type",
-        &Status::Custom("QaReview".to_string()),
-        &IssueType::Custom("Odd_Type".to_string()),
+        &Status::Custom("qareview".to_string()),
+        &IssueType::Custom("odd_type".to_string()),
         "customcase",
     );
 }

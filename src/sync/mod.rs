@@ -4857,9 +4857,14 @@ impl MergeContext {
     }
 
     /// Get all unique issue IDs across all three states.
+    ///
+    /// Returns a `BTreeSet` (sorted) so merge iteration order is
+    /// deterministic across runs — `HashSet` iteration order depends on the
+    /// per-process random seed and would leak nondeterminism into
+    /// `MergeReport` output (F-003).
     #[must_use]
-    pub fn all_issue_ids(&self) -> std::collections::HashSet<String> {
-        let mut ids = std::collections::HashSet::new();
+    pub fn all_issue_ids(&self) -> std::collections::BTreeSet<String> {
+        let mut ids = std::collections::BTreeSet::new();
         ids.extend(self.base.keys().cloned());
         ids.extend(self.left.keys().cloned());
         ids.extend(self.right.keys().cloned());
