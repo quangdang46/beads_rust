@@ -201,6 +201,12 @@ pub fn execute(
 *.db-journal
 *.db-shm
 *.db-wal
+# Explicit fsqlite sidecar families (ns-gate/ns-use, lock-pending/reserved/
+# shared, wal-cert chains) — covered implicitly by `*.db?*`-style wildcards
+# elsewhere, but listed explicitly for discoverability (#111).
+beads.db-*
+*-fsqlite-ns-gate
+*-fsqlite-ns-use
 
 # Lock files
 *.lock
@@ -210,6 +216,9 @@ pub fn execute(
 # Temporary
 last-touched
 *.tmp
+# Vacuum scratch files (e.g. .beads.vacuum.<pid>.tmp-*) must never be
+# committed (#111).
+.beads.vacuum.*
 
 # Local history backups
 .br_history/
@@ -653,6 +662,10 @@ mod tests {
         assert!(content.contains("*.db-journal"));
         assert!(content.contains("*.db-wal"));
         assert!(content.contains("*.db-shm"));
+        assert!(content.contains("beads.db-*"));
+        assert!(content.contains("*-fsqlite-ns-gate"));
+        assert!(content.contains("*-fsqlite-ns-use"));
+        assert!(content.contains(".beads.vacuum.*"));
         assert!(content.contains("*.lock"));
         // Doctor's gitignore.beads_inner_present check looks for these exact
         // patterns (not just the broader `*.lock` / generic tmp globs).

@@ -4,6 +4,16 @@
 *.db-journal
 *.db-wal
 *.db-shm
+# Explicit fsqlite sidecar families (ns-gate/ns-use, lock-pending/reserved/
+# shared, wal-cert chains) — covered implicitly by `*.db?*` above, but listed
+# explicitly for discoverability (#111).
+beads.db-*
+*-fsqlite-ns-gate
+*-fsqlite-ns-use
+
+# Vacuum scratch files (e.g. .beads.vacuum.<pid>.tmp-*) must never be
+# committed (#111).
+.beads.vacuum.*
 
 # Daemon runtime files
 daemon.lock
