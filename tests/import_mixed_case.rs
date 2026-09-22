@@ -221,9 +221,10 @@ fn import_custom_status_preserves_case_through_roundtrip() {
     assert_eq!(issues.len(), 1);
     match &issues[0].status {
         Status::Custom(val) => {
+            // Custom values normalize to lowercase (EXP-001).
             assert_eq!(
-                val, "QA_Review",
-                "custom status preserves original case through DB round-trip"
+                val, "qa_review",
+                "custom status normalizes to lowercase through DB round-trip"
             );
         }
         other => panic!("Expected Custom status, got {:?}", other),
@@ -249,9 +250,10 @@ fn import_custom_issue_type_preserves_case_through_roundtrip() {
     assert_eq!(issues.len(), 1);
     match &issues[0].issue_type {
         IssueType::Custom(val) => {
+            // Custom values normalize to lowercase (EXP-002).
             assert_eq!(
-                val, "Security_Audit",
-                "custom issue type preserves original case through DB round-trip"
+                val, "security_audit",
+                "custom issue type normalizes to lowercase through DB round-trip"
             );
         }
         other => panic!("Expected Custom issue type, got {:?}", other),

@@ -71,7 +71,7 @@ impl<'de> Deserialize<'de> for Status {
         let value = String::deserialize(deserializer)?;
         Ok(match Self::known_value(&value) {
             Some(status) => status,
-            None => Self::Custom(value),
+            None => Self::Custom(value.to_lowercase()),
         })
     }
 }
@@ -135,7 +135,7 @@ impl FromStr for Status {
     type Err = crate::error::BeadsError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self::known_value(s).unwrap_or_else(|| Self::Custom(s.to_string())))
+        Ok(Self::known_value(s).unwrap_or_else(|| Self::Custom(s.to_lowercase())))
     }
 }
 
@@ -214,7 +214,7 @@ impl<'de> Deserialize<'de> for IssueType {
         let value = String::deserialize(deserializer)?;
         Ok(match Self::known_value(&value) {
             Some(issue_type) => issue_type,
-            None => Self::Custom(value),
+            None => Self::Custom(value.to_lowercase()),
         })
     }
 }
@@ -304,7 +304,7 @@ impl FromStr for IssueType {
     type Err = crate::error::BeadsError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self::known_value(s).unwrap_or_else(|| Self::Custom(s.to_string())))
+        Ok(Self::known_value(s).unwrap_or_else(|| Self::Custom(s.to_lowercase())))
     }
 }
 
@@ -377,7 +377,7 @@ impl<'de> Deserialize<'de> for DependencyType {
             "until" => Self::Until,
             "validates" => Self::Validates,
             "delegated-from" => Self::DelegatedFrom,
-            _ => Self::Custom(value),
+            _ => Self::Custom(value.to_lowercase()),
         })
     }
 }
@@ -518,7 +518,7 @@ impl Serialize for EventType {
 impl<'de> Deserialize<'de> for EventType {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value = String::deserialize(deserializer)?;
-        let event_type = match value.as_str() {
+        let event_type = match value.to_lowercase().as_str() {
             "created" => Self::Created,
             "updated" => Self::Updated,
             "status_changed" => Self::StatusChanged,
@@ -534,7 +534,7 @@ impl<'de> Deserialize<'de> for EventType {
             "compacted" => Self::Compacted,
             "deleted" => Self::Deleted,
             "restored" => Self::Restored,
-            _ => Self::Custom(value),
+            _ => Self::Custom(value.to_lowercase()),
         };
         Ok(event_type)
     }
@@ -662,7 +662,7 @@ impl std::str::FromStr for MolType {
             "work" => Ok(Self::Work),
             "swarm" => Ok(Self::Swarm),
             "patrol" => Ok(Self::Patrol),
-            _ => Ok(Self::Custom(s.to_string())),
+            _ => Ok(Self::Custom(s.to_lowercase())),
         }
     }
 }
@@ -1434,13 +1434,16 @@ mod tests {
         assert_eq!(serialized, "\"custom_status\"");
 
         let mixed_case: Status = serde_json::from_str("\"QaReview\"").unwrap();
-        assert_eq!(mixed_case, Status::Custom("QaReview".to_string()));
+        // Custom values are normalized to lowercase so that
+        // `Custom("NEW") == Custom("new")` (EXP-001).
+        assert_eq!(mixed_case, Status::Custom("qareview".to_string()));
     }
 
     #[test]
     fn issue_type_custom_deserialize_preserves_spelling() {
         let issue_type: IssueType = serde_json::from_str("\"Odd_Type\"").unwrap();
-        assert_eq!(issue_type, IssueType::Custom("Odd_Type".to_string()));
+        // Custom values are normalized to lowercase (EXP-002).
+        assert_eq!(issue_type, IssueType::Custom("odd_type".to_string()));
     }
 
     #[test]
@@ -1610,7 +1613,8 @@ mod tests {
         assert_eq!(result, Status::Custom("invalid_status".to_string()));
 
         let mixed_case = Status::from_str("QaReview").unwrap();
-        assert_eq!(mixed_case, Status::Custom("QaReview".to_string()));
+        // Custom values are normalized to lowercase (EXP-001).
+        assert_eq!(mixed_case, Status::Custom("qareview".to_string()));
     }
 
     #[test]
@@ -1782,7 +1786,8 @@ mod tests {
         );
 
         let mixed_case = IssueType::from_str("Odd_Type").unwrap();
-        assert_eq!(mixed_case, IssueType::Custom("Odd_Type".to_string()));
+        // Custom values are normalized to lowercase (EXP-002).
+        assert_eq!(mixed_case, IssueType::Custom("odd_type".to_string()));
     }
 
     #[test]
