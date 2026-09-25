@@ -40,7 +40,36 @@ path = "src/main.rs"
 clap = { version = "4.5.60", features = ["derive", "env", "unstable-ext"] }
 clap_complete = { version = "4.6.5", features = ["unstable-dynamic"] }
 
-# Database (pure-Rust SQLite with concurrent writer support)
+# Database
+#
+# MIGRATION IN PROGRESS: fsqlite (frankensqlite) -> rusqlite 0.40.2 bundled.
+# See docs/RUSQLITE_MIGRATION_PLAN_2026_09_25.md.
+#
+# BOTH engines are declared here on purpose, and the fsqlite lines are NOT dead
+# weight. `src/storage/sqlite.rs` keeps importing fsqlite until Phase 7, so
+# dropping the declarations now would leave the tree uncompilable for six
+# consecutive phases and forfeit every test signal for the whole port. The 15
+# fsqlite lines are deleted in Phase 8, once no `src/` file imports fsqlite.
+#
+# Feature notes for the rusqlite line:
+#   bundled       - compiles the vendored SQLite amalgamation via `cc`, so no
+#                   pkg-config/vcpkg bootstrap. Transitively enables
+#                   modern_sqlite -> bundled_bindings, which are the
+#                   PREGENERATED bindings, so libclang/bindgen is NOT needed.
+#   cache         - prepared-statement LRU. In the default set since 0.38, so
+#                   listing it explicitly is only a guard against a future
+#                   upstream default change, not a fix for a current failure.
+#   fallible_uint - re-enables u64/usize ToSql/FromSql, off by default since
+#                   0.38.0. The storage layer uses unsigned counters.
+#   session and preupdate_hook MUST stay off. session implies preupdate_hook
+#   implies buildtime_bindgen, which would pull a libclang build dependency
+#   onto every build host. See docs/CI_SUPPLY_CHAIN.md.
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled", "cache", "fallible_uint"] }
+
+# Database, legacy engine (removed in Phase 8). frankensqlite ships an
+# OpenAI/Anthropic license rider and keeps its WAL index in process memory,
+# which is what makes `br doctor migrate-schema recover` permanently
+# unrecoverable on Windows.
 # NOTE: transitive fsqlite workspace deps listed explicitly so rch syncs them
 fsqlite = "0.1.7"
 fsqlite-types = "0.1.7"
