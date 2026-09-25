@@ -86,8 +86,8 @@ The binding constraint is multi-process WAL on Windows, which is `br`'s actual o
   executing and testing. It is also pre-1.0 with 35 published versions in 7 months, where v0.3.9 was
   an expedited patch because v0.3.8 shipped a CLI that could not open file databases at all.
 
-  **Live evidence, observed 2026-09-25 on this machine.** While building the task graph for this
-  migration, every `br` command began failing on Windows with:
+  **Live evidence, observed 2026-09-25 on this machine, and it is a hard blocker.** While building
+  the task graph for this migration, every `br` command began failing on Windows with:
 
   ```
   SYNC_CONFLICT: automatic WAL index recovery already failed for this exact database family at
@@ -95,16 +95,36 @@ The binding constraint is multi-process WAL on Windows, which is `br`'s actual o
   this platform)
   ```
 
-  `br` routes schema-migration recovery through WAL-index quarantine, and frankensqlite does not
-  support that on Windows. The result is a hard failure on **every** subcommand, read and write
-  alike, with no in-band recovery path. The recovery pre-state is retained under
-  `.beads/.br_recovery/schema-migrations/`, so no data is lost, but `br` is unusable until a human
-  runs `br doctor migrate-schema recover` explicitly.
+  The root cause, from `br doctor`:
 
-  This is the migration thesis demonstrated rather than argued: a platform-specific engine
+  ```
+  OK db.sidecars: SHM sidecar ... is inert beside the WAL (a WAL-only family is expected for
+  frankensqlite; the WAL index lives in process memory)
+  ```
+
+  frankensqlite keeps the WAL index in process memory rather than in the `-shm` file. `br` routes
+  schema-migration recovery through **WAL-index quarantine**, an operation that requires a
+  file-backed WAL index. On Windows that operation cannot succeed, ever.
+
+  **The documented remedy does not work.** `br doctor migrate-schema recover` was run with user
+  authorization on 2026-09-25T09:33:53Z and failed with the identical error at the identical stage.
+  This is not a stale marker that can be cleared; it is a hard incompatibility. Every normal
+  subcommand, read and write alike, is blocked, and `br` cannot be unblocked on this platform
+  through any documented path.
+
+  Data safety was verified rather than assumed. `br` retained a complete pre-state snapshot with
+  SHA-256 hashes of every component under
+  `.beads/.br_recovery/schema-migrations/<timestamp>/recovery-before/`. Before and after the
+  recovery attempt, `.beads/beads.db` hashed to `a31a3406283b2182ecfa580d34513c45` and
+  `.beads/issues.jsonl` to `714c90132e1b19655adc71ae1ff0cf27`, with all 42 task-graph beads intact
+  and `br doctor` still reporting `HEALTH workspace: healthy`.
+
+  This is the migration thesis demonstrated rather than argued. A platform-specific engine
   limitation, in a code path br depends on for self-healing, takes the whole tool offline on
-  Windows. The plan's own Phase 4 depends on `user_version`-driven migration recovery working
-  reliably. That is not a hypothetical dependency; it is currently broken on this platform.
+  Windows with no in-band escape. **Phase 4 of this plan is the DDL and migration runner, which
+  depends on exactly this recovery path.** It is not a hypothetical dependency; it is currently
+  broken on this platform, which makes it a prerequisite to fix independently of, or as part of,
+  this migration.
 - **Turso:** the only pure-Rust engine with real production evidence, and also pre-1.0. Its MVCC is
   documented as not production-ready (no index creation under MVCC, only
   `wal_checkpoint(TRUNCATE)` works, docs warn queries may return incorrect results). Its
@@ -385,6 +405,34 @@ the migration and keeps paying after `db.rs` is deleted.
 Each phase is one commit on the branch, individually revertible during development. The whole
 sequence merges to `main` as one merge commit. The 15 `fsqlite` lines are removed in Phase 8, the
 last phase, once no `src/` file imports fsqlite.
+
+### Task graph
+
+The plan is tracked in `br` under umbrella epic `beads_rust-t6se`: 1 umbrella, 8 phase epics, 33
+child tasks, 72 dependency edges, no cycles. `br dep cycles` is empty and `bv` reports `Cycles: []`.
+Every phase epic estimate equals the sum of its children, and the task subtotal is 12,600 minutes,
+which is 35.00 engineer-days, matching this document.
+
+P4 and P5 are modelled to run in parallel, because `schema.rs` and `events.rs` do not overlap with
+`sqlite.rs`. No edge connects them in either direction.
+
+### Seven dependency edges still to be added
+
+A graph audit found seven ordering constraints that are stated in prose but not yet encoded as `br`
+dependency edges. `br dep add` was unavailable at the time of the audit because of the
+schema-recovery blocker described in section 1, so they are recorded here. **Add all seven with
+`br dep add <issue> <depends-on>` once `br` is unblocked.** The graph is valid without them; they
+make the ordering enforceable rather than advisory.
+
+| Child task | Must wait for | Why |
+|---|---|---|
+| `beads_rust-t6se.5.3` | `beads_rust-t6se.2.2` | The static retry loop gates on `is_transient` at three points; P2.2 is where that predicate is ported. |
+| `beads_rust-t6se.5.4` | `beads_rust-t6se.2.2` | Same, for the method retry loop. |
+| `beads_rust-t6se.6.1` | `beads_rust-t6se.1.5` | The read path's exit criterion is a byte-identical golden comparison; the goldens are created in P1.5. |
+| `beads_rust-t6se.4.2` | `beads_rust-t6se.1.1` | The schema port migrates all 13 fixtures, whose readability P1.1 is what proves. |
+| `beads_rust-t6se.8.1` | `beads_rust-t6se.7.5` | The concurrency gate should run only once the write-path tests are in place. |
+| `beads_rust-t6se.3.1` | `beads_rust-t6se.1.4` | Porting cannot start before the baseline exists, because every later phase is judged against it. |
+| `beads_rust-t6se.8.5` | `beads_rust-t6se.1.4` | The final comparison against the baseline needs the baseline. |
 
 ### Phase 1: Build de-risk, frozen baseline, on-disk format proof (2.5 days)
 
