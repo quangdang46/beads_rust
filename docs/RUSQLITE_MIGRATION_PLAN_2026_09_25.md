@@ -211,7 +211,14 @@ half-day check that belongs before 1877 call sites depend on the answer.
 
 ## 3. On-disk compatibility: go, no data migration required
 
-**Verdict: PASS.**
+> **CORRECTED 2026-09-26 by Phase 1 measurement. Read section 16 before relying on this section.**
+> The header read that a `SQLite format 3` file is a *format* claim, not a *content* claim, was right to
+> insist on proving the content claim separately. Phase 1 did, and the result is not a clean pass:
+> **2 of the 13 fixtures cannot be opened by C SQLite at all**, and 1 more opens with 99
+> `integrity_check` violations. See section 16 for the measurement, the root cause, and the
+> open-time fallback the port now requires.
+
+**Verdict: PASS** (superseded — see section 16).
 
 The 11 project databases under `sample_beads_db_files/*/beads.db` (asupersync, beads_rust,
 flywheel_connectors, franken_whisper, frankensqlite, frankenterm, frankentui, mcp_agent_mail_rust,
@@ -1557,3 +1564,117 @@ verify_checksums_fragment_fails_on_corrupt_checksum
 workspace_failure_replay_manifest_expectations_hold_on_fresh_copies
 worktree::tests::test_detect_beads_state_shared
 ```
+
+---
+
+## 16. Phase 1 measured on-disk result: the format claim held, the content claim did not
+
+This is the finding that changed the plan's central go/no-go. It was measured twice, by two
+different bindings, and the results agree.
+
+### 16.1 Measurement
+
+Every fixture opened as `file:<ABS>?mode=ro&immutable=1`. `immutable=1` is load-bearing: all 13 are
+WAL-mode, and a plain `SQLITE_OPEN_READ_ONLY` open cannot create the `-shm` a read-only WAL open
+requires, so 10 of them fail with `SQLITE_CANTOPEN` for a reason unrelated to schema validity.
+
+Verified under `rusqlite` 0.40.2 and independently under Python's `sqlite3` (a different C SQLite
+binding). Identical outcome both times:
+
+```
+OK              issues=3378   sample_beads_db_files/asupersync/beads.db
+OPEN-FAILED                 sample_beads_db_files/beads_rust/beads.db
+                             -> malformed database schema (idx_blocked_cache_blocked_at)
+                                - no such table: main.blocked_issues_cache
+OK              issues=970    sample_beads_db_files/flywheel_connectors/beads.db
+OK              issues=170    sample_beads_db_files/franken_whisper/beads.db
+OK              issues=1484   sample_beads_db_files/frankensqlite/beads.db
+OK              issues=1727   sample_beads_db_files/frankenterm/beads.db
+OK              issues=2590   sample_beads_db_files/frankentui/beads.db
+OK              issues=1600   sample_beads_db_files/mcp_agent_mail_rust/beads.db
+OK              issues=160    sample_beads_db_files/mcp_agent_mail_website/beads.db
+OK              issues=1947   sample_beads_db_files/ntm/beads.db
+OK              issues=733    sample_beads_db_files/remote_compilation_helper/beads.db
+INTEGRITY(99)   issues=551    sample_beads_db_files/repro_beadsrust_import_write.M6eaGY/.beads/beads.db
+OPEN-FAILED                 sample_beads_db_files/repro_frankensqlite_import_write.ljw6cl/.beads/beads.db
+                             -> malformed database schema (idx_issues_status) - no such table: main.issues
+```
+
+10 open clean and non-empty. 1 opens but `PRAGMA integrity_check` returns 99 violations. **2 do not open.**
+
+### 16.2 Root cause
+
+C SQLite parses `sqlite_master` in **rowid order**. frankensqlite wrote INDEX rows at rowids LOWER
+than the TABLE row they reference, so when C SQLite reaches the INDEX definition, the table it names
+has not been created yet. Measured rowids: in the repro fixture `idx_issues_*` sits at 2-16 while
+`issues` sits at 47; in `beads_rust`, `idx_blocked_cache_blocked_at` sits at 4219 while
+`blocked_issues_cache` sits at 4220. `beads_rust` additionally has that index **duplicated** at rowid
+4222, the artifact of the fsqlite stale-schema-cache re-emit that `execute_batch`'s
+`is_index && is_stale_schema` skip at `src/storage/schema.rs:527-532` silently swallows.
+
+The 99 integrity findings in the third fixture are a different defect: `issues.design` and
+`issues.acceptance_criteria` are declared `NOT NULL` and every row stores NULL.
+
+This is a frankensqlite **write-path** bug that C SQLite's stricter schema parser exposes. It is not
+a file-format difference: both engines write valid SQLite 3 containers.
+
+### 16.3 Scope: is user data at risk?
+
+This project's own live `.beads/beads.db` was checked and is **clean**: `integrity_check = ok`, 951
+issues, opens normally under C SQLite. The defect is possible, not universal.
+
+For an upgrading user the exposure is bounded by section 3's existing argument, which survives:
+`.beads/beads.db` is a gitignored, machine-local derived cache and `.beads/issues.jsonl` is the
+canonical tracked source, so a cache that C SQLite refuses is rebuilt rather than migrated. **But**
+the rebuild only happens if `br` reaches it, and the failure arrives as an *open-time schema-parse
+error*, which is a shape the current open path does not specifically recognise.
+
+### 16.4 Required addition: open-time fallback
+
+```
+br open(path)
+  |- ok ................................. normal
+  |- Err(SqliteFailure(CORRUPT | NOT_A_DATABASE))
+  |    or Err(SqliteFailure(UNKNOWN, msg))
+  |      where msg contains "malformed database schema"
+  |        or "no such table: main."
+  |                                 -> classify as RECOVERABLE_SCHEMA_PARSE
+  |                                 -> fall through to the existing rebuild-from-JSONL path
+  |                                 -> only then surface the error
+  '- any other error ................. surface as before
+```
+
+Three requirements, all testable:
+
+1. **Classify, do not string-match into oblivion.** A dedicated `ErrorCode` arm for a schema-parse
+   refusal at open, distinct from genuine corruption. `no such table: main.` and
+   `malformed database schema` are stable C SQLite messages, but match on the error code first and
+   treat the message as corroboration.
+2. **It must reach the JSONL rebuild, not merely produce a better message.** The whole reason section 3
+   can say "no data migration required" is that the cache is disposable. That is only true if the
+   unusable-cache path is *automatic*.
+3. **It must not mask a real `issues` table that is merely empty.** A `no such table: main.issues` on a
+   database that never had the schema is a different condition and must not cause a rebuild loop.
+
+### 16.5 Consequences for the test corpus and the phase plan
+
+- `tests/storage_engine_compat.rs` (P1.1) must encode the **measured** state, not the plan's. The
+  plan's exit criterion "all 13 fixtures open with `integrity_check = ok`" is unmeetable and should be
+  restated as "10 open clean; the 3 exceptions are characterised and stable".
+- The 2 unreadable fixtures are exactly the right input for the new fallback test: they are real
+  databases C SQLite refuses, so they are the honest fixture for open-time recovery.
+- P1.1 is no longer a half-day formality. The fallback in 16.4 is new work belonging in P2,
+  alongside `is_transient`, because it is the same discipline: a new error arm, a table-driven test,
+  and a documented decision about which codes recover.
+
+---
+
+## 17. Phase 1 status
+
+| Task | State |
+|---|---|
+| P1.1 on-disk compat test | Measurement done twice, by two bindings. Test not yet written. |
+| P1.2 manifest: add rusqlite alongside fsqlite | **Done**, uncommitted pending disk. `rusqlite` 0.40.2 + `libsqlite3-sys` 0.38.2 resolve. |
+| P1.3 bundled build on the fleet | **Answered, but not on RCH.** `rch` is not installed on this host. The bundled C amalgamation compiled (`sqlite3.o`, 7.7 MB) with **zero** libclang/bindgen references, which was the actual question. A full build then hit `No space left on device`. |
+| P1.4 freeze the baseline | **Done.** 18,733 / 259 / 109 across 136 binaries, names in 14.7. |
+| P1.5 extend the golden harness | **Partly done**: harness made portable, 28 stale goldens re-accepted, 0 regressions. Per-parser and CLI parity goldens remain. |
