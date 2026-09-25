@@ -416,15 +416,21 @@ which is 35.00 engineer-days, matching this document.
 P4 and P5 are modelled to run in parallel, because `schema.rs` and `events.rs` do not overlap with
 `sqlite.rs`. No edge connects them in either direction.
 
-### Seven dependency edges still to be added
+### Seven dependency edges, now added
 
-A graph audit found seven ordering constraints that are stated in prose but not yet encoded as `br`
-dependency edges. `br dep add` was unavailable at the time of the audit because of the
-schema-recovery blocker described in section 1, so they are recorded here. **Add all seven with
-`br dep add <issue> <depends-on>` once `br` is unblocked.** The graph is valid without them; they
-make the ordering enforceable rather than advisory.
+A graph audit found seven ordering constraints stated in prose but not encoded as `br` dependency
+edges. `br dep add` was blocked by the schema-recovery defect in section 1, so they were added
+through `br`'s JSONL-only mode, which needs no database connection:
 
-| Child task | Must wait for | Why |
+```bash
+br dep add <issue> <depends-on> -t blocks --no-db
+```
+
+All seven are now in the graph. Total: 42 beads, 81 intra-graph edges, of which 40 are `blocks`
+edges, verified acyclic by direct traversal of the JSONL. P4 and P5 remain independently reachable,
+so their parallelism is preserved.
+
+| Child task | Waits for | Why |
 |---|---|---|
 | `beads_rust-t6se.5.3` | `beads_rust-t6se.2.2` | The static retry loop gates on `is_transient` at three points; P2.2 is where that predicate is ported. |
 | `beads_rust-t6se.5.4` | `beads_rust-t6se.2.2` | Same, for the method retry loop. |
@@ -999,19 +1005,69 @@ delete files by hand to use the tool again. This is also the concrete unblock fo
 document was written in.
 
 **D. Optionally, actually enable the repair on Windows.** Lower priority, because A makes it
-unnecessary, and because the primitives are more risk for repairing an inert file:
+unnecessary, and because the primitives carry more risk than repairing an inert file is worth. The
+three Windows primitives were verified against primary Microsoft sources and by direct measurement
+on this host (Windows 11 Pro, build 10.0.26200, NTFS), so the assessment below is measured rather
+than recalled.
 
-- `quarantine_name` can delegate to `db_inode_lock::rename_database_candidate_no_replace`
-  (`db_inode_lock.rs:186`), which **already exists in the same crate** and does exactly this on
-  Windows via `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`. The quarantine code is duplicating
-  a primitive that is already written, already `unsafe`-exempted, and already documented in the same
-  module.
-- `sync_directory` can be a no-op success on Windows. `MoveFileExW` with `MOVEFILE_WRITE_THROUGH`
-  already carries the durability intent for the move itself; there is no directory-handle flush on
-  Windows that gives POSIX `fsync` semantics.
-- `RecoveryLock::acquire` needs a `#[cfg(windows)]` arm using `LockFileEx` across
-  `0x4000_0000..0x4000_0200`. The one-byte `LockFileEx` call already exists at
-  `db_inode_lock.rs:248` and can be adapted.
+- **No-replace rename: available, and already in the crate.** `quarantine_name` can delegate to
+  `db_inode_lock::rename_database_candidate_no_replace` (`db_inode_lock.rs:186`), which exists in
+  the same crate and already does this on Windows via `MoveFileExW` without
+  `MOVEFILE_REPLACE_EXISTING`. The quarantine code is duplicating a primitive that is already
+  written, already `unsafe`-exempted, and already documented in the same module.
+
+  `MoveFileExW` with flags `0` is a true no-replace. Measured: with an existing target it fails and
+  leaves the source intact. The `tempfile` crate uses the identical trick for `persist_noclobber`.
+  `std::fs::rename` must **not** be used: it passes `MOVEFILE_REPLACE_EXISTING`, and measurement
+  confirms it silently clobbers.
+
+  If `SetFileInformationByHandle` is preferred, `FileRenameInfoEx` (class 22) with `Flags = 0` is
+  also a correct no-replace, gated on Windows 10 1607, with runtime detection and a
+  `MoveFileExW(src, dst, 0)` fallback. Two traps if that path is taken: omitting
+  `FILE_RENAME_FLAG_REPLACE_IF_EXISTS` is what gives fail-if-exists, and
+  `FILE_RENAME_FLAG_POSIX_SEMANTICS` is `0x2`, not the widely-repeated `0x4`.
+
+- **Directory sync: treat failure as non-fatal.** `FlushFileBuffers` on a directory handle opened
+  `GENERIC_WRITE | FILE_FLAG_BACKUP_SEMANTICS` does work on NTFS, measured, but it is undocumented:
+  the function's own documentation only ever describes files and volumes, and the official
+  directory-handle reference does not list it.
+
+  The precedent is decisive. **SQLite itself does not sync directories on Windows.** In
+  `src/os_win.c`, `winDelete` takes a `syncDir` parameter annotated "Not used on win32" and
+  immediately discards it, and `winSync` ignores `SQLITE_SYNC_DIRECTORY` outright. Git and LMDB do
+  not sync directories on Windows either. So making `sync_directory` a no-op success on Windows
+  matches what every serious system does, and `MOVEFILE_WRITE_THROUGH` already carries the
+  durability intent for the move itself.
+
+- **Locking: the refusal was more correct than a naive `LockFileEx` port.** This is the one place
+  where the verification changed the conclusion, so it is worth being precise.
+
+  `LockFileEx` locks are owned by the file object, which is the direct analogue of a POSIX open
+  file description, so lock *lifetime* already matches OFD. Measured on this host: closing a second
+  handle that holds no lock does not release the first handle's lock, and closing the locking handle
+  does. That matches OFD exactly.
+
+  But the *conflict* model differs in a way that cannot be configured away. Two independent
+  `open()` calls in one process take **independent, non-conflicting** Linux OFD locks. Two
+  independent `CreateFile` handles in one process taking `LockFileEx` over the same range **do
+  conflict**, measured, returning `ERROR_LOCK_VIOLATION` (33). Microsoft documents this directly:
+  "If the locking process opens the file a second time, it cannot access the specified region
+  through this second handle until it unlocks the region."
+
+  For `RecoveryLock` that difference is in fact **favourable**. This guard exists to conflict with
+  SQLite's own byte ranges, and on Windows SQLite uses `LockFileEx` on the same range, so
+  intra-process self-conflict is the desired behaviour rather than a defect. The one-byte
+  `LockFileEx` call already present at `db_inode_lock.rs:248` can therefore be adapted to cover
+  `0x4000_0000..0x4000_0200`.
+
+  The offset choice still matters, for the reason the module documents at `:22-24`: Windows locks are
+  mandatory, so the lock must not overlap any byte the engine reads. SQLite's header lives at offset
+  0 and its lock bytes at `0x4000_0000`, so locking the latter range is safe and the former is not.
+  That is exactly why the write-authority lock uses `i64::MAX - 1` and this one does not.
+
+  One operational caveat for all three: a file cannot be renamed if a peer holds it open without
+  `FILE_SHARE_DELETE`, and nothing in the program can force another process to share delete. Open
+  the source with `DELETE | FILE_SHARE_DELETE`.
 
 ### Relationship to the migration
 
