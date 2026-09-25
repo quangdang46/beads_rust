@@ -85,6 +85,26 @@ The binding constraint is multi-process WAL on Windows, which is `br`'s actual o
   rights to OpenAI, Anthropic, and entities acting on their behalf, and defines "use" to include
   executing and testing. It is also pre-1.0 with 35 published versions in 7 months, where v0.3.9 was
   an expedited patch because v0.3.8 shipped a CLI that could not open file databases at all.
+
+  **Live evidence, observed 2026-09-25 on this machine.** While building the task graph for this
+  migration, every `br` command began failing on Windows with:
+
+  ```
+  SYNC_CONFLICT: automatic WAL index recovery already failed for this exact database family at
+  stage private-recovery (Database error: I/O error: WAL-index quarantine is not supported on
+  this platform)
+  ```
+
+  `br` routes schema-migration recovery through WAL-index quarantine, and frankensqlite does not
+  support that on Windows. The result is a hard failure on **every** subcommand, read and write
+  alike, with no in-band recovery path. The recovery pre-state is retained under
+  `.beads/.br_recovery/schema-migrations/`, so no data is lost, but `br` is unusable until a human
+  runs `br doctor migrate-schema recover` explicitly.
+
+  This is the migration thesis demonstrated rather than argued: a platform-specific engine
+  limitation, in a code path br depends on for self-healing, takes the whole tool offline on
+  Windows. The plan's own Phase 4 depends on `user_version`-driven migration recovery working
+  reliably. That is not a hypothetical dependency; it is currently broken on this platform.
 - **Turso:** the only pure-Rust engine with real production evidence, and also pre-1.0. Its MVCC is
   documented as not production-ready (no index creation under MVCC, only
   `wal_checkpoint(TRUNCATE)` works, docs warn queries may return incorrect results). Its
