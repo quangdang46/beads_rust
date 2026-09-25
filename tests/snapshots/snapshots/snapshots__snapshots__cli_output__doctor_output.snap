@@ -12,8 +12,8 @@ OK permissions.recovery_dir
 OK permissions.write_lock
 OK permissions.root_gitignore
 OK permissions.config_yaml_secrets
-OK br_path_dupes
-WARN gitignore.beads_inner_present: /TMP/.beads/.gitignore exists but is missing expected pattern(s): .write.lock
+WARN br_path_dupes: Found 2 `br` executables on $PATH — operator may be confused which one runs
+OK gitignore.beads_inner_present
 OK tmp_files_orphan
 OK br_history.size
 OK routes_jsonl: No routes.jsonl present (ID-REDACTED routing is optional)
@@ -21,7 +21,7 @@ WARN rust_log: RUST_LOG=beads_rust=debug would dump verbose tracing to stderr an
 OK permissions.beads_dir: `.beads/` and critical children are ID-REDACTED
 OK config.yaml: config.yaml parses cleanly (99 bytes)
 OK metadata.json: metadata.json parses cleanly (62 bytes); declared targets exist on disk
-OK binary_version: Running br 0.2.15; no beads_rust Cargo.toml reachable from .beads/ — not flagging
+OK binary_version: Running br 0.1.3; no beads_rust Cargo.toml reachable from .beads/ — not flagging
 OK write_lock: .beads/.write.lock is 0s old (within 300s threshold); not stale
 OK routes.targets: No local or town routes.jsonl present (route targets are optional)
 OK startup_cache.health
@@ -40,7 +40,7 @@ OK db_bloat
 OK wal_size
 OK db.recovery_artifacts
 OK db.recovery_artifacts.aged
-WARN db.sidecars: WAL sidecar exists without a matching SHM sidecar at /TMP/.beads/beads.ID-REDACTED (expected for frankensqlite)
+OK db.sidecars
 OK schema.tables
 OK schema.columns
 OK db.recoverable_anomalies

@@ -1119,3 +1119,441 @@ migration retire the need for D later.
 `fsqlite` was adopted in this repository to replace an earlier `rusqlite` dependency. The previous
 configuration is recoverable at `d3d9bce6^:Cargo.toml:22` and has not been exercised since. Assume
 its 0.38.0 API surface matches 0.40.2 and verify during Phase 1 rather than assuming it.
+
+---
+
+## 14. Phase 1 measured baseline (2026-09-25, branch `feat/rusqlite-migration`)
+
+Frozen against `main` @ `6ff3acbe` before any manifest edit, on macOS (darwin 25.4.0,
+rustc 1.100.0-nightly). `rch` is **not installed on this host**, so every build ran locally.
+`CARGO_TARGET_DIR` is redirected to a private directory, because a shared `target/` was
+deleted out from under this session mid-run by another process.
+
+### 14.1 The rule for using this baseline
+
+The plan judges each phase against "no NEW failures versus this baseline". That only works if the
+baseline is recorded as **exact test names**, not a count. Diff the name list, not the totals.
+
+### 14.2 Raw measurements, unmodified tree
+
+| Measurement | Result |
+|---|---|
+| `cargo build` (debug, all features) | clean, 0 warnings |
+| `cargo test --all-features --no-fail-fast` | see 14.3 |
+| `cargo clippy --all-targets -- -D warnings` | **493 errors** |
+| `cargo clippy --lib --bins` | **228 errors** in the lib, plus 145 warnings |
+
+### 14.3 The macOS temp-path trap, and why counts alone are useless
+
+`TMPDIR` on this host is `/var/folders/...`, but macOS resolves that through a symlink to
+`/private/var/folders/...`. `std::env::temp_dir()` returns the canonicalized form, while a large
+number of tests compare a raw temp path against a canonicalized one. The result is a large block of
+failures that have nothing to do with product behaviour.
+
+The lib target alone: **120 failures** with the stock `TMPDIR`, **1 failure** with `TMPDIR` pointed
+at a real (non-symlinked) directory. Same code, same commit, 119 failures of pure environment.
+
+**This matters for the plan in a way that is easy to miss.** Many of those tests live in files the
+migration touches: `src/config/mod.rs` (P3.3), `src/cli/commands/doctor.rs` (P3.4),
+`src/cli/commands/sync.rs` and `src/sync/mod.rs` (P3.5). Judging the port against a baseline that
+is mostly environment noise would make the "no NEW failures" gate meaningless.
+
+### 14.4 The golden harness was inoperable, and why that was a blocker
+
+The plan's primary safety mechanism is a byte-identical golden comparison (P6 exit criteria). It
+did not work, for two independent reasons.
+
+**The committed goldens were stale.** `mol_type` / `work_type` / `wisp_type` were added to `Issue`
+and the issue-type enum grew from 7 to 15 members, but no snapshot was re-accepted. 26 of 243
+snapshot tests failed on `main` before any migration work. Commit `7b2ced28` is the source.
+
+**The normalizer could not run on macOS at all.** `tests/snapshots/mod.rs:87`:
+
+```rust
+Regex::new(r"(?:/data)?/tmp/[A-Za-z0-9_-]*/?\.tmp[a-zA-Z0-9]+|/var/folders/[a-zA-Z0-9/_-]+")
+```
+
+Two defects, both Linux-shaped assumptions. The macOS branch's character class excludes `.`, so it
+stops before the `tempfile` component and normalizes to `/TMP/.tmpAbC123` instead of `/TMP`, leaving
+a per-run random segment no committed snapshot can match. And macOS reports temp paths through the
+`/private` prefix, which the pattern does not consume. `tests/snapshots/history_diff_output.rs:53`
+had the mirror-image bug: it replaced the raw workspace root, but `br` logs the canonicalized path.
+
+Left unfixed, regenerating the goldens bakes a random machine path into the committed gate. This was
+caught by diffing the regeneration before accepting it, which is the reason to diff before accepting.
+
+Fixed, the harness is platform-correct, and `--test snapshots` is **243 passed / 0 failed**, stable
+across a second non-forced run, with zero machine-specific paths in the committed files.
+
+### 14.5 What is genuinely broken on `main`, independent of this migration
+
+None of the following is caused by the engine swap. None is a migration blocker. All are recorded so
+nobody re-derives them, and so a later reader does not mistake them for port regressions.
+
+1. **Go-parity `content_hash` does not match the `bd` fixtures.** `tests/conformance.rs:419` and
+   `tests/storage_id_hash_parity.rs:293` both fail. Tracked as `beads_rust-a1s1`. The migration does
+   not change hash computation, and the P6 gate only requires hashes to be *stable* across the
+   swap, not Go-correct, so this does not block the port.
+2. **`clippy -D warnings` is unsatisfiable.** 493 errors. Commit `7b2ced28` moved
+   `rust-toolchain.toml` to `nightly (latest)` and disabled clippy in CI, citing ~200 new lint
+   rules. **The plan's P8 exit criteria and AGENTS.md's mandated check are therefore both
+   currently unmeetable.** Judged as a name-set diff, not a count.
+3. **~120 lib-level path tests fail on macOS** for the reason in 14.3. They cover path discovery and
+   the sync allowlist, not the storage engine, so they do not gate the port.
+
+### 14.6 Consequences for the phase plan
+
+- P1.5 (golden harness) is partly **done**: the harness is fixed and the goldens are re-accepted.
+  What remains is the per-parser coverage and the ~60 CLI parity goldens the plan asks for.
+- P6's byte-identical gate is now **actually operational**, which was the precondition for the whole
+  risk argument. Without 14.4 this plan had no way to detect a silent column or storage-class shift.
+- P2's exit criterion ("exit-code and structured-error tests pass with zero test edits") is
+  **unmeetable as written**: 10 `e2e_structured_error_*` tests already fail on `main`, all at
+  `tests/e2e_errors.rs` "should be valid JSON". Re-baseline and diff by name instead.
+
+---
+
+## 15. Pre-port reconciliation (13-agent verification, 2026-09-25)
+
+Every claim in sections 5, 7, 8 and 13 was re-derived against the live tree. Most held. These did
+not, and they change the work.
+
+### 15.1 Correct counts
+
+| Section says | Actually | Why it matters |
+|---|---|---|
+| 14 `*_from_row` parsers | **16** across `src/` | P6 ports them all; the golden-case list was short by 2. |
+| 602 `SqliteValue::from` sites | **674** in `src/`, 719 repo-wide | The adapter's justification. Surface is 12–19% larger than budgeted. |
+| 34-file Phase 3 surface | **38** | 34 planned + 3 storage + **1 genuinely missed file**. |
+| 4,790 test attributes / 133 binaries | 4,790 attributes is right; **136** binaries execute | Executed cases are far higher, because proptest and doc-tests expand each attribute. |
+| `unsafe_code` at `Cargo.toml:183` | `:184` (183 is the `[lints.rust]` header) | Line ref only. Policy is intact. |
+| retry loop `:741-800` | `:741-807` | Copying the stated range truncates the retry-exhausted error return. |
+| `jittered_backoff` inside `:1484-1560` | at **`:1565-1584`**, outside the range | It is the load-bearing backoff; slicing the stated range loses it. |
+
+### 15.2 The ordering bug that would have broken the port
+
+`src/error/mod.rs:42` is `BeadsError::Database(#[from] fsqlite_error::FrankenError)`, and the plan
+ranks it **18th** as a "1-to-3 ref file" in Phase 3. But 8 files construct that variant
+(`config/mod.rs` 17 sites, `storage/sqlite.rs` 8, `storage/schema.rs` 7, `cli/commands/mod.rs` 6,
+`error/structured.rs` 3, `sync/mod.rs` 2, `cli/commands/create.rs` 1). Swapping the payload in Phase 3
+breaks every `#[from]` site at once, mid-phase. **It must land with Phase 2's error taxonomy, not as
+a Phase 3 leaf.** `config/mod.rs` is the worst case: 22 `FrankenError` variant references sit in a
+single production classification block at `:1058-1080`, and that variant set has no rusqlite
+equivalent.
+
+### 15.3 Files the plan's search pattern cannot see
+
+The plan inventories by `fsqlite|SqliteValue|FrankenError`. That pattern never matches the bare word
+**frankensqlite**, which hides a real behavioral contract:
+
+> `doctor.rs:1819` emits `WARN ... WAL sidecar exists without a matching SHM sidecar at {} (expected
+> for frankensqlite)`
+
+This is asserted in `src/health.rs:704-718`, baked into the `doctor_output` golden, and asserted by
+**4 fixture shell scripts** under `tests/doctor_fixtures/` plus 2 READMEs. Under C SQLite the `-shm`
+is real, so the check either stops firing or its severity and message must change. The plan discusses
+this in prose but lists none of these files in any phase, and the Phase 3 exit criterion (compile
+errors only in `src/storage/`) would pass green while the golden silently rots.
+
+### 15.4 Surface the plan's shape analysis missed
+
+- **`fsqlite::Row` as a named type.** `doctor.rs:23` and `federation.rs:90` take `&Row` /
+  `&fsqlite::Row`. rusqlite's `Row` borrows from its `Statement` and is not `'static`, so these
+  signatures cannot be mechanically substituted. The `db.rs` adapter covers values, not rows.
+- **9 sites in `doctor.rs` rely on owned row semantics** via `row.values()` (`:2942`, and
+  `:5124`-`:5501`). rusqlite's `get_ref` borrows; each needs a lifetime threaded through. The single
+  most invasive shape change in the heaviest file, and the plan folds it into a generic note.
+- **`fsqlite::compat::OpenFlags`** is used for a read-only open in `info.rs:234-236`. An API surface
+  the plan never mentions.
+- **`Cargo.lock` carries 5 transitive `fsqlite-ext-*` crates** not in `Cargo.toml`. Expect ~20
+  fsqlite packages to leave the lock, not 15.
+- **`rg rusqlite` already has false positives** in `src/util/markdown_import.rs` and
+  `tests/markdown_import.rs`, inside importer fixture strings. Any global replace during the port
+  would corrupt them.
+- **`Cargo.toml:169-181`** is a manifest-level comment documenting the fsqlite/frankensqlite decision.
+  It goes stale with the swap and the plan's supply-chain list does not name it.
+
+### 15.5 The plan's "consumers" are not all consumers
+
+Of the 24 files Phase 3 ranks by reference density, **9 contain no executable fsqlite code at all**:
+`logging.rs` (10 refs, all `tracing` filter directives like `fsqlite=error`), `sync.rs` (7, six doc
+comments), `main.rs` (4, all comments), `markdown_import.rs` (2, a fixture string), `web/mod.rs`,
+`web/api.rs`, `mcp/mod.rs`, `update.rs` (1 comment each), `init.rs` (5, `.gitignore` globs). These
+need a **decision** (delete the dead directives and globs, or retarget them), not a port. Two more,
+`delete.rs` and `cli/commands/mod.rs`, are test-only, so ranking them "trickiest first" is
+meaningless. And `tests/bench_synthetic_scale.rs` has **46** `SqliteValue` refs, second-heaviest in
+the tree, but the plan renders it "(2)" because its parenthetical tracks `fsqlite` density.
+
+Net effect on the estimate: the mechanical volume is *larger* than budgeted while the number of files
+needing real porting is *smaller*. These do not cancel out, and the 5.5-day P3 figure should be
+treated as the softest number in this document.
+
+
+### 14.7 Frozen failing-test names (the actual gate)
+
+Baseline: `main` @ `6ff3acbe` + the 14.4 golden-harness fix, stock `TMPDIR`, `feat/rusqlite-migration`.
+Totals: **18,733 passed / 259 failed / 109 ignored** across 136 test binaries (90 green, 46 red).
+
+Diff THIS LIST, never the counts. A phase is clean when this list is unchanged or shorter.
+
+```
+agent_baseline_snapshots_match_current_binary
+atomic_write_pipeline_produces_valid_output
+changelog_fragment_keeps_previous_tag_and_reliability_paths
+checksum_fragment_records_current_installer_hash
+cli_symlinked_beads_target_offline_recovers_after_restore
+cli_sync_crash_boundary_matrix_preserves_artifacts
+cli::commands::audit::tests::test_append_preserves_order
+cli::commands::audit::tests::test_audit_entry_exists_finds_existing_parent
+cli::commands::defer::tests::execute_defer_sets_status_and_until
+cli::commands::defer::tests::execute_defer_without_until_sets_indefinite
+cli::commands::defer::tests::execute_undefer_clears_defer_until
+cli::commands::defer::tests::execute_undefer_preserves_non_deferred_status_for_soft_defer
+cli::commands::defer::tests::execute_undefer_skips_terminal_issue_with_stale_defer_until
+cli::commands::doctor::tests::test_fix_recovery_artifacts_aged_is_idempotent_no_op_on_second_call
+cli::commands::doctor::tests::test_repair_database_from_jsonl_restores_issue_prefix_from_jsonl
+cli::commands::history::tests::test_commit_restored_target_restores_original_file_when_replace_fails
+cli::commands::history::tests::test_diff_backup_reports_missing_current_stem_file
+cli::commands::history::tests::test_restore_backup_recreates_missing_target_parent_directories
+cli::commands::history::tests::test_restore_backup_skips_stale_regular_temp_file
+cli::commands::history::tests::test_restore_backup_uses_metadata_target_path
+cli::commands::r#where::tests::resolve_where_output_does_not_create_missing_db
+cli::commands::r#where::tests::resolve_where_output_preserves_redirect_origin
+cli::commands::reopen::tests::execute_clears_defer_until_when_reopening_closed_deferred_issue
+cli::commands::reopen::tests::execute_reopen_tombstone_skips_without_resurrecting_it
+cli::commands::stats::tests::test_git_repo_context_from_filesystem_reads_gitdir_file
+cli::commands::stats::tests::test_git_repo_context_from_filesystem_reads_loose_head
+cli::commands::stats::tests::test_git_repo_context_reads_root_and_head
+cli::commands::sync::tests::sync_status_fast_open_miss_reuses_caller_write_lock_for_rebuild
+cli::commands::sync::tests::test_validate_sync_paths_allows_missing_internal_parent_directory
+cli::commands::tests::mutation_recovery_can_be_signaled_by_probe_after_constraint_style_error
+cli::commands::tests::retry_mutation_recovers_from_recoverable_database_error
+cli::commands::tests::retry_preserves_staged_attribution_across_jsonl_recovery
+cli::commands::tests::routed_workspace_write_lock_marks_cli_for_fast_open_recovery
+combined_checksums_fragment_is_null_safe_and_replaces_existing_file
+compare_fragment_reports_changed_and_unchanged_states
+concurrent_exports_no_corruption
+config::tests::discover_beads_dir_deeply_nested
+config::tests::discover_beads_dir_finds_at_root
+config::tests::discover_beads_dir_with_cli_from_falls_back_to_workspace_for_external_cli_db_override
+config::tests::discover_beads_dir_with_cli_from_falls_back_to_workspace_for_external_db_override
+config::tests::discover_beads_dir_with_cli_from_falls_back_to_workspace_for_relative_cli_db_override
+config::tests::discover_beads_dir_with_cli_from_uses_env_db_override
+config::tests::discover_optional_beads_dir_with_cli_follows_redirect_for_explicit_db_override
+config::tests::discover_optional_beads_dir_with_cli_uses_explicit_db_override
+config::tests::load_config_validates_external_jsonl_before_prefix_inference
+config::tests::open_storage_with_cli_backs_up_non_file_sidecars_that_block_recovery
+config::tests::open_storage_with_cli_backs_up_rollback_journal_sidecars_during_recovery
+config::tests::open_storage_with_cli_no_db_flushes_force_flush_without_dirty_rows
+config::tests::open_storage_with_cli_no_db_keeps_distinct_closed_issues_with_identical_content
+config::tests::open_storage_with_cli_no_db_validates_external_jsonl_before_hashing
+config::tests::open_storage_with_cli_rebuilds_missing_db_from_jsonl
+config::tests::open_storage_with_cli_recovers_corrupt_db_from_valid_jsonl
+config::tests::open_storage_with_cli_recovers_malformed_schema_db_from_valid_jsonl
+config::tests::open_storage_with_cli_recovers_malformed_schema_db_with_in_progress_issue
+config::tests::open_storage_with_cli_recovers_when_post_open_probe_finds_duplicate_config_rows
+config::tests::open_storage_with_cli_refuses_recovery_for_symlinked_db_path
+config::tests::open_storage_with_startup_config_uses_preloaded_paths
+config::tests::read_only_fast_open_miss_reuses_caller_write_lock_before_rebuild
+config::tests::resolve_bootstrap_issue_prefix_normalizes_directory_name
+conformance_content_hash_matches_go_bd_fixture
+conformance::conformance_content_hash_matches_go_bd_fixture
+content_hash_deterministic_fixture
+coordination_status_invalid_snapshot_fails_structured
+defer_nonexistent_error
+defer_until_invalid_error
+direct_sqlite_profile_marks_bypassed_sync_health
+dispatch_payload_shape_is_secret_free_and_complete
+doctor_fixture_suite_passes
+dry_run_and_dispatch_conditions_cover_changed_force_and_token_paths
+dry_run_fragment_reports_intended_notification
+e2e_basic_lifecycle
+e2e_bd_db_env_override_allows_access_outside_workspace
+e2e_beads_jsonl_env_overrides_metadata
+e2e_capabilities_command_detail_machine_output_contracts_json
+e2e_changelog_since_commit_uses_target_repo_root
+e2e_close_blocked_requires_force
+e2e_doctor_detects_and_quarantines_anomalous_wal_sidecar
+e2e_doctor_detects_issues
+e2e_doctor_healthy_workspace
+e2e_doctor_json
+e2e_doctor_json_output
+e2e_doctor_repair_json_rebuilds_and_returns_single_payload
+e2e_dotted_child_show_and_update_stay_on_exact_issue_after_rebuild
+e2e_error_text_json_parity_validation
+e2e_error_text_vs_json_parity
+e2e_full_workspace_lifecycle
+e2e_installer_detects_system_platform
+e2e_installer_platform_detection_linux_x64
+e2e_installer_uses_tagless_release_asset_names
+e2e_no_db_with_beads_jsonl
+e2e_non_hermetic_smoke_existing_workspace_preserves_env_sensitive_paths
+e2e_orphans_fix_before_init_rejects_machine_output
+e2e_parallel_mixed_db_commands_preserve_sqlite_integrity
+e2e_parallel_read_only_commands_serialize_without_busy_on_drop
+e2e_raw_fsqlite_keyed_lookup_matches_full_scan_after_alt_rebuild
+e2e_rebuilt_alt_db_preserves_fresh_lookup_and_mutation_paths
+e2e_routing_db_flag_external_path
+e2e_routing_dep_add_rejects_direct_cross_project_target
+e2e_routing_external_target_lock_blocks_routed_access
+e2e_routing_invalid_beads_dir_env
+e2e_routing_label_add_failure_does_not_mutate_earlier_batches
+e2e_routing_not_initialized_error
+e2e_routing_path_normalization
+e2e_routing_show_external_issue_not_found
+e2e_structured_error_ambiguous_id
+e2e_structured_error_conflict_markers
+e2e_structured_error_cycle_detected
+e2e_structured_error_dependency_target_not_found
+e2e_structured_error_invalid_priority
+e2e_structured_error_issue_not_found
+e2e_structured_error_label_too_long
+e2e_structured_error_label_validation
+e2e_structured_error_not_initialized
+e2e_structured_error_self_dependency
+e2e_sync_auto_rebuild_plain_import_reports_recovery_result
+e2e_sync_flush_refuses_to_overwrite_conflict_markers
+e2e_sync_rename_prefix_applies_after_missing_db_recovery_with_force
+e2e_sync_rename_prefix_applies_after_missing_db_recovery_without_force
+e2e_sync_rename_prefix_clears_duplicate_external_ref_after_missing_db_recovery
+e2e_sync_rename_prefix_failed_import_restores_original_corrupt_db_family
+e2e_sync_rename_prefix_import_failure_does_not_leave_missing_db_created
+e2e_update_tombstone_rejected
+export_cleans_up_temp_file_on_success
+export_count_matches_file_line_count
+export_produces_valid_jsonl_per_line
+export_sets_correct_permissions
+export_skips_stale_regular_temp_file_and_preserves_it
+golden_create_update_close_sqlite_rows_and_jsonl
+golden_init_directory_listing
+golden_init_expected_file_set
+golden_init_text_contents
+golden_list_rich_widths
+golden_show_rich_widths
+golden_stats_rich_widths
+hash_matches_go_bd_reference_for_shared_fields
+import_custom_issue_type_preserves_case_through_roundtrip
+import_custom_status_preserves_case_through_roundtrip
+import_export_roundtrip_normalizes_case
+import_failure_conflict_markers_no_db_changes
+import_failure_malformed_json_no_db_changes
+import_failure_prefix_mismatch_no_db_changes
+import_mixed_case_content_hash_matches_canonical
+import_mixed_case_issue_type_normalizes
+import_mixed_case_status_normalizes
+integration_sync_only_touches_allowed_files
+jsonl_import_mixed_case_status_issue_type_preserves_hash
+jsonl_import_normalizes_mixed_case_known_status_and_issue_type
+jsonl_import_preserves_custom_status_and_issue_type_case
+jsonl_round_trip_preserves_identity_hashes_and_relations
+mcp::tests::with_mutation_clears_read_snapshot_cache_before_writing
+mcp::tests::with_mutation_flushes_committed_changes_before_returning_late_error
+mcp::tools::tests::close_issue_batch_returns_ordered_items_partial_errors_and_flushes
+mcp::tools::tests::close_issue_legacy_single_result_shape_is_unchanged
+mcp::tools::tests::create_issue_accepts_500_multibyte_character_title
+mcp::tools::tests::create_issue_accepts_long_description_through_mcp
+mcp::tools::tests::create_issue_batch_returns_ordered_items_partial_errors_and_flushes
+mcp::tools::tests::create_issue_legacy_single_result_shape_is_unchanged
+mcp::tools::tests::create_issue_persists_canonical_content_hash
+mcp::tools::tests::manage_dependencies_allows_external_targets
+mcp::tools::tests::manage_dependencies_allows_non_blocking_reverse_links
+mcp::tools::tests::manage_dependencies_batch_returns_ordered_items_partial_errors_and_flushes
+mcp::tools::tests::manage_dependencies_legacy_single_result_shapes_are_unchanged
+mcp::tools::tests::update_issue_batch_rejects_invalid_comment_before_item_field_mutation
+mcp::tools::tests::update_issue_batch_returns_ordered_items_partial_errors_and_flushes
+mcp::tools::tests::update_issue_legacy_single_result_shape_is_unchanged
+mcp::tools::tests::update_issue_rejects_invalid_comment_before_field_mutation
+missing_token_fragment_is_notice_not_failure
+notify_workflow_exposes_expected_steps_and_main_trigger
+preflight_import_conflict_markers_shows_line_numbers
+preflight_import_rejects_conflict_markers
+previous_checksum_fragment_handles_previous_and_missing_versions
+prop_validate_accepts_canonical_jsonl
+re_export_overwrites_cleanly
+ready_imports_stale_external_jsonl_before_status_probe
+release_workflow_exposes_expected_fragment_steps
+release_workflow_uses_tagless_asset_file_names
+reliability_override_fragment_requires_reason_and_records_summary
+repository_workflow_action_pins_are_inventory_backed
+repro_sync_cycle_crash_binary_garbage_jsonl
+repro_sync_cycle_crash_export_upsert_orphan
+repro_sync_cycle_crash_mangled_binary
+repro_sync_cycle_crlf_jsonl
+repro_sync_cycle_duplicate_lines
+repro_sync_cycle_slow_unit_force_upsert_orphan
+required_artifact_fragment_reports_missing_platforms
+scenario_doctor_healthy_workspace
+scenario_doctor_json_output
+scenario_workspace_lifecycle
+signing_fragment_uses_private_ephemeral_key_file
+stale_temp_file_handled_gracefully
+successive_exports_idempotent
+summary_fragment_records_workflow_outcome
+sync::path::tests::test_allowed_db_file
+sync::path::tests::test_allowed_db_journal_file
+sync::path::tests::test_allowed_db_wal_file
+sync::path::tests::test_allowed_jsonl_file
+sync::path::tests::test_allowed_manifest_file
+sync::path::tests::test_allowed_metadata_file
+sync::path::tests::test_allowed_normalized_internal_path_with_parent_component
+sync::path::tests::test_allowed_pid_scoped_temp_file
+sync::path::tests::test_allowed_temp_file
+sync::path::tests::test_is_sync_path_allowed_accepts_normalized_internal_path
+sync::path::tests::test_is_sync_path_allowed_quick_check
+sync::path::tests::test_new_file_in_beads_dir
+sync::path::tests::test_rejected_directory_named_like_jsonl
+sync::path::tests::test_rejected_disallowed_extension
+sync::path::tests::test_rejected_outside_beads_dir
+sync::path::tests::test_rejected_source_file
+sync::path::tests::test_rejected_traversal
+sync::path::tests::test_relative_internal_symlink_is_not_misclassified_as_escape
+sync::path::tests::test_require_valid_sync_path_error
+sync::path::tests::test_require_valid_sync_path_ok
+sync::path::tests::test_safe_overwrite_allows_manifest_inside_beads
+sync::path::tests::test_temp_file_nested_beads_subdir
+sync::path::tests::test_temp_file_valid_same_directory
+sync::path::tests::test_temp_file_valid_same_directory_with_pid_scoped_name
+sync::path::tests::test_validation_logs_rejection
+sync::path::tests::validate_sync_path_does_not_accept_recovery_bak_directly
+sync::path::tests::validate_sync_path_rejects_absolute_external_path
+sync::tests::test_auto_flush_clears_byte_identical_dirty_marker_without_rewrite
+sync::tests::test_auto_flush_validates_path_before_reading_existing_jsonl
+sync::tests::test_auto_import_if_stale_validates_external_path_before_hashing
+sync::tests::test_auto_import_probe_validates_external_path_before_hashing
+sync::tests::test_preflight_export_passes_with_valid_setup
+sync::tests::test_preflight_import_conflict_markers_mixed_content
+sync::tests::test_preflight_import_empty_file_passes_json_check
+sync::tests::test_preflight_import_mixed_prefix_partial_mismatch
+sync::tests::test_preflight_import_only_blank_lines_passes_json_check
+sync::tests::test_preflight_import_passes_valid_json_lines
+sync::tests::test_preflight_import_passes_valid_jsonl
+sync::tests::test_preflight_import_prefix_accepts_slugged_ids
+sync::tests::test_preflight_import_prefix_passes_matching_prefix
+sync::tests::test_preflight_import_prefix_skips_tombstones
+sync::tests::test_preflight_import_rejects_conflict_markers
+sync::tests::test_preflight_import_rejects_duplicate_issue_ids_during_validation
+sync::tests::test_preflight_import_rejects_invalid_json_lines
+sync::tests::test_preflight_import_rejects_nonexistent_file
+sync::tests::test_preflight_import_rejects_prefix_mismatch
+sync::tests::test_preflight_import_rejects_semantically_invalid_issue_records
+sync::tests::test_preflight_import_rejects_shared_prefix_superset
+sync::tests::test_preflight_import_success_path_all_checks
+sync::tests::test_save_base_snapshot_from_jsonl_uses_finalized_export_contents
+sync::tests::test_save_base_snapshot_skips_stale_regular_temp_file
+sync::tests::test_save_base_snapshot_sorts_issues_deterministically
+synthetic_ci_profile_benchmarks_graph_projection_workloads
+synthetic_ci_profile_generates_valid_reproducible_manifest
+test_auto_flush_flush_on_label_change
+test_auto_flush_preserves_unrelated_existing_jsonl_lines
+test_create_deps_colon_title
+test_create_parent_standin
+test_create_parent_standin_forward_reference
+test_markdown_import_all_failed_returns_error
+test_update_package_manifests_workflow_uses_current_checksums
+test_version_consistency
+tests::preopened_storage_reuses_startup_paths
+verify_checksums_fragment_accepts_spaces_and_leading_dashes
+verify_checksums_fragment_fails_on_corrupt_checksum
+workspace_failure_replay_manifest_expectations_hold_on_fresh_copies
+worktree::tests::test_detect_beads_state_shared
+```

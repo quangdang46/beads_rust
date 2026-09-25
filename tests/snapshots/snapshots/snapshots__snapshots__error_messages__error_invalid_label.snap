@@ -1,6 +1,5 @@
 ---
 source: tests/snapshots/error_messages.rs
-assertion_line: 73
 expression: normalize_output(&output.stderr)
 ---
 YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Validating sync path path=/TMP/.beads/issues.jsonl beads_dir=/TMP/.beads
