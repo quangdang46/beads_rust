@@ -570,6 +570,14 @@ then prove it on the 24 files that contain no transaction logic before touching 
 **Goal:** migrate the DDL and migration engine plus the audit log. This phase contains a real
 deletion.
 
+**BLOCKED ON AN UPSTREAM FIX.** This phase operates the `user_version`-driven migration path, and
+that path is currently dead on Windows. Section 12 documents the root cause, the failure chain, and
+a three-part fix (skip the unsupported repair, classify terminal versus transient failures, add an
+operator escape hatch). That fix belongs to the 0.7.0 lineage, not to this repository, so it is a
+**prerequisite** to be delivered there rather than work inside this phase. Phase 4 cannot start on
+Windows until it lands. The optional fourth part, actually enabling the repair on Windows, is
+deferred: the migration retires the need for it.
+
 - Delete `split_sql_statements` (`schema.rs:402`) and the local `execute_batch` shim
   (`schema.rs:511`), about 110 lines total. Route all 25 call sites to `conn.execute_batch`,
   including the roughly 120-statement `SCHEMA_SQL`.
@@ -875,7 +883,154 @@ corrected against the local tree.
 
 ---
 
-## 12. Evidence appendix
+## 12. The Windows recovery dead end: root cause and fix
+
+This section records the investigation requested after the dead end was found. It is the most
+concrete evidence the migration has produced, and it is also a **prerequisite** for Phase 4.
+
+### Two repositories, not one
+
+The `br` on `PATH` is version **0.7.0** and was built from `Dicklesworthstone/beads_rust`, which
+pins **fsqlite 0.4.4**. This repository is `quangdang46/beads_rust` at version **0.1.3**, pinning
+**fsqlite 0.1.19**. They share a description and a common ancestor project (Steve Yegge's beads)
+but **not commit history**: this repository's first commit is 2026-01-15 with 2418 commits; the
+other was created 2026-01-18 and was pushed 2026-09-25. A local commit SHA does not resolve in the
+other repository.
+
+The 0.7.0 binary is nonetheless the thing operating on **this** repository's `.beads/` directory.
+That is how the defect below reached this workspace. Any fix belongs to the 0.7.0 lineage; this
+repository can only record the dependency.
+
+### Root cause, exact
+
+`src/sync/db_inode_lock.rs:115-129` in the 0.7.0 lineage:
+
+```rust
+#[cfg(not(any(target_os = "linux", target_os = "android",
+                target_os = "macos",  target_os = "ios")))]
+pub(crate) fn acquire(_file: File) -> Result<Self, TryLockError> {
+    // Never substitute flock: it does not exclude SQLite's POSIX locks
+    // on Linux. Other platforms need a qualified byte-range guard and
+    // durable quarantine primitive before enabling this repair.
+    Err(TryLockError::Error(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "WAL-index quarantine is not supported on this platform",
+    )))
+}
+```
+
+This is `RecoveryLock::acquire`, which must lock bytes `0x4000_0000` for length 512, deliberately
+overlapping SQLite's own PENDING/RESERVED/SHARED range. The comment above it (`:77-80`) explains
+why: replacing `-shm` while even an idle SQLite reader retains a mapping is unsafe. The Unix arm
+uses an open-file-description lock, `fcntl(F_OFD_SETLK)`. There is no such primitive on Windows, and
+the author chose to refuse rather than substitute something weaker. **That refusal is correct.**
+
+Two further Windows gates sit behind it, in `src/franken_sync/wal_index.rs`:
+
+- `quarantine_name` (`:270-296`) returns `Unsupported` off the four Unix targets. Its comment states
+  the rule: "a filesystem without atomic no-replace support must retain the live cache instead of
+  risking an evidence overwrite."
+- `sync_directory` (`:255-268`) returns `Unsupported` for `not(unix)`, and is called at `:383`,
+  before `quarantine_name` at `:391`.
+
+### The actual defect is not the refusal
+
+The refusal is sound engineering. **The defect is that an environmentally permanent refusal is
+persisted as a recovery marker, after which it becomes a permanent block on every command.**
+
+`recover_wal_index_for_startup` at `src/cli/commands/doctor_subsystems/schema_migration.rs:484`:
+
+1. `:496` `if !wal_index_needs_recovery(db_path)? { return Ok(()) }`. On Windows this is **always
+   true**, because frankensqlite keeps the WAL index in process memory rather than in `-shm`, so the
+   index looks missing on every startup. `br doctor` confirms it: "a WAL-only family is expected for
+   frankensqlite; the WAL index lives in process memory".
+2. `:504-517` if a prior failed recovery exists for a byte-identical family, return
+   `BeadsError::SyncConflict` and refuse. The intent, stated at `:499-503`, is sound: a rehearsal
+   over identical bytes is deterministic, so repeating it on every command only accumulates copies.
+3. `:523` otherwise attempt the recovery, which hits the `Unsupported` at `db_inode_lock.rs:121`.
+
+The guard in step 2 is **unconditional on the cause of the prior failure**. A transient I/O failure
+and a permanent platform refusal are treated identically, so a refusal that can never succeed is
+converted into a block that can never be lifted.
+
+There is no escape hatch. `br doctor migrate-schema` offers `recover`, `plan`, `apply`, and `undo`.
+`recover` re-enters the same path and fails identically. There is no `clear`, no `reset`, no
+`--force`. The only ways out are deleting the failure receipts by hand, or mutating the database so
+the byte-identity witness no longer matches. Both are worse than a supported command.
+
+### Why skipping is correct, not a workaround
+
+The repair replaces a poisoned `-shm`. On this platform and engine combination the `-shm` is
+**inert**: frankensqlite does not use it, because the WAL index lives in process memory and is
+rebuilt on open. So there is nothing to repair, and the "fix" is strictly worse than doing nothing.
+Failing every command to preserve an inert file is the actual bug.
+
+### The fix, in priority order
+
+**A. Do not attempt a repair the platform cannot perform.** At the top of
+`recover_wal_index_for_startup`, before any copying:
+
+```rust
+if !wal_index_recovery_supported() {
+    return Ok(());
+}
+```
+
+with `wal_index_recovery_supported()` being `cfg!(any(linux, android, macos, ios))`. This one change
+unblocks Windows completely, and it is correct rather than suppressive: it declines to repair a file
+that is inert on this platform. It also removes the copying of a 4.6 MB database family on every
+command, which the guard at `:499-503` was written to avoid.
+
+**B. Classify failures, so permanent ones do not become permanent blocks.** Add a cause to the
+receipt written to `recovery-failed.json`:
+
+- `Terminal` for `io::ErrorKind::Unsupported`, `NotSupported`, or any frankensqlite
+  platform-unsupported error.
+- `Transient` for I/O errors, busy, corrupt index, and the rest.
+
+Then in the guard at `:505`, keep the `SyncConflict` for `Transient` (the anti-hammering intent still
+holds) and downgrade `Terminal` to a single `tracing::warn!` that names the retained evidence. A
+failure that cannot recur must not be able to block the tool.
+
+**C. Give the operator a real escape hatch.** Add `br doctor migrate-schema clear-recovery`, which
+archives the failed receipts under the run directory and re-enables the path. Even with A and B, an
+unclassified permanent failure could still wedge a workspace, and no operator should ever need to
+delete files by hand to use the tool again. This is also the concrete unblock for the workspace this
+document was written in.
+
+**D. Optionally, actually enable the repair on Windows.** Lower priority, because A makes it
+unnecessary, and because the primitives are more risk for repairing an inert file:
+
+- `quarantine_name` can delegate to `db_inode_lock::rename_database_candidate_no_replace`
+  (`db_inode_lock.rs:186`), which **already exists in the same crate** and does exactly this on
+  Windows via `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`. The quarantine code is duplicating
+  a primitive that is already written, already `unsafe`-exempted, and already documented in the same
+  module.
+- `sync_directory` can be a no-op success on Windows. `MoveFileExW` with `MOVEFILE_WRITE_THROUGH`
+  already carries the durability intent for the move itself; there is no directory-handle flush on
+  Windows that gives POSIX `fsync` semantics.
+- `RecoveryLock::acquire` needs a `#[cfg(windows)]` arm using `LockFileEx` across
+  `0x4000_0000..0x4000_0200`. The one-byte `LockFileEx` call already exists at
+  `db_inode_lock.rs:248` and can be adapted.
+
+### Relationship to the migration
+
+This defect is upstream of Phase 4 and independent of the engine swap, so it is filed as a
+**prerequisite** rather than folded into the port. Two reasons.
+
+1. The recovery code lives in the 0.7.0 lineage, not in this repository. This repository cannot fix
+   it, only record it.
+2. With rusqlite the underlying need largely disappears. C SQLite keeps a real `-shm`, the
+   `sqlite3_busy_timeout` sleep-based handler works, and a poisoned index is an ordinary file that
+   SQLite rebuilds. The quarantine machinery exists to work around a pure-Rust engine keeping its
+   WAL index in process memory, which is precisely what the migration removes.
+
+So the ordering is: fix A, B, and C in the 0.7.0 lineage to unblock Windows now, and let the
+migration retire the need for D later.
+
+---
+
+## 13. Evidence appendix
 
 ### Locally verified
 
