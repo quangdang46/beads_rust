@@ -48,9 +48,26 @@ fn init_history_diff_workspace() -> BrWorkspace {
 
 fn normalize_history_output(raw: &str, workspace: &BrWorkspace) -> String {
     let workspace_root = workspace.root.to_string_lossy().replace('\\', "/");
-    raw.trim_end()
-        .replace('\\', "/")
-        .replace(&workspace_root, "$WORKSPACE")
+    // `br` reports canonicalized paths, and on macOS `/var` is a symlink to
+    // `/private/var`, so logged output carries a `/private` prefix the raw
+    // workspace root does not have. Replace the canonical form too, otherwise
+    // the token is never substituted and the golden records a platform path.
+    let canonical_root = workspace
+        .root
+        .canonicalize()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| workspace_root.clone());
+    let normalized = raw.trim_end().replace('\\', "/");
+    // Longest form first: the canonical root is a superstring of the raw one.
+    if canonical_root.len() > workspace_root.len() {
+        normalized
+            .replace(&canonical_root, "$WORKSPACE")
+            .replace(&workspace_root, "$WORKSPACE")
+    } else {
+        normalized
+            .replace(&workspace_root, "$WORKSPACE")
+            .replace(&canonical_root, "$WORKSPACE")
+    }
 }
 
 fn assert_valid_json(raw: &str, context: &str) {

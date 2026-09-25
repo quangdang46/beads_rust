@@ -14,6 +14,9 @@ expression: normalize_json(&json)
     "updated_at": "TIMESTAMP",
     "source_repo": "SOURCE_REPO",
     "source_repo_path": "SOURCE_REPO",
+    "mol_type": "work",
+    "work_type": "mutex",
+    "wisp_type": "none",
     "dependency_count": 0,
     "dependent_count": 0
   }

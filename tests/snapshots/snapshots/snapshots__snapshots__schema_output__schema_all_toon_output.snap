@@ -1,6 +1,5 @@
 ---
 source: tests/snapshots/schema_output.rs
-assertion_line: 202
 expression: normalized_toon
 ---
 tool: br
@@ -102,15 +101,58 @@ schemas:
       deleted_by.type[2]: string,"null"
       delete_reason.type[2]: string,"null"
       original_type.type[2]: string,"null"
-      compacted_at:
-        type[2]: string,"null"
-        format: date-time
-      compacted_at_commit.type[2]: string,"null"
       sender.type[2]: string,"null"
       ephemeral.type: boolean
+      no_history.type: boolean
       pinned.type: boolean
       is_template.type: boolean
+      mol_type:
+        "$ref": #/$defs/MolType
+        default: work
+      work_type:
+        "$ref": #/$defs/WorkType
+        default: mutex
+      wisp_type:
+        "$ref": #/$defs/WispType
+        default: none
+      spec_id.type[2]: string,"null"
+      points:
+        type[2]: integer,"null"
+        format: int32
+      started_at:
+        type[2]: string,"null"
+        format: date-time
+      metadata.type[2]: string,"null"
+      source_formula.type[2]: string,"null"
+      source_location.type[2]: string,"null"
+      await_type.type[2]: string,"null"
+      await_id.type[2]: string,"null"
+      timeout_seconds:
+        description: "Gate timeout in seconds.\n\nThe Go `bd` tool serializes this as `\"timeout\"` with nanosecond precision.\nThe `alias` attribute allows br to import bd JSONL with `\"timeout\"` fields.\nExport always uses `\"timeout_seconds\"` (seconds, not nanoseconds)."
+        type[2]: integer,"null"
+        format: int64
+      holder.type[2]: string,"null"
+      hook_bead.type[2]: string,"null"
+      role_bead.type[2]: string,"null"
+      agent_state.type[2]: string,"null"
+      role_type.type[2]: string,"null"
+      rig.type[2]: string,"null"
+      event_kind.type[2]: string,"null"
+      target.type[2]: string,"null"
+      payload.type[2]: string,"null"
+      quality_score:
+        type[2]: number,"null"
+        format: double
+      crystallizes.type: boolean
+      bonded_from:
+        type: array
+        items:
+          "$ref": #/$defs/BondRef
       labels:
+        type: array
+        items.type: string
+      waiters:
+        description: List of issue IDs waiting on this issue (coordination waiters).
         type: array
         items.type: string
       dependencies:
@@ -132,9 +174,12 @@ schemas:
     "$defs":
       Status:
         description: Issue lifecycle status.
-        anyOf[2]:
+        anyOf[3]:
           - type: string
             enum[8]: open,in_progress,blocked,deferred,draft,closed,tombstone,pinned
+          - description: "Claimed by an agent for exclusive execution (Go parity).\nAgent-claimed issues are excluded from `br ready` and have\nclaim-protection semantics — no other agent may claim them."
+            type: string
+            const: hooked
           - type: string
       Priority:
         description: "Issue priority (0=Critical, 4=Backlog)."
@@ -144,8 +189,76 @@ schemas:
         description: Issue type category.
         anyOf[2]:
           - type: string
-            enum[7]: task,bug,feature,epic,chore,docs,question
+            enum[15]: task,bug,feature,epic,chore,docs,question,decision,message,molecule,gate,spike,story,milestone,event
           - type: string
+      MolType:
+        description: MolType categorizes molecule types for swarm coordination.
+        anyOf[4]:
+          - description: Regular assigned work (default).
+            type: string
+            const: work
+          - description: "Swarm molecule: coordinated multi-worker work."
+            type: string
+            const: swarm
+          - description: "Patrol molecule: recurring operational work."
+            type: string
+            const: patrol
+          - description: User-defined mol type.
+            type: string
+      WorkType:
+        description: WorkType categorizes how work assignment operates for a bead.
+        anyOf[3]:
+          - description: "One worker, exclusive assignment (default)."
+            type: string
+            const: mutex
+          - description: "Many submit, buyer picks."
+            type: string
+            const: open_competition
+          - description: User-defined work type.
+            type: string
+      WispType:
+        description: WispType categorizes ephemeral wisps for TTL-based compaction.
+        anyOf[9]:
+          - description: Default (no specific wisp type).
+            type: string
+            const: none
+          - description: "Liveness pings (TTL: 6h)."
+            type: string
+            const: heartbeat
+          - description: "Health check ACKs (TTL: 6h)."
+            type: string
+            const: ping
+          - description: "Patrol cycle reports (TTL: 24h)."
+            type: string
+            const: patrol
+          - description: "Garbage collection reports (TTL: 24h)."
+            type: string
+            const: gc_report
+          - description: "Force-kill, recovery actions (TTL: 7d)."
+            type: string
+            const: recovery
+          - description: "Error reports (TTL: 7d)."
+            type: string
+            const: error
+          - description: "Human escalations (TTL: 7d)."
+            type: string
+            const: escalation
+          - description: User-defined wisp type.
+            type: string
+      BondRef:
+        description: "BondRef tracks compound molecule lineage.\nWhen protos or molecules are bonded together, BondRefs record\nwhich sources were combined and how they were attached."
+        type: object
+        properties:
+          source_id:
+            description: Source proto or molecule ID.
+            type: string
+          bond_type:
+            description: "Type of bond: sequential, parallel, conditional."
+            type: string
+          bond_point:
+            description: Attachment site (issue ID or empty for root).
+            type[2]: string,"null"
+        required[2]: source_id,bond_type
       Dependency:
         description: Relationship between two issues.
         type: object
@@ -167,7 +280,7 @@ schemas:
             description: Creator.
             type[2]: string,"null"
           metadata:
-            description: Optional metadata (JSON).
+            description: "Optional metadata (JSON).\n\nA degenerate empty (or whitespace-only) string is coerced to `None` on\ndeserialization to tolerate legacy JSONL that wrote `\"metadata\":\"\"`\ninstead of omitting the field. See [`deserialize_optional_metadata`]."
             type[2]: string,"null"
           thread_id:
             description: Thread ID for conversation linking.
@@ -175,9 +288,64 @@ schemas:
         required[4]: issue_id,depends_on_id,type,created_at
       DependencyType:
         description: Dependency relationship type.
-        anyOf[2]:
-          - type: string
-            enum[11]: blocks,parent-child,conditional-blocks,waits-for,related,discovered-from,replies-to,relates-to,duplicates,supersedes,caused-by
+        anyOf[20]:
+          - description: A blocks B (B cannot proceed until A is closed).
+            type: string
+            const: blocks
+          - description: A is a parent of B (B cannot be closed until A is closed).
+            type: string
+            const: parent-child
+          - description: B runs only if A fails.
+            type: string
+            const: conditional-blocks
+          - description: "Fanout gate: wait for dynamic children."
+            type: string
+            const: waits-for
+          - description: A is related to B (informational).
+            type: string
+            const: related
+          - description: B was discovered from A (tracing).
+            type: string
+            const: discovered-from
+          - description: B is a reply to A (conversation threading).
+            type: string
+            const: replies-to
+          - description: B relates to A (loose knowledge graph edge).
+            type: string
+            const: relates-to
+          - description: B duplicates A (deduplication link).
+            type: string
+            const: duplicates
+          - description: B supersedes A (version chain link).
+            type: string
+            const: supersedes
+          - description: A is authored by B (creator relationship).
+            type: string
+            const: authored-by
+          - description: A is assigned to B (assignment relationship).
+            type: string
+            const: assigned-to
+          - description: A is approved by B (approval relationship).
+            type: string
+            const: approved-by
+          - description: A attests that B has a given skill/attribute.
+            type: string
+            const: attests
+          - description: "A tracks B (convoy → issue tracking, non-blocking)."
+            type: string
+            const: tracks
+          - description: "A is active until B closes (e.g., muted until issue resolved)."
+            type: string
+            const: until
+          - description: "A is caused by B (triggered by target, audit trail)."
+            type: string
+            const: caused-by
+          - description: A validates B (approval/validation relationship).
+            type: string
+            const: validates
+          - description: A is delegated from B (work handoff).
+            type: string
+            const: delegated-from
           - type: string
       Comment:
         description: A comment on an issue.
@@ -245,9 +413,12 @@ schemas:
         required[9]: id,title,status,priority,issue_type,labels,dependency_count,dependent_count,latest_comments
       Status:
         description: Issue lifecycle status.
-        anyOf[2]:
+        anyOf[3]:
           - type: string
             enum[8]: open,in_progress,blocked,deferred,draft,closed,tombstone,pinned
+          - description: "Claimed by an agent for exclusive execution (Go parity).\nAgent-claimed issues are excluded from `br ready` and have\nclaim-protection semantics — no other agent may claim them."
+            type: string
+            const: hooked
           - type: string
       Priority:
         description: "Issue priority (0=Critical, 4=Backlog)."
@@ -257,7 +428,7 @@ schemas:
         description: Issue type category.
         anyOf[2]:
           - type: string
-            enum[7]: task,bug,feature,epic,chore,docs,question
+            enum[15]: task,bug,feature,epic,chore,docs,question,decision,message,molecule,gate,spike,story,milestone,event
           - type: string
       CoordinationComment:
         description: Bounded comment excerpt included with a coordination claim row.
@@ -576,9 +747,12 @@ schemas:
         required[9]: id,title,status,priority,issue_type,labels,dependency_count,dependent_count,latest_comments
       Status:
         description: Issue lifecycle status.
-        anyOf[2]:
+        anyOf[3]:
           - type: string
             enum[8]: open,in_progress,blocked,deferred,draft,closed,tombstone,pinned
+          - description: "Claimed by an agent for exclusive execution (Go parity).\nAgent-claimed issues are excluded from `br ready` and have\nclaim-protection semantics — no other agent may claim them."
+            type: string
+            const: hooked
           - type: string
       Priority:
         description: "Issue priority (0=Critical, 4=Backlog)."
@@ -588,7 +762,7 @@ schemas:
         description: Issue type category.
         anyOf[2]:
           - type: string
-            enum[7]: task,bug,feature,epic,chore,docs,question
+            enum[15]: task,bug,feature,epic,chore,docs,question,decision,message,molecule,gate,spike,story,milestone,event
           - type: string
       CoordinationComment:
         description: Bounded comment excerpt included with a coordination claim row.
@@ -909,15 +1083,58 @@ schemas:
       deleted_by.type[2]: string,"null"
       delete_reason.type[2]: string,"null"
       original_type.type[2]: string,"null"
-      compacted_at:
-        type[2]: string,"null"
-        format: date-time
-      compacted_at_commit.type[2]: string,"null"
       sender.type[2]: string,"null"
       ephemeral.type: boolean
+      no_history.type: boolean
       pinned.type: boolean
       is_template.type: boolean
+      mol_type:
+        "$ref": #/$defs/MolType
+        default: work
+      work_type:
+        "$ref": #/$defs/WorkType
+        default: mutex
+      wisp_type:
+        "$ref": #/$defs/WispType
+        default: none
+      spec_id.type[2]: string,"null"
+      points:
+        type[2]: integer,"null"
+        format: int32
+      started_at:
+        type[2]: string,"null"
+        format: date-time
+      metadata.type[2]: string,"null"
+      source_formula.type[2]: string,"null"
+      source_location.type[2]: string,"null"
+      await_type.type[2]: string,"null"
+      await_id.type[2]: string,"null"
+      timeout_seconds:
+        description: "Gate timeout in seconds.\n\nThe Go `bd` tool serializes this as `\"timeout\"` with nanosecond precision.\nThe `alias` attribute allows br to import bd JSONL with `\"timeout\"` fields.\nExport always uses `\"timeout_seconds\"` (seconds, not nanoseconds)."
+        type[2]: integer,"null"
+        format: int64
+      holder.type[2]: string,"null"
+      hook_bead.type[2]: string,"null"
+      role_bead.type[2]: string,"null"
+      agent_state.type[2]: string,"null"
+      role_type.type[2]: string,"null"
+      rig.type[2]: string,"null"
+      event_kind.type[2]: string,"null"
+      target.type[2]: string,"null"
+      payload.type[2]: string,"null"
+      quality_score:
+        type[2]: number,"null"
+        format: double
+      crystallizes.type: boolean
+      bonded_from:
+        type: array
+        items:
+          "$ref": #/$defs/BondRef
       labels:
+        type: array
+        items.type: string
+      waiters:
+        description: List of issue IDs waiting on this issue (coordination waiters).
         type: array
         items.type: string
       dependencies:
@@ -932,9 +1149,12 @@ schemas:
     "$defs":
       Status:
         description: Issue lifecycle status.
-        anyOf[2]:
+        anyOf[3]:
           - type: string
             enum[8]: open,in_progress,blocked,deferred,draft,closed,tombstone,pinned
+          - description: "Claimed by an agent for exclusive execution (Go parity).\nAgent-claimed issues are excluded from `br ready` and have\nclaim-protection semantics — no other agent may claim them."
+            type: string
+            const: hooked
           - type: string
       Priority:
         description: "Issue priority (0=Critical, 4=Backlog)."
@@ -944,8 +1164,76 @@ schemas:
         description: Issue type category.
         anyOf[2]:
           - type: string
-            enum[7]: task,bug,feature,epic,chore,docs,question
+            enum[15]: task,bug,feature,epic,chore,docs,question,decision,message,molecule,gate,spike,story,milestone,event
           - type: string
+      MolType:
+        description: MolType categorizes molecule types for swarm coordination.
+        anyOf[4]:
+          - description: Regular assigned work (default).
+            type: string
+            const: work
+          - description: "Swarm molecule: coordinated multi-worker work."
+            type: string
+            const: swarm
+          - description: "Patrol molecule: recurring operational work."
+            type: string
+            const: patrol
+          - description: User-defined mol type.
+            type: string
+      WorkType:
+        description: WorkType categorizes how work assignment operates for a bead.
+        anyOf[3]:
+          - description: "One worker, exclusive assignment (default)."
+            type: string
+            const: mutex
+          - description: "Many submit, buyer picks."
+            type: string
+            const: open_competition
+          - description: User-defined work type.
+            type: string
+      WispType:
+        description: WispType categorizes ephemeral wisps for TTL-based compaction.
+        anyOf[9]:
+          - description: Default (no specific wisp type).
+            type: string
+            const: none
+          - description: "Liveness pings (TTL: 6h)."
+            type: string
+            const: heartbeat
+          - description: "Health check ACKs (TTL: 6h)."
+            type: string
+            const: ping
+          - description: "Patrol cycle reports (TTL: 24h)."
+            type: string
+            const: patrol
+          - description: "Garbage collection reports (TTL: 24h)."
+            type: string
+            const: gc_report
+          - description: "Force-kill, recovery actions (TTL: 7d)."
+            type: string
+            const: recovery
+          - description: "Error reports (TTL: 7d)."
+            type: string
+            const: error
+          - description: "Human escalations (TTL: 7d)."
+            type: string
+            const: escalation
+          - description: User-defined wisp type.
+            type: string
+      BondRef:
+        description: "BondRef tracks compound molecule lineage.\nWhen protos or molecules are bonded together, BondRefs record\nwhich sources were combined and how they were attached."
+        type: object
+        properties:
+          source_id:
+            description: Source proto or molecule ID.
+            type: string
+          bond_type:
+            description: "Type of bond: sequential, parallel, conditional."
+            type: string
+          bond_point:
+            description: Attachment site (issue ID or empty for root).
+            type[2]: string,"null"
+        required[2]: source_id,bond_type
       Dependency:
         description: Relationship between two issues.
         type: object
@@ -967,7 +1255,7 @@ schemas:
             description: Creator.
             type[2]: string,"null"
           metadata:
-            description: Optional metadata (JSON).
+            description: "Optional metadata (JSON).\n\nA degenerate empty (or whitespace-only) string is coerced to `None` on\ndeserialization to tolerate legacy JSONL that wrote `\"metadata\":\"\"`\ninstead of omitting the field. See [`deserialize_optional_metadata`]."
             type[2]: string,"null"
           thread_id:
             description: Thread ID for conversation linking.
@@ -975,9 +1263,64 @@ schemas:
         required[4]: issue_id,depends_on_id,type,created_at
       DependencyType:
         description: Dependency relationship type.
-        anyOf[2]:
-          - type: string
-            enum[11]: blocks,parent-child,conditional-blocks,waits-for,related,discovered-from,replies-to,relates-to,duplicates,supersedes,caused-by
+        anyOf[20]:
+          - description: A blocks B (B cannot proceed until A is closed).
+            type: string
+            const: blocks
+          - description: A is a parent of B (B cannot be closed until A is closed).
+            type: string
+            const: parent-child
+          - description: B runs only if A fails.
+            type: string
+            const: conditional-blocks
+          - description: "Fanout gate: wait for dynamic children."
+            type: string
+            const: waits-for
+          - description: A is related to B (informational).
+            type: string
+            const: related
+          - description: B was discovered from A (tracing).
+            type: string
+            const: discovered-from
+          - description: B is a reply to A (conversation threading).
+            type: string
+            const: replies-to
+          - description: B relates to A (loose knowledge graph edge).
+            type: string
+            const: relates-to
+          - description: B duplicates A (deduplication link).
+            type: string
+            const: duplicates
+          - description: B supersedes A (version chain link).
+            type: string
+            const: supersedes
+          - description: A is authored by B (creator relationship).
+            type: string
+            const: authored-by
+          - description: A is assigned to B (assignment relationship).
+            type: string
+            const: assigned-to
+          - description: A is approved by B (approval relationship).
+            type: string
+            const: approved-by
+          - description: A attests that B has a given skill/attribute.
+            type: string
+            const: attests
+          - description: "A tracks B (convoy → issue tracking, non-blocking)."
+            type: string
+            const: tracks
+          - description: "A is active until B closes (e.g., muted until issue resolved)."
+            type: string
+            const: until
+          - description: "A is caused by B (triggered by target, audit trail)."
+            type: string
+            const: caused-by
+          - description: A validates B (approval/validation relationship).
+            type: string
+            const: validates
+          - description: A is delegated from B (work handoff).
+            type: string
+            const: delegated-from
           - type: string
       Comment:
         description: A comment on an issue.
@@ -1089,15 +1432,58 @@ schemas:
       deleted_by.type[2]: string,"null"
       delete_reason.type[2]: string,"null"
       original_type.type[2]: string,"null"
-      compacted_at:
-        type[2]: string,"null"
-        format: date-time
-      compacted_at_commit.type[2]: string,"null"
       sender.type[2]: string,"null"
       ephemeral.type: boolean
+      no_history.type: boolean
       pinned.type: boolean
       is_template.type: boolean
+      mol_type:
+        "$ref": #/$defs/MolType
+        default: work
+      work_type:
+        "$ref": #/$defs/WorkType
+        default: mutex
+      wisp_type:
+        "$ref": #/$defs/WispType
+        default: none
+      spec_id.type[2]: string,"null"
+      points:
+        type[2]: integer,"null"
+        format: int32
+      started_at:
+        type[2]: string,"null"
+        format: date-time
+      metadata.type[2]: string,"null"
+      source_formula.type[2]: string,"null"
+      source_location.type[2]: string,"null"
+      await_type.type[2]: string,"null"
+      await_id.type[2]: string,"null"
+      timeout_seconds:
+        description: "Gate timeout in seconds.\n\nThe Go `bd` tool serializes this as `\"timeout\"` with nanosecond precision.\nThe `alias` attribute allows br to import bd JSONL with `\"timeout\"` fields.\nExport always uses `\"timeout_seconds\"` (seconds, not nanoseconds)."
+        type[2]: integer,"null"
+        format: int64
+      holder.type[2]: string,"null"
+      hook_bead.type[2]: string,"null"
+      role_bead.type[2]: string,"null"
+      agent_state.type[2]: string,"null"
+      role_type.type[2]: string,"null"
+      rig.type[2]: string,"null"
+      event_kind.type[2]: string,"null"
+      target.type[2]: string,"null"
+      payload.type[2]: string,"null"
+      quality_score:
+        type[2]: number,"null"
+        format: double
+      crystallizes.type: boolean
+      bonded_from:
+        type: array
+        items:
+          "$ref": #/$defs/BondRef
       labels:
+        type: array
+        items.type: string
+      waiters:
+        description: List of issue IDs waiting on this issue (coordination waiters).
         type: array
         items.type: string
       dependencies:
@@ -1121,9 +1507,12 @@ schemas:
     "$defs":
       Status:
         description: Issue lifecycle status.
-        anyOf[2]:
+        anyOf[3]:
           - type: string
             enum[8]: open,in_progress,blocked,deferred,draft,closed,tombstone,pinned
+          - description: "Claimed by an agent for exclusive execution (Go parity).\nAgent-claimed issues are excluded from `br ready` and have\nclaim-protection semantics — no other agent may claim them."
+            type: string
+            const: hooked
           - type: string
       Priority:
         description: "Issue priority (0=Critical, 4=Backlog)."
@@ -1133,8 +1522,76 @@ schemas:
         description: Issue type category.
         anyOf[2]:
           - type: string
-            enum[7]: task,bug,feature,epic,chore,docs,question
+            enum[15]: task,bug,feature,epic,chore,docs,question,decision,message,molecule,gate,spike,story,milestone,event
           - type: string
+      MolType:
+        description: MolType categorizes molecule types for swarm coordination.
+        anyOf[4]:
+          - description: Regular assigned work (default).
+            type: string
+            const: work
+          - description: "Swarm molecule: coordinated multi-worker work."
+            type: string
+            const: swarm
+          - description: "Patrol molecule: recurring operational work."
+            type: string
+            const: patrol
+          - description: User-defined mol type.
+            type: string
+      WorkType:
+        description: WorkType categorizes how work assignment operates for a bead.
+        anyOf[3]:
+          - description: "One worker, exclusive assignment (default)."
+            type: string
+            const: mutex
+          - description: "Many submit, buyer picks."
+            type: string
+            const: open_competition
+          - description: User-defined work type.
+            type: string
+      WispType:
+        description: WispType categorizes ephemeral wisps for TTL-based compaction.
+        anyOf[9]:
+          - description: Default (no specific wisp type).
+            type: string
+            const: none
+          - description: "Liveness pings (TTL: 6h)."
+            type: string
+            const: heartbeat
+          - description: "Health check ACKs (TTL: 6h)."
+            type: string
+            const: ping
+          - description: "Patrol cycle reports (TTL: 24h)."
+            type: string
+            const: patrol
+          - description: "Garbage collection reports (TTL: 24h)."
+            type: string
+            const: gc_report
+          - description: "Force-kill, recovery actions (TTL: 7d)."
+            type: string
+            const: recovery
+          - description: "Error reports (TTL: 7d)."
+            type: string
+            const: error
+          - description: "Human escalations (TTL: 7d)."
+            type: string
+            const: escalation
+          - description: User-defined wisp type.
+            type: string
+      BondRef:
+        description: "BondRef tracks compound molecule lineage.\nWhen protos or molecules are bonded together, BondRefs record\nwhich sources were combined and how they were attached."
+        type: object
+        properties:
+          source_id:
+            description: Source proto or molecule ID.
+            type: string
+          bond_type:
+            description: "Type of bond: sequential, parallel, conditional."
+            type: string
+          bond_point:
+            description: Attachment site (issue ID or empty for root).
+            type[2]: string,"null"
+        required[2]: source_id,bond_type
       Dependency:
         description: Relationship between two issues.
         type: object
@@ -1156,7 +1613,7 @@ schemas:
             description: Creator.
             type[2]: string,"null"
           metadata:
-            description: Optional metadata (JSON).
+            description: "Optional metadata (JSON).\n\nA degenerate empty (or whitespace-only) string is coerced to `None` on\ndeserialization to tolerate legacy JSONL that wrote `\"metadata\":\"\"`\ninstead of omitting the field. See [`deserialize_optional_metadata`]."
             type[2]: string,"null"
           thread_id:
             description: Thread ID for conversation linking.
@@ -1164,9 +1621,64 @@ schemas:
         required[4]: issue_id,depends_on_id,type,created_at
       DependencyType:
         description: Dependency relationship type.
-        anyOf[2]:
-          - type: string
-            enum[11]: blocks,parent-child,conditional-blocks,waits-for,related,discovered-from,replies-to,relates-to,duplicates,supersedes,caused-by
+        anyOf[20]:
+          - description: A blocks B (B cannot proceed until A is closed).
+            type: string
+            const: blocks
+          - description: A is a parent of B (B cannot be closed until A is closed).
+            type: string
+            const: parent-child
+          - description: B runs only if A fails.
+            type: string
+            const: conditional-blocks
+          - description: "Fanout gate: wait for dynamic children."
+            type: string
+            const: waits-for
+          - description: A is related to B (informational).
+            type: string
+            const: related
+          - description: B was discovered from A (tracing).
+            type: string
+            const: discovered-from
+          - description: B is a reply to A (conversation threading).
+            type: string
+            const: replies-to
+          - description: B relates to A (loose knowledge graph edge).
+            type: string
+            const: relates-to
+          - description: B duplicates A (deduplication link).
+            type: string
+            const: duplicates
+          - description: B supersedes A (version chain link).
+            type: string
+            const: supersedes
+          - description: A is authored by B (creator relationship).
+            type: string
+            const: authored-by
+          - description: A is assigned to B (assignment relationship).
+            type: string
+            const: assigned-to
+          - description: A is approved by B (approval relationship).
+            type: string
+            const: approved-by
+          - description: A attests that B has a given skill/attribute.
+            type: string
+            const: attests
+          - description: "A tracks B (convoy → issue tracking, non-blocking)."
+            type: string
+            const: tracks
+          - description: "A is active until B closes (e.g., muted until issue resolved)."
+            type: string
+            const: until
+          - description: "A is caused by B (triggered by target, audit trail)."
+            type: string
+            const: caused-by
+          - description: A validates B (approval/validation relationship).
+            type: string
+            const: validates
+          - description: A is delegated from B (work handoff).
+            type: string
+            const: delegated-from
           - type: string
       Comment:
         description: A comment on an issue.
@@ -1210,6 +1722,15 @@ schemas:
           created_at:
             type: string
             format: date-time
+          agent_name:
+            description: "Tier 1 attribution: self-reported agent name (issue #312, Layer 3\ncapture-only). Recorded as an audit trail; never gated/enforced on.\n`None` when the mutating command supplied no attribution."
+            type[2]: string,"null"
+          harness:
+            description: "Tier 1 attribution: self-reported harness identifier (capture-only)."
+            type[2]: string,"null"
+          model:
+            description: "Tier 1 attribution: self-reported model identifier (capture-only)."
+            type[2]: string,"null"
         required[5]: id,issue_id,event_type,actor,created_at
       EventType.type: string
   IssueWithCounts:
@@ -1308,15 +1829,58 @@ schemas:
       deleted_by.type[2]: string,"null"
       delete_reason.type[2]: string,"null"
       original_type.type[2]: string,"null"
-      compacted_at:
-        type[2]: string,"null"
-        format: date-time
-      compacted_at_commit.type[2]: string,"null"
       sender.type[2]: string,"null"
       ephemeral.type: boolean
+      no_history.type: boolean
       pinned.type: boolean
       is_template.type: boolean
+      mol_type:
+        "$ref": #/$defs/MolType
+        default: work
+      work_type:
+        "$ref": #/$defs/WorkType
+        default: mutex
+      wisp_type:
+        "$ref": #/$defs/WispType
+        default: none
+      spec_id.type[2]: string,"null"
+      points:
+        type[2]: integer,"null"
+        format: int32
+      started_at:
+        type[2]: string,"null"
+        format: date-time
+      metadata.type[2]: string,"null"
+      source_formula.type[2]: string,"null"
+      source_location.type[2]: string,"null"
+      await_type.type[2]: string,"null"
+      await_id.type[2]: string,"null"
+      timeout_seconds:
+        description: "Gate timeout in seconds.\n\nThe Go `bd` tool serializes this as `\"timeout\"` with nanosecond precision.\nThe `alias` attribute allows br to import bd JSONL with `\"timeout\"` fields.\nExport always uses `\"timeout_seconds\"` (seconds, not nanoseconds)."
+        type[2]: integer,"null"
+        format: int64
+      holder.type[2]: string,"null"
+      hook_bead.type[2]: string,"null"
+      role_bead.type[2]: string,"null"
+      agent_state.type[2]: string,"null"
+      role_type.type[2]: string,"null"
+      rig.type[2]: string,"null"
+      event_kind.type[2]: string,"null"
+      target.type[2]: string,"null"
+      payload.type[2]: string,"null"
+      quality_score:
+        type[2]: number,"null"
+        format: double
+      crystallizes.type: boolean
+      bonded_from:
+        type: array
+        items:
+          "$ref": #/$defs/BondRef
       labels:
+        type: array
+        items.type: string
+      waiters:
+        description: List of issue IDs waiting on this issue (coordination waiters).
         type: array
         items.type: string
       dependencies:
@@ -1339,9 +1903,12 @@ schemas:
     "$defs":
       Status:
         description: Issue lifecycle status.
-        anyOf[2]:
+        anyOf[3]:
           - type: string
             enum[8]: open,in_progress,blocked,deferred,draft,closed,tombstone,pinned
+          - description: "Claimed by an agent for exclusive execution (Go parity).\nAgent-claimed issues are excluded from `br ready` and have\nclaim-protection semantics — no other agent may claim them."
+            type: string
+            const: hooked
           - type: string
       Priority:
         description: "Issue priority (0=Critical, 4=Backlog)."
@@ -1351,8 +1918,76 @@ schemas:
         description: Issue type category.
         anyOf[2]:
           - type: string
-            enum[7]: task,bug,feature,epic,chore,docs,question
+            enum[15]: task,bug,feature,epic,chore,docs,question,decision,message,molecule,gate,spike,story,milestone,event
           - type: string
+      MolType:
+        description: MolType categorizes molecule types for swarm coordination.
+        anyOf[4]:
+          - description: Regular assigned work (default).
+            type: string
+            const: work
+          - description: "Swarm molecule: coordinated multi-worker work."
+            type: string
+            const: swarm
+          - description: "Patrol molecule: recurring operational work."
+            type: string
+            const: patrol
+          - description: User-defined mol type.
+            type: string
+      WorkType:
+        description: WorkType categorizes how work assignment operates for a bead.
+        anyOf[3]:
+          - description: "One worker, exclusive assignment (default)."
+            type: string
+            const: mutex
+          - description: "Many submit, buyer picks."
+            type: string
+            const: open_competition
+          - description: User-defined work type.
+            type: string
+      WispType:
+        description: WispType categorizes ephemeral wisps for TTL-based compaction.
+        anyOf[9]:
+          - description: Default (no specific wisp type).
+            type: string
+            const: none
+          - description: "Liveness pings (TTL: 6h)."
+            type: string
+            const: heartbeat
+          - description: "Health check ACKs (TTL: 6h)."
+            type: string
+            const: ping
+          - description: "Patrol cycle reports (TTL: 24h)."
+            type: string
+            const: patrol
+          - description: "Garbage collection reports (TTL: 24h)."
+            type: string
+            const: gc_report
+          - description: "Force-kill, recovery actions (TTL: 7d)."
+            type: string
+            const: recovery
+          - description: "Error reports (TTL: 7d)."
+            type: string
+            const: error
+          - description: "Human escalations (TTL: 7d)."
+            type: string
+            const: escalation
+          - description: User-defined wisp type.
+            type: string
+      BondRef:
+        description: "BondRef tracks compound molecule lineage.\nWhen protos or molecules are bonded together, BondRefs record\nwhich sources were combined and how they were attached."
+        type: object
+        properties:
+          source_id:
+            description: Source proto or molecule ID.
+            type: string
+          bond_type:
+            description: "Type of bond: sequential, parallel, conditional."
+            type: string
+          bond_point:
+            description: Attachment site (issue ID or empty for root).
+            type[2]: string,"null"
+        required[2]: source_id,bond_type
       Dependency:
         description: Relationship between two issues.
         type: object
@@ -1374,7 +2009,7 @@ schemas:
             description: Creator.
             type[2]: string,"null"
           metadata:
-            description: Optional metadata (JSON).
+            description: "Optional metadata (JSON).\n\nA degenerate empty (or whitespace-only) string is coerced to `None` on\ndeserialization to tolerate legacy JSONL that wrote `\"metadata\":\"\"`\ninstead of omitting the field. See [`deserialize_optional_metadata`]."
             type[2]: string,"null"
           thread_id:
             description: Thread ID for conversation linking.
@@ -1382,9 +2017,64 @@ schemas:
         required[4]: issue_id,depends_on_id,type,created_at
       DependencyType:
         description: Dependency relationship type.
-        anyOf[2]:
-          - type: string
-            enum[11]: blocks,parent-child,conditional-blocks,waits-for,related,discovered-from,replies-to,relates-to,duplicates,supersedes,caused-by
+        anyOf[20]:
+          - description: A blocks B (B cannot proceed until A is closed).
+            type: string
+            const: blocks
+          - description: A is a parent of B (B cannot be closed until A is closed).
+            type: string
+            const: parent-child
+          - description: B runs only if A fails.
+            type: string
+            const: conditional-blocks
+          - description: "Fanout gate: wait for dynamic children."
+            type: string
+            const: waits-for
+          - description: A is related to B (informational).
+            type: string
+            const: related
+          - description: B was discovered from A (tracing).
+            type: string
+            const: discovered-from
+          - description: B is a reply to A (conversation threading).
+            type: string
+            const: replies-to
+          - description: B relates to A (loose knowledge graph edge).
+            type: string
+            const: relates-to
+          - description: B duplicates A (deduplication link).
+            type: string
+            const: duplicates
+          - description: B supersedes A (version chain link).
+            type: string
+            const: supersedes
+          - description: A is authored by B (creator relationship).
+            type: string
+            const: authored-by
+          - description: A is assigned to B (assignment relationship).
+            type: string
+            const: assigned-to
+          - description: A is approved by B (approval relationship).
+            type: string
+            const: approved-by
+          - description: A attests that B has a given skill/attribute.
+            type: string
+            const: attests
+          - description: "A tracks B (convoy → issue tracking, non-blocking)."
+            type: string
+            const: tracks
+          - description: "A is active until B closes (e.g., muted until issue resolved)."
+            type: string
+            const: until
+          - description: "A is caused by B (triggered by target, audit trail)."
+            type: string
+            const: caused-by
+          - description: A validates B (approval/validation relationship).
+            type: string
+            const: validates
+          - description: A is delegated from B (work handoff).
+            type: string
+            const: delegated-from
           - type: string
       Comment:
         description: A comment on an issue.
@@ -1439,7 +2129,7 @@ schemas:
         description: Issue type category.
         anyOf[2]:
           - type: string
-            enum[7]: task,bug,feature,epic,chore,docs,question
+            enum[15]: task,bug,feature,epic,chore,docs,question,decision,message,molecule,gate,spike,story,milestone,event
           - type: string
       Priority:
         description: "Issue priority (0=Critical, 4=Backlog)."
@@ -1447,9 +2137,12 @@ schemas:
         format: int32
       Status:
         description: Issue lifecycle status.
-        anyOf[2]:
+        anyOf[3]:
           - type: string
             enum[8]: open,in_progress,blocked,deferred,draft,closed,tombstone,pinned
+          - description: "Claimed by an agent for exclusive execution (Go parity).\nAgent-claimed issues are excluded from `br ready` and have\nclaim-protection semantics — no other agent may claim them."
+            type: string
+            const: hooked
           - type: string
   StaleIssue:
     "$schema": "https://json-schema.org/draft/2020-12/schema"
@@ -1478,7 +2171,7 @@ schemas:
         description: Issue type category.
         anyOf[2]:
           - type: string
-            enum[7]: task,bug,feature,epic,chore,docs,question
+            enum[15]: task,bug,feature,epic,chore,docs,question,decision,message,molecule,gate,spike,story,milestone,event
           - type: string
       Priority:
         description: "Issue priority (0=Critical, 4=Backlog)."
@@ -1486,9 +2179,12 @@ schemas:
         format: int32
       Status:
         description: Issue lifecycle status.
-        anyOf[2]:
+        anyOf[3]:
           - type: string
             enum[8]: open,in_progress,blocked,deferred,draft,closed,tombstone,pinned
+          - description: "Claimed by an agent for exclusive execution (Go parity).\nAgent-claimed issues are excluded from `br ready` and have\nclaim-protection semantics — no other agent may claim them."
+            type: string
+            const: hooked
           - type: string
   Statistics:
     "$schema": "https://json-schema.org/draft/2020-12/schema"

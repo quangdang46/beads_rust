@@ -21,7 +21,7 @@ YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Path validated for sync I/O pa
 YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync: ID-REDACTED: exporting dirty issues dirty_count=1 needs_flush=false
 YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Validating sync path path=/TMP/.beads/issues.jsonl beads_dir=/TMP/.beads
 YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Path validated for sync I/O path=/TMP/.beads/issues.jsonl
-YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::history: Created backup: /TMP/.beads/.br_history/issues.YYYYMMDD_HHMMSS_NANO.jsonl
+YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::history: Skipping backup: throttled (0s since latest < 5s floor)
 YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Validating sync path path=/TMP/.beads/issues.jsonl.PID.tmp beads_dir=/TMP/.beads
 YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Path validated for sync I/O path=/TMP/.beads/issues.jsonl.PID.tmp
 YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync: Temp file path validated temp_path=/TMP/.beads/issues.jsonl.PID.tmp target_path=/TMP/.beads/issues.jsonl
@@ -31,4 +31,12 @@ YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Sync path approved for destruc
 YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Validating sync path path=/TMP/.beads/issues.jsonl beads_dir=/TMP/.beads
 YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Path validated for sync I/O path=/TMP/.beads/issues.jsonl
 YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Sync path approved for destructive operation path=/TMP/.beads/issues.jsonl operation="overwrite JSONL output"
+YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Validating sync path path=/TMP/.beads/beads.base.jsonl.PID.tmp beads_dir=/TMP/.beads
+YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Path validated for sync I/O path=/TMP/.beads/beads.base.jsonl.PID.tmp
+YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Validating sync path path=/TMP/.beads/beads.base.jsonl.PID.tmp beads_dir=/TMP/.beads
+YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Path validated for sync I/O path=/TMP/.beads/beads.base.jsonl.PID.tmp
+YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Sync path approved for destructive operation path=/TMP/.beads/beads.base.jsonl.PID.tmp operation="rename base snapshot"
+YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Validating sync path path=/TMP/.beads/beads.base.jsonl beads_dir=/TMP/.beads
+YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Path validated for sync I/O path=/TMP/.beads/beads.base.jsonl
+YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Sync path approved for destructive operation path=/TMP/.beads/beads.base.jsonl operation="overwrite base snapshot"
 YYYY-MM-DDTHH:MM:SS  INFO beads_rust::sync: ID-REDACTED complete flushed=true exported=1
