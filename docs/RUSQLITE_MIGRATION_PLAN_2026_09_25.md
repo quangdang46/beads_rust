@@ -25,9 +25,15 @@ line. Land the port as a single atomic merge to `main`. Work proceeds on a long-
 
 `rusqlite` is the only mature, actively maintained, synchronous Rust binding to SQLite. Its API is
 close to a drop-in for the existing call sites: `Connection::open`, `execute`, `prepare`,
-`query_row`, `execute_batch`, `types::Value`, and `Error::QueryReturnedNoRows` all exist. The
-object-safe `Storage` trait at `src/storage/trait_.rs:28` needs no signature change, so all 35+
-CLI commands, the formatter, and the sync engine stay untouched.
+`query_row`, `execute_batch`, `types::Value`, and `Error::QueryReturnedNoRows` all exist.
+
+The load-bearing reason the blast radius stops at the storage layer is the `Storage` trait. It is
+636 lines at `src/storage/trait_.rs:28`, it is object-safe, and across its 55 methods it contains
+**zero** references to `Connection`: every operation is expressed in model types only. That means
+no signature changes, so all 35+ CLI commands, the formatter, the MCP surface, and the sync engine
+stay untouched. It is the single fact that makes an engine swap tractable rather than a rewrite, and
+it should be asserted as a test during Phase 3 so a later refactor cannot quietly reintroduce a
+`Connection` into the trait.
 
 MSRV 1.88.0 and edition 2024 match this crate exactly.
 
@@ -120,6 +126,37 @@ either one silently reintroduces a libclang build dependency on all 8 RCH worker
 
 `bundled` transitively enables `modern_sqlite` (which is `bundled_bindings`), so it does not need to
 be listed separately. The historical line at `d3d9bce6^:Cargo.toml:22` listed it redundantly.
+
+### Version policy
+
+`rusqlite` is pre-1.0 in the sense that matters here: it has shipped 40 breaking changes across 73
+releases, and its MSRV policy is "latest stable at release" rather than a committed long-term
+floor. Two consequences.
+
+**Pin the exact version for the migration.** Declare `0.40.2`, not `"0.40"`. A caret range would let
+a `cargo update` land a new breaking minor on the branch mid-port, which is the one thing that
+would invalidate a 35-day effort. Pinning costs nothing and makes the build reproducible for the
+duration.
+
+**Take 0.40.2 rather than starting at 0.39.0.** The two most recent releases are both security or
+memory-safety fixes, and both are reasons to take the latest:
+
+- 0.40.0 fixed a UB issue in `ToSqlOutput::from_rc`.
+- 0.40.1 fixed a SQL injection in SAVEPOINT names.
+
+A fresh migration has no reason to start one or two releases behind, and a UB fix in a type
+conversion that this codebase leans on heavily (602 parameter-binding sites) is not optional.
+
+**Decide the floating policy during Phase 1, not later.** After the merge, choose deliberately
+between a pinned `=0.40.2` and a caret `0.40`, and record the choice in
+`docs/operations/UPGRADE_LOG.md`. The MSRV declaration of 1.88 in this crate is not a binding
+constraint here, because the repo builds on nightly and the crate targets edition 2024; the real
+question is only how fast to absorb upstream breaking changes into a project with a Go-parity
+conformance suite.
+
+**Read the 0.40.0 to 0.40.2 changelog during Phase 1** and confirm none of the three releases changed
+`ToSql`/`FromSql` semantics or `Error` variant shapes in a way that affects this port. That is a
+half-day check that belongs before 1877 call sites depend on the answer.
 
 ---
 
@@ -264,9 +301,14 @@ test). rusqlite names it `Real`. A mechanical `Float` to `Real` rename is correc
 
 ## 6. Execution strategy: big-bang on the branch, atomic on main
 
-Both judge panels in planning split between this and a strangler-adapter approach. `AGENTS.md` is
-the tiebreaker and it is unambiguous: "Never create compatibility shims", "We want to do things the
-RIGHT way with NO TECH DEBT", and the bar for new files is "incredibly high".
+Four strategies were drafted independently and scored by a three-judge panel: big-bang swap,
+strangler adapter, risk-first sequencing, and dependency-thin swap. The panel split. This section
+records the decision and, just as importantly, the one idea grafted in from a losing strategy.
+
+### Why big-bang wins
+
+`AGENTS.md` is the tiebreaker and it is unambiguous: "Never create compatibility shims", "We want to
+do things the RIGHT way with NO TECH DEBT", and the bar for new files is "incredibly high".
 
 A strangler's `src/storage/dialect/` module is a multi-file compatibility shim behind an engine
 switch, and its two claimed benefits are not deliverable by its own mechanism. A compile-time switch
@@ -279,9 +321,33 @@ the entire window, and frankensqlite ships a license rider that names the tool's
 that in-tree for five weeks to serve as a rollback arm is the wrong trade for a tool whose
 `AGENTS.md` drives Claude Code and Codex sessions.
 
-One idea from the strangler is genuinely better and is kept: a **differential parity harness**
-comparing fixed CLI invocations across engines. It is grafted in as a **permanent test** rather than
-a temporary module, so it survives the migration and keeps paying after the adapter is deleted.
+### The one idea grafted in, and why it is not the forbidden shim
+
+The **dependency-thin swap** strategy proposed defining local compatibility types so the ~40,000
+lines of call sites barely change. It lost on the permanent-shim objection. Its core mechanism won:
+Phase 3 creates `src/storage/db.rs` with a `SqlValue` newtype that absorbs the shape difference
+between `fsqlite_types::SqliteValue` and `rusqlite::types::Value`, which is what turns 1175 of the
+1877 call sites into type-path churn instead of hand-written rewrites.
+
+That looks like the thing `AGENTS.md` forbids, so here is the distinction, and it is the reason a
+reviewer should approve it rather than reject it:
+
+1. **It is deleted before the merge.** `src/storage/db.rs` exists only between Phase 3 and Phase 8.
+   `main` never carries it. `AGENTS.md` forbids compatibility shims in the codebase; a file that
+   exists for five commits on a branch and is deleted before merge leaves no shim in the codebase.
+2. **It provides no backwards compatibility for anything.** The rule exists to stop us carrying
+   wrappers for deprecated APIs. `db.rs` wraps nothing that is deprecated. It absorbs one shape
+   difference between two engines during a single atomic change, which is a different job.
+3. **It is deleted rather than left as structure.** The permanent version of this idea is the
+   strangler's runtime enum, which is precisely what is being rejected. Taking the mechanism and
+   refusing the permanent form is the graft, not a compromise.
+
+**Rule for the implementer:** if `src/storage/db.rs` still exists when Phase 8 opens, Phase 8 does
+not merge. There is no path where it survives into `main`.
+
+The strangler's other strong idea, a differential parity harness comparing fixed CLI invocations
+across engines, is also kept, as a **permanent test** rather than a temporary module, so it survives
+the migration and keeps paying after `db.rs` is deleted.
 
 ---
 
@@ -291,6 +357,9 @@ Each phase is one commit on the branch, individually revertible during developme
 sequence merges to `main` as one merge commit with the 15 `fsqlite` lines removed.
 
 ### Phase 1: Build de-risk, frozen baseline, on-disk format proof (2.5 days)
+
+**Files touched:** `Cargo.toml`, `Cargo.lock`, `tests/storage_engine_compat.rs` (new),
+`tests/storage_golden_snapshot.rs`, `tests/snapshots/*.snap`
 
 **Goal:** retire the largest unknown before any of the 1877 call sites depend on it, and prove the
 bundled build resolves on the RCH fleet.
@@ -305,16 +374,34 @@ bundled build resolves on the RCH fleet.
 - Freeze the baseline. Run `rch exec -- cargo test --all-features` and
   `rch exec -- cargo clippy --all-targets -- -D warnings` on unmodified `main`. Record exact pass
   and fail counts and the current release binary size. Every later phase is judged against "no NEW
-  failures versus this baseline", not "all green" on a suite of roughly 1830 tests.
-- Build the differential parity corpus and goldens: roughly 60 fixed CLI invocations capturing
+  failures versus this baseline", not "all green" on the full suite. A static count finds 4,790 test
+  attributes across `src/` and `tests/` before cfg-gating, across 133 test binary targets, so the
+  pass count is a real number that has to be measured, not estimated.
+- **Extend the golden harness, do not build one from scratch.** The infrastructure already exists:
+  `tests/storage_golden_snapshot.rs` (210 lines) drives `SqliteStorage` through a
+  create/update/close cycle and asserts an `insta` snapshot that already masks volatile timestamps
+  while preserving row shape, event sequence, content hash, and JSONL field layout, backed by
+  `tests/snapshots/storage_golden_snapshot__create_update_close_sqlite_rows_and_jsonl.snap`. There
+  are 9 insta snapshots in total, 8 of them CLI-level (`golden_rich_panels__*`,
+  `golden_beads_init__*`).
+  What is missing is **coverage of the row parsers being rewritten**. Add one golden case per
+  `*_from_row` function covering its full column range, because Phase 6 rewrites all 14 and the
+  golden comparison is the only thing that catches a silent positional or storage-class shift.
+  On top of that, add CLI-level differential goldens for roughly 60 fixed invocations capturing
   stdout, stderr, and exit code (create, show, update, close, dep, labels, ready, blocked, list,
   search, stats, epic, audit, sql, `doctor --json`, `sync --flush-only`), plus `sqlite_master` and
   `PRAGMA table_info` dumps for every table.
+  Note that `tests/storage_golden_snapshot.rs` itself uses `fsqlite::Connection` and
+  `fsqlite_types::SqliteValue` directly, so it is one of the files Phase 3 must port.
 
 **Exit criteria:** all 13 fixtures open with `integrity_check = ok`; `bundled` builds on all 8
-workers; baseline pass/fail counts and binary size recorded; parity goldens committed.
+workers; baseline pass/fail counts and binary size recorded; per-parser goldens and CLI parity
+goldens committed.
 
 ### Phase 2: Error taxonomy and `is_transient` against C error codes (2 days)
+
+**Files touched:** `src/error/mod.rs`, `src/error/structured.rs`, `src/error/context.rs`, inline
+error tests in `src/error/mod.rs`
 
 **Goal:** reimplement the single predicate that gates the entire concurrency model, before any
 volume code depends on it.
@@ -332,10 +419,49 @@ volume code depends on it.
 **Exit criteria:** `cargo test error` green; the full error-taxonomy test set green with no
 assertion edits.
 
-### Phase 3: Type-compat adapter and 26 leaf consumers outside storage (5.5 days)
+### Phase 3: Type-compat adapter and 24 leaf consumers outside storage (5.5 days)
+
+**Files touched:** `src/storage/db.rs` (new, **deleted in Phase 8**), plus 24 non-storage `src/`
+files and 10 test files, ordered by `fsqlite` reference density:
+
+| File | `fsqlite` refs | `SqliteValue` refs |
+|---|---|---|
+| `src/cli/commands/doctor_subsystems/mutate.rs` | 27 | 27 |
+| `src/config/mod.rs` | 11 | 8 |
+| `src/logging.rs` | 10 | 0 |
+| `src/cli/commands/delete.rs` | 9 | 9 |
+| `src/cli/commands/doctor_subsystems/surface.rs` | 8 | 11 |
+| `src/cli/commands/doctor.rs` | 7 | 83 |
+| `src/cli/commands/sync.rs` | 7 | 0 |
+| `src/cli/commands/init.rs` | 5 | 0 |
+| `src/sync/mod.rs` | 4 | 9 |
+| `src/main.rs` | 4 | 0 |
+| `src/cli/commands/federation.rs` | 3 | 16 |
+| `src/cli/commands/info.rs` | 3 | 11 |
+| `src/cli/commands/mod.rs` | 3 | 0 |
+| `src/cli/commands/where.rs` | 2 | 3 |
+| `src/cli/commands/config.rs` | 2 | 3 |
+| `src/cli/mod.rs` | 2 | 2 |
+| `src/util/markdown_import.rs` | 2 | 0 |
+| `src/error/mod.rs` | 2 | 0 |
+| `src/cli/commands/sql_cmd.rs` | 1 | 17 |
+| `src/cli/commands/epic.rs` | 1 | 5 |
+| `src/web/mod.rs` | 1 | 0 |
+| `src/web/api.rs` | 1 | 0 |
+| `src/mcp/mod.rs` | 1 | 0 |
+| `src/cli/commands/update.rs` | 1 | 0 |
+
+Test and bench files: `tests/e2e_raw_fsqlite_rebuilt_lookup.rs` (8),
+`tests/e2e_doctor_chokepoint.rs` (5), `tests/storage_golden_snapshot.rs` (4),
+`tests/e2e_concurrency.rs` (3), `tests/storage_invariants.rs` (2), `tests/markdown_import.rs` (2),
+`tests/bench_synthetic_scale.rs` (2), `tests/storage_export_atomic.rs` (1),
+`tests/repro_issue_256_update_diff_target.rs` (1), `tests/e2e_workspace_commands.rs` (1).
+
+Note `tests/e2e_raw_fsqlite_rebuilt_lookup.rs` is named after the engine. Rename it in this phase,
+since "fsqlite" will no longer be a dependency by the time Phase 3 lands.
 
 **Goal:** build the shape-compat layer that collapses the mechanical majority into type-path churn,
-then prove it on the 26 files that contain no transaction logic before touching the 24.6k-line file.
+then prove it on the 24 files that contain no transaction logic before touching the 24.6k-line file.
 
 - Create `src/storage/db.rs` with four helpers:
   - `SqlValue`: a newtype over `rusqlite::types::Value` implementing `ToSql`, preserving the `From`
@@ -346,7 +472,7 @@ then prove it on the 26 files that contain no transaction logic before touching 
   - `query_one`: remaps `QueryReturnedNoRows`.
   - `db_exec` and `params` pass-throughs.
   This file is deleted in Phase 8.
-- Port the 26 non-storage consumers, trickiest first by reference density:
+- Port the 24 non-storage consumers, trickiest first by reference density:
   `doctor_subsystems/mutate.rs` (27 refs, the frankensqlite-to-`serde_json` bridge), `logging.rs`
   (10), `config/mod.rs` (11, including `with_database_family_snapshot` which is pure file copy and
   survives unchanged), `delete.rs` (9), `doctor_subsystems/surface.rs` (8), `doctor.rs` (7), then the
@@ -356,6 +482,9 @@ then prove it on the 26 files that contain no transaction logic before touching 
 `src/storage/{sqlite,schema,events}.rs`. That is what proves nothing outside storage was missed.
 
 ### Phase 4: `schema.rs` and `events.rs` (4.5 days)
+
+**Files touched:** `src/storage/schema.rs` (3,670 lines, 28 `fsqlite` refs, 55 `SqliteValue`),
+`src/storage/events.rs` (925 lines, 5 `fsqlite` refs, 34 `SqliteValue`)
 
 **Goal:** migrate the DDL and migration engine plus the audit log. This phase contains a real
 deletion.
@@ -373,6 +502,10 @@ local shim remains; the `SCHEMA_SQL` DDL applies cleanly on a fresh database and
 fixtures.
 
 ### Phase 5: `sqlite.rs` core (4 days)
+
+**Files touched:** `src/storage/sqlite.rs` (24,646 lines; only the `Connection::open` and
+`compat::open_with_flags` sites, the pragma block at `:1059` and `:1157`, both retry loops at
+`:741-800` and `:1484-1560`, and the `Drop` impl at `:13552-13577`)
 
 **Goal:** move the engine-facing surface where the semantics live, as distinct from the two phases
 that are mostly mechanical type-path churn.
@@ -397,6 +530,10 @@ proven to retry identically under injected `SQLITE_BUSY`; no temp-file residue o
 
 ### Phase 6: `sqlite.rs` read path (5 days)
 
+**Files touched:** `src/storage/sqlite.rs` (the 14 `*_from_row` parsers, the 268 `row.get` sites, the
+six per-parser closures, `parse_datetime_value` at `:11600`, `parse_opt_datetime_value` at `:11614`),
+`tests/storage_golden_snapshot.rs`, `tests/snapshots/*.snap`
+
 **Goal:** absorb the single largest mechanical cost, working parser-by-parser rather than
 site-by-site.
 
@@ -416,6 +553,11 @@ is a silent shift and must be investigated, not accepted. `cargo test --test pro
 green.
 
 ### Phase 7: `sqlite.rs` write path (6 days)
+
+**Files touched:** `src/storage/sqlite.rs` (the 602 `SqliteValue::from` parameter sites, the 138
+`execute_with_params` and 91 `query_with_params` call sites, the 41 `query_row_with_params` sites,
+the ~50 frankensqlite correctness workarounds whose comments must survive intact), plus deletion of
+`test_diag_data_visibility` (`:20211`) and `test_diag_root_page_visibility` (`:20315`)
 
 **Goal:** absorb the remaining bulk, under one governing rule: the engine's correctness workarounds
 stay exactly as they are.
@@ -439,10 +581,16 @@ stay exactly as they are.
 
 ### Phase 8: Concurrency contract, full suite, supply-chain docs, atomic merge (5.5 days)
 
+**Files touched:** `src/storage/db.rs` (deleted), `src/storage/sqlite.rs` (comments only),
+`tests/e2e_concurrency.rs` (22 tests; assertion text at `:221` and the busy/locked substrings at
+`:197-199`), `docs/CI_SUPPLY_CHAIN.md`, `docs/ARCHITECTURE.md`, `docs/SYNC_SAFETY.md`,
+`docs/operations/UPGRADE_LOG.md`, `AGENTS.md`, `README.md` (badge at `:9`, text at `:1008`),
+`CHANGELOG.md` (new entry superseding `:698`), `Cargo.toml`, `Cargo.lock`
+
 **Goal:** validate the part that is a genuine behavior change rather than a type change, land the
 whole port as one atomic merge, and close the supply-chain loop.
 
-- Run `tests/e2e_concurrency.rs` (11 tests) against real C SQLite. **This is the go/no-go for the
+- Run `tests/e2e_concurrency.rs` (22 tests) against real C SQLite. **This is the go/no-go for the
   whole plan.** See section 9.
 - Measure the composed worst case end to end (30s `.write.lock` + engine timeout + app retry) and
   write the number into a doc comment near `DEFAULT_BUSY_TIMEOUT_MS` and into `docs/SYNC_SAFETY.md`.
@@ -578,7 +726,7 @@ The mitigating factor is that the cross-process gate is `.beads/.write.lock`, pu
 `std::fs::File::try_lock` with zero frankensqlite involvement, so the engine rarely sees
 `SQLITE_BUSY` from another process. In-process thread contention is handled by the app retry loop.
 
-But "rarely" is not "never", and `tests/e2e_concurrency.rs` has 11 tests that must be run against
+But "rarely" is not "never", and `tests/e2e_concurrency.rs` has 22 tests that must be run against
 real C SQLite before this document is a plan rather than a hope. That is Phase 8, and it is a
 go/no-go gate, not a checkbox. If the tests fail in a way that indicates an engine-level WAL defect
 rather than a port bug, the correct response is to fall back to system-linked SQLite or to raise the
@@ -598,14 +746,17 @@ issue upstream, not to patch around it.
    add the `rusqlite` line, regenerate `Cargo.lock`. Nothing imports rusqlite yet, so this compiles
    only the dependency.
 4. Run `rch exec -- cargo build --release` on all 8 workers. The single gating infra check.
-5. Build the differential parity corpus and goldens: roughly 60 fixed CLI invocations capturing
-   stdout, stderr, and exit code, plus `sqlite_master` and `PRAGMA table_info` dumps for every table.
+5. Extend the existing golden harness, not a new one. `tests/storage_golden_snapshot.rs` (210 lines)
+   and 9 insta snapshots already exist. Add one golden case per `*_from_row` parser (14 of them,
+   all rewritten in Phase 6), then add CLI-level goldens for roughly 60 fixed invocations capturing
+   stdout, stderr, and exit code, plus `sqlite_master` and `PRAGMA table_info` dumps for every
+   table. This file is itself an fsqlite consumer and is ported in Phase 3.
 6. Port the error taxonomy: change `src/error/mod.rs:42` and reimplement `is_transient()` at `:210`
    against `sqlite_error_code()`. Never string-match. Do this before any volume code depends on it;
    the failure mode is silent.
 7. Create `src/storage/db.rs` with `SqlValue`, `query_rows`, `query_one`, and the `db_exec` / `params`
    pass-throughs. It is deleted in Phase 8.
-8. Port the 26 non-storage consumers, trickiest first. Exit criterion: `cargo check --all-targets`
+8. Port the 24 non-storage consumers, trickiest first. Exit criterion: `cargo check --all-targets`
    reports errors in **only** `src/storage/{sqlite,schema,events}.rs`.
 9. Delete `split_sql_statements` (`schema.rs:402`) and the local `execute_batch` shim (`:511`), route
    all 25 call sites to `conn.execute_batch`, then grep the finished file for `execute("...;")`.
@@ -632,6 +783,10 @@ corrected against the local tree.
 | `fsqlite-mvcc` is in use and provides concurrent-writer capability the migration would lose. | A negative finding, verified. No `src/` file references MVCC, snapshot isolation, `TransactionBehavior`, or deferred transactions. All transactions are raw SQL strings. `.write.lock` is pure `std::fs::File::try_lock`. The crate is a compile-graph artifact, not a used feature. The migration buys no multi-writer capability and loses none. |
 | libclang and bindgen are required by `libsqlite3-sys`, adding a heavy build dependency. | Only under `buildtime_bindgen`, and `bundled` avoids it: `bundled = ["libsqlite3-sys?/bundled", "modern_sqlite"]` and `modern_sqlite = ["libsqlite3-sys?/bundled_bindings"]`, so `bundled` transitively enables the in-crate pregenerated bindings. The guardrail is simply to keep `session` and `preupdate_hook` off. |
 | The `cache` feature is opt-in and forgetting it is a silent perf regression. | Half right, wrong emphasis. `default = ["cache", "ffi-sqlite-wasm-rs"]`, so `cache` moved into the default set in 0.38 and is lost only because this plan passes `default-features = false`. Listing it explicitly is correct and self-documenting, but it is a hygiene measure, not a fix for an active failure mode. |
+| `tests/e2e_concurrency.rs` has 11 tests. | It has 22: 22 `#[test]` attributes and 22 `fn e2e_*` definitions. The go/no-go gate is twice as wide as the plan first stated. |
+| The suite has roughly 1830 tests. | Unverified and too low. A static count finds 4,790 test attributes across `src/` and `tests/` before cfg-gating, spread over 133 test binary targets. The real pass count has to be measured in Phase 1, not estimated. |
+| The differential parity corpus must be built from scratch in Phase 1. | The infrastructure already exists: `tests/storage_golden_snapshot.rs` (210 lines) asserts an `insta` snapshot that already masks volatile timestamps while preserving row shape, event sequence, content hash, and JSONL field layout, and there are 9 `insta` snapshots in `tests/snapshots/`, 8 of them CLI-level. The real gap is per-parser coverage for the 14 `*_from_row` functions, not the harness. |
+| `Cargo.toml` declares 26 fsqlite consumers outside storage. | 24 `src/` files, plus 10 test and bench files, listed with exact reference counts in the Phase 3 file table. |
 
 ---
 
