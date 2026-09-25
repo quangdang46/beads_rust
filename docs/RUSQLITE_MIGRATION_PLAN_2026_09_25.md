@@ -15,9 +15,18 @@ rusqlite = { version = "0.40.2", default-features = false,
              features = ["bundled", "cache", "fallible_uint"] }
 ```
 
-Delete all 15 `fsqlite-*` declarations at `Cargo.toml:45-59` in the same commit that adds this
-line. Land the port as a single atomic merge to `main`. Work proceeds on a long-lived branch as
-8 individually revertible commits, but `main` never sees a half-migrated tree.
+The end state deletes all 15 `fsqlite-*` declarations at `Cargo.toml:45-59`. Land the port as a single
+atomic merge to `main`. Work proceeds on a long-lived branch as 8 individually revertible commits,
+but `main` never sees a half-migrated tree.
+
+**On the branch, both engines are present from Phase 1 until Phase 8.** The `fsqlite` lines are
+*added alongside* `rusqlite` in Phase 1 and removed only in Phase 8, not in Phase 1. This is
+required, not a preference: `src/storage/sqlite.rs` keeps importing fsqlite until Phase 7, so
+deleting the declarations in Phase 1 would leave the tree unable to compile for six consecutive
+phases, which forfeits every test signal for the entire port. The atomic-merge guarantee is
+unaffected, because `main` only ever sees the final state where fsqlite is gone and rusqlite is
+present. There is no compatibility shim here: the two crates simply coexist while different files
+are still on different engines.
 
 **Rollback** is a cache rebuild, or a revert of the merge commit if that is ever needed.
 
@@ -354,7 +363,8 @@ the migration and keeps paying after `db.rs` is deleted.
 ## 7. Phase plan
 
 Each phase is one commit on the branch, individually revertible during development. The whole
-sequence merges to `main` as one merge commit with the 15 `fsqlite` lines removed.
+sequence merges to `main` as one merge commit. The 15 `fsqlite` lines are removed in Phase 8, the
+last phase, once no `src/` file imports fsqlite.
 
 ### Phase 1: Build de-risk, frozen baseline, on-disk format proof (2.5 days)
 
@@ -367,8 +377,11 @@ bundled build resolves on the RCH fleet.
 - Write `tests/storage_engine_compat.rs`: open all 11 `sample_beads_db_files/*/beads.db` plus the 2
   repro fixtures under rusqlite, assert `PRAGMA integrity_check == 'ok'` and
   `SELECT COUNT(*) FROM issues > 0` for each.
-- Swap the manifest: delete the 15 declarations at `Cargo.toml:45-59`, add the `rusqlite` line,
-  regenerate `Cargo.lock`. Nothing imports rusqlite yet, so this compiles only the dependency.
+- Swap the manifest: **add** the `rusqlite` line at `Cargo.toml:45-59` alongside the existing
+  `fsqlite` block, regenerate `Cargo.lock`. Do **not** delete the fsqlite lines yet: they stay until
+  Phase 8, because `src/storage/sqlite.rs` still imports them until Phase 7 and removing them now
+  would break the build for six phases. Nothing imports rusqlite yet, so this step compiles only
+  the new dependency.
 - Run `rch exec -- cargo build --release` on all 8 workers. This is the gating infra check. If a
   worker cannot build it, that is a one-day fix discovered now rather than in Phase 8.
 - Freeze the baseline. Run `rch exec -- cargo test --all-features` and
@@ -607,6 +620,9 @@ whole port as one atomic merge, and close the supply-chain loop.
   `"unique constraint failed: blocked_issues_cache.issue_id"` while C SQLite emits uppercase
   `UNIQUE`. Flag in the commit message any test that becomes trivially true under real WAL MVCC, so
   it is not counted as evidence the port is correct.
+- **Delete the 15 `fsqlite` declarations at `Cargo.toml:45-59` and regenerate `Cargo.lock`.** This
+  is the point at which no `src/` file imports fsqlite, so the removal is now possible. Verify with
+  `grep -rn fsqlite src/ tests/ benches/` returning zero before deleting the lines.
 - Merge to `main` as one merge commit. Then `git push origin main` and `git push origin main:master`.
 
 **Exit criteria:** `e2e_concurrency.rs` fully green; composed worst case documented; docs updated;
@@ -742,9 +758,10 @@ issue upstream, not to patch around it.
 2. Freeze the baseline before touching engine code: run `rch exec -- cargo test --all-features` and
    `rch exec -- cargo clippy --all-targets -- -D warnings` on unmodified `main`. Record exact pass
    and fail counts and the current release binary size.
-3. Swap the manifest as a pure dependency probe: delete the 15 declarations at `Cargo.toml:45-59`,
-   add the `rusqlite` line, regenerate `Cargo.lock`. Nothing imports rusqlite yet, so this compiles
-   only the dependency.
+3. Swap the manifest as a pure dependency probe: **add** the `rusqlite` line alongside the existing
+   `fsqlite` block at `Cargo.toml:45-59` and regenerate `Cargo.lock`. Do not delete the fsqlite
+   lines yet, they go in Phase 8. Nothing imports rusqlite at this point, so this compiles only the
+   new dependency.
 4. Run `rch exec -- cargo build --release` on all 8 workers. The single gating infra check.
 5. Extend the existing golden harness, not a new one. `tests/storage_golden_snapshot.rs` (210 lines)
    and 9 insta snapshots already exist. Add one golden case per `*_from_row` parser (14 of them,
