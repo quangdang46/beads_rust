@@ -1845,7 +1845,7 @@ impl SqliteStorage {
         // so it never blocks other connections.  The WAL file may grow slightly
         // larger between checkpoints, but journal_size_limit (set in
         // apply_runtime_pragmas) caps it.
-        if let Err(e) = self.conn().execute("PRAGMA wal_checkpoint(PASSIVE)", []) {
+        if let Err(e) = self.conn().execute_batch("PRAGMA wal_checkpoint(PASSIVE)") {
             tracing::debug!(error = %e, "WAL checkpoint failed (non-fatal, will retry later)");
         }
     }
@@ -1866,12 +1866,12 @@ impl SqliteStorage {
     /// Returns an error only if even a PASSIVE checkpoint fails. TRUNCATE
     /// failure is downgraded to a warning because it is best-effort.
     pub(crate) fn checkpoint_full(&self) -> Result<()> {
-        if let Err(e) = self.conn().execute("PRAGMA wal_checkpoint(TRUNCATE)", []) {
+        if let Err(e) = self.conn().execute_batch("PRAGMA wal_checkpoint(TRUNCATE)") {
             tracing::debug!(
                 error = %e,
                 "TRUNCATE checkpoint failed; falling back to PASSIVE"
             );
-            self.conn().execute("PRAGMA wal_checkpoint(PASSIVE)", [])?;
+            self.conn().execute_batch("PRAGMA wal_checkpoint(PASSIVE)")?;
         }
         Ok(())
     }
@@ -2447,7 +2447,7 @@ impl SqliteStorage {
                 "SELECT 1 FROM issues WHERE id = ?1 LIMIT 1",
                 &[SqlValue::from(issue.id.as_str())],
             ) {
-                Ok(_) => {
+                Ok(Some(_)) => {
                     return Err(BeadsError::IdCollision {
                         id: issue.id.clone(),
                     });
@@ -10915,8 +10915,17 @@ fn database_header_user_version(path: &Path) -> Result<Option<u32>> {
         BeadsError::Config(format!("Cannot open database file to read header: {e}"))
     })?;
     let mut header = [0_u8; 100];
-    file.read_exact(&mut header)
-        .map_err(|e| BeadsError::Config(format!("Cannot read database header: {e}")))?;
+    // A file shorter than the 100-byte header is a database C SQLite has created but not yet
+    // written: it materialises the file on open and fills the header on first use, where
+    // frankensqlite wrote a valid header immediately. A short file therefore means "fresh
+    // database", which is not forward skew, so report no version rather than failing the open.
+    match file.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => {
+            return Err(BeadsError::Config(format!("Cannot read database header: {e}")));
+        }
+    }
     if &header[..16] != b"SQLite format 3\0" {
         return Ok(None);
     }
@@ -13616,7 +13625,7 @@ impl Drop for SqliteStorage {
         // `with_write_transaction` — get one final TRUNCATE here so WAL
         // frames are not stranded on disk after the process ends (#270).
         if self.mutation_count > 0
-            && let Err(e) = self.conn().execute("PRAGMA wal_checkpoint(TRUNCATE)", [])
+            && let Err(e) = self.conn().execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
         {
             tracing::debug!(error = %e, "WAL checkpoint on drop failed (non-fatal)");
         }
