@@ -17923,15 +17923,15 @@ mod tests {
 
     #[test]
     fn test_repair_recoverable_db_state_skips_repair_for_wal_without_shm_warn() -> Result<()> {
-        // WAL-without-SHM is now a Warn (not Error) for frankensqlite compatibility.
-        // repair_recoverable_db_state should NOT attempt any repair for this condition.
+        // WAL-without-SHM is a Warn (not Error), so repair_recoverable_db_state
+        // must not quarantine the WAL on the strength of this check alone.
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
         fs::create_dir_all(&beads_dir)?;
         let db_path = beads_dir.join("beads.db");
         fs::write(&db_path, b"not a sqlite database")?;
         let wal_path = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
-        fs::write(&wal_path, b"frankensqlite wal without shm")?;
+        fs::write(&wal_path, b"orphaned wal without shm")?;
 
         let report = DoctorReport {
             ok: true, // Warn-only report is considered ok
@@ -17955,14 +17955,18 @@ mod tests {
             None,
             &FixerFilter::default(),
         );
+        // The behaviour under test is that the sidecar check does not trigger a
+        // repair. Asserting that the WAL is still on disk would additionally
+        // pin an engine behaviour that is no longer true: C SQLite removes an
+        // orphaned `-wal` when the connection closes, even when every pragma
+        // against the file failed with "file is not a database". frankensqlite
+        // left the file in place, so the old assertion passed for a reason that
+        // had nothing to do with the repair logic under test.
         assert!(
             repair.quarantined_artifacts.is_empty(),
             "WAL should not be quarantined for a Warn-level sidecar check"
         );
-        assert!(
-            wal_path.exists(),
-            "WAL file should remain untouched when sidecar check is only a warning"
-        );
+        let _ = &wal_path;
         Ok(())
     }
 

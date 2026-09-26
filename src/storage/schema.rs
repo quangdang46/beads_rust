@@ -52,8 +52,8 @@ pub const SCHEMA_SQL: &str = r"
         ephemeral INTEGER NOT NULL DEFAULT 0,
         pinned INTEGER NOT NULL DEFAULT 0,
         is_template INTEGER NOT NULL DEFAULT 0,
-        -- source_repo_path is appended at the end (after is_template) to match
-        -- the position SQLite assigns to ALTER TABLE ADD COLUMN on existing DBs.
+        -- Appended at the end (after is_template) to match the position SQLite
+        -- assigns to ALTER TABLE ADD COLUMN on existing DBs.
         -- This keeps `EXPECTED_ISSUE_COLUMN_ORDER` consistent for both freshly-
         -- created and migrated databases. See #289 for context.
         source_repo_path TEXT,
@@ -1880,7 +1880,6 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
             CREATE INDEX IF NOT EXISTS idx_dependencies_depends_on ON dependencies(depends_on_id);
             CREATE INDEX IF NOT EXISTS idx_dependencies_type ON dependencies(type);
             CREATE INDEX IF NOT EXISTS idx_dependencies_depends_on_type ON dependencies(depends_on_id, type);
-            CREATE INDEX IF NOT EXISTS idx_dependencies_thread ON dependencies(thread_id) WHERE thread_id != '';
             -- Composite for blocking lookups
             CREATE INDEX IF NOT EXISTS idx_dependencies_blocking
                 ON dependencies(depends_on_id, issue_id)
@@ -1888,6 +1887,12 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
         ",
         )?;
 
+        // `thread_id` is a recent addition, so a database created before it
+        // has a `dependencies` table without the column. Creating an index over
+        // a missing column aborts the whole batch, which would take the
+        // remaining index creation down with it -- so this one is gated on the
+        // column actually existing. The other four indexes above only reference
+        // columns present since the first schema version.
         if column_exists(conn, "dependencies", "thread_id") {
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_dependencies_thread ON dependencies(thread_id) WHERE thread_id != ''",
@@ -2579,31 +2584,28 @@ mod tests {
 
         apply_schema(&conn).expect("Failed to apply schema");
 
-        let row = query_one_row(&conn, "SELECT sql FROM sqlite_master WHERE type='table' AND name='issues'");
-        let issues_sql = row
-            .get(0)
-            .and_then(SqlValue::as_text)
-            .expect("issues table SQL should be present");
+        // Assert on the parsed table rather than on substrings of the DDL text.
+        // A substring count cannot tell a column declaration from a comment that
+        // merely mentions the column, so any editorial change to a neighbouring
+        // comment would fail this test while the schema stayed correct. A
+        // duplicate column is what actually matters, and PRAGMA table_info
+        // reports the real column list.
+        let columns: Vec<String> = query_all(
+            &conn,
+            "SELECT name FROM pragma_table_info('issues')",
+        )
+        .expect("read issues columns")
+        .iter()
+        .filter_map(|row| row.first().and_then(|v| v.as_text()).map(str::to_owned))
+        .collect();
 
-        // Use trailing space to disambiguate from `source_repo_path` (which
-        // contains `source_repo` as a prefix). The column declaration is
-        // `source_repo TEXT ...`, so the space-suffixed form matches the
-        // canonical declaration site exactly once.
-        assert_eq!(
-            issues_sql.matches("source_repo ").count(),
-            1,
-            "issues table SQL should define source_repo exactly once"
-        );
-        assert_eq!(
-            issues_sql.matches("source_repo_path ").count(),
-            1,
-            "issues table SQL should define source_repo_path exactly once"
-        );
-        assert_eq!(
-            issues_sql.matches("is_template").count(),
-            1,
-            "issues table SQL should define is_template exactly once"
-        );
+        for name in ["source_repo", "source_repo_path", "is_template"] {
+            let count = columns.iter().filter(|c| c.as_str() == name).count();
+            assert_eq!(
+                count, 1,
+                "issues table should define {name} exactly once; columns: {columns:?}"
+            );
+        }
     }
 
     /// Conformance test: Verify schema matches bd (Go) for interoperability.
