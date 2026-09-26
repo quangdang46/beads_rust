@@ -9,7 +9,7 @@ use crate::model::{
 use crate::storage::events::get_events;
 use crate::storage::schema::CURRENT_SCHEMA_VERSION;
 use crate::storage::schema::{
-    apply_runtime_compatible_schema, apply_schema, execute_batch, runtime_schema_compatible,
+    apply_runtime_compatible_schema, apply_schema, runtime_schema_compatible,
     table_exists,
 };
 use crate::sync::{
@@ -1196,9 +1196,7 @@ impl SqliteStorage {
     ///
     /// Returns an error if any DROP/CREATE statement fails.
     pub fn reset_data_tables(&mut self) -> Result<()> {
-        use crate::storage::schema::execute_batch;
-        execute_batch(
-            &self.conn,
+        self.conn.execute_batch(
             r"
             DROP TABLE IF EXISTS blocked_issues_cache;
             DROP TABLE IF EXISTS export_hashes;
@@ -6492,8 +6490,7 @@ impl SqliteStorage {
         } else {
             // Table doesn't exist yet (fresh DB before schema fully applied,
             // or recovery scenario).  Fall back to CREATE.
-            execute_batch(
-                conn,
+            conn.execute_batch(
                 r"
                 CREATE TABLE blocked_issues_cache (
                     issue_id TEXT PRIMARY KEY,
@@ -13614,7 +13611,7 @@ impl SqliteStorage {
     ///
     /// Returns an error if the SQL execution fails.
     pub fn execute_test_sql(&self, sql: &str) -> Result<()> {
-        crate::storage::schema::execute_batch(&self.conn, sql)?;
+        self.conn.execute_batch(sql)?;
         Ok(())
     }
 }
@@ -22406,8 +22403,7 @@ mod tests {
     #[test]
     fn test_get_ready_issues_treats_null_legacy_flags_as_false() {
         let conn = Connection::open(":memory:").unwrap();
-        crate::storage::schema::execute_batch(
-            &conn,
+        conn.execute_batch(
             r"
             CREATE TABLE issues (
                 id TEXT PRIMARY KEY,

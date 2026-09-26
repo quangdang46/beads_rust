@@ -4768,8 +4768,7 @@ mod tests {
         drop(storage);
 
         let conn = Connection::open(db_path.to_string_lossy().into_owned()).expect("open setup db");
-        crate::storage::schema::execute_batch(
-            &conn,
+        conn.execute_batch(
             "DROP TABLE blocked_issues_cache;
             CREATE TABLE blocked_issues_cache (
                 issue_id TEXT PRIMARY KEY,

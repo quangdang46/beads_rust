@@ -1227,11 +1227,8 @@ fn run_db_migrate(
     //     `PRAGMA user_version = to`. On any failure the chokepoint's
     //     recovery path can restore from the pre-migrate snapshot we
     //     wrote in step (1).
-    // The migration handle stays on the legacy engine: `run_migrations_atomic` is Phase 4's
-    // subject, and it still takes an fsqlite connection. Everything above it in this function
-    // is fully ported, so this is the single remaining coupling point in the file, and it is
-    // removed by Phase 4 rather than by a change here.
-    let migrate_conn = fsqlite::Connection::open(db_path.to_string_lossy().into_owned())?;
+    // Phase 4 ported the migration runner, so this handle no longer needs the legacy engine.
+    let migrate_conn = Connection::open(db_path)?;
     let migration_result = crate::storage::schema::run_migrations_atomic(&migrate_conn, from, to);
     let _ = migrate_conn.close();
     match migration_result {
@@ -2084,10 +2081,9 @@ mod tests {
             // `fsqlite::Connection` until the storage layer is ported. So the DDL half
             // of this fixture keeps a frankensqlite handle while the assertion half
             // below is rusqlite. Both engines read the same file, so this is a scoping
-            // constraint, not a behaviour change.
-            let conn = fsqlite::Connection::open(db.to_string_lossy().into_owned()).unwrap();
+            let conn = Connection::open(&db).unwrap();
             crate::storage::schema::apply_schema(&conn).expect("apply_schema on fresh test DB");
-            let _ = conn.close();
+            conn.close().map_err(|(_, e)| e).expect("close");
         }
         // Demote user_version so run_migrations_atomic has work to do.
         {
