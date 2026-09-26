@@ -191,8 +191,16 @@ fn parse_created_id(stdout: &str) -> String {
         .to_string()
 }
 
+/// Whether a non-zero exit is ordinary lock contention rather than a fault.
+///
+/// Shares the finding-identifier caveat documented on
+/// [`contains_integrity_failure_signal`]: the excluded terms are checked
+/// against output with `fm-*` identifiers removed, so a passing check named
+/// `fm-state_files-sqlite-page-malformed` is not mistaken for a malformed
+/// database.
 fn is_expected_contention_failure(result: &BrResult) -> bool {
-    let combined = format!("{} {}", result.stdout, result.stderr).to_lowercase();
+    let raw = format!("{} {}", result.stdout, result.stderr);
+    let combined = STRIPPED_FINDING_ID.replace_all(&raw, "").to_lowercase();
     !result.success
         && (combined.contains("busy")
             || combined.contains("locked")
@@ -216,8 +224,24 @@ fn has_integrity_failure_signal(result: &BrResult) -> bool {
     !result.success && contains_integrity_failure_signal(&result.stdout)
 }
 
+/// Detect a real integrity failure in command output.
+///
+/// The check names carry the vocabulary of the failures they look for, so a
+/// raw substring search over the whole output reports a healthy database as
+/// corrupt. `br doctor --json` on a clean workspace always contains
+/// `sqlite.integrity_check` with `status: ok` and a `finding_id` of
+/// `fm-state_files-sqlite-page-malformed`; likewise
+/// `fm-configs-yaml-malformed` and `fm-routes_external-routes-jsonl-corrupt`.
+/// Matching "malformed" or "corrupt" anywhere in that payload flags a passing
+/// integrity check as a failure.
+///
+/// So the finding identifiers -- which are the taxonomy the doctor uses to name
+/// what it would report, not what it found -- are removed before searching.
+/// What remains is prose and error text, where a genuine corruption or
+/// constraint violation actually appears.
 fn contains_integrity_failure_signal(output: &str) -> bool {
-    let output = output.to_lowercase();
+    let without_finding_ids = STRIPPED_FINDING_ID.replace_all(output, "");
+    let output = without_finding_ids.to_lowercase();
     output.contains("unique constraint failed: blocked_issues_cache.issue_id")
         || output.contains("constraint failed")
         || output.contains("constraint")
@@ -226,6 +250,10 @@ fn contains_integrity_failure_signal(output: &str) -> bool {
         || output.contains("unexpected token")
         || output.contains("panic")
 }
+
+/// Every `fm-*` finding identifier, which is vocabulary rather than evidence.
+static STRIPPED_FINDING_ID: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"fm-[a-z0-9_-]+").expect("finding id pattern"));
 
 fn assert_no_integrity_failure_signals(role: &str, results: &[BrResult]) {
     let mut integrity_failures = Vec::new();
