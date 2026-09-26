@@ -6,22 +6,19 @@
 use beads_rust::model::{Issue, IssueType, Priority, Status};
 use beads_rust::storage::{IssueUpdate, SqliteStorage};
 use chrono::{TimeZone, Utc};
-use fsqlite::Connection;
-use fsqlite_types::SqliteValue;
+use beads_rust::storage::db::{query_all, query_row_all};
+use rusqlite::Connection;
 use insta::assert_snapshot;
 use serde_json::Value;
 use std::fmt::Write;
 use tempfile::TempDir;
 
-fn value_text(row: &fsqlite::Row, idx: usize) -> String {
-    row.get(idx)
-        .and_then(SqliteValue::as_text)
-        .unwrap_or("")
-        .to_string()
+fn value_text(row: &[beads_rust::storage::db::SqlValue], idx: usize) -> String {
+    row.get(idx).and_then(|v| v.as_text()).unwrap_or("").to_string()
 }
 
-fn value_i64(row: &fsqlite::Row, idx: usize) -> i64 {
-    row.get(idx).and_then(SqliteValue::as_integer).unwrap_or(0)
+fn value_i64(row: &[beads_rust::storage::db::SqlValue], idx: usize) -> i64 {
+    row.get(idx).and_then(|v| v.as_integer()).unwrap_or(0)
 }
 
 fn fixed_issue() -> Issue {
@@ -94,13 +91,14 @@ fn fixed_issue() -> Issue {
 }
 
 fn push_issue_row_snapshot(out: &mut String, conn: &Connection) {
-    let row = conn
-        .query_row(
-            "SELECT id, title, status, priority, issue_type, assignee, description, \
-                    close_reason, closed_by_session, created_at, updated_at, closed_at, content_hash \
-             FROM issues WHERE id = 'storage-golden-1'",
-        )
-        .expect("issue row");
+    let row = query_row_all(
+        conn,
+        "SELECT id, title, status, priority, issue_type, assignee, description, \
+                close_reason, closed_by_session, created_at, updated_at, closed_at, content_hash \
+         FROM issues WHERE id = 'storage-golden-1'",
+    )
+    .expect("issue row")
+    .expect("issue row present");
 
     writeln!(out, "issue:").unwrap();
     writeln!(out, "  id: {}", value_text(&row, 0)).unwrap();
@@ -119,12 +117,12 @@ fn push_issue_row_snapshot(out: &mut String, conn: &Connection) {
 }
 
 fn push_events_snapshot(out: &mut String, conn: &Connection) {
-    let rows = conn
-        .query(
-            "SELECT id, event_type, actor, old_value, new_value, comment \
-             FROM events WHERE issue_id = 'storage-golden-1' ORDER BY id ASC",
-        )
-        .expect("event rows");
+    let rows = query_all(
+        conn,
+        "SELECT id, event_type, actor, old_value, new_value, comment \
+         FROM events WHERE issue_id = 'storage-golden-1' ORDER BY id ASC",
+    )
+    .expect("event rows");
 
     writeln!(out, "events:").unwrap();
     for row in &rows {
@@ -196,7 +194,7 @@ fn golden_create_update_close_sqlite_rows_and_jsonl() {
         )
         .expect("close issue");
 
-    let conn = Connection::open(db_path.to_string_lossy().into_owned()).expect("open raw db");
+    let conn = Connection::open(db_path.to_string_lossy().as_ref()).expect("open raw db");
     let mut snapshot = String::new();
     push_issue_row_snapshot(&mut snapshot, &conn);
     push_events_snapshot(&mut snapshot, &conn);

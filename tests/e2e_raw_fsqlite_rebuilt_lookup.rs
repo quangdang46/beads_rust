@@ -2,9 +2,8 @@ mod common;
 
 use beads_rust::storage::SqliteStorage;
 use common::cli::{BrWorkspace, run_br};
-use fsqlite::Connection;
-use fsqlite_error::FrankenError;
-use fsqlite_types::SqliteValue;
+use beads_rust::storage::db::{SqlValue, query_all, query_row_with, query_rows_with};
+use rusqlite::Connection;
 use serde_json::Value;
 use std::path::Path;
 
@@ -14,59 +13,39 @@ fn extract_json(run_stdout: &str) -> Value {
 }
 
 fn scan_issue_ids(conn: &Connection) -> Vec<String> {
-    conn.query("SELECT id FROM issues ORDER BY rowid")
+    query_all(conn, "SELECT id FROM issues ORDER BY rowid")
         .unwrap()
         .into_iter()
-        .filter_map(|row| {
-            row.values()
-                .first()
-                .and_then(SqliteValue::as_text)
-                .map(ToOwned::to_owned)
-        })
+        .filter_map(|row| row.first().and_then(SqlValue::as_text).map(ToOwned::to_owned))
         .collect()
 }
 
 fn keyed_issue_ids(conn: &Connection, id: &str) -> Vec<String> {
-    conn.query_with_params(
+    query_rows_with(
+        conn,
         "SELECT id FROM issues WHERE id = ?",
-        &[SqliteValue::from(id)],
+        &[SqlValue::from(id)],
     )
     .unwrap()
     .into_iter()
-    .filter_map(|row| {
-        row.values()
-            .first()
-            .and_then(SqliteValue::as_text)
-            .map(ToOwned::to_owned)
-    })
+    .filter_map(|row| row.first().and_then(SqlValue::as_text).map(ToOwned::to_owned))
     .collect()
 }
 
 fn keyed_issue_row(conn: &Connection, id: &str) -> Option<String> {
-    match conn.query_row_with_params(
+    query_row_with(
+        conn,
         "SELECT id FROM issues WHERE id = ?",
-        &[SqliteValue::from(id)],
-    ) {
-        Ok(row) => row
-            .values()
-            .first()
-            .and_then(SqliteValue::as_text)
-            .map(ToOwned::to_owned),
-        Err(FrankenError::QueryReturnedNoRows) => None,
-        Err(error) => panic!("query_row issue lookup failed for {id}: {error}"),
-    }
+        &[SqlValue::from(id)],
+    )
+    .unwrap_or_else(|error| panic!("query_row issue lookup failed for {id}: {error}"))
+    .and_then(|row| row.first().and_then(SqlValue::as_text).map(ToOwned::to_owned))
 }
 
 fn keyed_text_value(conn: &Connection, sql: &str, key: &str) -> Option<String> {
-    match conn.query_row_with_params(sql, &[SqliteValue::from(key)]) {
-        Ok(row) => row
-            .values()
-            .first()
-            .and_then(SqliteValue::as_text)
-            .map(ToOwned::to_owned),
-        Err(FrankenError::QueryReturnedNoRows) => None,
-        Err(error) => panic!("text lookup failed for key {key} with sql {sql:?}: {error}"),
-    }
+    query_row_with(conn, sql, &[SqlValue::from(key)])
+        .unwrap_or_else(|error| panic!("text lookup failed for key {key} with sql {sql:?}: {error}"))
+        .and_then(|row| row.first().and_then(SqlValue::as_text).map(ToOwned::to_owned))
 }
 
 fn create_seed_issue(workspace: &BrWorkspace, title: &str) {
@@ -119,7 +98,7 @@ fn assert_fresh_lookup_round_trip(workspace: &BrWorkspace, alt_db: &Path, i: usi
     let create_json = extract_json(&create.stdout);
     let fresh_id = create_json["id"].as_str().expect("fresh id").to_string();
 
-    let conn = Connection::open(alt_db.to_string_lossy().into_owned()).unwrap();
+    let conn = Connection::open(alt_db.to_string_lossy().as_ref()).unwrap();
 
     let issue_prefix = keyed_text_value(
         &conn,
@@ -129,7 +108,7 @@ fn assert_fresh_lookup_round_trip(workspace: &BrWorkspace, alt_db: &Path, i: usi
     assert_eq!(
         issue_prefix.as_deref(),
         Some("raw"),
-        "raw fsqlite config lookup should keep returning the configured prefix after rebuild on loop {i}"
+        "raw storage config lookup should keep returning the configured prefix after rebuild on loop {i}"
     );
 
     let needs_flush_raw = keyed_text_value(
@@ -148,7 +127,7 @@ fn assert_fresh_lookup_round_trip(workspace: &BrWorkspace, alt_db: &Path, i: usi
     assert_eq!(
         keyed,
         vec![fresh_id.clone()],
-        "raw fsqlite keyed query_with_params diverged from full scan for {fresh_id} on loop {i}; scanned_tail={:?}",
+        "raw storage keyed query diverged from full scan for {fresh_id} on loop {i}; scanned_tail={:?}",
         &scanned[scanned.len().saturating_sub(10)..]
     );
 
@@ -156,7 +135,7 @@ fn assert_fresh_lookup_round_trip(workspace: &BrWorkspace, alt_db: &Path, i: usi
     assert_eq!(
         keyed_row.as_deref(),
         Some(fresh_id.as_str()),
-        "raw fsqlite query_row_with_params diverged for {fresh_id} on loop {i}; keyed={keyed:?}"
+        "raw storage query_row diverged for {fresh_id} on loop {i}; keyed={keyed:?}"
     );
 
     let storage = SqliteStorage::open(alt_db).expect("open storage against rebuilt alt db");
@@ -181,10 +160,10 @@ fn assert_fresh_lookup_round_trip(workspace: &BrWorkspace, alt_db: &Path, i: usi
 }
 
 #[test]
-fn e2e_raw_fsqlite_keyed_lookup_matches_full_scan_after_alt_rebuild() {
+fn e2e_raw_keyed_lookup_matches_full_scan_after_alt_rebuild() {
     const LOOP_COUNT: usize = 20;
 
-    let _log = common::test_log("e2e_raw_fsqlite_keyed_lookup_matches_full_scan_after_alt_rebuild");
+    let _log = common::test_log("e2e_raw_keyed_lookup_matches_full_scan_after_alt_rebuild");
     let workspace = BrWorkspace::new();
 
     let init = run_br(

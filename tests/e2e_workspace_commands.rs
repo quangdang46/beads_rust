@@ -6,7 +6,7 @@
 mod common;
 
 use common::cli::{BrWorkspace, extract_json_payload, parse_list_issues, run_br, run_br_with_env};
-use fsqlite::Connection;
+use rusqlite::Connection;
 use serde_json::Value;
 use std::fs;
 
@@ -465,10 +465,10 @@ fn e2e_doctor_repair_json_rebuilds_and_returns_single_payload() {
         "issues.jsonl should exist before repair test"
     );
 
-    let conn = Connection::open(db_path.to_string_lossy().into_owned()).expect("open beads db");
-    conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-a')")
+    let conn = Connection::open(db_path.to_string_lossy().as_ref()).expect("open beads db");
+    conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-a')", [])
         .expect("insert duplicate config row a");
-    conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-b')")
+    conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-b')", [])
         .expect("insert duplicate config row b");
 
     let pre_repair = run_br(&workspace, ["doctor", "--json"], "doctor_pre_repair_json");
@@ -574,11 +574,11 @@ fn e2e_startup_auto_recovery_preserves_unflushed_tombstones() {
     // the next `br` invocation tries to reopen the DB.
     let db_path = workspace.root.join(".beads").join("beads.db");
     {
-        let conn = Connection::open(db_path.to_string_lossy().into_owned())
+        let conn = Connection::open(db_path.to_string_lossy().as_ref())
             .expect("open beads db for anomaly injection");
-        conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-a')")
+        conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-a')", [])
             .expect("insert duplicate config row a");
-        conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-b')")
+        conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-b')", [])
             .expect("insert duplicate config row b");
     }
 
@@ -671,11 +671,11 @@ fn e2e_doctor_repair_preserves_unflushed_tombstones() {
     // fall-through to the JSONL rebuild path.
     let db_path = workspace.root.join(".beads").join("beads.db");
     {
-        let conn = Connection::open(db_path.to_string_lossy().into_owned())
+        let conn = Connection::open(db_path.to_string_lossy().as_ref())
             .expect("open beads db for anomaly injection");
-        conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-a')")
+        conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-a')", [])
             .expect("insert duplicate config row a");
-        conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-b')")
+        conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-b')", [])
             .expect("insert duplicate config row b");
     }
 

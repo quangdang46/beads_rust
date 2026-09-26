@@ -15,7 +15,7 @@
 //! stdout references a different bead's title + fields.
 //!
 //! The root cause is that the post-write display path used a second
-//! `get_issue(id)` read to render the diff.  A rare fsqlite read-path
+//! `get_issue(id)` read to render the diff.  A rare read-path
 //! inconsistency (prepared-statement / pager cache edge case) can make that
 //! second read return data that belongs to a different row while the write
 //! itself is correct.

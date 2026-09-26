@@ -42,8 +42,8 @@ use beads_rust::util::hex_encode;
 use chrono::Utc;
 use common::binary_discovery::discover_binaries;
 use common::dataset_registry::KnownDataset;
-use fsqlite::Connection;
-use fsqlite_types::SqliteValue;
+use beads_rust::storage::db::{SqlValue, exec_with, query_row_all};
+use rusqlite::Connection;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use serde::{Deserialize, Serialize};
@@ -881,9 +881,9 @@ fn populate_sqlite_direct(db_path: &Path, jsonl_path: &Path) -> std::io::Result<
     {
         let _storage = sqlite_io(SqliteStorage::open(db_path))?;
     }
-    let conn = sqlite_io(Connection::open(db_path.to_string_lossy().into_owned()))?;
-    sqlite_io(conn.execute("PRAGMA synchronous=OFF"))?;
-    sqlite_io(conn.execute("BEGIN IMMEDIATE"))?;
+    let conn = sqlite_io(Connection::open(db_path.to_string_lossy().as_ref()))?;
+    sqlite_io(conn.execute("PRAGMA synchronous=OFF", []))?;
+    sqlite_io(conn.execute("BEGIN IMMEDIATE", []))?;
 
     let file = File::open(jsonl_path)?;
     let reader = BufReader::new(file);
@@ -907,9 +907,10 @@ fn populate_sqlite_direct(db_path: &Path, jsonl_path: &Path) -> std::io::Result<
         }
     }
 
-    sqlite_io(conn.execute("COMMIT"))?;
-    let row = sqlite_io(conn.query_row("SELECT count(*) FROM issues"))?;
-    let persisted_count = row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0);
+    sqlite_io(conn.execute("COMMIT", []))?;
+    let row = sqlite_io(query_row_all(&conn, "SELECT count(*) FROM issues"))?
+        .expect("count row present");
+    let persisted_count = row.first().and_then(SqlValue::as_integer).unwrap_or(0);
     let persisted_count = usize::try_from(persisted_count).unwrap_or(0);
     if persisted_count != issue_count {
         return Err(std::io::Error::other(format!(
@@ -919,13 +920,13 @@ fn populate_sqlite_direct(db_path: &Path, jsonl_path: &Path) -> std::io::Result<
     Ok(())
 }
 
-fn optional_text(value: Option<&str>) -> SqliteValue {
-    value.map_or(SqliteValue::Null, SqliteValue::from)
+fn optional_text(value: Option<&str>) -> SqlValue {
+    value.map_or(SqlValue::null(), SqlValue::from)
 }
 
-fn optional_datetime(value: Option<chrono::DateTime<Utc>>) -> SqliteValue {
-    value.map_or(SqliteValue::Null, |timestamp| {
-        SqliteValue::from(timestamp.to_rfc3339())
+fn optional_datetime(value: Option<chrono::DateTime<Utc>>) -> SqlValue {
+    value.map_or(SqlValue::null(), |timestamp| {
+        SqlValue::from(timestamp.to_rfc3339())
     })
 }
 
@@ -934,7 +935,7 @@ fn insert_issue_direct(conn: &Connection, issue: &Issue) -> std::io::Result<()> 
         .content_hash
         .clone()
         .unwrap_or_else(|| issue.compute_content_hash());
-    sqlite_io(conn.execute_with_params(
+    sqlite_io(exec_with(&conn, 
         "INSERT INTO issues (
             id, content_hash, title, description, design, acceptance_criteria, notes,
             status, priority, issue_type, assignee, owner, estimated_minutes,
@@ -944,76 +945,76 @@ fn insert_issue_direct(conn: &Connection, issue: &Issue) -> std::io::Result<()> 
             sender, ephemeral, pinned, is_template
          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         &[
-            SqliteValue::from(issue.id.as_str()),
-            SqliteValue::from(content_hash.as_str()),
-            SqliteValue::from(issue.title.as_str()),
-            SqliteValue::from(issue.description.as_deref().unwrap_or("")),
-            SqliteValue::from(issue.design.as_deref().unwrap_or("")),
-            SqliteValue::from(issue.acceptance_criteria.as_deref().unwrap_or("")),
-            SqliteValue::from(issue.notes.as_deref().unwrap_or("")),
-            SqliteValue::from(issue.status.as_str()),
-            SqliteValue::from(issue.priority.0),
-            SqliteValue::from(issue.issue_type.as_str()),
+            SqlValue::from(issue.id.as_str()),
+            SqlValue::from(content_hash.as_str()),
+            SqlValue::from(issue.title.as_str()),
+            SqlValue::from(issue.description.as_deref().unwrap_or("")),
+            SqlValue::from(issue.design.as_deref().unwrap_or("")),
+            SqlValue::from(issue.acceptance_criteria.as_deref().unwrap_or("")),
+            SqlValue::from(issue.notes.as_deref().unwrap_or("")),
+            SqlValue::from(issue.status.as_str()),
+            SqlValue::from(issue.priority.0),
+            SqlValue::from(issue.issue_type.as_str()),
             optional_text(issue.assignee.as_deref()),
-            SqliteValue::from(issue.owner.as_deref().unwrap_or("")),
-            issue.estimated_minutes.map_or(SqliteValue::Null, SqliteValue::from),
-            SqliteValue::from(issue.created_at.to_rfc3339()),
-            SqliteValue::from(issue.created_by.as_deref().unwrap_or("")),
-            SqliteValue::from(issue.updated_at.to_rfc3339()),
+            SqlValue::from(issue.owner.as_deref().unwrap_or("")),
+            issue.estimated_minutes.map_or(SqlValue::null(), SqlValue::from),
+            SqlValue::from(issue.created_at.to_rfc3339()),
+            SqlValue::from(issue.created_by.as_deref().unwrap_or("")),
+            SqlValue::from(issue.updated_at.to_rfc3339()),
             optional_datetime(issue.closed_at),
-            SqliteValue::from(issue.close_reason.as_deref().unwrap_or("")),
-            SqliteValue::from(issue.closed_by_session.as_deref().unwrap_or("")),
+            SqlValue::from(issue.close_reason.as_deref().unwrap_or("")),
+            SqlValue::from(issue.closed_by_session.as_deref().unwrap_or("")),
             optional_datetime(issue.due_at),
             optional_datetime(issue.defer_until),
             optional_text(issue.external_ref.as_deref()),
-            SqliteValue::from(issue.source_system.as_deref().unwrap_or("")),
-            SqliteValue::from(issue.source_repo.as_deref().unwrap_or(".")),
+            SqlValue::from(issue.source_system.as_deref().unwrap_or("")),
+            SqlValue::from(issue.source_repo.as_deref().unwrap_or(".")),
             optional_datetime(issue.deleted_at),
-            SqliteValue::from(issue.deleted_by.as_deref().unwrap_or("")),
-            SqliteValue::from(issue.delete_reason.as_deref().unwrap_or("")),
-            SqliteValue::from(issue.original_type.as_deref().unwrap_or("")),
-            SqliteValue::from(issue.sender.as_deref().unwrap_or("")),
-            SqliteValue::from(i64::from(i32::from(issue.ephemeral))),
-            SqliteValue::from(i64::from(i32::from(issue.pinned))),
-            SqliteValue::from(i64::from(i32::from(issue.is_template))),
+            SqlValue::from(issue.deleted_by.as_deref().unwrap_or("")),
+            SqlValue::from(issue.delete_reason.as_deref().unwrap_or("")),
+            SqlValue::from(issue.original_type.as_deref().unwrap_or("")),
+            SqlValue::from(issue.sender.as_deref().unwrap_or("")),
+            SqlValue::from(i64::from(i32::from(issue.ephemeral))),
+            SqlValue::from(i64::from(i32::from(issue.pinned))),
+            SqlValue::from(i64::from(i32::from(issue.is_template))),
         ],
     ))?;
 
     for label in &issue.labels {
-        sqlite_io(conn.execute_with_params(
+        sqlite_io(exec_with(&conn, 
             "INSERT OR IGNORE INTO labels (issue_id, label) VALUES (?, ?)",
             &[
-                SqliteValue::from(issue.id.as_str()),
-                SqliteValue::from(label.as_str()),
+                SqlValue::from(issue.id.as_str()),
+                SqlValue::from(label.as_str()),
             ],
         ))?;
     }
 
     for dependency in &issue.dependencies {
-        sqlite_io(conn.execute_with_params(
+        sqlite_io(exec_with(&conn, 
             "INSERT OR IGNORE INTO dependencies (
                 issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id
              ) VALUES (?, ?, ?, ?, ?, ?, ?)",
             &[
-                SqliteValue::from(issue.id.as_str()),
-                SqliteValue::from(dependency.depends_on_id.as_str()),
-                SqliteValue::from(dependency.dep_type.as_str()),
-                SqliteValue::from(dependency.created_at.to_rfc3339()),
-                SqliteValue::from(dependency.created_by.as_deref().unwrap_or("synthetic")),
-                SqliteValue::from(dependency.metadata.as_deref().unwrap_or("{}")),
-                SqliteValue::from(dependency.thread_id.as_deref().unwrap_or("")),
+                SqlValue::from(issue.id.as_str()),
+                SqlValue::from(dependency.depends_on_id.as_str()),
+                SqlValue::from(dependency.dep_type.as_str()),
+                SqlValue::from(dependency.created_at.to_rfc3339()),
+                SqlValue::from(dependency.created_by.as_deref().unwrap_or("synthetic")),
+                SqlValue::from(dependency.metadata.as_deref().unwrap_or("{}")),
+                SqlValue::from(dependency.thread_id.as_deref().unwrap_or("")),
             ],
         ))?;
     }
 
     for comment in &issue.comments {
-        sqlite_io(conn.execute_with_params(
+        sqlite_io(exec_with(&conn, 
             "INSERT INTO comments (issue_id, author, text, created_at) VALUES (?, ?, ?, ?)",
             &[
-                SqliteValue::from(issue.id.as_str()),
-                SqliteValue::from(comment.author.as_str()),
-                SqliteValue::from(comment.body.as_str()),
-                SqliteValue::from(comment.created_at.to_rfc3339()),
+                SqlValue::from(issue.id.as_str()),
+                SqlValue::from(comment.author.as_str()),
+                SqlValue::from(comment.body.as_str()),
+                SqlValue::from(comment.created_at.to_rfc3339()),
             ],
         ))?;
     }
