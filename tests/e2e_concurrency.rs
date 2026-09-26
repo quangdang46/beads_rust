@@ -11,8 +11,8 @@ mod common;
 
 use assert_cmd::Command;
 use common::dataset_registry::{DatasetRegistry, IsolatedDataset, KnownDataset};
-use fsqlite::Connection;
-use fsqlite_types::SqliteValue;
+use beads_rust::storage::db::{SqlValue, query_rows_with};
+use rusqlite::Connection;
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::path::Path;
@@ -272,17 +272,17 @@ fn assert_only_success_or_contention(role: &str, results: &[BrResult]) -> usize 
 
 fn issue_title_count(root: &Path, title: &str) -> i64 {
     let db_path = root.join(".beads").join("beads.db");
-    let conn = Connection::open(db_path.to_string_lossy().into_owned()).expect("open beads db");
-    let rows = conn
-        .query_with_params(
-            "SELECT COUNT(*) FROM issues WHERE title = ?",
-            &[SqliteValue::from(title)],
-        )
-        .expect("count issue title");
+    let conn = Connection::open(db_path.to_string_lossy().as_ref()).expect("open beads db");
+    let rows = query_rows_with(
+        &conn,
+        "SELECT COUNT(*) FROM issues WHERE title = ?",
+        &[SqlValue::from(title)],
+    )
+    .expect("count issue title");
 
     rows.first()
-        .and_then(|row| row.get(0))
-        .and_then(SqliteValue::as_integer)
+        .and_then(|row| row.first())
+        .and_then(SqlValue::as_integer)
         .unwrap_or(0)
 }
 
@@ -323,7 +323,7 @@ fn extract_issues_array(stdout: &str) -> Vec<serde_json::Value> {
 
 /// Assert that `br doctor` reports the workspace as healthy.
 ///
-/// If the initial check fails with only recoverable fsqlite-layer issues
+/// If the initial check fails with only recoverable storage-layer issues
 /// (WAL-without-SHM, minor page accounting gaps after concurrent load), this
 /// runs `doctor --repair` which checkpoints the WAL and reconciles page
 /// accounting. `doctor --repair` exits non-zero only when post-repair
@@ -723,20 +723,21 @@ fn e2e_read_command_witness_refresh_waits_for_write_lock() {
 
     let beads_dir = root.join(".beads");
     let db_path = beads_dir.join("beads.db");
-    let conn = Connection::open(db_path.to_string_lossy().into_owned()).expect("open beads db");
-    conn.execute("DELETE FROM metadata WHERE key = 'jsonl_size'")
+    let conn = Connection::open(db_path.to_string_lossy().as_ref()).expect("open beads db");
+    conn.execute("DELETE FROM metadata WHERE key = 'jsonl_size'", [])
         .expect("delete jsonl_size witness");
-    conn.execute("INSERT INTO metadata (key, value) VALUES ('jsonl_size', '0')")
+    conn.execute("INSERT INTO metadata (key, value) VALUES ('jsonl_size', '0')", [])
         .expect("write stale jsonl_size witness");
     // beads_rust-mjmk: also corrupt jsonl_content_hash so the staleness probe
     // actually concludes the JSONL is newer. compute_jsonl_newer_impl falls
     // back to hash comparison when size mismatches; if the hash still matches
     // the actual JSONL, the probe returns "not newer" and the read command
     // never tries to refresh witnesses, making this test a no-op.
-    conn.execute("DELETE FROM metadata WHERE key = 'jsonl_content_hash'")
+    conn.execute("DELETE FROM metadata WHERE key = 'jsonl_content_hash'", [])
         .expect("delete jsonl_content_hash witness");
     conn.execute(
         "INSERT INTO metadata (key, value) VALUES ('jsonl_content_hash', 'stale_witness_hash_mjmk')",
+        [],
     )
     .expect("write stale jsonl_content_hash witness");
     drop(conn);
