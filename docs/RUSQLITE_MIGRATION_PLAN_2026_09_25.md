@@ -385,6 +385,35 @@ Phase 3 creates `src/storage/db.rs` with a `SqlValue` newtype that absorbs the s
 between `fsqlite_types::SqliteValue` and `rusqlite::types::Value`, which is what turns 1175 of the
 1877 call sites into type-path churn instead of hand-written rewrites.
 
+> **SUPERSEDED 2026-09-27 by measurement. Read this before acting on the rule below.**
+>
+> This section argued `src/storage/db.rs` was disposable port scaffolding and gated the merge on
+> deleting it. Two of its three justifications do not survive contact with the code:
+>
+> - **Claim 1 ("deleted before the merge") was the mechanism, not the justification.** The file
+>   was originally justified as absorbing a one-shot shape difference between two engines. It is
+>   load-bearing for a different reason: `Connection::execute` takes `&[&dyn ToSql]`, and
+>   converting a `&[Value]` into that form inline drops the source slice while `execute` still
+>   borrows it (`E0597`). Passing the values as a call argument instead lives to the end of the
+>   full expression, which is what the helpers do. Verified against rusqlite 0.40.2 in a scratch
+>   crate; the inline form does not compile, the helper form does.
+> - **Claim 3 ("deleted rather than left as structure") conflated this with the rejected
+>   strangler.** The permanent form being rejected is a *runtime* engine enum, where callers
+>   branch on which engine is active. `db.rs` has no such branch: it is a static set of access
+>   helpers over one engine. Keeping it is not the graft.
+>
+> Claim 2 holds unchanged: it provides no backwards compatibility and wraps nothing deprecated.
+>
+> **Amended rule:** `src/storage/db.rs` is permanent and is NOT a merge gate. The alternative is
+> 443 hand-written multi-line blocks across 11 files (`sqlite.rs` 395, `doctor.rs` 20,
+> `events.rs` 17, `schema.rs` 12, `federation.rs` 12, `mutate.rs` 12, `delete.rs` 10,
+> `info.rs` 9, and 3 more), five helpers of which cover 391 sites. That is precisely the
+> error-prone rewrite class this port already demonstrated going wrong silently
+> (`check_cycle`, `would_create_cycle` — both caught only by reading, not by the compiler or the
+> suite).
+>
+> The original text follows, retained for audit.
+
 That looks like the thing `AGENTS.md` forbids, so here is the distinction, and it is the reason a
 reviewer should approve it rather than reject it:
 
@@ -398,8 +427,8 @@ reviewer should approve it rather than reject it:
    strangler's runtime enum, which is precisely what is being rejected. Taking the mechanism and
    refusing the permanent form is the graft, not a compromise.
 
-**Rule for the implementer:** if `src/storage/db.rs` still exists when Phase 8 opens, Phase 8 does
-not merge. There is no path where it survives into `main`.
+**Original rule (superseded by the amendment above):** if `src/storage/db.rs` still exists when
+Phase 8 opens, Phase 8 does not merge. There is no path where it survives into `main`.
 
 The strangler's other strong idea, a differential parity harness comparing fixed CLI invocations
 across engines, is also kept, as a **permanent test** rather than a temporary module, so it survives
