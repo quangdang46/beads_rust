@@ -292,9 +292,6 @@ pub fn query_rows_with(
 
 /// `conn.query_row_with_params(sql, &[..])` returning the row, or `None` when it matched
 /// nothing.
-///
-/// `None` rather than an error, because that is what the frankensqlite call sites expect: a
-/// metadata row that is simply not there is an ordinary outcome for them, not a failure.
 pub fn query_row_with(
     conn: &Connection,
     sql: &str,
