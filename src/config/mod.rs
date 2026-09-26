@@ -5315,7 +5315,24 @@ labels:
         fs::create_dir_all(&beads_dir).expect("create beads dir");
 
         let discovered = discover_beads_dir(Some(temp.path())).expect("discover");
-        assert_eq!(discovered, beads_dir);
+        // Discovery canonicalizes; the expectation must too. On macOS
+        // `TempDir` hands back a `/var/...` path whose canonical form is
+        // `/private/var/...`, so comparing against the raw path fails for a
+        // reason that has nothing to do with discovery.
+        assert_eq!(discovered, dunce::canonicalize(&beads_dir).expect("canonical"));
+    }
+
+    /// Discovery canonicalizes its result, so expectations must too.
+    ///
+    /// On macOS `TempDir` yields a `/var/folders/...` path whose canonical form
+    /// is `/private/var/folders/...`. Comparing a discovered (canonical) path
+    /// against a raw temp path fails for a reason unrelated to discovery.
+    fn expect_discovered_eq(discovered: &std::path::Path, expected: &std::path::Path) {
+        assert_eq!(
+            discovered,
+            &dunce::canonicalize(expected).unwrap_or_else(|_| expected.to_path_buf()),
+            "discovered path should match the expected workspace location"
+        );
     }
 
     #[test]
@@ -5335,7 +5352,7 @@ labels:
         fs::create_dir_all(&nested).expect("create nested");
 
         let discovered = discover_beads_dir(Some(&nested)).expect("discover");
-        assert_eq!(discovered, beads_dir);
+        expect_discovered_eq(&discovered, &beads_dir);
     }
 
     #[test]
@@ -5351,7 +5368,7 @@ labels:
 
         let discovered =
             discover_optional_beads_dir_with_cli(&cli).expect("optional discovery with db");
-        assert_eq!(discovered, Some(beads_dir));
+        assert_eq!(discovered, Some(dunce::canonicalize(&beads_dir).expect("canonical")));
     }
 
     #[test]
@@ -5365,7 +5382,7 @@ labels:
             discover_beads_dir_with_cli_from(None, &CliOverrides::default(), None, Some(&db_path))
                 .expect("discovery with env db override");
 
-        assert_eq!(discovered, beads_dir);
+        expect_discovered_eq(&discovered, &beads_dir);
     }
 
     #[test]
@@ -5384,7 +5401,7 @@ labels:
 
         let discovered =
             discover_optional_beads_dir_with_cli(&cli).expect("optional discovery with redirect");
-        assert_eq!(discovered, Some(target_beads));
+        assert_eq!(discovered, Some(dunce::canonicalize(&target_beads).expect("canonical")));
     }
 
     #[test]
@@ -5419,7 +5436,7 @@ labels:
             Some(Path::new("/tmp/not-a-beads-db")),
         )
         .expect("external env db should still reuse discovered workspace");
-        assert_eq!(discovered, beads_dir);
+        expect_discovered_eq(&discovered, &beads_dir);
     }
 
     #[test]
@@ -5441,7 +5458,7 @@ labels:
         )
         .expect("external cli db override should reuse discovered workspace");
 
-        assert_eq!(discovered, beads_dir);
+        expect_discovered_eq(&discovered, &beads_dir);
     }
 
     #[test]
@@ -5463,7 +5480,7 @@ labels:
         )
         .expect("relative cli db override should reuse discovered workspace");
 
-        assert_eq!(discovered, beads_dir);
+        expect_discovered_eq(&discovered, &beads_dir);
     }
 
     #[test]

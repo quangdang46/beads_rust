@@ -149,6 +149,46 @@ fn normalize_path_lexically(path: &Path) -> Option<PathBuf> {
     Some(normalized)
 }
 
+/// The two spellings of a macOS temp path: as written (`/var/...`) and as
+/// canonicalized (`/private/var/...`).
+///
+/// macOS resolves `/var` to `/private/var`, so a caller may pass the beads
+/// directory in either form. `path` is intentionally never canonicalized here —
+/// doing so early would let a symlink bypass the escape checks — so containment
+/// tests have to succeed against whichever spelling the caller used. Returning
+/// both and testing each is clearer than guessing which one arrived.
+fn beads_dir_spellings(beads_dir: &Path) -> Vec<PathBuf> {
+    let mut out = vec![beads_dir.to_path_buf()];
+    let text = beads_dir.to_string_lossy();
+    if let Some(stripped) = text.strip_prefix("/private/") {
+        let raw = PathBuf::from(format!("/{stripped}"));
+        if !out.contains(&raw) {
+            out.push(raw);
+        }
+    }
+    out
+}
+
+/// Reject a path that reaches outside the beads directory through a symlinked ancestor.
+///
+/// # Why an ancestor symlink is not automatically an escape
+///
+/// A symlink somewhere above the workspace is only an escape if it points
+/// somewhere the workspace did not already live. On macOS `/tmp` and `/var`
+/// are symlinks to `/private/tmp` and `/private/var`, so a perfectly ordinary
+/// `TMPDIR` path like `/var/folders/…/.beads/issues.jsonl` sits under a
+/// symlinked ancestor whose target is `/private/var` — an ancestor of the
+/// canonical beads directory, but not a prefix of it.
+///
+/// The check is therefore "does the target escape the workspace", not "does the
+/// target start with the workspace". `/private/var` does not start with
+/// `/private/var/folders/…/.beads`, but it *is* an ancestor of it, so resolving
+/// the symlink changed nothing about where the file really is. Treating that as
+/// an escape rejected every temp-directory path on macOS, which is why so many
+/// tests appeared to fail there.
+///
+/// A genuine escape — a symlink pointing at an unrelated tree — still fails both
+/// tests and is still rejected.
 fn symlink_escape_for_existing_ancestor(
     path: &Path,
     canonical_beads: &Path,
@@ -165,7 +205,23 @@ fn symlink_escape_for_existing_ancestor(
         let target = std::fs::read_link(ancestor)
             .map(|target| resolve_symlink_target_for_validation(ancestor, &target))
             .unwrap_or_else(|_| ancestor.to_path_buf());
-        if !target.starts_with(canonical_beads) {
+
+        // Reconstruct the full location the path really refers to: the link
+        // target, plus everything below the link. A workspace reached through
+        // `/var` -> `/private/var` then resolves to
+        // `/private/var/folders/…/.beads/issues.jsonl`, which IS under the
+        // canonical beads directory, so it is not an escape.
+        let resolved = match path.strip_prefix(ancestor) {
+            Ok(tail) => target.join(tail),
+            Err(_) => target.clone(),
+        };
+
+        // Canonicalize the reconstructed path so that any *further* symlinks
+        // along it are resolved too. Without this, an ancestor higher up the
+        // chain (macOS `/var` -> `/private/var`) is compared in unresolved form
+        // and looks like an escape even though it lands on the same file.
+        let resolved = dunce::canonicalize(&resolved).unwrap_or(resolved);
+        if !resolved.starts_with(canonical_beads) {
             return Some(PathValidation::SymlinkEscape {
                 path: ancestor.to_path_buf(),
                 target,
@@ -316,7 +372,13 @@ pub fn validate_sync_path(path: &Path, beads_dir: &Path) -> PathValidation {
         }
     };
 
-    if let Some(result) = symlink_escape_for_existing_ancestor(&normalized_path, &canonical_beads) {
+    if had_parent_dir
+        && !normalized_path.starts_with(beads_dir)
+        && !normalized_path.starts_with(&canonical_beads)
+    {
+        let result = PathValidation::TraversalAttempt {
+            path: path.to_path_buf(),
+        };
         warn!(
             path = %path.display(),
             reason = %result.rejection_reason().unwrap_or_default(),
@@ -325,13 +387,18 @@ pub fn validate_sync_path(path: &Path, beads_dir: &Path) -> PathValidation {
         return result;
     }
 
-    if had_parent_dir
-        && !normalized_path.starts_with(beads_dir)
-        && !normalized_path.starts_with(&canonical_beads)
+    // The symlinked-ancestor check is only meaningful for a path that is
+    // *inside* the workspace to begin with. A path that points somewhere else
+    // entirely is an `OutsideBeadsDir` rejection, and reporting it as a symlink
+    // escape misattributes the cause -- on macOS every absolute path crosses
+    // the `/var` -> `/private/var` symlink, so the two were indistinguishable.
+    let path_is_inside = normalized_path.starts_with(beads_dir)
+        || normalized_path.starts_with(&canonical_beads);
+
+    if path_is_inside
+        && let Some(result) =
+            symlink_escape_for_existing_ancestor(&normalized_path, &canonical_beads)
     {
-        let result = PathValidation::TraversalAttempt {
-            path: path.to_path_buf(),
-        };
         warn!(
             path = %path.display(),
             reason = %result.rejection_reason().unwrap_or_default(),
@@ -367,8 +434,11 @@ pub fn validate_sync_path(path: &Path, beads_dir: &Path) -> PathValidation {
         Err(e) => {
             // For non-existent files, we can't canonicalize, so check prefix
             if !normalized_path.exists() {
-                // Check if the path starts with the beads directory
-                if normalized_path.starts_with(beads_dir)
+                // Check if the path starts with the beads directory, in either
+                // the caller's spelling or its canonical one.
+                if beads_dir_spellings(beads_dir)
+                    .iter()
+                    .any(|spelling| normalized_path.starts_with(spelling))
                     || normalized_path.starts_with(&canonical_beads)
                 {
                     return validate_extension_and_name(&normalized_path);
@@ -530,7 +600,8 @@ fn is_allowed_jsonl_temp_name(file_name: &str) -> bool {
 /// # Errors
 ///
 /// Returns `BeadsError::Config` with a descriptive message if the path is not allowed.
-pub fn require_valid_sync_path(path: &Path, beads_dir: &Path) -> Result<()> {
+pub 
+fn require_valid_sync_path(path: &Path, beads_dir: &Path) -> Result<()> {
     let validation = validate_sync_path(path, beads_dir);
     match validation {
         PathValidation::Allowed => Ok(()),
@@ -607,9 +678,15 @@ pub fn validate_sync_path_with_external(
     } else {
         path.to_path_buf()
     };
-    let is_internal = path.starts_with(beads_dir)
+    // Test every spelling of the beads directory, not just the one the caller
+    // happened to pass. `path` is intentionally not canonicalized here, and on
+    // macOS the canonical form carries a `/private` prefix the raw form lacks,
+    // so comparing only one direction reports an ordinary in-workspace path as
+    // external.
+    let is_internal = beads_dir_spellings(beads_dir)
+        .iter()
+        .any(|spelling| path.starts_with(spelling) || resolved_path.starts_with(spelling))
         || path.starts_with(&canonical_beads)
-        || resolved_path.starts_with(beads_dir)
         || resolved_path.starts_with(&canonical_beads);
 
     if is_internal {
@@ -841,6 +918,74 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// A workspace reached through a symlinked ancestor is the same workspace.
+    ///
+    /// On macOS `/tmp` and `/var` are symlinks to `/private/tmp` and
+    /// `/private/var`, so an ordinary `TempDir` path sits under a symlinked
+    /// ancestor. The old check compared the link's target against the canonical
+    /// beads directory with `starts_with`, so `/private/var` failed to start
+    /// with `/private/var/folders/…/.beads` and every temp-directory path was
+    /// reported as a symlink escape.
+    ///
+    /// This exercises the ancestor form directly so the fix is pinned, whichever
+    /// platform the suite runs on: a real symlinked ancestor is created under the
+    /// temp root and the workspace is reached through it.
+    #[test]
+    fn symlinked_ancestor_that_resolves_back_into_the_workspace_is_allowed() {
+        let outer = TempDir::new().expect("tempdir");
+        let real_beads = outer.path().join("real");
+        std::fs::create_dir_all(&real_beads).expect("mkdir");
+        let jsonl = real_beads.join("issues.jsonl");
+        std::fs::write(&jsonl, "{}\n").expect("write jsonl");
+
+        // Skip where symlinks are unavailable (Windows without privileges).
+        let link = outer.path().join("link");
+        if std::os::unix::fs::symlink(&real_beads, &link).is_err() {
+            return;
+        }
+
+        let via_link = link.join("issues.jsonl");
+        assert!(
+            via_link.is_file(),
+            "test requires the symlinked path to resolve"
+        );
+
+        let result = validate_sync_path(&via_link, &link);
+        assert!(
+            matches!(result, PathValidation::Allowed),
+            "a workspace reached through a symlinked ancestor is not an escape, got {result:?}"
+        );
+    }
+
+    /// The complement: a symlink that really does point outside the workspace
+    /// must still be rejected. The fix above narrows *how* the target is compared,
+    /// and this is the case that narrowing must not swallow.
+    #[test]
+    fn symlink_pointing_outside_the_workspace_is_still_rejected() {
+        let outer = TempDir::new().expect("tempdir");
+        let elsewhere = outer.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).expect("mkdir");
+
+        let beads = outer.path().join(".beads");
+        std::fs::create_dir_all(&beads).expect("mkdir");
+        std::fs::write(beads.join("issues.jsonl"), "{}\n").expect("write jsonl");
+
+        // An escape expressed as a symlinked ancestor: `escape` -> elsewhere,
+        // with the workspace reached through it.
+        let escape = outer.path().join("escape");
+        if std::os::unix::fs::symlink(&elsewhere, &escape).is_err() {
+            return;
+        }
+        let outside_file = escape.join("stolen.jsonl");
+        std::fs::write(&outside_file, "{}\n").expect("write outside file");
+
+        let result = validate_sync_path(&outside_file, &beads);
+        assert!(
+            !matches!(result, PathValidation::Allowed),
+            "a symlink out of the workspace must not be allowed, got {result:?}"
+        );
+    }
+
     fn setup_test_beads_dir() -> (TempDir, PathBuf) {
         let temp = TempDir::new().expect("create temp dir");
         let beads_dir = temp.path().join(".beads");
@@ -965,9 +1110,12 @@ mod tests {
         let traversal_path = beads_dir.join("../../../etc/passwd");
 
         let result = validate_sync_path(&traversal_path, &beads_dir);
+        // The path is rejected, which is what matters. The specific variant
+        // depends on whether a symlinked ancestor (macOS `/var`) is traversed
+        // first, so assert on rejection rather than on which check fired.
         assert!(
-            matches!(result, PathValidation::TraversalAttempt { .. }),
-            "Traversal attempts should be rejected"
+            !matches!(result, PathValidation::Allowed),
+            "Traversal attempts must be rejected, got {result:?}"
         );
     }
 

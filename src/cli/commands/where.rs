@@ -416,7 +416,10 @@ mod tests {
         assert_eq!(
             output.database_path,
             Some(
-                canonicalize_lossy(&target_beads.join("beads.db"))
+                // Canonicalize the directory, not the (absent) database file --
+                // see the matching note in the sibling test.
+                canonicalize_lossy(&target_beads)
+                    .join("beads.db")
                     .display()
                     .to_string()
             )
@@ -450,7 +453,13 @@ mod tests {
         assert_eq!(
             output.database_path,
             Some(
-                canonicalize_lossy(&beads_dir.join("beads.db"))
+                // Canonicalize the parent, not the file: this test
+                // deliberately does not create `beads.db`, so canonicalizing
+                // the file itself fails and falls back to the raw path, while
+                // the resolver canonicalizes the directory and appends the
+                // filename. On macOS the two differ by the `/private` prefix.
+                canonicalize_lossy(&beads_dir)
+                    .join("beads.db")
                     .display()
                     .to_string()
             )
