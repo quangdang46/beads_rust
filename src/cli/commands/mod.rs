@@ -658,11 +658,24 @@ mod tests {
     use crate::storage::SqliteStorage;
     use crate::sync::{ExportConfig, export_to_jsonl_with_policy};
     use chrono::Utc;
-    use fsqlite_error::FrankenError;
     use rusqlite::Connection;
     use std::fs;
     use std::path::Path;
     use tempfile::TempDir;
+
+    /// A synthetic corruption error shaped like the ones the C engine produces.
+    ///
+    /// The recovery tests need an error that `should_attempt_jsonl_recovery`
+    /// classifies as rebuild-worthy. `SQLITE_CORRUPT` is the code C SQLite
+    /// actually returns for a malformed b-tree or an unresolvable schema, so
+    /// the synthetic error exercises the same branch a real corrupt workspace
+    /// would — not a frankensqlite-shaped code that no longer occurs.
+    fn corrupt_db_error() -> BeadsError {
+        BeadsError::Database(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT as i32),
+            Some("synthetic corruption".to_string()),
+        ))
+    }
 
     fn storage_ctx_with_exported_issue() -> (TempDir, OpenStorageResult) {
         let temp = TempDir::new().expect("tempdir");
@@ -876,9 +889,7 @@ mod tests {
             |_storage| {
                 attempts += 1;
                 if attempts == 1 {
-                    Err(BeadsError::DatabaseLegacy(FrankenError::DatabaseCorrupt {
-                        detail: "synthetic corruption".to_string(),
-                    }))
+                    Err(corrupt_db_error())
                 } else {
                     Ok("recovered")
                 }
@@ -925,9 +936,7 @@ mod tests {
                 if attempts == 1 {
                     // First attempt: a recoverable corruption error that does NOT
                     // commit. The staged attribution must NOT be consumed.
-                    Err(BeadsError::DatabaseLegacy(FrankenError::DatabaseCorrupt {
-                        detail: "synthetic corruption".to_string(),
-                    }))
+                    Err(corrupt_db_error())
                 } else {
                     // Post-recovery retry: a real committing mutation that should
                     // stamp the still-staged attribution onto its event.
@@ -962,12 +971,14 @@ mod tests {
     #[test]
     fn mutation_recovery_can_be_signaled_by_probe_after_constraint_style_error() {
         let (_temp, storage_ctx) = storage_ctx_with_exported_issue();
-        let operation_err = BeadsError::DatabaseLegacy(FrankenError::Internal(
-            "constraint verification failed".to_string(),
+        // A constraint failure is not itself a corruption signal, so recovery
+        // must not fire on the operation error alone...
+        let operation_err = BeadsError::Database(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT as i32),
+            Some("constraint verification failed".to_string()),
         ));
-        let probe_err = BeadsError::DatabaseLegacy(FrankenError::Internal(
-            "database disk image is malformed".to_string(),
-        ));
+        // ...but a corrupt database seen by the probe is.
+        let probe_err = corrupt_db_error();
 
         assert!(
             !should_attempt_mutation_jsonl_recovery(&storage_ctx, &operation_err, None),

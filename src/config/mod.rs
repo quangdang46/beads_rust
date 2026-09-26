@@ -26,7 +26,6 @@ use crate::util::id::{
     IdConfig, abbreviate_prefix, normalize_prefix, parse_id, split_prefix_remainder,
 };
 use chrono::Utc;
-use fsqlite_error::FrankenError;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -1047,55 +1046,75 @@ fn rebuild_or_defer_after_open_error(
     }
 }
 
+/// Decide whether an open failure is severe enough that rebuilding the
+/// workspace from JSONL is the right recovery.
+///
+/// # Why this is a hand-written classifier rather than a code check
+///
+/// frankensqlite had a dedicated variant per corruption shape
+/// (`DatabaseCorrupt`, `WalCorrupt`, `ShortRead`, `TableExists`, `IndexExists`),
+/// plus a catch-all `Internal(String)` that had to be string-matched. C SQLite
+/// has no such variants, so the mapping is not one-to-one and was measured
+/// against real corrupt databases rather than assumed:
+///
+/// | Condition | frankensqlite | C SQLite result code |
+/// |---|---|---|
+/// | corrupt / malformed b-tree, page | `DatabaseCorrupt` | `SQLITE_CORRUPT` |
+/// | WAL index unusable, short read | `WalCorrupt` / `ShortRead` | `SQLITE_IOERR` / `SQLITE_CORRUPT` |
+/// | not a database file | `NotADatabase` | `SQLITE_NOTADB` |
+/// | object already exists | `TableExists` / `IndexExists` | **`SQLITE_ERROR`** |
+/// | stale row missing from index | `Internal(msg)` | `SQLITE_CORRUPT` |
+///
+/// The last row is the one that matters. The `sample_beads_db_files/beads_rust`
+/// fixture — a real workspace, not a synthetic one — is refused outright by C
+/// SQLite with `SQLITE_CORRUPT: malformed database schema
+/// (idx_blocked_cache_blocked_at) - no such table: main.blocked_issues_cache`,
+/// because frankensqlite wrote its INDEX rows at `sqlite_master` rowids *below*
+/// the TABLE rows they reference. The other 10 fixtures open cleanly, and a
+/// freshly created `br` database is clean too, so this is a property of
+/// databases written by the old engine rather than a universal one.
+///
+/// The `SQLITE_ERROR` row is why there is still a message check below.
+/// `SQLITE_ERROR` is SQLite's generic fallback code, so keying on it alone would
+/// treat every ordinary SQL mistake as a corruption signal. The check is
+/// therefore scoped to that one code and additionally requires a
+/// duplicate-schema-entry shape.
+///
+/// # The events caveat
+///
+/// This gate rebuilds from JSONL, and the JSONL does **not** carry the `events`
+/// audit log — so a rebuild produces an empty events table. That predates the
+/// engine migration; the migration neither introduces nor fixes it. It is filed
+/// separately (`beads_rust-i976`) so the audit-log loss gets decided on its own
+/// merits rather than as a side effect of an engine swap.
 fn should_attempt_jsonl_recovery(open_err: &BeadsError, db_path: &Path, jsonl_path: &Path) -> bool {
     if !db_path.is_file() || !jsonl_path.is_file() {
         return false;
     }
 
-    // Legacy frankensqlite variants. `DatabaseLegacy` until Phase 8.
-    //
-    // NOTE: this gate already rebuilds from JSONL, and the JSONL does NOT contain the
-    // `events` audit log -- a rebuild therefore produces an empty events table. That property
-    // predates the engine migration; the migration neither introduces nor fixes it. Filed
-    // separately so the audit-log loss is decided on its own merits rather than as a
-    // side effect of an engine swap.
+    let BeadsError::Database(e) = open_err else {
+        return false;
+    };
+
+    // Structural damage and an unreadable data path: rebuild unconditionally.
+    // `SystemIoFailure` covers the frankensqlite `ShortRead` case, which C SQLite
+    // does not report as a distinct condition.
     if matches!(
-        open_err,
-        BeadsError::DatabaseLegacy(
-            FrankenError::DatabaseCorrupt { .. }
-                | FrankenError::NotADatabase { .. }
-                | FrankenError::WalCorrupt { .. }
-                | FrankenError::ShortRead { .. }
-                | FrankenError::TableExists { .. }
-                | FrankenError::IndexExists { .. }
+        e.sqlite_error_code(),
+        Some(
+            rusqlite::ffi::ErrorCode::DatabaseCorrupt
+                | rusqlite::ffi::ErrorCode::NotADatabase
+                | rusqlite::ffi::ErrorCode::SystemIoFailure
         )
     ) {
         return true;
     }
-    if matches!(
-        open_err,
-        BeadsError::DatabaseLegacy(FrankenError::Internal(detail))
-            if is_recoverable_database_internal_error(detail)
-    ) {
-        return true;
-    }
 
-    // C engine equivalents. frankensqlite had distinct `WalCorrupt` and `ShortRead`
-    // variants; C SQLite has no such variants, and both conditions surface as one of the
-    // three codes below. Without this arm the self-heal would silently disappear in Phase 7
-    // and present as "br doctor no longer recovers my workspace".
-    matches!(
-        open_err,
-        BeadsError::Database(e)
-            if matches!(
-                e.sqlite_error_code(),
-                Some(
-                    rusqlite::ffi::ErrorCode::DatabaseCorrupt
-                        | rusqlite::ffi::ErrorCode::NotADatabase
-                        | rusqlite::ffi::ErrorCode::SystemIoFailure
-                )
-            )
-    )
+    // Duplicate schema entries. Scoped to `SQLITE_ERROR` (`ErrorCode::Unknown`),
+    // because that code is SQLite's generic fallback and carries every ordinary
+    // SQL error too; on its own it would treat any bad statement as corruption.
+    e.sqlite_error_code() == Some(rusqlite::ffi::ErrorCode::Unknown)
+        && is_duplicate_schema_entry_open_error(&e.to_string())
 }
 
 fn should_attempt_jsonl_recovery_after_open(
@@ -1104,10 +1123,6 @@ fn should_attempt_jsonl_recovery_after_open(
     jsonl_path: &Path,
 ) -> bool {
     should_attempt_jsonl_recovery(probe_err, db_path, jsonl_path)
-        || matches!(
-            probe_err,
-            BeadsError::DatabaseLegacy(FrankenError::QueryReturnedMultipleRows)
-        )
 }
 
 fn is_duplicate_schema_entry_open_error(detail: &str) -> bool {
@@ -6383,96 +6398,108 @@ routing:
         fs::write(&db_path, b"sqlite bytes").expect("write db placeholder");
         fs::write(&jsonl_path, "{}\n").expect("write jsonl");
 
+        // Structural damage: rebuild from JSONL. These are the codes C SQLite
+        // actually returns for the conditions frankensqlite gave dedicated
+        // variants; each was measured, not assumed (see the classifier's docs).
+        for (code, label) in [
+            (rusqlite::ffi::ErrorCode::DatabaseCorrupt, "corrupt"),
+            (rusqlite::ffi::ErrorCode::NotADatabase, "not-a-db"),
+            (rusqlite::ffi::ErrorCode::SystemIoFailure, "io/short-read"),
+        ] {
+            assert!(
+                should_attempt_jsonl_recovery(&db_error(code, "detail"), &db_path, &jsonl_path),
+                "{label} ({code:?}) must trigger a rebuild"
+            );
+        }
+
+        // The real-world schema-ordering defect, verbatim from the
+        // `sample_beads_db_files/beads_rust` fixture. frankensqlite wrote INDEX
+        // rows at sqlite_master rowids below the TABLE rows they reference.
+        let fixture_msg = "malformed database schema (idx_blocked_cache_blocked_at) - no such table: main.blocked_issues_cache";
         assert!(should_attempt_jsonl_recovery(
-            &BeadsError::DatabaseLegacy(FrankenError::DatabaseCorrupt {
-                detail: "bad page".to_string()
-            }),
-            &db_path,
-            &jsonl_path
-        ));
-        assert!(should_attempt_jsonl_recovery(
-            &BeadsError::DatabaseLegacy(FrankenError::NotADatabase {
-                path: db_path.clone()
-            }),
-            &db_path,
-            &jsonl_path
-        ));
-        assert!(should_attempt_jsonl_recovery(
-            &BeadsError::DatabaseLegacy(FrankenError::WalCorrupt {
-                detail: "bad wal".to_string()
-            }),
-            &db_path,
-            &jsonl_path
-        ));
-        assert!(should_attempt_jsonl_recovery(
-            &BeadsError::DatabaseLegacy(FrankenError::ShortRead {
-                expected: 4096,
-                actual: 12
-            }),
-            &db_path,
-            &jsonl_path
-        ));
-        assert!(should_attempt_jsonl_recovery(
-            &BeadsError::DatabaseLegacy(FrankenError::TableExists {
-                name: "blocked_issues_cache".to_string()
-            }),
-            &db_path,
-            &jsonl_path
-        ));
-        assert!(should_attempt_jsonl_recovery(
-            &BeadsError::DatabaseLegacy(FrankenError::IndexExists {
-                name: "idx_blocked_cache_blocked_at".to_string()
-            }),
-            &db_path,
-            &jsonl_path
-        ));
-        assert!(should_attempt_jsonl_recovery(
-            &BeadsError::DatabaseLegacy(FrankenError::Internal(
-                "malformed database schema (blocked_issues_cache) - table \"blocked_issues_cache\" already exists"
-                    .to_string()
-            )),
-            &db_path,
-            &jsonl_path
-        ));
-        assert!(should_attempt_jsonl_recovery(
-            &BeadsError::DatabaseLegacy(FrankenError::Internal(
-                "database disk image is malformed".to_string()
-            )),
-            &db_path,
-            &jsonl_path
-        ));
-        assert!(should_attempt_jsonl_recovery(
-            &BeadsError::DatabaseLegacy(FrankenError::Internal(
-                "row 13 missing from index idx_issues_list_active_order".to_string()
-            )),
+            &db_error(rusqlite::ffi::ErrorCode::DatabaseCorrupt, fixture_msg),
             &db_path,
             &jsonl_path
         ));
 
+        // Duplicate schema entries arrive as the generic SQLITE_ERROR code, so
+        // the classifier must additionally recognise the message shape. Without
+        // this, a workspace whose schema half-applied would never self-heal.
+        for msg in [
+            "table t already exists",
+            "index idx_issues already exists",
+            fixture_msg,
+        ] {
+            assert!(
+                should_attempt_jsonl_recovery(
+                    &db_error(rusqlite::ffi::ErrorCode::Unknown, msg),
+                    &db_path,
+                    &jsonl_path
+                ),
+                "SQLITE_ERROR with a duplicate-schema message ({msg}) must trigger a rebuild"
+            );
+        }
+
+        // Ordinary SQL failures are NOT corruption. `SQLITE_ERROR` is SQLite's
+        // generic fallback code, so a message-blind check here would classify
+        // every bad statement as a corrupt database and destroy real data.
         assert!(!should_attempt_jsonl_recovery(
-            &BeadsError::DatabaseLegacy(FrankenError::SchemaChanged),
+            &db_error(
+                rusqlite::ffi::ErrorCode::Unknown,
+                "no such column: nonexistent_column"
+            ),
             &db_path,
             &jsonl_path
         ));
+
+        // Lock contention, read-only, and full disk are all transient or
+        // environmental: rebuilding the database would throw away good data.
+        for (code, label) in [
+            (rusqlite::ffi::ErrorCode::DatabaseBusy, "busy"),
+            (rusqlite::ffi::ErrorCode::DatabaseLocked, "locked"),
+            (rusqlite::ffi::ErrorCode::ReadOnly, "read-only"),
+            (rusqlite::ffi::ErrorCode::DiskFull, "disk-full"),
+            (rusqlite::ffi::ErrorCode::ConstraintViolation, "constraint"),
+            (rusqlite::ffi::ErrorCode::SchemaChanged, "schema-changed"),
+            (rusqlite::ffi::ErrorCode::CannotOpen, "cannot-open"),
+        ] {
+            assert!(
+                !should_attempt_jsonl_recovery(&db_error(code, "detail"), &db_path, &jsonl_path),
+                "{label} ({code:?}) must NOT trigger a rebuild"
+            );
+        }
+
+        // Both files must actually exist. A missing JSONL means there is nothing
+        // to rebuild from, so a corrupt database must surface rather than
+        // silently opening empty.
         assert!(!should_attempt_jsonl_recovery(
-            &BeadsError::DatabaseLegacy(FrankenError::CannotOpen {
-                path: db_path.clone()
-            }),
+            &db_error(rusqlite::ffi::ErrorCode::DatabaseCorrupt, "bad page"),
             &db_path,
-            &jsonl_path
+            &Path::new("/nonexistent/issues.jsonl")
         ));
-        assert!(!should_attempt_jsonl_recovery(
-            &BeadsError::DatabaseLegacy(FrankenError::Busy),
-            &db_path,
-            &jsonl_path
-        ));
-        assert!(!should_attempt_jsonl_recovery(
-            &BeadsError::DatabaseLegacy(FrankenError::Internal(
-                "constraint verification failed".to_string()
-            )),
-            &db_path,
-            &jsonl_path
-        ));
+    }
+
+    /// Build the `BeadsError` the C engine would produce for `code`.
+    fn db_error(code: rusqlite::ffi::ErrorCode, msg: &str) -> BeadsError {
+        use rusqlite::ffi;
+        let raw = match code {
+            ffi::ErrorCode::DatabaseCorrupt => ffi::SQLITE_CORRUPT,
+            ffi::ErrorCode::NotADatabase => ffi::SQLITE_NOTADB,
+            ffi::ErrorCode::SystemIoFailure => ffi::SQLITE_IOERR,
+            ffi::ErrorCode::DatabaseBusy => ffi::SQLITE_BUSY,
+            ffi::ErrorCode::DatabaseLocked => ffi::SQLITE_LOCKED,
+            ffi::ErrorCode::ReadOnly => ffi::SQLITE_READONLY,
+            ffi::ErrorCode::DiskFull => ffi::SQLITE_FULL,
+            ffi::ErrorCode::ConstraintViolation => ffi::SQLITE_CONSTRAINT,
+            ffi::ErrorCode::SchemaChanged => ffi::SQLITE_SCHEMA,
+            ffi::ErrorCode::CannotOpen => ffi::SQLITE_CANTOPEN,
+            ffi::ErrorCode::Unknown => ffi::SQLITE_ERROR,
+            other => panic!("no raw code mapped for {other:?}; add it rather than skipping"),
+        };
+        BeadsError::Database(rusqlite::Error::SqliteFailure(
+            ffi::Error::new(raw as i32),
+            Some(msg.to_string()),
+        ))
     }
 
     #[test]

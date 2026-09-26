@@ -42,16 +42,13 @@ clap_complete = { version = "4.6.5", features = ["unstable-dynamic"] }
 
 # Database
 #
-# MIGRATION IN PROGRESS: fsqlite (frankensqlite) -> rusqlite 0.40.2 bundled.
-# See docs/RUSQLITE_MIGRATION_PLAN_2026_09_25.md.
+# The engine is the C library behind `rusqlite`, bundled at build time. It
+# replaced the pure-Rust `fsqlite`/frankensqlite stack, which shipped an
+# OpenAI/Anthropic license rider and kept its WAL index in process memory --
+# the latter is what made `br doctor migrate-schema recover` permanently
+# unrecoverable on Windows. See docs/RUSQLITE_MIGRATION_PLAN_2026_09_25.md.
 #
-# BOTH engines are declared here on purpose, and the fsqlite lines are NOT dead
-# weight. `src/storage/sqlite.rs` keeps importing fsqlite until Phase 7, so
-# dropping the declarations now would leave the tree uncompilable for six
-# consecutive phases and forfeit every test signal for the whole port. The 15
-# fsqlite lines are deleted in Phase 8, once no `src/` file imports fsqlite.
-#
-# Feature notes for the rusqlite line:
+# Feature notes:
 #   bundled       - compiles the vendored SQLite amalgamation via `cc`, so no
 #                   pkg-config/vcpkg bootstrap. Transitively enables
 #                   modern_sqlite -> bundled_bindings, which are the
@@ -62,30 +59,9 @@ clap_complete = { version = "4.6.5", features = ["unstable-dynamic"] }
 #   fallible_uint - re-enables u64/usize ToSql/FromSql, off by default since
 #                   0.38.0. The storage layer uses unsigned counters.
 #   session and preupdate_hook MUST stay off. session implies preupdate_hook
-#   implies buildtime_bindgen, which would pull a libclang build dependency
-#   onto every build host. See docs/CI_SUPPLY_CHAIN.md.
+#                   implies buildtime_bindgen, which would pull a libclang build
+#                   dependency onto every build host. See docs/CI_SUPPLY_CHAIN.md.
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled", "cache", "fallible_uint"] }
-
-# Database, legacy engine (removed in Phase 8). frankensqlite ships an
-# OpenAI/Anthropic license rider and keeps its WAL index in process memory,
-# which is what makes `br doctor migrate-schema recover` permanently
-# unrecoverable on Windows.
-# NOTE: transitive fsqlite workspace deps listed explicitly so rch syncs them
-fsqlite = "0.1.7"
-fsqlite-types = "0.1.7"
-fsqlite-error = "0.1.7"
-fsqlite-core = "0.1.7"
-fsqlite-func = "0.1.7"
-fsqlite-vdbe = "0.1.7"
-fsqlite-vfs = "0.1.7"
-fsqlite-pager = "0.1.7"
-fsqlite-parser = "0.1.7"
-fsqlite-planner = "0.1.7"
-fsqlite-wal = "0.1.7"
-fsqlite-btree = "0.1.7"
-fsqlite-ast = "0.1.7"
-fsqlite-mvcc = "0.1.7"
-fsqlite-observability = "0.1.7"
 
 # Serialization
 serde = { version = "1.0.228", features = ["derive"] }
@@ -197,12 +173,12 @@ web = ["dep:axum", "dep:tokio", "dep:tower-http", "dep:rust-embed"]
 
 # NOTE: no `[patch.crates-io]` here.
 #
-# All dependencies — fsqlite 0.1.3+, its fsqlite-* transitive crates, and
-# fastmcp-rust 0.3.1+ — are published on crates.io, so this crate
-# resolves everything from the registry out of the box.  That makes
+# All dependencies — rusqlite 0.40.2+ and fastmcp-rust 0.3.1+ — are
+# published on crates.io, so this crate resolves everything from the
+# registry out of the box.  That makes
 # `cargo install --git https://github.com/quangdang46/beads_rust.git`
-# work without requiring sibling `frankensqlite` or `fastmcp_rust`
-# checkouts (issue #250 bug 1).
+# work without requiring a sibling `fastmcp_rust` checkout
+# (issue #250 bug 1).
 #
 # Local co-development: contributors who want to hack on frankensqlite
 # or fastmcp_rust alongside beads_rust can add a workspace-level

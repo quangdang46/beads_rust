@@ -551,12 +551,10 @@ impl StructuredError {
                 ErrorCode::SchemaMismatch,
                 Some(json!({"expected": expected, "found": found})),
             ),
-            // Both engine payloads map to the SAME code on purpose. The exit-code table is a
-            // shipped Go-parity contract, and splitting it by engine would make the exit code
-            // depend on which SQLite implementation happened to fail -- a wire-format change
-            // for no behavioural gain. `DatabaseLegacy` is deleted in Phase 8; this arm goes
-            // with it.
-            BeadsError::Database(_) | BeadsError::DatabaseLegacy(_) => (ErrorCode::DatabaseError, None),
+            // One code for every database failure, regardless of SQLite result code. The
+            // exit-code table is a shipped Go-parity contract, so the mapping must not vary
+            // with which underlying condition happened to fire.
+            BeadsError::Database(_) => (ErrorCode::DatabaseError, None),
             BeadsError::NotInitialized => (ErrorCode::NotInitialized, None),
             BeadsError::AlreadyInitialized { path } => (
                 ErrorCode::AlreadyInitialized,

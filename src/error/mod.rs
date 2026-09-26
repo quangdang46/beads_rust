@@ -48,18 +48,6 @@ pub enum BeadsError {
     #[error("Database error: {0}")]
     Database(#[from] rusqlite::Error),
 
-    /// `SQLite` database error from the legacy pure-Rust engine (frankensqlite).
-    ///
-    /// TEMPORARY, deleted in Phase 8. It exists only because the two engines coexist on the
-    /// migration branch: `src/storage/sqlite.rs` keeps producing frankensqlite errors until
-    /// Phase 7, so removing this arm in Phase 2 would break 15+ `From` conversions in that
-    /// file and leave the tree uncompilable for six consecutive phases. This is the same
-    /// category of thing as `src/storage/db.rs`: a branch-only scaffold with a named deletion
-    /// point, never a shipped compatibility shim. **If this variant still exists when Phase 8
-    /// opens, Phase 8 does not merge.**
-    #[error("Database error: {0}")]
-    DatabaseLegacy(#[from] fsqlite_error::FrankenError),
-
     // === Issue Errors ===
     /// Issue with the specified ID was not found.
     #[error("Issue not found: {id}")]
@@ -224,16 +212,17 @@ pub enum BeadsError {
 }
 
 impl BeadsError {
-    /// True when this is a database error from *either* engine.
+    /// True when this is a database error.
     ///
-    /// Phase 8 deletes [`Self::DatabaseLegacy`], after which this collapses to a single
-    /// variant. Call sites that mean "is this a database error" should use this rather than
-    /// naming a variant: writing `matches!(e, BeadsError::Database(_))` matches only the C
-    /// engine today, and silently stops firing for frankensqlite errors with no compile error
-    /// and no failing test.
+    /// Call sites that mean "is this a database error" should use this rather
+    /// than naming a variant in a `matches!`. The distinction is invisible to
+    /// the compiler: during the engine migration this helper matched two
+    /// variants, and a `matches!(e, BeadsError::Database(_))` written at the
+    /// wrong moment stopped firing for the other engine with no compile error
+    /// and no failing test — which silently disabled JSONL mutation recovery.
     #[must_use]
     pub fn is_database_error(&self) -> bool {
-        matches!(self, Self::Database(_) | Self::DatabaseLegacy(_))
+        matches!(self, Self::Database(_))
     }
 
     /// Returns true if the error is transient and can be retried.
@@ -272,10 +261,6 @@ impl BeadsError {
     pub fn is_transient(&self) -> bool {
         match self {
             Self::Database(e) => Self::sqlite_error_is_transient(e),
-            // Phase 8 deletes this arm along with the variant. Until then the legacy engine
-            // still produces these, and the retry loops in `storage/sqlite.rs` still gate on
-            // them, so dropping it now would stop those loops from ever retrying.
-            Self::DatabaseLegacy(e) => e.is_transient(),
             Self::Io(e) => {
                 matches!(
                     e.kind(),
@@ -556,26 +541,6 @@ mod tests {
             !err.is_transient(),
             "BUSY_SNAPSHOT must not be retried; waiting does not clear a stale snapshot"
         );
-    }
-
-    /// The legacy arm must keep working until Phase 8 deletes it. If it silently stopped
-    /// returning true for busy, the retry loops still running on frankensqlite would stop
-    /// retrying without any compile error.
-    #[test]
-    fn legacy_engine_arm_still_classifies() {
-        use fsqlite_error::FrankenError;
-        for (err, expect) in [
-            (FrankenError::Busy, true),
-            (FrankenError::DatabaseLocked { path: PathBuf::from("x") }, true),
-            (FrankenError::Internal("x".to_string()), false),
-        ] {
-            let wrapped = BeadsError::DatabaseLegacy(err);
-            assert_eq!(
-                wrapped.is_transient(),
-                expect,
-                "legacy arm changed behaviour; the frankensqlite retry loops depend on it"
-            );
-        }
     }
 
     /// `Self::Io` must stay transient for the three kinds that are transient for reasons
