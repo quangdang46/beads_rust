@@ -20,12 +20,12 @@ pub use path::{
 use crate::error::{BeadsError, Result};
 use crate::model::{Comment, Dependency, Issue};
 use crate::storage::SqliteStorage;
+use fsqlite_types::SqliteValue;
 use crate::sync::history::HistoryConfig;
 use crate::util::id::{IdConfig, IdGenerator, parse_id};
 use crate::util::progress::{create_progress_bar, create_spinner};
 use crate::validation::IssueValidator;
 use chrono::{DateTime, Utc};
-use fsqlite_types::SqliteValue;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -4733,13 +4733,57 @@ fn process_import_action(
     Ok(())
 }
 
+/// True when `error` is the row-key collision that an import insert can race into.
+///
+/// # Why this is not `BeadsError::is_database_error`
+///
+/// The caller falls back to an upsert, and that is only the right recovery for a duplicate key.
+/// `is_database_error` is strictly broader -- it is also true for a locked file, a corrupt
+/// image, a missing table -- and routing those through the fallback would turn a hard failure
+/// into a second INSERT attempt that fails for the same reason, reported as success-shaped work
+/// rather than the original error.
+///
+/// # Why both engines are matched
+///
+/// `BeadsError` carries two database variants until Phase 8, and `src/storage/sqlite.rs` still
+/// produces the legacy one. Matching only the C engine would silently retire the fallback: the
+/// code would still compile, the `Err(error) => Err(error)` arm would still catch the legacy
+/// error, and no test covers the race -- a concurrent duplicate key would simply become a hard
+/// import failure. The legacy arm dies with [`BeadsError::DatabaseLegacy`] in Phase 8.
+///
+/// # Why the result code and not the message
+///
+/// For `SqliteFailure(_, Some(msg))` the `Display` impl prints only `msg`; the result code is
+/// not in the text at all, so matching on `"UNIQUE constraint failed"` would be reading a
+/// string this code does not control. `ffi::Error::new` masks with `0xff`, so both
+/// `SQLITE_CONSTRAINT_PRIMARYKEY` and `SQLITE_CONSTRAINT_UNIQUE` land on
+/// [`rusqlite::ffi::ErrorCode::ConstraintViolation`] -- the same `SQLITE_CONSTRAINT` bucket
+/// frankensqlite mapped both of its variants to.
+///
+/// Note the one deliberate widening: `SQLITE_CONSTRAINT` also covers NOT NULL, CHECK and
+/// FOREIGN KEY, which frankensqlite gave their own variants and this arm did not name. Those
+/// are not swallowed -- the upsert re-issues the same INSERT and `?` propagates the failure --
+/// but if exactness is wanted, `sqlite_extended_error_code()` distinguishes them via
+/// `SQLITE_CONSTRAINT_PRIMARYKEY` / `SQLITE_CONSTRAINT_UNIQUE`. That is left to the owner of
+/// `insert_new_issue_row_for_import`, who knows whether the error reaching here is SQLite's own
+/// or a reconstruction.
+fn is_key_collision(error: &BeadsError) -> bool {
+    match error {
+        BeadsError::DatabaseLegacy(
+            fsqlite_error::FrankenError::PrimaryKeyViolation
+            | fsqlite_error::FrankenError::UniqueViolation { .. },
+        ) => true,
+        BeadsError::Database(e) => {
+            e.sqlite_error_code() == Some(rusqlite::ffi::ErrorCode::ConstraintViolation)
+        }
+        _ => false,
+    }
+}
+
 fn insert_new_import_issue(storage: &SqliteStorage, issue: &Issue) -> Result<bool> {
     match storage.insert_new_issue_for_import(issue) {
         Ok(_) => Ok(true),
-        Err(BeadsError::DatabaseLegacy(
-            fsqlite_error::FrankenError::PrimaryKeyViolation
-            | fsqlite_error::FrankenError::UniqueViolation { .. },
-        )) => {
+        Err(error) if is_key_collision(&error) => {
             tracing::debug!(
                 id = %issue.id,
                 "Import insert found a concurrent key collision; falling back to upsert"
@@ -5603,8 +5647,8 @@ pub(crate) fn scan_jsonl_for_tombstone_filter(path: &Path) -> Result<JsonlTombst
 mod tests {
     use super::*;
     use crate::model::{Comment, Issue, IssueType, Priority, Status};
+    use crate::storage::db::SqlValue;
     use chrono::Utc;
-    use fsqlite_types::SqliteValue;
     use std::collections::HashMap;
     use std::io::{self, Write};
     #[cfg(unix)]

@@ -58,6 +58,16 @@ impl SqlValue {
         Self(value)
     }
 
+    /// SQL `NULL`.
+    ///
+    /// The direct analogue of `fsqlite_types::SqliteValue::Null`, which appears at ~71 sites
+    /// as the nullable-column idiom. It cannot be a `From` impl, because there is no
+    /// distinguishing type to convert *from*.
+    #[must_use]
+    pub fn null() -> Self {
+        Self(Value::Null)
+    }
+
     /// Borrow the underlying value.
     #[must_use]
     pub fn value(&self) -> &Value {
@@ -239,6 +249,47 @@ pub fn db_exec(conn: &Connection, sql: &str) -> rusqlite::Result<usize> {
     conn.execute(sql, [])
 }
 
+/// Borrow a `&[SqlValue]` as the `&[&dyn ToSql]` rusqlite's parameter APIs take.
+///
+/// The frankensqlite call sites all pass `&[SqliteValue::from(..), ..]`; rusqlite wants
+/// `&[&dyn ToSql]`, and the two do not coerce. This is the single conversion point, so the
+/// ~138 `execute_with_params` and ~91 `query_with_params` sites are a type-path change
+/// rather than 229 separate rewrites.
+///
+/// The returned vector borrows from `values`, so it cannot outlive the call — which is
+/// exactly the constraint the call sites already have.
+pub fn params_from(values: &[SqlValue]) -> Vec<&dyn ToSql> {
+    values.iter().map(|v| v as &dyn ToSql).collect()
+}
+
+/// [`query_rows`] with bind parameters.
+pub fn query_rows_with_params<'stmt, P>(
+    stmt: &'stmt mut Statement<'_>,
+    params: P,
+) -> rusqlite::Result<Vec<Vec<SqlValue>>>
+where
+    P: rusqlite::Params,
+{
+    let total = stmt.column_count();
+    let mut rows = stmt.query(params)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(column_values(row, 0, total)?);
+    }
+    Ok(out)
+}
+
+/// [`query_row_values`] with bind parameters.
+pub fn query_row_values_with_params<P>(
+    stmt: &mut Statement<'_>,
+    params: P,
+) -> rusqlite::Result<Option<Vec<SqlValue>>>
+where
+    P: rusqlite::Params,
+{
+    Ok(query_rows_with_params(stmt, params)?.into_iter().next())
+}
+
 /// Remap `QueryReturnedNoRows`.
 ///
 /// frankensqlite's `query_row` returned the row directly; rusqlite returns
@@ -416,13 +467,32 @@ mod tests {
     }
 
     #[test]
-    fn get_str_rejects_a_non_text_column() {
+    /// `get_str` operates on a borrowed `Row`, unlike the owned-value helpers, so it needs a
+    /// live statement. It must reject a non-text column and report NULL rather than
+    /// stringifying it.
+    ///
+    /// The column choices are load-bearing. The fixture table is
+    /// `a INTEGER, b TEXT, c REAL, d BLOB, e`, and SQLite applies **column affinity on
+    /// insert**: a `TEXT` column holding `5` is stored as the string `'5'`, so reading it back
+    /// as text is correct, not a coercion. The genuinely non-text values here are `'hello'`
+    /// surviving an INTEGER column and `2.5` in the REAL column.
+    #[test]
+    fn get_str_accepts_text_rejects_non_text_and_reports_null() {
         let c = conn();
-        c.execute("INSERT INTO t (a) VALUES (5)", []).expect("insert");
-        let mut stmt = c.prepare("SELECT a FROM t").expect("prepare");
-        let mut stmt = c.prepare("SELECT a FROM t").expect("prepare");
-        let rows = query_rows(&mut stmt).expect("collect");
-        assert_eq!(rows[0][0].as_integer(), Some(5));
+        c.execute("INSERT INTO t (a, b, c, e) VALUES ('hello', 5, 2.5, NULL)", [])
+            .expect("insert");
+        let mut stmt = c.prepare("SELECT a, b, c, e FROM t").expect("prepare");
+        let mut rows = stmt.query([]).expect("query");
+        let row = rows.next().expect("one row").expect("no error");
+
+        // 'hello' cannot be converted by INTEGER affinity, so it stays TEXT.
+        assert_eq!(get_str(row, 0).expect("text"), Some("hello".to_string()));
+        // 5 in a TEXT column is affinity-converted to '5' on insert: this is the engine, not
+        // the accessor, and reading it as text is therefore the faithful answer.
+        assert_eq!(get_str(row, 1).expect("affinity text"), Some("5".to_string()));
+        // A REAL column is genuinely not text and must not stringify.
+        assert!(get_str(row, 2).is_err(), "a real column must not stringify");
+        assert_eq!(get_str(row, 3).expect("null column"), None);
     }
 
     #[test]

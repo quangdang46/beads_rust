@@ -17,9 +17,9 @@ use crate::config::{
 };
 use crate::error::{BeadsError, Result};
 use crate::output::OutputContext;
-use fsqlite::Connection;
-use fsqlite_types::SqliteValue;
+use crate::storage::db::{self, SqlValue};
 use rich_rust::prelude::*;
+use rusqlite::Connection;
 use serde_json::json;
 use shell_words::split as split_shell_words;
 use std::collections::BTreeMap;
@@ -321,14 +321,24 @@ fn load_db_layer_without_recovery(paths: &ConfigPaths) -> ConfigLayer {
 
     match config::with_database_family_snapshot(&paths.db_path, |snapshot_db_path| {
         let conn = Connection::open(snapshot_db_path.to_string_lossy().into_owned())?;
-        let rows = conn.query("SELECT key, value FROM config")?;
+        // The rows are collected as OWNED column values, which is the only shape rusqlite
+        // can return: a `Row` borrows its `Statement` and has no `Clone`, so it cannot be
+        // lifted out of a `Rows` iterator. The statement is scoped so it is dropped --
+        // and its SQLite handle finalized -- before `close` below consumes the connection.
+        let rows = {
+            let mut stmt = conn.prepare("SELECT key, value FROM config")?;
+            db::query_rows(&mut stmt)?
+        };
         let mut layer = ConfigLayer::default();
 
-        for row in rows {
-            let Some(key) = row.get(0).and_then(SqliteValue::as_text) else {
+        for row in &rows {
+            // `Vec::get` is the same lenient lookup frankensqlite's `Row::get` was, and
+            // `SqlValue::as_text` is the same non-coercing text extractor, so a short row
+            // or a non-text column is still skipped rather than treated as an error.
+            let Some(key) = row.get(0).and_then(SqlValue::as_text) else {
                 continue;
             };
-            let Some(value) = row.get(1).and_then(SqliteValue::as_text) else {
+            let Some(value) = row.get(1).and_then(SqlValue::as_text) else {
                 continue;
             };
             if config::is_startup_key(key) {
@@ -337,7 +347,10 @@ fn load_db_layer_without_recovery(paths: &ConfigPaths) -> ConfigLayer {
             layer.runtime.insert(key.to_string(), value.to_string());
         }
 
-        conn.close()?;
+        // `close` consumes the connection and hands it back inside the error on failure, so
+        // drop the handle and propagate only the engine error -- which is what the `?` did
+        // when `close` returned the error directly. A close failure still skips the layer.
+        conn.close().map_err(|(_, error)| error)?;
         Ok(layer)
     }) {
         Ok(layer) => layer,

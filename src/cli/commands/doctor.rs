@@ -20,9 +20,6 @@ use crate::sync::{
     validate_no_git_path, validate_sync_path, validate_sync_path_with_external,
 };
 use chrono::{NaiveDate, Utc};
-use fsqlite::{Connection, Row};
-use fsqlite_error::FrankenError;
-use fsqlite_types::SqliteValue;
 use rich_rust::prelude::*;
 use serde::Serialize;
 use std::collections::BTreeSet;
@@ -31,6 +28,54 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
+
+// --- SQL read helpers -------------------------------------------------------------
+//
+// These three exist because the frankensqlite read shape -- `query_all(&conn, sql)` returning an
+// owned `Vec<Row>`, then `row.values()` handing back an owned slice -- has no single
+// equivalent in rusqlite. `Rows` is a lazy borrow of its `Statement`, and `Row` is a handle
+// onto that statement rather than data, so there is no `Vec<Row>` to hand back and the
+// columns have to be copied out column by column.
+//
+// They are deliberately private and deliberately boring. A version of this that "helpfully"
+// coerced a text column to an integer would make the doctor's orphan counts look plausible
+// while measuring the wrong thing, which is the failure mode the whole engine swap is trying
+// to make impossible.
+
+use crate::storage::db::{self, SqlValue};
+use rusqlite::Connection;
+use rusqlite::types::Value;
+
+/// Run a read query and return every row as owned column values.
+fn query_all(conn: &Connection, sql: &str) -> Result<Vec<Vec<SqlValue>>> {
+    let mut stmt = conn.prepare(sql)?;
+    Ok(db::query_rows(&mut stmt)?)
+}
+
+/// The integer in the first column of the first row, or `0`.
+///
+/// Replaces `rows.first().and_then(|r| r.values().first()...)` with an `Integer` arm, which
+/// was the shape of every orphan-count probe in this file.
+fn first_row_integer(rows: &[Vec<SqlValue>]) -> i64 {
+    rows.first()
+        .and_then(|row| row.first())
+        .and_then(|v| match v.value() {
+            Value::Integer(n) => Some(*n),
+            _ => None,
+        })
+        .unwrap_or(0)
+}
+
+/// The text of one column across every row, skipping rows where it is not text.
+fn column_texts(rows: &[Vec<SqlValue>], idx: usize) -> Vec<String> {
+    rows.iter()
+        .filter_map(|row| row.get(idx))
+        .filter_map(|v| match v.value() {
+            Value::Text(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect()
+}
 
 /// Check result status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1333,48 +1378,53 @@ fn repair_via_vacuum(
 /// persisted.  The insert-then-read pattern catches read-after-write
 /// divergence that a simple no-op UPDATE would miss.
 fn write_probe_after_repair(db_path: &Path) -> bool {
-    let Ok(conn) = Connection::open(db_path.to_string_lossy().into_owned()) else {
+    let Ok(conn) = Connection::open(&db_path) else {
         return false;
     };
-    let _ = conn.execute("PRAGMA busy_timeout=5000");
+    let _ = conn.execute("PRAGMA busy_timeout=5000", []);
 
     // Use a probe ID that cannot collide with real issues.
     let probe_id = "__doctor_write_probe__";
     let now = chrono::Utc::now().to_rfc3339();
 
     let probe = (|| -> std::result::Result<(), Box<dyn std::error::Error>> {
-        conn.execute("BEGIN IMMEDIATE")?;
+        conn.execute("BEGIN IMMEDIATE", [])?;
 
-        conn.execute_with_params(
+        let probe_values = [
+            SqlValue::from(probe_id),
+            SqlValue::from("doctor write probe"),
+            SqlValue::from(now.as_str()),
+            SqlValue::from(now.as_str()),
+        ];
+        let probe_params = db::params_from(&probe_values);
+        conn.execute(
             "INSERT OR REPLACE INTO issues (id, title, status, priority, created_at, updated_at) \
              VALUES (?, ?, 'open', 2, ?, ?)",
-            &[
-                SqliteValue::from(probe_id),
-                SqliteValue::from("doctor write probe"),
-                SqliteValue::from(now.as_str()),
-                SqliteValue::from(now.as_str()),
-            ],
+            probe_params.as_slice(),
         )?;
 
         // Read it back inside the same transaction to verify the read path
         // agrees with what we just wrote. CTE-wrap per #254 so the probe
         // itself does not hit fsqlite's prepared-statement fast-path cache
         // and report false-healthy against a stale plan.
-        let rows = conn.query_with_params(
+        let mut probe_stmt = conn.prepare(
             "WITH target(id_value) AS (SELECT ?) \
              SELECT i.id FROM issues AS i, target AS t \
              WHERE i.id = t.id_value",
-            &[SqliteValue::from(probe_id)],
+        )?;
+        let rows = db::query_rows_with_params(
+            &mut probe_stmt,
+            db::params_from(&[SqlValue::from(probe_id)]).as_slice(),
         )?;
         if rows.is_empty() {
-            conn.execute("ROLLBACK")?;
+            conn.execute("ROLLBACK", [])?;
             tracing::warn!("Write probe: INSERT succeeded but SELECT returned no rows");
             return Err("read-after-write divergence".into());
         }
 
         // Always ROLLBACK — the probe is non-destructive.  No data is
         // persisted, so JSONL export state stays clean.
-        conn.execute("ROLLBACK")?;
+        conn.execute("ROLLBACK", [])?;
         Ok(())
     })();
 
@@ -1386,12 +1436,12 @@ fn write_probe_after_repair(db_path: &Path) -> bool {
         Err(err) => {
             tracing::warn!(error = %err, "Post-repair write probe failed — DB may still be corrupt");
             // Best-effort rollback in case we're stuck mid-transaction.
-            let _ = conn.execute("ROLLBACK");
+            let _ = conn.execute("ROLLBACK", []);
             false
         }
     };
 
-    if let Err(err) = conn.close() {
+    if let Err((_, err)) = conn.close() {
         tracing::warn!(error = %err, "Post-repair write probe connection close failed");
         return false;
     }
@@ -2094,8 +2144,8 @@ fn push_inspection_error(
 
 fn build_issue_write_probe_check(
     issue_id: &str,
-    update_result: std::result::Result<usize, FrankenError>,
-    rollback_result: std::result::Result<usize, FrankenError>,
+    update_result: rusqlite::Result<usize>,
+    rollback_result: rusqlite::Result<usize>,
 ) -> CheckResult {
     let mut details = serde_json::json!({ "issue_id": issue_id });
 
@@ -2511,8 +2561,8 @@ fn repair_partial_indexes(
         db_path.to_string_lossy().into_owned(),
     ) {
         Ok(conn) => {
-            let _ = conn.execute("PRAGMA busy_timeout=30000");
-            match conn.execute("REINDEX") {
+            let _ = conn.execute("PRAGMA busy_timeout=30000", []);
+            match conn.execute("REINDEX", []) {
                 Ok(_) => {
                     tracing::info!(
                         path = %db_path.display(),
@@ -2528,7 +2578,7 @@ fn repair_partial_indexes(
                     );
                 }
             }
-            if let Err(err) = conn.close() {
+            if let Err((_, err)) = conn.close() {
                 tracing::warn!(
                     path = %db_path.display(),
                     error = %err,
@@ -2771,10 +2821,10 @@ fn render_doctor_rich(report: &DoctorReport, ctx: &OutputContext) {
 }
 
 fn collect_table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
-    let rows = conn.query(&format!("PRAGMA table_info({table})"))?;
+    let rows = query_all(&conn, &format!("PRAGMA table_info({table})"))?;
     let mut columns = Vec::with_capacity(rows.len());
     for row in &rows {
-        if let Some(name) = row.get(1).and_then(SqliteValue::as_text) {
+        if let Some(name) = row.get(1).and_then(SqlValue::as_text) {
             columns.push(name.to_string());
         }
     }
@@ -2783,11 +2833,10 @@ fn collect_table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> 
 
 #[allow(clippy::too_many_lines)]
 fn required_schema_checks(conn: &Connection, checks: &mut Vec<CheckResult>) -> Result<()> {
-    let rows = conn
-        .query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")?;
+    let rows = query_all(conn, "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")?;
     let mut tables = Vec::with_capacity(rows.len());
     for row in &rows {
-        if let Some(name) = row.get(0).and_then(SqliteValue::as_text) {
+        if let Some(name) = row.first().and_then(SqlValue::as_text) {
             tables.push(name.to_string());
         }
     }
@@ -2811,7 +2860,7 @@ fn required_schema_checks(conn: &Connection, checks: &mut Vec<CheckResult>) -> R
     if tables.is_empty() {
         for &table in &required_tables {
             let probe = format!("SELECT 1 FROM {table} LIMIT 1");
-            if conn.query(&probe).is_ok() {
+            if query_all(&conn, &probe).is_ok() {
                 tables.push(table.to_string());
             }
         }
@@ -2925,7 +2974,7 @@ fn integrity_messages_only_benign(messages: &[String]) -> bool {
 }
 
 fn check_integrity(conn: &Connection, checks: &mut Vec<CheckResult>) {
-    let rows = match conn.query("PRAGMA integrity_check") {
+    let rows = match query_all(conn, "PRAGMA integrity_check") {
         Ok(rows) => rows,
         Err(err) => {
             push_check(
@@ -2939,7 +2988,7 @@ fn check_integrity(conn: &Connection, checks: &mut Vec<CheckResult>) {
         }
     };
 
-    let row_values: Vec<Vec<SqliteValue>> = rows.iter().map(|row| row.values().to_vec()).collect();
+    let row_values: Vec<Vec<SqlValue>> = rows.clone();
     let messages = integrity_check_messages(&row_values);
     if messages.len() == 1 && messages[0].trim().eq_ignore_ascii_case("ok") {
         push_check(
@@ -2972,17 +3021,13 @@ fn check_integrity(conn: &Connection, checks: &mut Vec<CheckResult>) {
 }
 
 fn latest_metadata_value(conn: &Connection, key: &str) -> Option<String> {
-    conn.query_row_with_params(
+    conn.query_row(
         "SELECT value FROM metadata WHERE key = ? ORDER BY rowid DESC LIMIT 1",
-        &[SqliteValue::from(key)],
+        db::params_from(&[SqlValue::from(key)]).as_slice(),
+        |r| r.get::<_, String>(0),
     )
     .ok()
-    .and_then(|row| {
-        row.get(0)
-            .and_then(SqliteValue::as_text)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-    })
+    .filter(|value| !value.is_empty())
 }
 
 /// Pass-4 cycle 4 — detector for `fm-caches_indexes-export-hash-cache-divergence`.
@@ -3236,7 +3281,7 @@ fn sqlite_shm_sidecar_path(db_path: &Path) -> PathBuf {
 }
 
 fn checkpoint_wal_truncate(db_path: &Path) -> Result<()> {
-    let conn = Connection::open(db_path.to_string_lossy().into_owned())?;
+    let conn = Connection::open(&db_path)?;
     let checkpoint_complete = match wal_checkpoint_truncate_complete(&conn) {
         Ok(complete) => complete,
         Err(err) => {
@@ -3244,7 +3289,7 @@ fn checkpoint_wal_truncate(db_path: &Path) -> Result<()> {
             return Err(err.into());
         }
     };
-    conn.close()?;
+    conn.close().map_err(|(_, e)| e)?;
     if !checkpoint_complete {
         return Err(BeadsError::internal(
             "doctor: WAL checkpoint did not complete; a reader may still hold a snapshot",
@@ -5112,37 +5157,23 @@ fn check_root_gitignore_writable(repo_root: &Path, checks: &mut Vec<CheckResult>
 /// to attempt rewriting non-existent records. Auto-fixable via a
 /// targeted chokepointed prune that snapshots matching rows first.
 fn check_dirty_bitmap_divergence(conn: &Connection, checks: &mut Vec<CheckResult>) {
-    let Ok(rows) = conn.query(
+    let Ok(rows) = query_all(&conn, 
         "SELECT COUNT(*) FROM dirty_issues d LEFT JOIN issues i ON d.issue_id = i.id WHERE i.id IS NULL",
     ) else {
         // dirty_issues missing → upstream schema check covers it.
         push_check(checks, "dirty_bitmap", CheckStatus::Ok, None, None);
         return;
     };
-    let orphan_count = rows
-        .first()
-        .and_then(|row| row.values().first().cloned())
-        .and_then(|v| match v {
-            SqliteValue::Integer(n) => Some(n),
-            _ => None,
-        })
-        .unwrap_or(0);
+    let orphan_count = first_row_integer(&rows);
     if orphan_count == 0 {
         push_check(checks, "dirty_bitmap", CheckStatus::Ok, None, None);
         return;
     }
     // Sample up to 5 orphan ids for the operator.
-    let sample: Vec<String> = match conn.query(
+    let sample: Vec<String> = match query_all(conn, 
         "SELECT d.issue_id FROM dirty_issues d LEFT JOIN issues i ON d.issue_id = i.id WHERE i.id IS NULL LIMIT 5",
     ) {
-        Ok(rows) => rows
-            .iter()
-            .filter_map(|row| row.values().first().cloned())
-            .filter_map(|v| match v {
-                SqliteValue::Text(s) => Some(s.to_string()),
-                _ => None,
-            })
-            .collect(),
+        Ok(rows) => column_texts(&rows, 0),
         Err(_) => Vec::new(),
     };
     push_check(
@@ -5233,35 +5264,21 @@ fn fix_dirty_bitmap_orphans_if_warned(
 /// cycle 29's dirty-bitmap surgical-DELETE pattern through the
 /// chokepoint.
 fn check_comments_orphans(conn: &Connection, checks: &mut Vec<CheckResult>) {
-    let Ok(rows) = conn.query(
+    let Ok(rows) = query_all(&conn, 
         "SELECT COUNT(*) FROM comments c LEFT JOIN issues i ON c.issue_id = i.id WHERE i.id IS NULL",
     ) else {
         push_check(checks, "comments.orphans", CheckStatus::Ok, None, None);
         return;
     };
-    let orphan_count = rows
-        .first()
-        .and_then(|row| row.values().first().cloned())
-        .and_then(|v| match v {
-            SqliteValue::Integer(n) => Some(n),
-            _ => None,
-        })
-        .unwrap_or(0);
+    let orphan_count = first_row_integer(&rows);
     if orphan_count == 0 {
         push_check(checks, "comments.orphans", CheckStatus::Ok, None, None);
         return;
     }
-    let sample: Vec<String> = match conn.query(
+    let sample: Vec<String> = match query_all(conn, 
         "SELECT c.issue_id FROM comments c LEFT JOIN issues i ON c.issue_id = i.id WHERE i.id IS NULL LIMIT 5",
     ) {
-        Ok(rows) => rows
-            .iter()
-            .filter_map(|row| row.values().first().cloned())
-            .filter_map(|v| match v {
-                SqliteValue::Text(s) => Some(s.to_string()),
-                _ => None,
-            })
-            .collect(),
+        Ok(rows) => column_texts(&rows, 0),
         Err(_) => Vec::new(),
     };
     push_check(
@@ -5348,35 +5365,21 @@ fn fix_comments_orphans_if_warned(
 /// cycle 29's dirty-bitmap surgical-DELETE pattern through the
 /// chokepoint.
 fn check_labels_orphans(conn: &Connection, checks: &mut Vec<CheckResult>) {
-    let Ok(rows) = conn.query(
+    let Ok(rows) = query_all(&conn, 
         "SELECT COUNT(*) FROM labels l LEFT JOIN issues i ON l.issue_id = i.id WHERE i.id IS NULL",
     ) else {
         push_check(checks, "labels.orphans", CheckStatus::Ok, None, None);
         return;
     };
-    let orphan_count = rows
-        .first()
-        .and_then(|row| row.values().first().cloned())
-        .and_then(|v| match v {
-            SqliteValue::Integer(n) => Some(n),
-            _ => None,
-        })
-        .unwrap_or(0);
+    let orphan_count = first_row_integer(&rows);
     if orphan_count == 0 {
         push_check(checks, "labels.orphans", CheckStatus::Ok, None, None);
         return;
     }
-    let sample: Vec<String> = match conn.query(
+    let sample: Vec<String> = match query_all(conn, 
         "SELECT l.issue_id FROM labels l LEFT JOIN issues i ON l.issue_id = i.id WHERE i.id IS NULL LIMIT 5",
     ) {
-        Ok(rows) => rows
-            .iter()
-            .filter_map(|row| row.values().first().cloned())
-            .filter_map(|v| match v {
-                SqliteValue::Text(s) => Some(s.to_string()),
-                _ => None,
-            })
-            .collect(),
+        Ok(rows) => column_texts(&rows, 0),
         Err(_) => Vec::new(),
     };
     push_check(
@@ -5467,25 +5470,18 @@ const DEPENDENCIES_ORPHAN_PREDICATE: &str = "issue_id NOT IN (SELECT id FROM iss
          AND depends_on_id NOT IN (SELECT id FROM issues))";
 
 fn check_dependencies_orphans(conn: &Connection, checks: &mut Vec<CheckResult>) {
-    let Ok(rows) = conn.query(&format!(
+    let Ok(rows) = query_all(&conn, &format!(
         "SELECT COUNT(*) FROM dependencies WHERE {DEPENDENCIES_ORPHAN_PREDICATE}"
     )) else {
         push_check(checks, "dependencies.orphans", CheckStatus::Ok, None, None);
         return;
     };
-    let orphan_count = rows
-        .first()
-        .and_then(|row| row.values().first().cloned())
-        .and_then(|v| match v {
-            SqliteValue::Integer(n) => Some(n),
-            _ => None,
-        })
-        .unwrap_or(0);
+    let orphan_count = first_row_integer(&rows);
     if orphan_count == 0 {
         push_check(checks, "dependencies.orphans", CheckStatus::Ok, None, None);
         return;
     }
-    let sample: Vec<String> = match conn.query(&format!(
+    let sample: Vec<String> = match query_all(conn, &format!(
         "SELECT issue_id, depends_on_id FROM dependencies \
          WHERE {DEPENDENCIES_ORPHAN_PREDICATE} \
          ORDER BY issue_id, depends_on_id \
@@ -5494,14 +5490,8 @@ fn check_dependencies_orphans(conn: &Connection, checks: &mut Vec<CheckResult>) 
         Ok(rows) => rows
             .iter()
             .filter_map(|row| {
-                let issue_id = row.values().first().and_then(|v| match v {
-                    SqliteValue::Text(s) => Some(s.as_str()),
-                    _ => None,
-                })?;
-                let depends_on_id = row.values().get(1).and_then(|v| match v {
-                    SqliteValue::Text(s) => Some(s.as_str()),
-                    _ => None,
-                })?;
+                let issue_id = row.first().and_then(SqlValue::as_text)?;
+                let depends_on_id = row.get(1).and_then(SqlValue::as_text)?;
                 Some(format!("{issue_id} -> {depends_on_id}"))
             })
             .collect(),
@@ -5665,7 +5655,7 @@ fn check_suspect_close_reasons(conn: &Connection, checks: &mut Vec<CheckResult>)
     // GROUP_CONCAT separator can't contain commas in case a label ever
     // does — the validator forbids commas today, but we don't want to
     // create a latent bug if the schema ever changes.
-    let rows = match conn.query(
+    let rows = match query_all(conn, 
         "SELECT i.id, i.close_reason,
                 COALESCE(GROUP_CONCAT(l.label, char(31)), '') AS labels
          FROM issues i
@@ -5693,17 +5683,17 @@ fn check_suspect_close_reasons(conn: &Connection, checks: &mut Vec<CheckResult>)
     for row in rows {
         let id = row
             .get(0)
-            .and_then(SqliteValue::as_text)
+            .and_then(SqlValue::as_text)
             .unwrap_or("")
             .to_string();
         let reason = row
             .get(1)
-            .and_then(SqliteValue::as_text)
+            .and_then(SqlValue::as_text)
             .unwrap_or("")
             .to_string();
         let labels = row
             .get(2)
-            .and_then(SqliteValue::as_text)
+            .and_then(SqlValue::as_text)
             .unwrap_or("")
             .to_string();
         if id.is_empty() || reason.is_empty() {
@@ -5795,7 +5785,7 @@ fn check_workflow_statuses(conn: &Connection, beads_dir: &Path, checks: &mut Vec
     }
 
     let rows =
-        match conn.query("SELECT id, status FROM issues WHERE status IS NOT NULL ORDER BY id") {
+        match query_all(conn, "SELECT id, status FROM issues WHERE status IS NOT NULL ORDER BY id") {
             Ok(rows) => rows,
             Err(err) => {
                 push_check(
@@ -5815,12 +5805,12 @@ fn check_workflow_statuses(conn: &Connection, beads_dir: &Path, checks: &mut Vec
     for row in rows {
         let id = row
             .get(0)
-            .and_then(SqliteValue::as_text)
+            .and_then(SqlValue::as_text)
             .unwrap_or("")
             .to_string();
         let status = row
             .get(1)
-            .and_then(SqliteValue::as_text)
+            .and_then(SqlValue::as_text)
             .unwrap_or("")
             .to_string();
         if id.is_empty() || status.is_empty() {
@@ -5863,7 +5853,7 @@ fn check_workflow_statuses(conn: &Connection, beads_dir: &Path, checks: &mut Vec
 }
 
 fn check_recoverable_anomalies(conn: &Connection, checks: &mut Vec<CheckResult>) -> Result<()> {
-    let duplicate_schema_rows = conn.query(
+    let duplicate_schema_rows = query_all(&conn, 
         "SELECT type, name, COUNT(*) AS row_count
          FROM sqlite_master
          WHERE name IN ('blocked_issues_cache', 'idx_blocked_cache_blocked_at')
@@ -5873,7 +5863,7 @@ fn check_recoverable_anomalies(conn: &Connection, checks: &mut Vec<CheckResult>)
          LIMIT 1",
     )?;
 
-    let duplicate_config = conn.query(
+    let duplicate_config = query_all(&conn, 
         "SELECT key, COUNT(*) AS row_count
          FROM config
          GROUP BY key
@@ -5882,7 +5872,7 @@ fn check_recoverable_anomalies(conn: &Connection, checks: &mut Vec<CheckResult>)
          LIMIT 1",
     )?;
 
-    let duplicate_metadata = conn.query(
+    let duplicate_metadata = query_all(&conn, 
         "SELECT key, COUNT(*) AS row_count
          FROM metadata
          GROUP BY key
@@ -5896,13 +5886,13 @@ fn check_recoverable_anomalies(conn: &Connection, checks: &mut Vec<CheckResult>)
     if let Some(row) = duplicate_schema_rows.first() {
         let object_type = row
             .get(0)
-            .and_then(SqliteValue::as_text)
+            .and_then(SqlValue::as_text)
             .unwrap_or("object");
         let name = row
             .get(1)
-            .and_then(SqliteValue::as_text)
+            .and_then(SqlValue::as_text)
             .unwrap_or("unknown");
-        let row_count = row.get(2).and_then(SqliteValue::as_integer).unwrap_or(2);
+        let row_count = row.get(2).and_then(SqlValue::as_integer).unwrap_or(2);
         findings.push(format!(
             "sqlite_master contains duplicate {object_type} entries for '{name}' ({row_count} rows)"
         ));
@@ -5911,9 +5901,9 @@ fn check_recoverable_anomalies(conn: &Connection, checks: &mut Vec<CheckResult>)
     if let Some(row) = duplicate_config.first() {
         let key = row
             .get(0)
-            .and_then(SqliteValue::as_text)
+            .and_then(SqlValue::as_text)
             .unwrap_or("unknown");
-        let row_count = row.get(1).and_then(SqliteValue::as_integer).unwrap_or(2);
+        let row_count = row.get(1).and_then(SqlValue::as_integer).unwrap_or(2);
         findings.push(format!(
             "config contains duplicate rows for key '{key}' ({row_count} rows)"
         ));
@@ -5922,9 +5912,9 @@ fn check_recoverable_anomalies(conn: &Connection, checks: &mut Vec<CheckResult>)
     if let Some(row) = duplicate_metadata.first() {
         let key = row
             .get(0)
-            .and_then(SqliteValue::as_text)
+            .and_then(SqlValue::as_text)
             .unwrap_or("unknown");
-        let row_count = row.get(1).and_then(SqliteValue::as_integer).unwrap_or(2);
+        let row_count = row.get(1).and_then(SqlValue::as_integer).unwrap_or(2);
         findings.push(format!(
             "metadata contains duplicate rows for key '{key}' ({row_count} rows)"
         ));
@@ -5933,13 +5923,22 @@ fn check_recoverable_anomalies(conn: &Connection, checks: &mut Vec<CheckResult>)
     if latest_metadata_value(conn, "blocked_cache_state").as_deref() == Some("stale") {
         findings.push(BLOCKED_CACHE_STALE_FINDING.to_string());
     }
-    let blocked_cache_health = SqliteStorage::blocked_cache_projection_health(conn);
-    if blocked_cache_health.has_mismatch() {
-        findings.push(BLOCKED_CACHE_CONTENT_MISMATCH_FINDING.to_string());
-    }
-    let ready_projection_health = SqliteStorage::ready_projection_health(conn);
-    if ready_projection_health.has_mismatch() {
-        findings.push(READY_PROJECTION_CONTENT_MISMATCH_FINDING.to_string());
+    // These two still read through the storage layer, which is on the legacy engine until
+    // Phase 7, so they need a handle of that engine's type even though every check above this
+    // line is fully ported. Opening a second, short-lived handle is deliberate: rewriting the
+    // projection-health functions here would be Phase 7's change made in the wrong file, and
+    // skipping the checks would silently drop two doctor findings.
+    if let Some(path) = conn.path()
+        && let Ok(legacy) = fsqlite::Connection::open(path)
+    {
+        let blocked_cache_health = SqliteStorage::blocked_cache_projection_health(&legacy);
+        if blocked_cache_health.has_mismatch() {
+            findings.push(BLOCKED_CACHE_CONTENT_MISMATCH_FINDING.to_string());
+        }
+        let ready_projection_health = SqliteStorage::ready_projection_health(&legacy);
+        if ready_projection_health.has_mismatch() {
+            findings.push(READY_PROJECTION_CONTENT_MISMATCH_FINDING.to_string());
+        }
     }
 
     push_recoverable_anomalies_check(checks, &findings);
@@ -6070,8 +6069,8 @@ fn check_null_defaults(conn: &Connection, checks: &mut Vec<CheckResult>) {
 
     for (table, column, fix_sql) in queries {
         let count_sql = format!("SELECT COUNT(*) FROM {table} WHERE typeof({column}) = 'null'");
-        if let Ok(row) = conn.query_row(&count_sql) {
-            let count = row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0);
+        if let Ok(count) = conn.query_row(&count_sql, [], |r| r.get::<_, i64>(0)) {
+            let count = count;
             if count > 0 {
                 null_findings.push(serde_json::json!({
                     "table": table,
@@ -6203,12 +6202,11 @@ fn fix_null_defaults_if_warned(
 }
 
 fn check_issue_write_probe(conn: &Connection, checks: &mut Vec<CheckResult>) {
-    let issue_id = match conn.query_row("SELECT id FROM issues ORDER BY id LIMIT 1") {
-        Ok(row) => row
-            .get(0)
-            .and_then(SqliteValue::as_text)
-            .map(ToString::to_string),
-        Err(FrankenError::QueryReturnedNoRows) => None,
+    let issue_id = match conn.query_row("SELECT id FROM issues ORDER BY id LIMIT 1", [], |r| {
+        r.get::<_, String>(0)
+    }) {
+        Ok(id) => Some(id),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
         Err(err) => {
             push_check(
                 checks,
@@ -6232,9 +6230,15 @@ fn check_issue_write_probe(conn: &Connection, checks: &mut Vec<CheckResult>) {
         return;
     };
 
-    let begin_result = conn.execute("BEGIN IMMEDIATE");
+    let begin_result = conn.execute("BEGIN IMMEDIATE", []);
     if let Err(err) = begin_result {
-        let status = if err.is_transient() {
+        // Render first (that only borrows), then move the error into the classifier.
+        //
+        // Classify the REAL error, not a stand-in: a write probe that could not take the
+        // lock because another agent holds it is a Warn ("retry later"), while any other
+        // failure is an Error. Substituting a synthetic code would silently collapse the two.
+        let detail = format!("Failed to begin rollback-only write probe: {err}");
+        let status = if BeadsError::Database(err).is_transient() {
             CheckStatus::Warn
         } else {
             CheckStatus::Error
@@ -6243,17 +6247,19 @@ fn check_issue_write_probe(conn: &Connection, checks: &mut Vec<CheckResult>) {
             checks,
             "db.write_probe",
             status,
-            Some(format!("Failed to begin rollback-only write probe: {err}")),
+            Some(detail),
             Some(serde_json::json!({ "issue_id": issue_id })),
         );
         return;
     }
 
-    let update_result = conn.execute_with_params(
+    let update_values = [SqlValue::from(issue_id.as_str())];
+    let update_params = db::params_from(&update_values);
+    let update_result = conn.execute(
         "UPDATE issues SET priority = priority, status = status WHERE id = ?",
-        &[SqliteValue::from(issue_id.as_str())],
+        update_params.as_slice(),
     );
-    let rollback_result = conn.execute("ROLLBACK");
+    let rollback_result = conn.execute("ROLLBACK", []);
 
     checks.push(build_issue_write_probe_check(
         &issue_id,
@@ -6348,7 +6354,7 @@ fn check_sqlite_cli_integrity(db_path: &Path, checks: &mut Vec<CheckResult>) {
     }
 }
 
-fn integrity_check_messages(rows: &[Vec<SqliteValue>]) -> Vec<String> {
+fn integrity_check_messages(rows: &[Vec<SqlValue>]) -> Vec<String> {
     let mut messages = Vec::new();
     for row in rows {
         for value in row {
@@ -9090,13 +9096,13 @@ fn compute_db_jsonl_id_delta(conn: &Connection, jsonl_path: &Path) -> Result<IdD
 
     // DB side: include the same filter the cardinality check uses so
     // counts and ids agree on the same population.
-    let rows = conn.query(
+    let rows = query_all(&conn, 
         "SELECT id FROM issues \
          WHERE (ephemeral = 0 OR ephemeral IS NULL) AND id NOT LIKE '%-wisp-%'",
     )?;
     let mut db_ids: HashSet<String> = HashSet::with_capacity(rows.len());
     for row in &rows {
-        if let Some(id) = row.get(0).and_then(SqliteValue::as_text) {
+        if let Some(id) = row.first().and_then(SqlValue::as_text) {
             db_ids.insert(id.to_string());
         }
     }
@@ -9200,10 +9206,9 @@ fn check_db_count(
 ) -> Result<()> {
     let db_count: i64 = conn.query_row(
         "SELECT count(*) FROM issues WHERE (ephemeral = 0 OR ephemeral IS NULL) AND id NOT LIKE '%-wisp-%'",
-    )?
-        .get(0)
-        .and_then(SqliteValue::as_integer)
-        .unwrap_or(0);
+        [],
+        |r| r.get(0),
+    )?;
 
     match jsonl_count {
         JsonlCountState::Available(jsonl_count) => {
@@ -9610,9 +9615,7 @@ fn check_sync_metadata(
 
     // Check dirty issues count
     let dirty_count: i64 = conn
-        .query_row("SELECT count(*) FROM dirty_issues")
-        .ok()
-        .and_then(|row| row.get(0).and_then(SqliteValue::as_integer))
+        .query_row("SELECT count(*) FROM dirty_issues", [], |r| r.get(0))
         .unwrap_or(0);
 
     let mut details = serde_json::json!({
@@ -9797,8 +9800,8 @@ fn execute_repair_indexes(
     // Open the DB and enumerate every user-defined index so we don't
     // reindex sqlite_autoindex_* or any internal index — those are
     // managed by SQLite and not the partial-index class we're after.
-    let conn = Connection::open(paths.db_path.to_string_lossy().into_owned())?;
-    let rows = match conn.query(
+    let conn = Connection::open(&paths.db_path)?;
+    let rows = match query_all(&conn, 
         "SELECT name FROM sqlite_master \
          WHERE type = 'index' \
            AND name NOT LIKE 'sqlite_autoindex_%' \
@@ -9813,14 +9816,14 @@ fn execute_repair_indexes(
     };
     let index_names: Vec<String> = rows
         .iter()
-        .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(String::from))
+        .filter_map(|row| row.first().and_then(SqlValue::as_text).map(String::from))
         .collect();
 
     if index_names.is_empty() {
         // No user indexes — nothing to reindex. Leave the snapshot in
         // place so the operator has a recoverable pre-state regardless.
         ctx.info("doctor --repair-indexes: no user indexes found; nothing to do");
-        conn.close()?;
+        conn.close().map_err(|(_, e)| e)?;
         return Ok(());
     }
 
@@ -9829,23 +9832,23 @@ fn execute_repair_indexes(
     // pre-state on any failure mid-pass. This avoids the
     // half-rebuilt-tree window the user flagged in their #288 repro
     // (step 2 -> 3 -> 4 iterative discovery).
-    if let Err(err) = conn.execute("BEGIN IMMEDIATE") {
+    if let Err(err) = conn.execute("BEGIN IMMEDIATE", []) {
         close_repair_indexes_connection(conn, "after BEGIN IMMEDIATE failed");
         return Err(err.into());
     }
     let reindex_result: Result<usize> = (|| {
         let mut reindexed_count = 0;
         for name in &index_names {
-            conn.execute(&format!("REINDEX {}", quote_sql_identifier(name)))?;
+            conn.execute(&format!("REINDEX {}", quote_sql_identifier(name)), [])?;
             reindexed_count += 1;
         }
-        conn.execute("COMMIT")?;
+        conn.execute("COMMIT", [])?;
         Ok(reindexed_count)
     })();
 
     match reindex_result {
         Ok(reindexed_count) => {
-            conn.close()?;
+            conn.close().map_err(|(_, e)| e)?;
             ctx.success(&format!(
                 "doctor --repair-indexes: REINDEX completed on {reindexed_count} user indexes (pre-snapshot retained at {})",
                 snapshot_path.display(),
@@ -9857,7 +9860,7 @@ fn execute_repair_indexes(
             // the pre-snapshot for defense in depth — if rollback
             // itself failed (corrupt WAL etc.), the snapshot is the
             // authoritative pre-state.
-            let _ = conn.execute("ROLLBACK");
+            let _ = conn.execute("ROLLBACK", []);
             tracing::warn!(
                 error = %err,
                 snapshot = %snapshot_path.display(),
@@ -9881,7 +9884,7 @@ fn checkpoint_and_snapshot_repair_indexes(db_path: &Path, snapshot_path: &Path) 
     // pre-state — otherwise a restore would overwrite the live DB
     // with a snapshot that's missing whatever data the WAL still
     // held, silently destroying committed-but-uncheckpointed work.
-    let conn = Connection::open(db_path.to_string_lossy().into_owned())?;
+    let conn = Connection::open(&db_path)?;
     let checkpoint_complete = match wal_checkpoint_truncate_complete(&conn) {
         Ok(complete) => complete,
         Err(checkpoint_err) => {
@@ -9997,27 +10000,36 @@ impl WalCheckpointStats {
     }
 }
 
-fn wal_checkpoint_truncate_complete(conn: &Connection) -> std::result::Result<bool, FrankenError> {
-    let rows = conn.query("PRAGMA wal_checkpoint(TRUNCATE)")?;
+fn wal_checkpoint_truncate_complete(conn: &Connection) -> Result<bool> {
+    let rows = query_all(conn, "PRAGMA wal_checkpoint(TRUNCATE)")?;
     let Some(row) = rows.first() else {
         return Ok(false);
     };
     Ok(wal_checkpoint_stats_from_row(row).is_some_and(WalCheckpointStats::complete))
 }
 
-fn wal_checkpoint_stats_from_row(row: &Row) -> Option<WalCheckpointStats> {
+/// PRAGMA wal_checkpoint returns (busy, log_frames, checkpointed_frames).
+///
+/// This took an engine `Row` before. It now takes the collected column values, because
+/// rusqlite's `Row` is a handle onto its `Statement` rather than data: it is not `Clone` and
+/// cannot outlive the statement, so it cannot be threaded through this function the way
+/// frankensqlite's could. Note also that the bare name `Row` in this file now resolves to
+/// `rich_rust::renderables::Row` from the prelude, which is why the engine type had to go.
+fn wal_checkpoint_stats_from_row(row: &[SqlValue]) -> Option<WalCheckpointStats> {
     Some(WalCheckpointStats {
-        busy: sqlite_value_i64(row.get(0))?,
-        log_frames: sqlite_value_i64(row.get(1))?,
-        checkpointed_frames: sqlite_value_i64(row.get(2))?,
+        busy: sql_value_i64(row.first())?,
+        log_frames: sql_value_i64(row.get(1))?,
+        checkpointed_frames: sql_value_i64(row.get(2))?,
     })
 }
 
-const fn sqlite_value_i64(value: Option<&SqliteValue>) -> Option<i64> {
-    match value {
-        Some(SqliteValue::Integer(value)) => Some(*value),
+/// Read an integer column. The adapter deliberately does not coerce, so a non-integer
+/// column reads as `None` rather than being coerced into a count.
+fn sql_value_i64(value: Option<&SqlValue>) -> Option<i64> {
+    value.and_then(|v| match v.value() {
+        Value::Integer(n) => Some(*n),
         _ => None,
-    }
+    })
 }
 
 fn restore_repair_indexes_snapshot(
@@ -10110,7 +10122,7 @@ fn sidecar_suffix(sidecar: &Path) -> Option<&'static str> {
 }
 
 fn close_repair_indexes_connection(conn: Connection, context: &str) {
-    if let Err(close_err) = conn.close() {
+    if let Err((_, close_err)) = conn.close() {
         tracing::warn!(
             error = %close_err,
             context,
@@ -10601,7 +10613,7 @@ fn inspect_existing_doctor_database(
 ) {
     match config::with_database_family_snapshot(db_path, |snapshot_db_path| {
         let conn = Connection::open(snapshot_db_path.to_string_lossy().into_owned())?;
-        let _ = conn.execute("PRAGMA busy_timeout=30000");
+        let _ = conn.execute("PRAGMA busy_timeout=30000", []);
         if let Err(err) = required_schema_checks(&conn, checks) {
             push_inspection_error(
                 checks,
@@ -10662,7 +10674,7 @@ fn inspect_existing_doctor_database(
             check_sync_metadata(&conn, snapshot_db_path, jsonl_path, checks);
             check_issue_write_probe(&conn, checks);
         }
-        conn.close()?;
+        conn.close().map_err(|(_, e)| e)?;
         Ok(())
     }) {
         Ok(()) => {
@@ -11862,11 +11874,34 @@ mod tests {
     use crate::health::{AnomalyClass, WorkspaceHealth};
     use crate::model::{Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
+    use fsqlite_types::SqliteValue;
     use chrono::Utc;
-    use fsqlite::Connection;
+    use rusqlite::Connection;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::{NamedTempFile, TempDir};
+
+    // The one test below that reads rows back out of `SqliteStorage` still sees
+    // `fsqlite_types::SqliteValue`, because `SqliteStorage::execute_raw_query` hands the storage
+    // layer's own rows back and that layer is still on frankensqlite until Phase 7. There is
+    // no way to lift those rows into the rusqlite `SqlValue` surface without touching
+    // `src/storage/sqlite.rs`, which this file does not own. The alias and this note come off
+    // together in Phase 7, when `execute_raw_query` changes shape.
+    use fsqlite_types::SqliteValue as FsSqliteValue;
+
+    /// A `rusqlite::Error` whose `Display` is exactly `message`.
+    ///
+    /// `rusqlite::Error` has no generic "internal error" variant to construct, and these
+    /// three tests only ever read the rendered message — the ffi result code is never
+    /// observed. `SqliteFailure(_, Some(msg))` renders as `msg` and nothing else, so the
+    /// messages the assertions match on are byte-identical to what the frankensqlite
+    /// `Internal` variant produced.
+    fn rusqlite_message_error(message: &str) -> rusqlite::Error {
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_NOMEM as i32),
+            Some(message.to_string()),
+        )
+    }
 
     fn find_check<'a>(checks: &'a [CheckResult], name: &str) -> Option<&'a CheckResult> {
         checks.iter().find(|check| check.name == name)
@@ -11906,13 +11941,14 @@ mod tests {
     }
 
     fn insert_dependency_row(conn: &Connection, issue_id: &str, depends_on_id: &str) {
-        conn.execute_with_params(
+        conn.execute(
             "INSERT INTO dependencies(issue_id, depends_on_id, type) VALUES (?1, ?2, ?3)",
-            &[
-                SqliteValue::Text(issue_id.into()),
-                SqliteValue::Text(depends_on_id.into()),
-                SqliteValue::Text("blocks".into()),
-            ],
+            db::params_from(&[
+                SqlValue::from(issue_id),
+                SqlValue::from(depends_on_id),
+                SqlValue::from("blocks"),
+            ])
+            .as_slice(),
         )
         .unwrap();
     }
@@ -12047,17 +12083,18 @@ mod tests {
     }
 
     fn dependency_row_count(conn: &Connection, issue_id: &str, depends_on_id: &str) -> i64 {
-        let rows = conn
-            .query("SELECT issue_id, depends_on_id FROM dependencies")
+        let rows = query_all(conn, "SELECT issue_id, depends_on_id FROM dependencies")
             .unwrap();
         rows.iter()
             .filter(|row| {
-                let values = row.values();
-                matches!(
-                    (values.first(), values.get(1)),
-                    (Some(SqliteValue::Text(owner)), Some(SqliteValue::Text(target)))
-                        if owner.as_str() == issue_id && target.as_str() == depends_on_id
-                )
+                let values = row.clone();
+                // `SqlValue` is a newtype, not an enum, so this cannot be a `matches!` arm:
+                // extract the two text columns and compare them.
+                // Bound to locals rather than compared inline: the inline form trips
+                // rustc's Option<&str> inference limitation (rust-lang/rust#130366).
+                let owner: Option<&str> = values.first().and_then(SqlValue::as_text);
+                let target: Option<&str> = values.get(1).and_then(SqlValue::as_text);
+                owner.is_some_and(|o| o == issue_id) && target.is_some_and(|t| t == depends_on_id)
             })
             .count()
             .try_into()
@@ -12076,8 +12113,8 @@ mod tests {
         }
         drop(storage);
 
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
-        let _ = conn.execute("PRAGMA foreign_keys = OFF");
+        let conn = Connection::open(&db_path).unwrap();
+        let _ = conn.execute("PRAGMA foreign_keys = OFF", []);
         for (issue_id, depends_on_id) in [
             ("bd-orphan-fix-d", "bd-other"),
             ("bd-owner-d", "bd-missing-local-target"),
@@ -12095,7 +12132,7 @@ mod tests {
             reliability_audit: None,
             checks: Vec::new(),
         };
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
         check_dependencies_orphans(&conn, &mut report.checks);
         report
     }
@@ -13352,7 +13389,7 @@ mod tests {
             .unwrap();
         drop(storage);
 
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
         let mut checks = Vec::new();
         check_base_jsonl_missing_post_flush(&conn, &beads_dir, &mut checks);
 
@@ -13376,7 +13413,7 @@ mod tests {
         let db_path = beads_dir.join("beads.db");
         let _storage = SqliteStorage::open(&db_path).unwrap();
 
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
         let mut checks = Vec::new();
         check_base_jsonl_missing_post_flush(&conn, &beads_dir, &mut checks);
 
@@ -13390,7 +13427,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("beads.db");
         let _storage = SqliteStorage::open(&db_path).unwrap();
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
         let mut checks = Vec::new();
         check_dirty_bitmap_divergence(&conn, &mut checks);
         let check = find_check(&checks, "dirty_bitmap").expect("check present");
@@ -13404,16 +13441,10 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("beads.db");
         let _storage = SqliteStorage::open(&db_path).unwrap();
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
         // Disable FK enforcement so the orphan insert succeeds.
-        let _ = conn.execute("PRAGMA foreign_keys = OFF");
-        conn.execute_with_params(
-            "INSERT INTO dirty_issues(issue_id, marked_at) VALUES (?1, ?2)",
-            &[
-                SqliteValue::Text("bd-orphan-1".into()),
-                SqliteValue::Text("2026-05-14T00:00:00Z".into()),
-            ],
-        )
+        let _ = conn.execute("PRAGMA foreign_keys = OFF", []);
+        { let __v = [SqlValue::from("bd-orphan-1"), SqlValue::from("2026-05-14T00:00:00Z"),]; let __p = crate::storage::db::params_from(&__v); conn.execute("INSERT INTO dirty_issues(issue_id, marked_at) VALUES (?1, ?2)", __p.as_slice()) }
         .unwrap();
 
         let mut checks = Vec::new();
@@ -13444,16 +13475,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("beads.db");
         let _storage = SqliteStorage::open(&db_path).unwrap();
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
-        let _ = conn.execute("PRAGMA foreign_keys = OFF");
-        conn.execute_with_params(
-            "INSERT INTO dependencies(issue_id, depends_on_id, type) VALUES (?1, ?2, ?3)",
-            &[
-                SqliteValue::Text("bd-orphan-d".into()),
-                SqliteValue::Text("bd-other".into()),
-                SqliteValue::Text("blocks".into()),
-            ],
-        )
+        let conn = Connection::open(&db_path).unwrap();
+        let _ = conn.execute("PRAGMA foreign_keys = OFF", []);
+        { let __v = [SqlValue::from("bd-orphan-d"), SqlValue::from("bd-other"), SqlValue::from("blocks"),]; let __p = crate::storage::db::params_from(&__v); conn.execute("INSERT INTO dependencies(issue_id, depends_on_id, type) VALUES (?1, ?2, ?3)", __p.as_slice()) }
         .unwrap();
 
         let mut checks = Vec::new();
@@ -13480,15 +13504,8 @@ mod tests {
             )
             .unwrap();
         drop(storage);
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
-        conn.execute_with_params(
-            "INSERT INTO dependencies(issue_id, depends_on_id, type) VALUES (?1, ?2, ?3)",
-            &[
-                SqliteValue::Text("bd-owner-d".into()),
-                SqliteValue::Text("bd-missing-local-target".into()),
-                SqliteValue::Text("blocks".into()),
-            ],
-        )
+        let conn = Connection::open(&db_path).unwrap();
+        { let __v = [SqlValue::from("bd-owner-d"), SqlValue::from("bd-missing-local-target"), SqlValue::from("blocks"),]; let __p = crate::storage::db::params_from(&__v); conn.execute("INSERT INTO dependencies(issue_id, depends_on_id, type) VALUES (?1, ?2, ?3)", __p.as_slice()) }
         .unwrap();
 
         let mut checks = Vec::new();
@@ -13527,15 +13544,8 @@ mod tests {
             )
             .unwrap();
         drop(storage);
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
-        conn.execute_with_params(
-            "INSERT INTO dependencies(issue_id, depends_on_id, type) VALUES (?1, ?2, ?3)",
-            &[
-                SqliteValue::Text("bd-local-d".into()),
-                SqliteValue::Text("external:upstream-1".into()),
-                SqliteValue::Text("blocks".into()),
-            ],
-        )
+        let conn = Connection::open(&db_path).unwrap();
+        { let __v = [SqlValue::from("bd-local-d"), SqlValue::from("external:upstream-1"), SqlValue::from("blocks"),]; let __p = crate::storage::db::params_from(&__v); conn.execute("INSERT INTO dependencies(issue_id, depends_on_id, type) VALUES (?1, ?2, ?3)", __p.as_slice()) }
         .unwrap();
         let mut checks = Vec::new();
         check_dependencies_orphans(&conn, &mut checks);
@@ -13567,7 +13577,7 @@ mod tests {
         )
         .unwrap();
 
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
         let mut checks = Vec::new();
         check_workflow_statuses(&conn, beads_dir, &mut checks);
         let check = find_check(&checks, "policy.workflow_statuses").expect("check present");
@@ -13607,7 +13617,7 @@ mod tests {
         )
         .unwrap();
 
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
         let mut checks = Vec::new();
         check_workflow_statuses(&conn, beads_dir, &mut checks);
         let check = find_check(&checks, "policy.workflow_statuses").expect("check present");
@@ -13628,7 +13638,7 @@ mod tests {
         storage.create_issue(&bad, "tester").unwrap();
         drop(storage);
 
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
         let mut checks = Vec::new();
         check_workflow_statuses(&conn, beads_dir, &mut checks);
         assert!(
@@ -13664,7 +13674,7 @@ mod tests {
         ));
 
         let mut after = Vec::new();
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
         check_dependencies_orphans(&conn, &mut after);
         let check = find_check(&after, "dependencies.orphans").expect("check present");
         assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
@@ -13690,15 +13700,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("beads.db");
         let _storage = SqliteStorage::open(&db_path).unwrap();
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
-        let _ = conn.execute("PRAGMA foreign_keys = OFF");
-        conn.execute_with_params(
-            "INSERT INTO labels(issue_id, label) VALUES (?1, ?2)",
-            &[
-                SqliteValue::Text("bd-orphan-l".into()),
-                SqliteValue::Text("doc".into()),
-            ],
-        )
+        let conn = Connection::open(&db_path).unwrap();
+        let _ = conn.execute("PRAGMA foreign_keys = OFF", []);
+        { let __v = [SqlValue::from("bd-orphan-l"), SqlValue::from("doc"),]; let __p = crate::storage::db::params_from(&__v); conn.execute("INSERT INTO labels(issue_id, label) VALUES (?1, ?2)", __p.as_slice()) }
         .unwrap();
 
         let mut checks = Vec::new();
@@ -13718,7 +13722,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("beads.db");
         let _storage = SqliteStorage::open(&db_path).unwrap();
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
         let mut checks = Vec::new();
         check_labels_orphans(&conn, &mut checks);
         let check = find_check(&checks, "labels.orphans").expect("check present");
@@ -13733,15 +13737,9 @@ mod tests {
         let db_path = beads_dir.join("beads.db");
         let _storage = SqliteStorage::open(&db_path).unwrap();
         {
-            let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
-            let _ = conn.execute("PRAGMA foreign_keys = OFF");
-            conn.execute_with_params(
-                "INSERT INTO labels(issue_id, label) VALUES (?1, ?2)",
-                &[
-                    SqliteValue::Text("bd-orphan-fix-l".into()),
-                    SqliteValue::Text("doc".into()),
-                ],
-            )
+            let conn = Connection::open(&db_path).unwrap();
+            let _ = conn.execute("PRAGMA foreign_keys = OFF", []);
+            { let __v = [SqlValue::from("bd-orphan-fix-l"), SqlValue::from("doc"),]; let __p = crate::storage::db::params_from(&__v); conn.execute("INSERT INTO labels(issue_id, label) VALUES (?1, ?2)", __p.as_slice()) }
             .unwrap();
         }
 
@@ -13752,7 +13750,7 @@ mod tests {
             checks: Vec::new(),
         };
         {
-            let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            let conn = Connection::open(&db_path).unwrap();
             check_labels_orphans(&conn, &mut report.checks);
         }
         assert!(
@@ -13773,7 +13771,7 @@ mod tests {
         ));
 
         let mut after = Vec::new();
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
         check_labels_orphans(&conn, &mut after);
         let check = find_check(&after, "labels.orphans").expect("check present");
         assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
@@ -13784,17 +13782,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("beads.db");
         let _storage = SqliteStorage::open(&db_path).unwrap();
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
-        let _ = conn.execute("PRAGMA foreign_keys = OFF");
-        conn.execute_with_params(
-            "INSERT INTO comments(issue_id, text, created_at, author) VALUES (?1, ?2, ?3, ?4)",
-            &[
-                SqliteValue::Text("bd-orphan-c".into()),
-                SqliteValue::Text("orphan body".into()),
-                SqliteValue::Text("2026-05-15T00:00:00Z".into()),
-                SqliteValue::Text("ghost".into()),
-            ],
-        )
+        let conn = Connection::open(&db_path).unwrap();
+        let _ = conn.execute("PRAGMA foreign_keys = OFF", []);
+        { let __v = [SqlValue::from("bd-orphan-c"), SqlValue::from("orphan body"), SqlValue::from("2026-05-15T00:00:00Z"), SqlValue::from("ghost"),]; let __p = crate::storage::db::params_from(&__v); conn.execute("INSERT INTO comments(issue_id, text, created_at, author) VALUES (?1, ?2, ?3, ?4)", __p.as_slice()) }
         .unwrap();
 
         let mut checks = Vec::new();
@@ -13814,7 +13804,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("beads.db");
         let _storage = SqliteStorage::open(&db_path).unwrap();
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
         let mut checks = Vec::new();
         check_comments_orphans(&conn, &mut checks);
         let check = find_check(&checks, "comments.orphans").expect("check present");
@@ -13829,17 +13819,9 @@ mod tests {
         let db_path = beads_dir.join("beads.db");
         let _storage = SqliteStorage::open(&db_path).unwrap();
         {
-            let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
-            let _ = conn.execute("PRAGMA foreign_keys = OFF");
-            conn.execute_with_params(
-                "INSERT INTO comments(issue_id, text, created_at, author) VALUES (?1, ?2, ?3, ?4)",
-                &[
-                    SqliteValue::Text("bd-orphan-fix".into()),
-                    SqliteValue::Text("orphan body".into()),
-                    SqliteValue::Text("2026-05-15T00:00:00Z".into()),
-                    SqliteValue::Text("ghost".into()),
-                ],
-            )
+            let conn = Connection::open(&db_path).unwrap();
+            let _ = conn.execute("PRAGMA foreign_keys = OFF", []);
+            { let __v = [SqlValue::from("bd-orphan-fix"), SqlValue::from("orphan body"), SqlValue::from("2026-05-15T00:00:00Z"), SqlValue::from("ghost"),]; let __p = crate::storage::db::params_from(&__v); conn.execute("INSERT INTO comments(issue_id, text, created_at, author) VALUES (?1, ?2, ?3, ?4)", __p.as_slice()) }
             .unwrap();
         }
 
@@ -13850,7 +13832,7 @@ mod tests {
             checks: Vec::new(),
         };
         {
-            let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            let conn = Connection::open(&db_path).unwrap();
             check_comments_orphans(&conn, &mut report.checks);
         }
         assert!(
@@ -13871,7 +13853,7 @@ mod tests {
         ));
 
         let mut after = Vec::new();
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
         check_comments_orphans(&conn, &mut after);
         let check = find_check(&after, "comments.orphans").expect("check present");
         assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
@@ -13893,8 +13875,8 @@ mod tests {
         let storage = SqliteStorage::open(&db_path).unwrap();
         drop(storage);
         {
-            let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
-            conn.execute("DROP TABLE events").unwrap();
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute("DROP TABLE events", []).unwrap();
             conn.execute(
                 "CREATE TABLE events (
                     id INTEGER PRIMARY KEY,
@@ -13904,17 +13886,10 @@ mod tests {
                     created_at TEXT NOT NULL DEFAULT '',
                     metadata TEXT
                 )",
-            )
+            [],
+        )
             .unwrap();
-            conn.execute_with_params(
-                "INSERT INTO events(issue_id, event_type, actor, created_at) VALUES (?1, ?2, ?3, ?4)",
-                &[
-                    SqliteValue::Text("bd-null-fix".into()),
-                    SqliteValue::Text("created".into()),
-                    SqliteValue::Null,
-                    SqliteValue::Text("2026-05-15T00:00:00Z".into()),
-                ],
-            )
+            { let __v = [SqlValue::from("bd-null-fix"), SqlValue::from("created"), SqlValue::null(), SqlValue::from("2026-05-15T00:00:00Z"),]; let __p = crate::storage::db::params_from(&__v); conn.execute("INSERT INTO events(issue_id, event_type, actor, created_at) VALUES (?1, ?2, ?3, ?4)", __p.as_slice()) }
             .unwrap();
         }
 
@@ -13925,7 +13900,7 @@ mod tests {
             checks: Vec::new(),
         };
         {
-            let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            let conn = Connection::open(&db_path).unwrap();
             check_null_defaults(&conn, &mut report.checks);
         }
         assert!(
@@ -13947,17 +13922,16 @@ mod tests {
         ));
 
         // Detector now clean, and the NULL was backfilled to the schema default ''.
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
         let mut after = Vec::new();
         check_null_defaults(&conn, &mut after);
         let check = find_check(&after, "db.null_defaults").expect("check present");
         assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
-        let rows = conn
-            .query("SELECT actor FROM events WHERE issue_id = 'bd-null-fix'")
+        let rows = query_all(&conn, "SELECT actor FROM events WHERE issue_id = 'bd-null-fix'")
             .unwrap();
-        let actor = rows.first().and_then(|row| row.values().first().cloned());
+        let actor = rows.first().and_then(|row| row.first());
         assert!(
-            matches!(actor, Some(SqliteValue::Text(ref s)) if s.is_empty()),
+            actor.and_then(SqlValue::as_text) == Some(""),
             "actor should be backfilled to '': {actor:?}"
         );
     }
@@ -13973,15 +13947,9 @@ mod tests {
         let db_path = beads_dir.join("beads.db");
         let _storage = SqliteStorage::open(&db_path).unwrap();
         {
-            let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
-            let _ = conn.execute("PRAGMA foreign_keys = OFF");
-            conn.execute_with_params(
-                "INSERT INTO dirty_issues(issue_id, marked_at) VALUES (?1, ?2)",
-                &[
-                    SqliteValue::Text("bd-orphan-fix".into()),
-                    SqliteValue::Text("2026-05-15T00:00:00Z".into()),
-                ],
-            )
+            let conn = Connection::open(&db_path).unwrap();
+            let _ = conn.execute("PRAGMA foreign_keys = OFF", []);
+            { let __v = [SqlValue::from("bd-orphan-fix"), SqlValue::from("2026-05-15T00:00:00Z"),]; let __p = crate::storage::db::params_from(&__v); conn.execute("INSERT INTO dirty_issues(issue_id, marked_at) VALUES (?1, ?2)", __p.as_slice()) }
             .unwrap();
         }
 
@@ -13992,7 +13960,7 @@ mod tests {
             checks: Vec::new(),
         };
         {
-            let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            let conn = Connection::open(&db_path).unwrap();
             check_dirty_bitmap_divergence(&conn, &mut report.checks);
         }
         let warned = report
@@ -14013,7 +13981,7 @@ mod tests {
 
         // Re-run the detector against the same DB; it must now be clean.
         let mut after = Vec::new();
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
         check_dirty_bitmap_divergence(&conn, &mut after);
         let check = find_check(&after, "dirty_bitmap").expect("check present");
         assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
@@ -14031,15 +13999,9 @@ mod tests {
         let db_path = beads_dir.join("beads.db");
         let _storage = SqliteStorage::open(&db_path).unwrap();
         {
-            let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
-            let _ = conn.execute("PRAGMA foreign_keys = OFF");
-            conn.execute_with_params(
-                "INSERT INTO dirty_issues(issue_id, marked_at) VALUES (?1, ?2)",
-                &[
-                    SqliteValue::Null,
-                    SqliteValue::Text("2026-05-15T00:00:00Z".into()),
-                ],
-            )
+            let conn = Connection::open(&db_path).unwrap();
+            let _ = conn.execute("PRAGMA foreign_keys = OFF", []);
+            { let __v = [SqlValue::null(), SqlValue::from("2026-05-15T00:00:00Z"),]; let __p = crate::storage::db::params_from(&__v); conn.execute("INSERT INTO dirty_issues(issue_id, marked_at) VALUES (?1, ?2)", __p.as_slice()) }
             .unwrap();
         }
 
@@ -14050,7 +14012,7 @@ mod tests {
             checks: Vec::new(),
         };
         {
-            let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            let conn = Connection::open(&db_path).unwrap();
             check_dirty_bitmap_divergence(&conn, &mut report.checks);
         }
         assert!(
@@ -14070,12 +14032,9 @@ mod tests {
             Some(&mut session),
         ));
 
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
-        let count = conn
-            .query_row("SELECT COUNT(*) FROM dirty_issues")
-            .unwrap()
-            .get(0)
-            .and_then(SqliteValue::as_integer)
+        let conn = Connection::open(&db_path).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM dirty_issues", [], |r| r.get(0))
             .unwrap_or(-1);
         assert_eq!(count, 0, "NULL issue_id orphan should be pruned");
     }
@@ -14095,7 +14054,7 @@ mod tests {
             reliability_audit: None,
             checks: Vec::new(),
         };
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
         check_dirty_bitmap_divergence(&conn, &mut report.checks);
 
         let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
@@ -15582,8 +15541,12 @@ mod tests {
         let beads_dir = temp.path().join(".beads");
         fs::create_dir_all(&beads_dir).unwrap();
         let db_path = beads_dir.join("beads.db");
-        let wal_writer = create_valid_oversized_wal(&db_path);
-        wal_writer.close().unwrap();
+        // Deliberately NOT closed before the check. C SQLite runs a checkpoint and removes the
+        // -wal file when the last connection closes, so a closed handle leaves nothing oversized
+        // on disk and the check correctly reports nothing. frankensqlite did not checkpoint on
+        // close, which is why the original fixture could close first. The WAL is only oversized
+        // while a writer holds it open, so the check has to run against the live file.
+        let _wal_writer = create_valid_oversized_wal(&db_path);
 
         let mut report = DoctorReport {
             ok: false,
@@ -15619,19 +15582,18 @@ mod tests {
     }
 
     fn create_valid_oversized_wal(db_path: &Path) -> Connection {
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
-        conn.execute("PRAGMA journal_mode = WAL").unwrap();
-        conn.execute("PRAGMA wal_autocheckpoint = 0").unwrap();
-        conn.execute("CREATE TABLE wal_growth (id INTEGER PRIMARY KEY, payload TEXT)")
+        let conn = Connection::open(&db_path).unwrap();
+        // Returns the new journal mode, so it must be a query, not an execute.
+        conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))
+            .unwrap();
+        conn.pragma_update(None, "wal_autocheckpoint", "0").unwrap();
+        conn.execute("CREATE TABLE wal_growth (id INTEGER PRIMARY KEY, payload TEXT)", [])
             .unwrap();
 
         let payload = "x".repeat(1024 * 1024);
         let wal_path = sqlite_wal_sidecar_path(db_path);
         for _ in 0..(WAL_OVERSIZED_BYTES / (1024 * 1024) + 4) {
-            conn.execute_with_params(
-                "INSERT INTO wal_growth(payload) VALUES (?1)",
-                &[SqliteValue::Text(payload.as_str().into())],
-            )
+            { let __v = [SqlValue::from(payload.as_str())]; let __p = crate::storage::db::params_from(&__v); conn.execute("INSERT INTO wal_growth(payload) VALUES (?1)", __p.as_slice()) }
             .unwrap();
             if fs::metadata(&wal_path).map_or(0, |meta| meta.len()) > WAL_OVERSIZED_BYTES {
                 break;
@@ -16943,7 +16905,7 @@ mod tests {
         let db_path = beads_dir.join("beads.db");
         let jsonl_path = beads_dir.join("issues.jsonl");
 
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
         conn.execute(
             r"
             CREATE TABLE issues (
@@ -16956,6 +16918,7 @@ mod tests {
                 updated_at TEXT NOT NULL
             )
             ",
+            [],
         )
         .unwrap();
         conn.close().unwrap();
@@ -16992,7 +16955,7 @@ mod tests {
         let db_path = beads_dir.join("beads.db");
         let jsonl_path = beads_dir.join("issues.jsonl");
 
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
         conn.execute(
             r"
             CREATE TABLE issues (
@@ -17005,6 +16968,7 @@ mod tests {
                 updated_at TEXT NOT NULL
             )
             ",
+            [],
         )
         .unwrap();
         fs::write(&jsonl_path, "{\"id\":\"bd-test\"}\n").unwrap();
@@ -17439,8 +17403,8 @@ mod tests {
     #[test]
     fn test_integrity_check_messages_collects_all_rows() {
         let messages = integrity_check_messages(&[
-            vec![SqliteValue::Text("row 1 missing from index idx_a".into())],
-            vec![SqliteValue::Text("row 2 missing from index idx_a".into())],
+            vec![SqlValue::from("row 1 missing from index idx_a")],
+            vec![SqlValue::from("row 2 missing from index idx_a")],
         ]);
 
         assert_eq!(
@@ -17466,7 +17430,7 @@ mod tests {
         storage.set_metadata("jsonl_content_hash", &jsonl_hash)?;
         drop(storage);
 
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
         let mut checks = Vec::new();
         check_sync_metadata(&conn, &db_path, Some(&jsonl_path), &mut checks);
 
@@ -17498,7 +17462,7 @@ mod tests {
         assert_eq!(storage.get_dirty_issue_count()?, 0);
         drop(storage);
 
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
         let mut checks = Vec::new();
         check_sync_metadata(&conn, &db_path, Some(&jsonl_path), &mut checks);
 
@@ -17538,7 +17502,7 @@ mod tests {
         assert_eq!(storage.get_dirty_issue_count()?, 0);
         drop(storage);
 
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
         let mut checks = Vec::new();
         check_sync_metadata(&conn, &db_path, Some(&jsonl_path), &mut checks);
 
@@ -17569,7 +17533,7 @@ mod tests {
         storage.create_issue(&sample_issue("bd-local", "Local dirty issue"), "tester")?;
         drop(storage);
 
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
         let mut checks = Vec::new();
         check_sync_metadata(&conn, &db_path, Some(&jsonl_path), &mut checks);
 
@@ -17595,14 +17559,14 @@ mod tests {
         let db_path = temp.path().join("beads.db");
         let _storage = SqliteStorage::open(&db_path).unwrap();
 
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
-        conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-a')")
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-a')", [])
             .unwrap();
-        conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-b')")
+        conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-b')", [])
             .unwrap();
-        conn.execute("INSERT INTO metadata (key, value) VALUES ('project', 'dup-a')")
+        conn.execute("INSERT INTO metadata (key, value) VALUES ('project', 'dup-a')", [])
             .unwrap();
-        conn.execute("INSERT INTO metadata (key, value) VALUES ('project', 'dup-b')")
+        conn.execute("INSERT INTO metadata (key, value) VALUES ('project', 'dup-b')", [])
             .unwrap();
 
         let mut checks = Vec::new();
@@ -17644,7 +17608,7 @@ mod tests {
         let mut storage = SqliteStorage::open(&db_path).unwrap();
         storage.mark_blocked_cache_stale()?;
 
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
         let mut checks = Vec::new();
         check_recoverable_anomalies(&conn, &mut checks)?;
 
@@ -17673,7 +17637,7 @@ mod tests {
         )?;
         drop(storage);
 
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
         let mut checks = Vec::new();
         check_recoverable_anomalies(&conn, &mut checks)?;
 
@@ -17715,7 +17679,7 @@ mod tests {
         )?;
         drop(storage);
 
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
         let mut checks = Vec::new();
         check_recoverable_anomalies(&conn, &mut checks)?;
 
@@ -18059,7 +18023,7 @@ mod tests {
                 .unwrap();
         }
 
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
         let mut checks = Vec::new();
         check_issue_write_probe(&conn, &mut checks);
 
@@ -18089,8 +18053,8 @@ mod tests {
                 .unwrap();
         }
 
-        let lock_conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
-        lock_conn.execute("BEGIN IMMEDIATE").unwrap();
+        let lock_conn = Connection::open(&db_path).unwrap();
+        lock_conn.execute("BEGIN IMMEDIATE", []).unwrap();
 
         let mut checks = Vec::new();
         inspect_existing_doctor_database(
@@ -18115,7 +18079,7 @@ mod tests {
             check.message
         );
 
-        lock_conn.execute("ROLLBACK").unwrap();
+        lock_conn.execute("ROLLBACK", []).unwrap();
     }
 
     #[test]
@@ -18123,7 +18087,10 @@ mod tests {
         let check = build_issue_write_probe_check(
             "bd-probe",
             Ok(1),
-            Err(FrankenError::Internal("rollback failed".to_string())),
+            Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR as i32),
+                Some("rollback failed".to_string()),
+            )),
         );
 
         assert!(matches!(check.status, CheckStatus::Error));
@@ -18163,7 +18130,10 @@ mod tests {
         let check = build_issue_write_probe_check(
             "bd-probe",
             Ok(0),
-            Err(FrankenError::Internal("rollback failed".to_string())),
+            Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR as i32),
+                Some("rollback failed".to_string()),
+            )),
         );
 
         assert!(matches!(check.status, CheckStatus::Error));
@@ -18193,7 +18163,10 @@ mod tests {
     fn test_build_issue_write_probe_check_preserves_write_failure() {
         let check = build_issue_write_probe_check(
             "bd-probe",
-            Err(FrankenError::Internal("write failed".to_string())),
+            Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR as i32),
+                Some("write failed".to_string()),
+            )),
             Ok(0),
         );
 
@@ -18634,7 +18607,7 @@ mod tests {
         );
         storage.create_issue(&bad, "tester").unwrap();
 
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
         let mut checks = Vec::new();
         check_suspect_close_reasons(&conn, &mut checks);
 
@@ -18663,7 +18636,7 @@ mod tests {
         triaged.labels = vec!["audit-historical-cycle-close-2026-05-09".to_string()];
         storage.create_issue(&triaged, "tester").unwrap();
 
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
         let mut checks = Vec::new();
         check_suspect_close_reasons(&conn, &mut checks);
 
@@ -18688,7 +18661,7 @@ mod tests {
         malformed.labels = vec!["audit-historical-cycle-close-not-a-date".to_string()];
         storage.create_issue(&malformed, "tester").unwrap();
 
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
         let mut checks = Vec::new();
         check_suspect_close_reasons(&conn, &mut checks);
 
@@ -18717,7 +18690,7 @@ mod tests {
         suspect.labels = vec!["audit-suspect-allowed".to_string()];
         storage.create_issue(&suspect, "tester").unwrap();
 
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
         let mut checks = Vec::new();
         check_suspect_close_reasons(&conn, &mut checks);
 
@@ -18745,7 +18718,7 @@ mod tests {
         );
         storage.create_issue(&normal, "tester").unwrap();
 
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
         let mut checks = Vec::new();
         check_suspect_close_reasons(&conn, &mut checks);
 
@@ -18765,7 +18738,7 @@ mod tests {
         );
         storage.create_issue(&auto, "tester").unwrap();
 
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
         let mut checks = Vec::new();
         check_suspect_close_reasons(&conn, &mut checks);
 
@@ -20136,7 +20109,7 @@ version = "2026-05-11-abc123"
         write_jsonl_with_ids(&jsonl_path, &["bd-1", "bd-2", "bd-only-jsonl"]);
 
         let conn =
-            Connection::open(db_path.to_string_lossy().into_owned()).expect("open db for read");
+            Connection::open(&db_path).expect("open db for read");
         let delta = compute_db_jsonl_id_delta(&conn, &jsonl_path).expect("id delta should succeed");
 
         // The intersection contains bd-1 and bd-2.
@@ -20157,7 +20130,7 @@ version = "2026-05-11-abc123"
         let jsonl_path = tmp.path().join("issues.jsonl");
         write_jsonl_with_ids(&jsonl_path, &["bd-a", "bd-b"]);
 
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
         let delta = compute_db_jsonl_id_delta(&conn, &jsonl_path).unwrap();
 
         assert_eq!(delta.both_count, 2);
@@ -20650,10 +20623,10 @@ version = "2026-05-11-abc123"
             .unwrap();
         drop(storage);
 
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
-        conn.execute(r#"CREATE INDEX "123doctor_weird" ON issues(title)"#)
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(r#"CREATE INDEX "123doctor_weird" ON issues(title)"#, [])
             .unwrap();
-        conn.execute(r#"CREATE INDEX "doctor""quoted" ON issues(status)"#)
+        conn.execute(r#"CREATE INDEX "doctor""quoted" ON issues(status)"#, [])
             .unwrap();
         conn.close().unwrap();
 
@@ -20772,7 +20745,7 @@ version = "2026-05-11-abc123"
         let jsonl_path = tmp.path().join("issues.jsonl");
         write_jsonl_with_ids(&jsonl_path, &["bd-a", "bd-wisp-ephemeral"]);
 
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
         let delta = compute_db_jsonl_id_delta(&conn, &jsonl_path).unwrap();
 
         // The wisp id must be filtered out, otherwise the delta would

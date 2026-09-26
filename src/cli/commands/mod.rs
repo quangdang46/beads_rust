@@ -658,8 +658,8 @@ mod tests {
     use crate::storage::SqliteStorage;
     use crate::sync::{ExportConfig, export_to_jsonl_with_policy};
     use chrono::Utc;
-    use fsqlite::Connection;
     use fsqlite_error::FrankenError;
+    use rusqlite::Connection;
     use std::fs;
     use std::path::Path;
     use tempfile::TempDir;
@@ -792,9 +792,9 @@ mod tests {
         let db_path = temp.path().join("beads.db");
         let mut storage = SqliteStorage::open(&db_path).expect("storage");
         let conn = Connection::open(db_path.to_string_lossy().into_owned()).expect("conn");
-        conn.execute("DROP TABLE blocked_issues_cache")
+        conn.execute("DROP TABLE blocked_issues_cache", [])
             .expect("drop blocked cache table");
-        conn.execute("DROP TABLE metadata")
+        conn.execute("DROP TABLE metadata", [])
             .expect("drop metadata table");
 
         let result: crate::Result<()> = Err(BeadsError::validation("ids", "boom"));
@@ -823,7 +823,7 @@ mod tests {
         let db_path = temp.path().join("beads.db");
         let mut storage = SqliteStorage::open(&db_path).expect("storage");
         let conn = Connection::open(db_path.to_string_lossy().into_owned()).expect("conn");
-        conn.execute("DROP TABLE blocked_issues_cache")
+        conn.execute("DROP TABLE blocked_issues_cache", [])
             .expect("drop blocked cache table");
 
         finalize_batched_blocked_cache_refresh(&mut storage, true, "close")
