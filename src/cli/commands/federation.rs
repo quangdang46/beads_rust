@@ -5,12 +5,12 @@
 //! with parameterized queries (no SQL interpolation).
 
 use clap::{Args, Subcommand};
-use fsqlite::Connection;
-use fsqlite_types::SqliteValue;
+use rusqlite::Connection;
 
 use crate::error::{BeadsError, Result};
 use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
+use crate::storage::db::{self, SqlValue};
 use crate::sync::{self, ExportConfig, ImportConfig};
 use crate::util::credentials::CredentialKey;
 use chrono::Utc;
@@ -87,12 +87,22 @@ struct FederationPeer {
 }
 
 impl FederationPeer {
-    fn from_row(row: &fsqlite::Row) -> Self {
+    /// Build a peer from one row's column values.
+    ///
+    /// Takes a borrowed slice rather than a row handle. frankensqlite's `Row` owned its
+    /// `Vec<SqliteValue>`, so a `&Row` could outlive the statement that produced it; a rusqlite
+    /// `Row` is a handle onto its `Statement` and has no `Clone`, so the only owned shape
+    /// available is the column values themselves, copied out as the statement is iterated.
+    /// Index-by-index with a lenient `unwrap_or_default` is unchanged from the frankensqlite
+    /// version: a NULL, a non-text value, and a short row all read as the empty string here,
+    /// exactly as they did when `row.get(idx)` returned `None` for all three.
+    fn from_row(values: &[SqlValue]) -> Self {
         let get_text = |idx: usize| -> String {
-            row.get(idx)
-                .and_then(SqliteValue::as_text)
-                .map(String::from)
+            values
+                .get(idx)
+                .and_then(SqlValue::as_text)
                 .unwrap_or_default()
+                .to_string()
         };
         Self {
             name: get_text(0),
@@ -110,6 +120,38 @@ impl FederationPeer {
 // Database helpers
 // ---------------------------------------------------------------------------
 
+/// Bind a slice of [`SqlValue`] as statement parameters.
+///
+/// frankensqlite took `&[SqliteValue]` directly; rusqlite takes any `Params`, and iterating the
+/// borrowed values is the exact equivalent without copying them into a `Vec`. Local to this file
+/// on purpose: the adapter in `storage::db` is deleted in Phase 8, and so is the need for this
+/// shim, since the call sites then bind plain `&str` literals.
+fn params_from(values: &[SqlValue]) -> impl rusqlite::Params + '_ {
+    rusqlite::params_from_iter(values.iter())
+}
+
+/// Collect every row of a bound statement as owned column values.
+///
+/// `db::query_rows` is the adapter's version of this loop, but it binds no parameters, so the
+/// `WHERE name = ?1` query cannot use it. The loop is otherwise identical, and the eager copy is
+/// still mandatory rather than an optimisation: a rusqlite `Row` is a handle onto its statement
+/// with no `Clone`, so the columns have to be read out as the `Rows` iterator walks them.
+fn query_rows_with_params(
+    stmt: &mut rusqlite::Statement<'_>,
+    params: impl rusqlite::Params,
+) -> rusqlite::Result<Vec<Vec<SqlValue>>> {
+    let total = stmt.column_count();
+    let mut rows = stmt.query(params)?;
+    let mut out = Vec::new();
+    // `Rows::next` is an INHERENT method here, not the `FallibleStreamingIterator` trait method,
+    // so no trait import is needed to reach it. It is still a fallible streaming iterator, which
+    // is why this cannot be a plain `for` loop.
+    while let Some(row) = rows.next()? {
+        out.push(db::column_values(row, 0, total)?);
+    }
+    Ok(out)
+}
+
 /// Path to the default beads database.
 fn default_beads_dir() -> PathBuf {
     let cwd = std::env::current_dir().unwrap_or_default();
@@ -125,9 +167,10 @@ fn open_connection() -> Result<Connection> {
     let path_str = db_path.to_str().ok_or_else(|| BeadsError::Internal {
         message: "invalid beads directory path".to_string(),
     })?;
-    // `DatabaseLegacy` because this still opens through frankensqlite; Phase 8 deletes that
-    // variant once no `src/` file imports fsqlite. See the variant's doc comment.
-    Connection::open(path_str).map_err(BeadsError::DatabaseLegacy)
+    // Errors come from the current engine, so they land in `Database`. The sibling
+    // `DatabaseLegacy` variant still exists only because the rest of `src/` has not finished the
+    // frankensqlite port; Phase 8 deletes it. See the variant's doc comment.
+    Connection::open(path_str).map_err(db::db_err)
 }
 
 /// Insert a new federation peer using parameterized queries.
@@ -136,62 +179,71 @@ fn federation_peers_insert(
     peer: &FederationPeer,
     encrypted_password: Option<Vec<u8>>,
 ) -> Result<()> {
-    conn.execute_with_params(
+    let params = [
+        SqlValue::from(peer.name.as_str()),
+        SqlValue::from(peer.remote_url.as_str()),
+        SqlValue::from(peer.username.as_str()),
+        match &encrypted_password {
+            Some(bytes) => SqlValue::from(std::sync::Arc::<[u8]>::from(bytes.as_slice())),
+            None => SqlValue::new(rusqlite::types::Value::Null),
+        },
+        SqlValue::from(peer.sovereignty.as_str()),
+        SqlValue::from(peer.last_sync.as_str()),
+        SqlValue::from(peer.created_at.as_str()),
+        SqlValue::from(peer.updated_at.as_str()),
+    ];
+    conn.execute(
         "INSERT OR REPLACE INTO federation_peers
          (name, remote_url, username, password_encrypted, sovereignty, last_sync, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        &[
-            SqliteValue::from(peer.name.as_str()),
-            SqliteValue::from(peer.remote_url.as_str()),
-            SqliteValue::from(peer.username.as_str()),
-            match &encrypted_password {
-                Some(bytes) => SqliteValue::Blob(std::sync::Arc::from(bytes.as_slice())),
-                None => SqliteValue::Null,
-            },
-            SqliteValue::from(peer.sovereignty.as_str()),
-            SqliteValue::from(peer.last_sync.as_str()),
-            SqliteValue::from(peer.created_at.as_str()),
-            SqliteValue::from(peer.updated_at.as_str()),
-        ],
+        params_from(&params),
     )
-    .map_err(BeadsError::DatabaseLegacy)?;
+    .map_err(db::db_err)?;
     Ok(())
 }
 
 /// List all federation peers.
 fn federation_peers_list(conn: &Connection) -> Result<Vec<FederationPeer>> {
-    let rows = conn
-        .query(
+    let mut stmt = conn
+        .prepare(
             "SELECT name, remote_url, username, password_encrypted,
                     sovereignty, last_sync, created_at, updated_at
              FROM federation_peers
              ORDER BY name",
         )
-        .map_err(BeadsError::DatabaseLegacy)?;
-    Ok(rows.iter().map(FederationPeer::from_row).collect())
+        .map_err(db::db_err)?;
+    let rows = db::query_rows(&mut stmt).map_err(db::db_err)?;
+    Ok(rows
+        .iter()
+        .map(|values| FederationPeer::from_row(values.as_slice()))
+        .collect())
 }
 
 /// Get a single peer by name.
 fn federation_peers_get(conn: &Connection, name: &str) -> Result<Option<FederationPeer>> {
-    let rows = conn
-        .query_with_params(
+    let params = [SqlValue::from(name)];
+    let mut stmt = conn
+        .prepare(
             "SELECT name, remote_url, username, password_encrypted,
                     sovereignty, last_sync, created_at, updated_at
              FROM federation_peers
              WHERE name = ?1",
-            &[SqliteValue::from(name)],
         )
-        .map_err(BeadsError::DatabaseLegacy)?;
-    Ok(rows.first().map(|r| FederationPeer::from_row(r)))
+        .map_err(db::db_err)?;
+    let rows = query_rows_with_params(&mut stmt, params_from(&params)).map_err(db::db_err)?;
+    Ok(rows
+        .first()
+        .map(|values| FederationPeer::from_row(values.as_slice())))
 }
 
 /// Delete a peer by name.
 fn federation_peers_delete(conn: &Connection, name: &str) -> Result<()> {
-    conn.execute_with_params(
+    let params = [SqlValue::from(name)];
+    conn.execute(
         "DELETE FROM federation_peers WHERE name = ?1",
-        &[SqliteValue::from(name)],
+        params_from(&params),
     )
-    .map_err(BeadsError::DatabaseLegacy)?;
+    .map_err(db::db_err)?;
     Ok(())
 }
 
@@ -433,15 +485,16 @@ fn cmd_sync(conn: &Connection, args: &FederationSyncArgs, ctx: &OutputContext) -
 
     // Step 3: Update last_sync timestamp
     let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    conn.execute_with_params(
+    let params = [
+        SqlValue::from(now.as_str()),
+        SqlValue::from(now.as_str()),
+        SqlValue::from(args.name.as_str()),
+    ];
+    conn.execute(
         "UPDATE federation_peers SET last_sync = ?1, updated_at = ?2 WHERE name = ?3",
-        &[
-            SqliteValue::from(now.as_str()),
-            SqliteValue::from(now.as_str()),
-            SqliteValue::from(args.name.as_str()),
-        ],
+        params_from(&params),
     )
-    .map_err(BeadsError::DatabaseLegacy)?;
+    .map_err(db::db_err)?;
 
     if ctx.is_json() {
         println!(
@@ -566,6 +619,7 @@ mod tests {
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             )",
+            [],
         )
         .unwrap();
 

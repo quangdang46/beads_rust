@@ -3,8 +3,7 @@
 use clap::builder::StyledStr;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use clap_complete::engine::{ArgValueCompleter, CompletionCandidate};
-use fsqlite::Connection;
-use fsqlite_types::SqliteValue;
+use rusqlite::Connection;
 use serde::Deserialize;
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
@@ -16,6 +15,7 @@ use std::sync::OnceLock;
 use crate::config;
 use crate::format::{format_status_label, truncate_title};
 use crate::model::{IssueType, Status};
+use crate::storage::db::{SqlValue, db_err, query_rows};
 
 pub mod commands;
 
@@ -241,12 +241,14 @@ fn saved_queries_from_db(db_path: &Path) -> BTreeSet<String> {
 
     let Ok(queries) = config::with_database_family_snapshot(db_path, |snapshot_db_path| {
         let conn = Connection::open(snapshot_db_path.to_string_lossy().into_owned())?;
-        let _ = conn.execute("PRAGMA busy_timeout=0");
-        let rows = conn.query("SELECT key FROM config")?;
+        let _ = conn.execute("PRAGMA busy_timeout=0", []);
+        let rows = conn
+            .prepare("SELECT key FROM config")
+            .and_then(|mut stmt| query_rows(&mut stmt))?;
         let mut queries = BTreeSet::new();
 
         for row in &rows {
-            let Some(key) = row.get(0).and_then(SqliteValue::as_text) else {
+            let Some(key) = row.first().and_then(SqlValue::as_text) else {
                 continue;
             };
             if let Some(name) = key.strip_prefix(SAVED_QUERY_PREFIX)
@@ -256,7 +258,7 @@ fn saved_queries_from_db(db_path: &Path) -> BTreeSet<String> {
             }
         }
 
-        conn.close()?;
+        conn.close().map_err(|(_, err)| db_err(err))?;
         Ok(queries)
     }) else {
         return BTreeSet::new();

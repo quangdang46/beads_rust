@@ -1839,3 +1839,40 @@ write `matches!(e, BeadsError::Database(_))` to mean "is this a database error".
 predicate, so that when Phase 8 deletes `DatabaseLegacy` the call sites need no edit and no
 re-audit. `matches!` on a specific variant is only correct where the *engine* is genuinely the
 thing being tested.
+
+### 18.8 Phase 3's leaf-consumer scope is not independently achievable
+
+Phase 3 lists 24 "leaf" files outside `src/storage/`, on the reasoning that anything not touching
+the storage layer can be ported before the storage engine moves. Measured while executing it,
+that reasoning is wrong for a substantial subset, and the rule is simple:
+
+> A file that receives a **connection from `SqliteStorage`** cannot be ported before Phase 7,
+> because the handle it is handed is the storage layer's engine type. A file that opens its
+> **own** connection can.
+
+Concretely, files that call `storage.mutate(..) |conn, ..|`, `conn.execute_with_params(..)` on a
+storage-owned handle, `conn.query_row(..)` on one, or pass a handle to
+`SqliteStorage::{blocked_cache_projection_health, ready_projection_health}` are all coupled, and
+the bind values they construct must be the storage engine's type. Porting the consumer side while
+the producer side still emits the old type produces a mixed-type file that does not compile and
+cannot be made to compile without doing the storage port.
+
+Affected and deliberately left on frankensqlite until Phase 7:
+
+- `epic.rs` — binds `SqlValue`s through a `storage.mutate` handle
+- `sql_cmd.rs` — receives `Vec<Vec<SqliteValue>>` from `execute_read_only_query`
+- `info.rs` — passes its handle to two `SqliteStorage` projection-health functions
+- `doctor.rs` — the production half is fully ported; two projection-health calls still open a
+  short-lived legacy handle, commented, rather than dropping the two findings
+- `doctor_subsystems/mutate.rs` — fully ported except the `run_migrations_atomic` handle, which is
+  Phase 4's subject
+
+**Consequence for sequencing:** the honest order is P2, then the storage port (P4–P7), then the
+leaf consumers. Doing P3 first produces churn that Phase 7 rewrites. P3 is not wasted -- the
+adapter (`db.rs`) is the load-bearing artefact and it is complete and tested -- but the per-file
+leaf ports are cheaper to do once, after, rather than twice.
+
+**The revision gate is the point of this document.** The plan's own Phase 3 exit criterion
+("`cargo check --all-targets` reports errors in only `src/storage/{sqlite,schema,events}.rs`") is
+unmeetable, and the first attempt at it failed for this reason. Had the plan's confidence
+statements been taken at face value, this would have been rediscovered the hard way in Phase 4.
