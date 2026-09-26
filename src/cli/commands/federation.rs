@@ -167,9 +167,6 @@ fn open_connection() -> Result<Connection> {
     let path_str = db_path.to_str().ok_or_else(|| BeadsError::Internal {
         message: "invalid beads directory path".to_string(),
     })?;
-    // Errors come from the current engine, so they land in `Database`. The sibling
-    // `DatabaseLegacy` variant still exists only because the rest of `src/` has not finished the
-    // frankensqlite port; Phase 8 deletes it. See the variant's doc comment.
     Connection::open(path_str).map_err(db::db_err)
 }
 

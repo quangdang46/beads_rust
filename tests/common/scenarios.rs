@@ -3215,7 +3215,7 @@ pub mod catalog {
         // any non-OK check — WARN or ERROR — now flips `ok` to false and
         // exits 1. The stress harness legitimately produces WARN-level
         // findings (RUST_LOG=beads_rust=debug set by the test runner,
-        // WAL-without-SHM "expected for frankensqlite", missing
+        // WAL-without-SHM (no open connection), missing
         // beads.base.jsonl anchor after the final flush, and a
         // .beads/.gitignore that doesn't list `.write.lock` because
         // `br init` writes a minimal one). None of those degrade the

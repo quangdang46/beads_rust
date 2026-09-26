@@ -19,7 +19,6 @@ use crate::sync::{
 use crate::util::id::{normalize_prefix, parse_id};
 use crate::validation::{CommentValidator, ISSUE_LABEL_MAX_COUNT, IssueValidator, LabelValidator};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
-use fsqlite_error::FrankenError;
 use rusqlite::{Connection, OpenFlags, params as rusqlite_params};
 
 use crate::storage::db::{self, SqlValue};
@@ -10871,9 +10870,9 @@ fn finish_issue_mutation_write_probe(
                     "ROLLBACK failed after zero-row issue write probe"
                 );
             }
-            Err(BeadsError::DatabaseLegacy(FrankenError::Internal(
-                "write probe did not find issue inside mutation transaction".to_string(),
-            )))
+            Err(BeadsError::internal(
+                "write probe did not find issue inside mutation transaction",
+            ))
         }
         (Ok(_), Ok(_)) => Ok(()),
         (Ok(_), Err(rollback_err)) => Err(BeadsError::Database(rollback_err)),
@@ -13029,10 +13028,10 @@ impl SqliteStorage {
         if issue_exists {
             let rows = self.update_issue_row_for_import(issue, &timestamps)?;
             if rows == 0 {
-                return Err(BeadsError::DatabaseLegacy(FrankenError::Internal(format!(
+                return Err(BeadsError::internal(format!(
                     "import update did not find existing issue {}",
                     issue.id
-                ))));
+                )));
             }
             return Ok(true);
         }

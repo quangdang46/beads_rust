@@ -709,7 +709,7 @@ fn chokepoint_robot_triage_envelope_v1() {
         .expect("robot-triage spawned");
     let exit = out.status.code().unwrap_or(-1);
     // A freshly-initialized workspace currently emits one P2 finding
-    // (`db.sidecars` — WAL-without-SHM is "expected for frankensqlite"
+    // (`db.sidecars` — WAL-without-SHM just means "no open connection"
     // per the detector's own message). The triage exit code is 0
     // because no errors were raised, just warnings.
     assert!(

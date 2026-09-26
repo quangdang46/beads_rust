@@ -2,8 +2,8 @@
 # Fixture: healthy_workspace_baseline (control)
 #
 # Plants a clean `br init` workspace with no failure. Asserts the doctor
-# health surface returns ok/degraded (per the "expected for frankensqlite"
-# WAL-without-SHM warning) and that `--repair` is a no-op (idempotence).
+# health surface returns ok/degraded (per the warn-only "no open connection"
+# WAL-without-SHM finding) and that `--repair` is a no-op (idempotence).
 
 set -euo pipefail
 target_dir="${1:?usage: corrupt.sh <target_dir>}"

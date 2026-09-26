@@ -1860,13 +1860,14 @@ fn inspect_database_sidecars(db_path: &Path) -> Result<SidecarInspection> {
     }
 
     if wal_kind.is_regular_file() && !shm_kind.exists() {
-        // frankensqlite manages the WAL index in process-local memory rather than in an SHM
-        // file, so a WAL without a sibling SHM is the normal operating state — not an error.
-        // We record this as a warning finding so callers can observe it, but we do not
-        // quarantine the WAL, because the WAL is valid and the database is accessible.
+        // A WAL without a sibling SHM is not an error. C SQLite creates the SHM
+        // while a connection is open and removes it on clean close, so an
+        // orphaned WAL is the normal state of a database nobody currently has
+        // open, and the WAL is valid and checkpointable. We record it as a
+        // warning so callers can observe it, but we do not quarantine the WAL.
         // The db.write_probe check validates liveness.
         inspection.warning_findings.push(format!(
-            "WAL sidecar exists without a matching SHM sidecar at {} (expected for frankensqlite)",
+            "WAL sidecar exists without a matching SHM sidecar at {} (no open connection)",
             PathBuf::from(format!("{}-wal", db_path.to_string_lossy())).display()
         ));
     }
@@ -17940,7 +17941,7 @@ mod tests {
                 name: "db.sidecars".to_string(),
                 status: CheckStatus::Warn,
                 message: Some(
-                    "WAL sidecar exists without a matching SHM sidecar (expected for frankensqlite)"
+                    "WAL sidecar exists without a matching SHM sidecar (no open connection)"
                         .to_string(),
                 ),
                 details: None,

@@ -9,7 +9,6 @@ use crate::storage::db::SqlValue;
 use crate::error::Result;
 use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
-use fsqlite_types::SqliteValue;
 use serde_json::Value as JsonValue;
 use std::borrow::Cow;
 

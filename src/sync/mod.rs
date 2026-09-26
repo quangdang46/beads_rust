@@ -4769,10 +4769,6 @@ fn process_import_action(
 /// or a reconstruction.
 fn is_key_collision(error: &BeadsError) -> bool {
     match error {
-        BeadsError::DatabaseLegacy(
-            fsqlite_error::FrankenError::PrimaryKeyViolation
-            | fsqlite_error::FrankenError::UniqueViolation { .. },
-        ) => true,
         BeadsError::Database(e) => {
             e.sqlite_error_code() == Some(rusqlite::ffi::ErrorCode::ConstraintViolation)
         }
