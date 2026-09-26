@@ -20439,13 +20439,19 @@ version = "2026-05-11-abc123"
         fs::copy(&db_path, &recent).unwrap();
         fs::copy(&db_path, &bad_sibling).unwrap();
 
+        // Set the mtime through std rather than shelling out to `touch -d`.
+        // GNU and BSD `touch` spell relative dates differently -- `-d "60 days
+        // ago"` is a GNU extension that macOS rejects outright -- so the test
+        // failed on any BSD system regardless of the code under test.
+        let sixty_days_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(60 * 24 * 60 * 60);
         for path in [&aged, &bad_sibling] {
-            let status = Command::new("touch")
-                .args(["-d", "60 days ago"])
-                .arg(path)
-                .status()
-                .unwrap();
-            assert!(status.success(), "touch failed for {}", path.display());
+            let file = fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
+            file.set_modified(sixty_days_ago)
+                .unwrap_or_else(|e| panic!("set mtime on {}: {e}", path.display()));
         }
 
         let report = DoctorReport {

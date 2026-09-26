@@ -250,10 +250,14 @@ fn detect_beads_state(worktree_path: &Path, main_beads_dir: Option<&Path>) -> Be
 
     if beads_dir.is_dir() {
         if let Some(ref main) = main_beads_dir {
-            if let Ok(abs_worktree) = beads_dir.canonicalize() {
-                if abs_worktree == *main {
-                    return BeadsState::Shared;
-                }
+            // Canonicalize both sides. On macOS `/var` resolves to `/private/var`,
+            // so the worktree's canonical `.beads` never equalled the raw main
+            // path and a genuinely shared directory was reported as `Local`.
+            if let Ok(abs_worktree) = dunce::canonicalize(&beads_dir)
+                && let Ok(abs_main) = dunce::canonicalize(main)
+                && abs_worktree == abs_main
+            {
+                return BeadsState::Shared;
             }
         }
         return BeadsState::Local;
