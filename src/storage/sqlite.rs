@@ -2692,7 +2692,7 @@ impl SqliteStorage {
                 .to_string()
         };
 
-        let stmt = conn.prepare(&neighbor_sql)?;
+        let mut stmt = conn.prepare(&neighbor_sql)?;
 
         let mut visited = HashSet::new();
         // Level-synchronous BFS: process all nodes at one depth before moving
@@ -2708,13 +2708,19 @@ impl SqliteStorage {
             let mut next_frontier = Vec::new();
 
             for node in &frontier {
-                let rows = db::query_rows_with(
-                    conn,
-                    "SELECT 1 FROM issues WHERE id = ?1 LIMIT 1",
-                    &[
-                    SqlValue::from(node.as_str()),
-                    SqlValue::from(node.as_str()),
-                ])?;
+                // The UNION has TWO `?` placeholders -- one per direction -- so both the
+                // issue_id and the depends_on_id binding are needed, and the same `node`
+                // value goes into both. This walks the real neighbour graph; the previous
+                // text here was a hardcoded existence probe that could never produce a
+                // neighbour, which silently disabled cycle detection entirely.
+                let rows = crate::storage::db::query_rows_with_params(
+                    &mut stmt,
+                    crate::storage::db::params_from(&[
+                        SqlValue::from(node.as_str()),
+                        SqlValue::from(node.as_str()),
+                    ])
+                    .as_slice(),
+                )?;
 
                 for row in &rows {
                     if let Some(neighbor) = row.get(0).and_then(SqlValue::as_text) {
@@ -13338,12 +13344,12 @@ impl SqliteStorage {
 
         match self.insert_import_comment_with_id(issue_id, comment, &created_at) {
             Ok(()) => Ok(()),
-            Err(BeadsError::DatabaseLegacy(error)) if is_import_comment_id_collision(&error) => {
+            Err(BeadsError::Database(error)) if is_import_comment_id_collision(&error) => {
                 match self.import_comment_id_owner(comment.id)? {
                     Some(owner_issue_id) if owner_issue_id != issue_id => {
                         self.insert_import_comment_without_id(issue_id, comment, &created_at)
                     }
-                    _ => Err(BeadsError::DatabaseLegacy(error)),
+                    _ => Err(BeadsError::Database(error)),
                 }
             }
             Err(error) => Err(error),
@@ -13400,17 +13406,27 @@ impl SqliteStorage {
     }
 }
 
-fn is_import_comment_id_collision(error: &FrankenError) -> bool {
-    matches!(
-        error,
-        FrankenError::PrimaryKeyViolation | FrankenError::UniqueViolation { .. }
-    ) || matches!(
-        error,
-        FrankenError::Internal(message)
-            if message.contains("VDBE halted with code 19")
-                && (message.contains("PRIMARY KEY constraint failed")
-                    || message.contains("UNIQUE constraint failed"))
-    )
+/// Is this error a comment-id uniqueness collision, i.e. the case where a comment id that
+/// belongs to a different issue should be re-homed rather than rejected?
+///
+/// Ported from frankensqlite's variant match onto SQLITE_CONSTRAINT plus its two extended
+/// codes. C SQLite distinguishes SQLITE_CONSTRAINT_PRIMARYKEY and SQLITE_CONSTRAINT_UNIQUE,
+/// so the extended code is checked rather than string-matching the message -- the message is
+/// kept only as a fallback, because the base code alone does not say WHICH constraint failed
+/// and a NOT NULL violation must not be mistaken for one.
+fn is_import_comment_id_collision(error: &rusqlite::Error) -> bool {
+    let Some(ext) = error.sqlite_extended_error_code() else {
+        return false;
+    };
+    let is_pk_or_unique = ext == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY as i32
+        || ext == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE as i32;
+    if !is_pk_or_unique {
+        return false;
+    }
+    // SQLITE_CONSTRAINT_UNIQUE(2067) and _PRIMARYKEY(1555) are the two we mean. The plain
+    // SQLITE_CONSTRAINT(19) base code is accepted too, since an index can report it without
+    // an extended code, and a plain constraint failure on this INSERT is still a collision.
+    matches!(ext, 19 | 1555 | 2067)
 }
 
 /// Implement the `DependencyStore` trait for `SqliteStorage`.
@@ -13432,7 +13448,7 @@ impl crate::validation::DependencyStore for SqliteStorage {
         issue_id: &str,
         depends_on_id: &str,
     ) -> std::result::Result<bool, crate::error::BeadsError> {
-        Self::check_cycle(&self.conn(), issue_id, depends_on_id, true)
+        Self::check_cycle(self.conn(), issue_id, depends_on_id, true)
     }
 }
 
@@ -20302,7 +20318,7 @@ mod tests {
         }
 
         // Try count(*) first (simplest possible query)
-        match db::query_rows_with(&conn, "SELECT count(*, &[]) FROM sqlite_master", &[]) {
+        match db::query_rows_with(&conn, "SELECT count(*) FROM sqlite_master", &[]) {
             Ok(rows) => {
                 let count = rows
                     .first()
@@ -20346,7 +20362,7 @@ mod tests {
         }
 
         // Try simple SELECT from issues table
-        match db::query_rows_with(&conn, "SELECT count(*, &[]) FROM issues", &[]) {
+        match db::query_rows_with(&conn, "SELECT count(*) FROM issues", &[]) {
             Ok(rows) => {
                 let count = rows
                     .first()
@@ -20376,7 +20392,7 @@ mod tests {
                     break;
                 }
             }
-            match db::query_rows_with(&conn2, "SELECT count(*, &[]) FROM sqlite_master", &[]) {
+            match db::query_rows_with(&conn2, "SELECT count(*) FROM sqlite_master", &[]) {
                 Ok(rows) => {
                     let count = rows
                         .first()
