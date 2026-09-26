@@ -4745,11 +4745,11 @@ fn process_import_action(
 ///
 /// # Why both engines are matched
 ///
-/// `BeadsError` carries two database variants until Phase 8, and `src/storage/sqlite.rs` still
-/// produces the legacy one. Matching only the C engine would silently retire the fallback: the
-/// code would still compile, the `Err(error) => Err(error)` arm would still catch the legacy
-/// error, and no test covers the race -- a concurrent duplicate key would simply become a hard
-/// import failure. The legacy arm dies with [`BeadsError::DatabaseLegacy`] in Phase 8.
+/// There is now one database variant, so this matches a single arm. It is kept as a named
+/// predicate rather than inlined because the arm it guards is a deliberate widening: matching
+/// only `SQLITE_CONSTRAINT` by name would exclude NOT NULL / CHECK / FOREIGN KEY, which land in
+/// the same bucket. Widening it here means a concurrent duplicate key falls through to the
+/// upsert retry rather than becoming a hard import failure, and no test covers that race.
 ///
 /// # Why the result code and not the message
 ///

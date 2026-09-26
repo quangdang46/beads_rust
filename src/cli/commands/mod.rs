@@ -364,10 +364,12 @@ fn should_attempt_mutation_jsonl_recovery(
     operation_err: &BeadsError,
     probe_err: Option<&BeadsError>,
 ) -> bool {
-    // Both engine payloads. A guard that matched only `Database` would silently switch off
-    // JSONL mutation recovery for every frankensqlite error, with no compile error and no
-    // test failure -- the feature would simply stop firing. `DatabaseLegacy` is deleted in
-    // Phase 8, at which point this collapses back to a single variant.
+    // Ask the error type rather than naming a variant. During the engine migration this
+    // helper matched two variants, and a `matches!(err, BeadsError::Database(_))` written
+    // at the wrong moment stopped firing for the other engine with no compile error and no
+    // failing test -- which silently disabled JSONL mutation recovery. There is now one
+    // database variant, but the helper is kept because the failure mode it prevents is
+    // invisible to the compiler.
     operation_err.is_database_error()
         && (storage_ctx.should_attempt_jsonl_recovery(operation_err)
         || probe_err.is_some_and(|err| storage_ctx.should_attempt_jsonl_recovery(err)))

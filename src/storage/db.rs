@@ -382,11 +382,11 @@ where
     stmt.query_row([], |row| row.get(0))
 }
 
-/// Convert a rusqlite error into the crate's own error type.
+/// Convert a `rusqlite` error into the crate's own error type.
 ///
-/// The engine swap changed which error type reaches `BeadsError`, and Phase 2 gave
-/// `BeadsError` a second variant so the tree keeps compiling. This helper is the seam: once
-/// Phase 8 deletes `DatabaseLegacy`, every call site of this function becomes `?` again.
+/// `BeadsError` carries `#[from] rusqlite::Error`, so `?` covers most call sites. This
+/// exists for the ones that already hold the error as a value — `map_err(db_err)` — and
+/// for the `Connection::open` call sites, where the error arrives already wrapped.
 pub fn db_err(err: Error) -> crate::error::BeadsError {
     crate::error::BeadsError::Database(err)
 }
