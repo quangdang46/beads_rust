@@ -11,6 +11,7 @@
 
 pub mod routing;
 
+use crate::storage::db::{self, SqlValue};
 use crate::error::{BeadsError, Result, ResultExt};
 use crate::model::{IssueType, Priority};
 use crate::storage::SqliteStorage;
@@ -26,7 +27,6 @@ use crate::util::id::{
 };
 use chrono::Utc;
 use fsqlite_error::FrankenError;
-use fsqlite_types::SqliteValue;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -1951,7 +1951,7 @@ fn count_recovery_table_rows(storage: &SqliteStorage, table: &str) -> Result<usi
     let count = rows
         .first()
         .and_then(|row| row.first())
-        .and_then(SqliteValue::as_integer)
+        .and_then(SqlValue::as_integer)
         .unwrap_or(0);
     usize::try_from(count).map_err(|_| {
         BeadsError::Config(format!(
@@ -1972,9 +1972,9 @@ fn verify_blocked_cache_payloads(storage: &SqliteStorage) -> Result<()> {
     for row in rows {
         let issue_id = row
             .first()
-            .and_then(SqliteValue::as_text)
+            .and_then(SqlValue::as_text)
             .unwrap_or("<missing>");
-        let blocked_by = row.get(1).and_then(SqliteValue::as_text).ok_or_else(|| {
+        let blocked_by = row.get(1).and_then(SqlValue::as_text).ok_or_else(|| {
             BeadsError::Config(format!(
                 "post-recovery validation failed: blocked_issues_cache.blocked_by missing for {issue_id}"
             ))
@@ -2024,7 +2024,7 @@ fn expected_child_counters(storage: &SqliteStorage) -> Result<HashMap<String, u3
         .iter()
         .filter_map(|row| {
             row.first()
-                .and_then(SqliteValue::as_text)
+                .and_then(SqlValue::as_text)
                 .map(str::to_string)
         })
         .collect();
@@ -2067,14 +2067,14 @@ fn actual_child_counters(storage: &SqliteStorage) -> Result<HashMap<String, u32>
     for row in rows {
         let parent_id = row
             .first()
-            .and_then(SqliteValue::as_text)
+            .and_then(SqlValue::as_text)
             .ok_or_else(|| {
                 BeadsError::Config(
                     "post-recovery validation failed: child_counters.parent_id missing".to_string(),
                 )
             })?
             .to_string();
-        let last_child = row.get(1).and_then(SqliteValue::as_integer).ok_or_else(|| {
+        let last_child = row.get(1).and_then(SqlValue::as_integer).ok_or_else(|| {
             BeadsError::Config(format!(
                 "post-recovery validation failed: child_counters.last_child missing for {parent_id}"
             ))
@@ -4650,7 +4650,7 @@ mod tests {
     use crate::model::{Comment, Dependency, DependencyType, Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
     use chrono::Utc;
-    use fsqlite::Connection;
+    use rusqlite::Connection;
     use tempfile::TempDir;
 
     struct RelationRichFixture {
@@ -4767,7 +4767,7 @@ mod tests {
             .expect("seed issue prefix");
         drop(storage);
 
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).expect("open setup db");
+        let conn = Connection::open(&db_path).expect("open setup db");
         conn.execute_batch(
             "DROP TABLE blocked_issues_cache;
             CREATE TABLE blocked_issues_cache (
@@ -4781,11 +4781,11 @@ mod tests {
     }
 
     fn insert_duplicate_issue_prefix_config_row(db_path: &Path, value: &str) {
-        let conn = Connection::open(db_path.to_string_lossy().into_owned()).expect("open setup db");
+        let conn = Connection::open(&db_path).expect("open setup db");
         conn.execute(&format!(
             "INSERT INTO config (key, value) VALUES ('issue_prefix', '{}')",
             value.replace('\'', "''")
-        ))
+        ), [])
         .expect("insert duplicate issue_prefix config row");
     }
 
@@ -7712,11 +7712,12 @@ routing:
         let _ = fs::remove_file(&journal_path);
 
         let prefix = with_database_family_snapshot(&db_path, |snapshot_db_path| {
-            let conn = fsqlite::Connection::open(snapshot_db_path.to_string_lossy().into_owned())?;
-            let row = conn.query_row("SELECT value FROM config WHERE key = 'issue_prefix'")?;
+            let conn = Connection::open(&snapshot_db_path)?;
+            let row = db::query_row_all(&conn, "SELECT value FROM config WHERE key = 'issue_prefix'")?;
             Ok(row
-                .get(0)
-                .and_then(fsqlite_types::SqliteValue::as_text)
+                .as_ref()
+                .and_then(|r| r.first())
+                .and_then(SqlValue::as_text)
                 .map(str::to_string))
         })
         .expect("read snapshot");
