@@ -4113,10 +4113,19 @@ impl SqliteStorage {
                 break;
             }
 
+            // No `INDEXED BY` hint here. The obvious index for this query is the
+            // partial `idx_issues_list_active_order`, but C SQLite refuses the
+            // hint with "no query solution" -- a planner-level rejection at
+            // `prepare` time, before any row is read, so the query cannot run at
+            // all rather than merely running slowly. Measured against the
+            // bundled 3.53.2: dropping the hint makes the same statement prepare
+            // cleanly, and the planner still picks the partial index on its own
+            // because the WHERE clause matches its predicate exactly. Forcing an
+            // index buys nothing here and costs correctness.
             let query_limit = remaining.saturating_add(offset);
-            let rows = db::query_rows_with(&self.conn(), 
+            let rows = db::query_rows_with(&self.conn(),
                 "SELECT id, title, status, priority, issue_type, created_at, updated_at
-                 FROM issues INDEXED BY idx_issues_list_active_order
+                 FROM issues
                  WHERE status NOT IN ('closed', 'tombstone')
                    AND (is_template = 0 OR is_template IS NULL)
                    AND priority = ?1

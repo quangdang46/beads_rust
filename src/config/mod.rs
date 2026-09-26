@@ -1113,8 +1113,38 @@ fn should_attempt_jsonl_recovery(open_err: &BeadsError, db_path: &Path, jsonl_pa
     // Duplicate schema entries. Scoped to `SQLITE_ERROR` (`ErrorCode::Unknown`),
     // because that code is SQLite's generic fallback and carries every ordinary
     // SQL error too; on its own it would treat any bad statement as corruption.
-    e.sqlite_error_code() == Some(rusqlite::ffi::ErrorCode::Unknown)
+    if e.sqlite_error_code() == Some(rusqlite::ffi::ErrorCode::Unknown)
         && is_duplicate_schema_entry_open_error(&e.to_string())
+    {
+        return true;
+    }
+
+    // A non-file object sitting where a SQLite sidecar belongs (`beads.db-wal`
+    // as a directory, say) makes the engine fail the open outright with
+    // `SQLITE_CANTOPEN` — it cannot create its WAL past the obstruction. That
+    // is recoverable, because the fix is to move the obstruction aside, which
+    // the JSONL rebuild already does.
+    //
+    // Gated on the obstruction actually existing, because `SQLITE_CANTOPEN` is
+    // also what a permissions problem or a full disk reports, and rebuilding
+    // the database in either case destroys good data to fix nothing.
+    e.sqlite_error_code() == Some(rusqlite::ffi::ErrorCode::CannotOpen)
+        && has_non_file_sidecar(db_path)
+}
+
+/// Is something that is not a regular file sitting in a SQLite sidecar path?
+///
+/// Checked rather than assumed so the `SQLITE_CANTOPEN` recovery above stays
+/// narrow: a plain unreadable database is a permissions or disk problem, and
+/// neither is fixed by rebuilding from JSONL.
+fn has_non_file_sidecar(db_path: &Path) -> bool {
+    let stem = db_path.to_string_lossy().into_owned();
+    ["-wal", "-shm", "-journal"]
+        .iter()
+        .any(|suffix| {
+            let candidate = PathBuf::from(format!("{stem}{suffix}"));
+            candidate.exists() && !candidate.is_file()
+        })
 }
 
 fn should_attempt_jsonl_recovery_after_open(
@@ -6468,6 +6498,26 @@ routing:
                 "{label} ({code:?}) must NOT trigger a rebuild"
             );
         }
+
+        // `SQLITE_CANTOPEN` alone is NOT corruption. It is also what a
+        // permissions problem or a full disk reports, and rebuilding the
+        // database in those cases throws away good data to fix nothing.
+        assert!(!should_attempt_jsonl_recovery(
+            &db_error(rusqlite::ffi::ErrorCode::CannotOpen, "unable to open database file"),
+            &db_path,
+            &jsonl_path
+        ));
+
+        // ...but it IS recoverable when a non-file object is blocking a sidecar
+        // path, because the rebuild moves the obstruction aside.
+        let wal_dir = beads_dir.join("beads.db-wal");
+        fs::create_dir_all(&wal_dir).expect("block the wal path with a directory");
+        assert!(should_attempt_jsonl_recovery(
+            &db_error(rusqlite::ffi::ErrorCode::CannotOpen, "unable to open database file"),
+            &db_path,
+            &jsonl_path
+        ));
+        fs::remove_dir_all(&wal_dir).expect("unblock the wal path");
 
         // Both files must actually exist. A missing JSONL means there is nothing
         // to rebuild from, so a corrupt database must surface rather than
