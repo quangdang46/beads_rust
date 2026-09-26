@@ -1678,3 +1678,164 @@ Three requirements, all testable:
 | P1.3 bundled build on the fleet | **Answered, but not on RCH.** `rch` is not installed on this host. The bundled C amalgamation compiled (`sqlite3.o`, 7.7 MB) with **zero** libclang/bindgen references, which was the actual question. A full build then hit `No space left on device`. |
 | P1.4 freeze the baseline | **Done.** 18,733 / 259 / 109 across 136 binaries, names in 14.7. |
 | P1.5 extend the golden harness | **Partly done**: harness made portable, 28 stale goldens re-accepted, 0 regressions. Per-parser and CLI parity goldens remain. |
+
+---
+
+## 18. Phase 2 findings: three corrections the plan did not anticipate
+
+An adversarial review of the Phase 2 design (15 agents) produced findings that change this
+document's central safety argument. All three were re-verified against the live tree before being
+recorded here, and two of them are behavioural, not cosmetic.
+
+### 18.1 The events audit log is NOT in the JSONL, so "the cache is disposable" is false
+
+Section 3 justifies the whole migration with: *".beads/beads.db is a gitignored, machine-local
+derived cache and .beads/issues.jsonl is the canonical tracked source, so a user upgrade is a cache
+rebuild, not a data migration."*
+
+That is true for issues and **false for the audit log**. Verified:
+
+- `.beads/issues.jsonl`: 951 records, **0** carrying an `events` field, and no event-related key in
+  any record.
+- There is **no events export path at all**. `rg 'get_events_for_export'` returns nothing.
+- `hydrate_export_issues_full_scan` (`sync/mod.rs:1742`) hydrates issues, labels, comments and
+  dependencies. `events` appears in `sync/mod.rs` only in the FK-violation table list (`:3024`)
+  and the orphan-cleanup list (`:4382`) -- never in the export path.
+- `Issue` (`model/mod.rs:853+`) has no events field.
+
+So a rebuild-from-JSONL produces a database with an **empty `events` table**, and
+`move_database_family_to_recovery` (`config/mod.rs:2275`) quarantines the old file without anything
+re-importing events from it before `discard_pending_recovery_backup()` (`:2624`). Lost: every close,
+reopen, status transition, and Tier-1 actor attribution (issue #312).
+
+Three of the four candidate designs described the database as "a derived cache" without checking
+what was in it. Filed as **`beads_rust-i976`**. The existing `should_attempt_jsonl_recovery` gate
+(`config/mod.rs:1050`) **already** rebuilds on corruption today, so this property predates the
+migration; the migration neither introduces nor fixes it.
+
+### 18.2 Operator decision: quarantine and report, never auto-rebuild
+
+Section 16.4 originally specified an automatic rebuild-from-JSONL on a schema-parse refusal. That
+is withdrawn, on the strength of 18.1: an automatic rebuild silently empties the audit log.
+
+**Replacing section 16.4 with:**
+
+On a schema-parse refusal under C SQLite, `br` must **quarantine and report, never auto-rebuild**:
+
+1. Move the database family to `.beads/recovery/` exactly as `move_database_family_to_recovery`
+   already does, so no bytes are destroyed.
+2. Report that the workspace could not be opened, that the previous database is preserved at that
+   path, and that the audit log is intact inside it.
+3. Require an **explicit operator command** to rebuild from JSONL. The operator is the only party
+   who can decide whether losing the audit log is acceptable for their workspace.
+
+A schema-parse refusal is specifically *not* a signal that the data is gone: the tables are present
+and intact, only their `sqlite_master` ordering is wrong. That is a case for preserving evidence,
+not for discarding it. Genuine page corruption keeps its existing behaviour, which is the separate
+question tracked in `beads_rust-i976`.
+
+### 18.3 Two `is_transient` predicates lived inside a single retry loop
+
+`BeadsError::is_transient` was not the only classifier in play. At `sqlite.rs:756`, `:768`, `:1501`
+and `:1524` the guard was `Err(e) if e.is_transient()` where `e` came straight from
+`conn.execute(...)` -- a raw `FrankenError` -- so it consulted `FrankenError::is_transient`, a
+*different* method on a *different* type. Only `:790`, `:868` and `:1545` received a `BeadsError`
+and therefore used the method the plan means to port.
+
+**This is invisible to the compiler**: both types happen to have an `is_transient()` method, so the
+whole tree built and the whole suite passed while half the retry gates were on the old classifier.
+The two agree today, but nothing kept them agreeing, and Phase 7 changes the engine type under those
+lines.
+
+Fixed by converting the error once at the top of each arm and classifying the `BeadsError`. This is
+behaviour-preserving and it makes Phase 7 a type change rather than a logic change scattered through
+delicate retry code. Both ROLLBACK `tracing::warn!` messages are preserved verbatim, because
+`br doctor --json` is asserted against a golden that captures stderr.
+
+### 18.4 `WalCorrupt` and `ShortRead` had no replacement
+
+`config/mod.rs:1050` self-heals on `DatabaseCorrupt | NotADatabase | WalCorrupt | ShortRead |
+TableExists | IndexExists`. frankensqlite had distinct `WalCorrupt` and `ShortRead` variants; C
+SQLite has no such variants, and both conditions surface as `SQLITE_CORRUPT` / `SQLITE_IOERR`. With
+no arm for them, the self-heal would have vanished in Phase 7 and presented as "br doctor no longer
+recovers my workspace". An arm covering those three C codes restores it.
+
+### 18.5 Design change: `BeadsError` carries both payloads until Phase 8
+
+The plan assumed Phase 2 would leave the tree uncompilable until Phase 7, because `#[from]`
+generates `From<FrankenError> for BeadsError` and 15+ sites in `sqlite.rs` call `e.into()` on a bare
+engine error. Measured, the actual blast radius was 28 compile errors across 6 files.
+
+That is avoidable. The two engines genuinely coexist on this branch -- `fsqlite` stays a dependency
+until Phase 8 and `storage/sqlite.rs` keeps producing frankensqlite errors until Phase 7 -- so
+`BeadsError` gains a temporary second variant:
+
+```rust
+Database(#[from] rusqlite::Error),              // the migration target
+DatabaseLegacy(#[from] fsqlite_error::FrankenError),  // deleted in Phase 8
+```
+
+Both map to the same `ErrorCode::DatabaseError` in `structured.rs`, so the Go-parity exit-code
+table is untouched. This is the same category of thing as `src/storage/db.rs`: a branch-only
+scaffold with a named deletion point, never a shipped shim. **If `DatabaseLegacy` still exists when
+Phase 8 opens, Phase 8 does not merge.** The practical effect is that the tree compiles at every
+commit from here on, which is strictly better than the plan assumed.
+
+### 18.6 Smaller corrections, recorded so nobody re-derives them
+
+- **`SQLITE_IOERR` is NOT transient, but for the opposite reason to the one first proposed.**
+  `sqliteErrorFromPosixError` (`sqlite3.c:41211-41232`) maps `EACCES`, `EAGAIN`, `ETIMEDOUT`,
+  `EBUSY`, `EINTR` and `ENOLCK` to `SQLITE_BUSY`, so NFS/SMB lock contention already arrives as
+  `SQLITE_BUSY`. `SQLITE_IOERR` is the *data* path failing: `unixRead`/`unixWrite` returning
+  `EIO`/`ENOSPC`, a short read, or a fault during page I/O. Retrying a full disk is a hot loop.
+- **`SQLITE_PROTOCOL` is NOT transient.** A stable environmental fault, not a race. Classifying it
+  as transient converts an immediate error into a ~12.7s stall in the 8-attempt loops and then
+  surfaces the same error.
+- **`SQLITE_BUSY_SNAPSHOT` is NOT transient** even though its primary code is `SQLITE_BUSY`. SQLite
+  documents that it is not resolved by waiting. Masking the extended code with `0xff` would spin.
+- **`SQLITE_BUSY_TIMEOUT` (773) can never be returned** by this build: its only site in the
+  amalgamation is inside `#ifdef SQLITE_ENABLE_SETLK_TIMEOUT`, which is not enabled.
+- **Path-bearing database errors lose their paths.** frankensqlite's `Display` embeds structured
+  fields (`"file is not a database: '{path}'"`, `"short read: expected {n} bytes, got {m}"`);
+  `SqliteFailure(_, Some(msg))` displays **only** the message. `code` and `exit_code` are stable, but
+  the agent-facing JSON `message` is a wire-format change. Never string-match it to recover a code --
+  the code is not in the text at all.
+- **`is_transient_wal_tail_read_error` (`sqlite.rs:10868`) matches frankensqlite text that C SQLite
+  never emits**, so after the swap it returns `false` for everything and every blocked-cache read
+  failure escalates from `tracing::trace!` to `tracing::warn!` on the `br ready` hot path. Since
+  stderr noise breaks agents parsing `--json` and `doctor_output` is a golden, this needs a decision
+  in Phase 6, not a silent log-volume change.
+- **`use rusqlite::ErrorCode;` is a duplicate-import compile error**: `error/mod.rs:17` already
+  re-exports `ErrorCode` and the test module does `use super::*`. Reference `rusqlite::ffi::ErrorCode`
+  by full path instead.
+
+### 18.7 Splitting the variant silently disabled a feature, and `is_database_error` now names it
+
+Splitting `Database` into `Database` + `DatabaseLegacy` broke five `matches!(e,
+BeadsError::Database(_))` sites that mean *"is this a database error?"* rather than *"did the C
+engine fail?"*. Two of them were **production**, in
+`should_attempt_mutation_jsonl_recovery` and `retry_mutation_with_jsonl_recovery`
+(`cli/commands/mod.rs`). After the split they matched only the C engine, so **JSONL mutation
+recovery stopped firing for every frankensqlite error** -- no compile error, no failing test at the
+time of the change, and a feature that simply stopped working. Three more were tests asserting
+"this is a database error" and failed on the next run.
+
+This is the single most dangerous shape in the whole port, because it is invisible twice over: the
+compiler accepts it, and the retry/recovery paths that break are usually not covered by a test that
+would notice.
+
+The fix is a named predicate rather than a repeated two-variant `matches!`:
+
+```rust
+/// True when this is a database error from *either* engine.
+#[must_use]
+pub fn is_database_error(&self) -> bool {
+    matches!(self, Self::Database(_) | Self::DatabaseLegacy(_))
+}
+```
+
+Every site that means "is this a database error" calls it. **Rule for the rest of the port: never
+write `matches!(e, BeadsError::Database(_))` to mean "is this a database error".** Name the
+predicate, so that when Phase 8 deletes `DatabaseLegacy` the call sites need no edit and no
+re-audit. `matches!` on a specific variant is only correct where the *engine* is genuinely the
+thing being tested.

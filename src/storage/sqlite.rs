@@ -753,34 +753,52 @@ impl SqliteStorage {
         for attempt in 0..MAX_RETRIES {
             match conn.execute("BEGIN IMMEDIATE") {
                 Ok(_) => {}
-                Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
-                    last_error = Some(e.into());
-                    let backoff = Self::jittered_backoff(base_backoff_ms, attempt);
-                    std::thread::sleep(Duration::from_millis(backoff));
-                    continue;
+                Err(e) => {
+                    // Convert once and classify through `BeadsError`, so this loop and every
+                    // other caller share ONE definition of "retryable". `e` here is a raw engine
+                    // error; calling its own `is_transient()` would consult a different
+                    // classifier from the one `BeadsError` uses. They agree today, but nothing
+                    // keeps them agreeing, and Phase 7 swaps the engine type under this line.
+                    let e: crate::error::BeadsError = e.into();
+                    if e.is_transient() && attempt < MAX_RETRIES - 1 {
+                        last_error = Some(e);
+                        let backoff = Self::jittered_backoff(base_backoff_ms, attempt);
+                        std::thread::sleep(Duration::from_millis(backoff));
+                        continue;
+                    }
+                    return Err(e);
                 }
-                Err(e) => return Err(e.into()),
             }
 
             match f(conn) {
                 Ok(result) => match conn.execute("COMMIT") {
                     Ok(_) => return Ok(result),
-                    Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
-                        if let Err(rb_err) = conn.execute("ROLLBACK") {
-                            tracing::warn!(
-                                error = %rb_err,
-                                "ROLLBACK failed after transient COMMIT error"
-                            );
-                        }
-                        last_error = Some(e.into());
-                        let backoff = Self::jittered_backoff(base_backoff_ms, attempt);
-                        std::thread::sleep(Duration::from_millis(backoff));
-                    }
                     Err(e) => {
+                        let e: crate::error::BeadsError = e.into();
+                        let transient = e.is_transient() && attempt < MAX_RETRIES - 1;
                         if let Err(rb_err) = conn.execute("ROLLBACK") {
-                            tracing::warn!(error = %rb_err, "ROLLBACK failed after COMMIT error");
+                            // Both messages are kept verbatim: `br doctor --json` is asserted
+                            // against a golden that captures stderr, so the log text is part of
+                            // the observable surface.
+                            if transient {
+                                tracing::warn!(
+                                    error = %rb_err,
+                                    "ROLLBACK failed after transient COMMIT error"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    error = %rb_err,
+                                    "ROLLBACK failed after COMMIT error"
+                                );
+                            }
                         }
-                        return Err(e.into());
+                        if transient {
+                            last_error = Some(e);
+                            let backoff = Self::jittered_backoff(base_backoff_ms, attempt);
+                            std::thread::sleep(Duration::from_millis(backoff));
+                        } else {
+                            return Err(e);
+                        }
                     }
                 },
                 Err(e) => {
@@ -939,7 +957,7 @@ impl SqliteStorage {
 
     fn restore_foreign_keys(conn: &Connection, operation: &str) -> Result<()> {
         conn.execute("PRAGMA foreign_keys = ON")
-            .map_err(BeadsError::Database)?;
+            .map_err(BeadsError::DatabaseLegacy)?;
 
         if Self::foreign_keys_enabled(conn)? {
             return Ok(());
@@ -1498,13 +1516,19 @@ impl SqliteStorage {
         for attempt in 0..MAX_RETRIES {
             match self.conn.execute("BEGIN IMMEDIATE") {
                 Ok(_) => {}
-                Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
-                    last_error = Some(e.into());
-                    let backoff = Self::jittered_backoff(base_backoff_ms, attempt);
-                    std::thread::sleep(Duration::from_millis(backoff));
-                    continue;
+                Err(e) => {
+                    // Convert once and classify through `BeadsError`, so this loop and every
+                    // other caller share ONE definition of "retryable". See the same pattern
+                    // in `with_connection_write_transaction`.
+                    let e: crate::error::BeadsError = e.into();
+                    if e.is_transient() && attempt < MAX_RETRIES - 1 {
+                        last_error = Some(e);
+                        let backoff = Self::jittered_backoff(base_backoff_ms, attempt);
+                        std::thread::sleep(Duration::from_millis(backoff));
+                        continue;
+                    }
+                    return Err(e);
                 }
-                Err(e) => return Err(e.into()),
             }
 
             match f(self) {
@@ -1521,20 +1545,26 @@ impl SqliteStorage {
                             }
                             return Ok(result);
                         }
-                        Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
-                            if let Err(rb_err) = self.conn.execute("ROLLBACK") {
-                                tracing::warn!(error = %rb_err, "ROLLBACK failed after transient COMMIT error");
-                            }
-                            last_error = Some(e.into());
-                            let backoff = Self::jittered_backoff(base_backoff_ms, attempt);
-                            std::thread::sleep(Duration::from_millis(backoff));
-                            // retry
-                        }
                         Err(e) => {
+                            let e: crate::error::BeadsError = e.into();
+                            let transient = e.is_transient() && attempt < MAX_RETRIES - 1;
                             if let Err(rb_err) = self.conn.execute("ROLLBACK") {
-                                tracing::warn!(error = %rb_err, "ROLLBACK failed after COMMIT error");
+                                // Both messages kept verbatim; stderr is asserted by the
+                                // `doctor_output` golden.
+                                if transient {
+                                    tracing::warn!(error = %rb_err, "ROLLBACK failed after transient COMMIT error");
+                                } else {
+                                    tracing::warn!(error = %rb_err, "ROLLBACK failed after COMMIT error");
+                                }
                             }
-                            return Err(e.into());
+                            if transient {
+                                last_error = Some(e);
+                                let backoff = Self::jittered_backoff(base_backoff_ms, attempt);
+                                std::thread::sleep(Duration::from_millis(backoff));
+                                // retry
+                            } else {
+                                return Err(e);
+                            }
                         }
                     }
                 }
@@ -10804,19 +10834,19 @@ fn finish_issue_mutation_write_probe(
                     "ROLLBACK failed after zero-row issue write probe"
                 );
             }
-            Err(BeadsError::Database(FrankenError::Internal(
+            Err(BeadsError::DatabaseLegacy(FrankenError::Internal(
                 "write probe did not find issue inside mutation transaction".to_string(),
             )))
         }
         (Ok(_), Ok(_)) => Ok(()),
-        (Ok(_), Err(rollback_err)) => Err(BeadsError::Database(rollback_err)),
-        (Err(probe_err), Ok(_)) => Err(BeadsError::Database(probe_err)),
+        (Ok(_), Err(rollback_err)) => Err(BeadsError::DatabaseLegacy(rollback_err)),
+        (Err(probe_err), Ok(_)) => Err(BeadsError::DatabaseLegacy(probe_err)),
         (Err(probe_err), Err(rollback_err)) => {
             tracing::warn!(
                 error = %rollback_err,
                 "ROLLBACK failed after issue write probe"
             );
-            Err(BeadsError::Database(probe_err))
+            Err(BeadsError::DatabaseLegacy(probe_err))
         }
     }
 }
@@ -12956,7 +12986,7 @@ impl SqliteStorage {
         if issue_exists {
             let rows = self.update_issue_row_for_import(issue, &timestamps)?;
             if rows == 0 {
-                return Err(BeadsError::Database(FrankenError::Internal(format!(
+                return Err(BeadsError::DatabaseLegacy(FrankenError::Internal(format!(
                     "import update did not find existing issue {}",
                     issue.id
                 ))));
@@ -13271,12 +13301,12 @@ impl SqliteStorage {
 
         match self.insert_import_comment_with_id(issue_id, comment, &created_at) {
             Ok(()) => Ok(()),
-            Err(BeadsError::Database(error)) if is_import_comment_id_collision(&error) => {
+            Err(BeadsError::DatabaseLegacy(error)) if is_import_comment_id_collision(&error) => {
                 match self.import_comment_id_owner(comment.id)? {
                     Some(owner_issue_id) if owner_issue_id != issue_id => {
                         self.insert_import_comment_without_id(issue_id, comment, &created_at)
                     }
-                    _ => Err(BeadsError::Database(error)),
+                    _ => Err(BeadsError::DatabaseLegacy(error)),
                 }
             }
             Err(error) => Err(error),

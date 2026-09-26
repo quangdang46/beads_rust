@@ -534,7 +534,7 @@ pub(crate) fn execute_batch(conn: &Connection, sql: &str) -> Result<()> {
                 "execute_batch failed on statement: {}\nError: {:?}",
                 stmt, e
             );
-            return Err(BeadsError::Database(e));
+            return Err(BeadsError::DatabaseLegacy(e));
         }
     }
     Ok(())
@@ -572,7 +572,7 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
         conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
             .map_err(|e| {
                 eprintln!("PRAGMA user_version failed: {:?}", e);
-                BeadsError::Database(e)
+                BeadsError::DatabaseLegacy(e)
             })?;
     } else {
         // Existing database: run migrations for schema upgrades.
@@ -588,7 +588,7 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
         conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
             .map_err(|e| {
                 eprintln!("PRAGMA user_version failed: {:?}", e);
-                BeadsError::Database(e)
+                BeadsError::DatabaseLegacy(e)
             })?;
     }
 
@@ -676,7 +676,7 @@ pub fn run_migrations_atomic(conn: &Connection, from: u32, target_version: u32) 
     // the snapshot before returning.
     run_migrations(conn, false)?;
     conn.execute(&format!("PRAGMA user_version = {target_version}"))
-        .map_err(BeadsError::Database)?;
+        .map_err(BeadsError::DatabaseLegacy)?;
 
     // Post-state verification: `user_version` must reflect the target.
     // If fsqlite raced its own PRAGMA cache and didn't persist the
@@ -705,7 +705,7 @@ pub(crate) fn apply_runtime_compatible_schema(conn: &Connection) -> Result<()> {
     execute_batch(conn, SCHEMA_SQL)?;
     run_migrations(conn, false)?;
     conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
-        .map_err(BeadsError::Database)?;
+        .map_err(BeadsError::DatabaseLegacy)?;
     apply_runtime_pragmas(conn)?;
     Ok(())
 }
@@ -1071,7 +1071,7 @@ fn foreign_keys_enabled(conn: &Connection) -> Result<bool> {
 
 fn restore_foreign_keys(conn: &Connection, operation: &str) -> Result<()> {
     conn.execute("PRAGMA foreign_keys = ON")
-        .map_err(BeadsError::Database)?;
+        .map_err(BeadsError::DatabaseLegacy)?;
 
     if foreign_keys_enabled(conn)? {
         return Ok(());

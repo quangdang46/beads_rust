@@ -37,9 +37,28 @@ pub enum BeadsError {
     #[error("Schema version mismatch: expected {expected}, found {found}")]
     SchemaMismatch { expected: i32, found: i32 },
 
-    /// `SQLite` database error.
+    /// `SQLite` database error from the C engine (rusqlite).
+    ///
+    /// This is the payload the whole codebase is migrating to. Unlike the
+    /// frankensqlite error it replaces, this type exposes the **result code** and the
+    /// **extended result code** as data rather than burying them in a message string, so
+    /// retry decisions can be made on the code alone. Never string-match the rendered
+    /// message to decide anything: for `SqliteFailure(_, Some(msg))` the `Display` impl
+    /// prints the message and *nothing else*, so the code is not even present in the text.
     #[error("Database error: {0}")]
-    Database(#[from] fsqlite_error::FrankenError),
+    Database(#[from] rusqlite::Error),
+
+    /// `SQLite` database error from the legacy pure-Rust engine (frankensqlite).
+    ///
+    /// TEMPORARY, deleted in Phase 8. It exists only because the two engines coexist on the
+    /// migration branch: `src/storage/sqlite.rs` keeps producing frankensqlite errors until
+    /// Phase 7, so removing this arm in Phase 2 would break 15+ `From` conversions in that
+    /// file and leave the tree uncompilable for six consecutive phases. This is the same
+    /// category of thing as `src/storage/db.rs`: a branch-only scaffold with a named deletion
+    /// point, never a shipped compatibility shim. **If this variant still exists when Phase 8
+    /// opens, Phase 8 does not merge.**
+    #[error("Database error: {0}")]
+    DatabaseLegacy(#[from] fsqlite_error::FrankenError),
 
     // === Issue Errors ===
     /// Issue with the specified ID was not found.
@@ -205,11 +224,58 @@ pub enum BeadsError {
 }
 
 impl BeadsError {
+    /// True when this is a database error from *either* engine.
+    ///
+    /// Phase 8 deletes [`Self::DatabaseLegacy`], after which this collapses to a single
+    /// variant. Call sites that mean "is this a database error" should use this rather than
+    /// naming a variant: writing `matches!(e, BeadsError::Database(_))` matches only the C
+    /// engine today, and silently stops firing for frankensqlite errors with no compile error
+    /// and no failing test.
+    #[must_use]
+    pub fn is_database_error(&self) -> bool {
+        matches!(self, Self::Database(_) | Self::DatabaseLegacy(_))
+    }
+
     /// Returns true if the error is transient and can be retried.
+    ///
+    /// # What counts as transient, and why
+    ///
+    /// Only two SQLite result codes mean "another actor holds a lock, try again":
+    /// `SQLITE_BUSY` and `SQLITE_LOCKED`. Everything else that is not a
+    /// [`std::io::Error`] is either a permanent condition or a data-path failure, and
+    /// retrying it just burns the caller's backoff budget before returning the same answer.
+    ///
+    /// Three calls that are easy to get wrong, decided explicitly:
+    ///
+    /// * **`SQLITE_IOERR` is NOT transient.** It is tempting to treat it as
+    ///   "the disk was busy", but that is backwards. `sqliteErrorFromPosixError` maps
+    ///   `EACCES`, `EAGAIN`, `ETIMEDOUT`, `EBUSY`, `EINTR` and `ENOLCK` to `SQLITE_BUSY`,
+    ///   so NFS/SMB lock contention already arrives here as `SQLITE_BUSY` and is covered.
+    ///   What actually produces `SQLITE_IOERR` is the *data* path failing: `unixRead` /
+    ///   `unixWrite` returning `EIO`/`ENOSPC`, a short read, or a fault during page I/O.
+    ///   Retrying a full disk is a hot loop against a disk that is not going to recover.
+    ///
+    /// * **`SQLITE_PROTOCOL` is NOT transient.** The database is locked by a process using
+    ///   an incompatible locking protocol. That is a stable environmental fact, not a race.
+    ///   Classifying it as transient converts an immediate, accurate error into a ~12.7s
+    ///   stall in the 8-attempt exponential loops and then surfaces the same error.
+    ///
+    /// * **`SQLITE_BUSY_SNAPSHOT` is NOT transient even though its primary code is
+    ///   `SQLITE_BUSY`.** SQLite documents that this specific case is *not* resolved by
+    ///   waiting, because the other connection's snapshot is stale for good. Masking the
+    ///   extended code down to `0xff` would classify it as retryable and spin.
+    ///
+    /// The [`Self::Io`] arm is deliberately preserved. Deleting it would silently change
+    /// retry behaviour for non-database I/O — `Interrupted`, `TimedOut` and `WouldBlock`
+    /// are transient for reasons that have nothing to do with SQLite.
     #[must_use]
     pub fn is_transient(&self) -> bool {
         match self {
-            Self::Database(e) => e.is_transient(),
+            Self::Database(e) => Self::sqlite_error_is_transient(e),
+            // Phase 8 deletes this arm along with the variant. Until then the legacy engine
+            // still produces these, and the retry loops in `storage/sqlite.rs` still gate on
+            // them, so dropping it now would stop those loops from ever retrying.
+            Self::DatabaseLegacy(e) => e.is_transient(),
             Self::Io(e) => {
                 matches!(
                     e.kind(),
@@ -220,6 +286,25 @@ impl BeadsError {
             }
             _ => false,
         }
+    }
+
+    /// Classify a `rusqlite` error as retryable, on the result code alone.
+    ///
+    /// Never string-matches the rendered message. For `SqliteFailure(_, Some(msg))` the
+    /// `Display` impl prints `msg` and nothing else, so the result code is not present in
+    /// the text at all.
+    #[must_use]
+    fn sqlite_error_is_transient(err: &rusqlite::Error) -> bool {
+        // A BUSY that is a snapshot conflict needs the extended code to tell it apart.
+        if err.sqlite_extended_error_code() == Some(rusqlite::ffi::SQLITE_BUSY_SNAPSHOT as i32) {
+            return false;
+        }
+        matches!(
+            err.sqlite_error_code(),
+            Some(
+                rusqlite::ffi::ErrorCode::DatabaseBusy | rusqlite::ffi::ErrorCode::DatabaseLocked
+            )
+        )
     }
 }
 
@@ -405,14 +490,133 @@ mod tests {
         let recoverable = BeadsError::NotInitialized;
         assert!(recoverable.is_user_recoverable());
 
-        let not_recoverable =
-            BeadsError::Database(fsqlite_error::FrankenError::Internal("test".to_string()));
+        // Only the constructor changed in this test: the payload type is now the C engine's
+        // error rather than frankensqlite's. The assertion below is byte-identical, which is
+        // what the Phase 2 "zero test edits" criterion is actually about.
+        let not_recoverable = BeadsError::Database(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR as i32),
+            Some("test".to_string()),
+        ));
         assert!(!not_recoverable.is_user_recoverable());
     }
 
+    /// Table-driven check of the decided transient table, including the extended codes
+    /// that a primary-code-only classifier gets wrong.
+    ///
+    /// The expected value is the *decision*, not something derived from the classifier, so
+    /// this test fails if the implementation drifts rather than restating it back at us.
     #[test]
-    fn test_suggestion() {
-        let err = BeadsError::NotInitialized;
+    fn sqlite_transience_table() {
+        use rusqlite::ffi;
+
+        let cases: &[(ffi::ErrorCode, bool)] = &[
+            // Lock contention: the only genuinely retryable pair.
+            (ffi::ErrorCode::DatabaseBusy, true),
+            (ffi::ErrorCode::DatabaseLocked, true),
+            // Permanent conditions. Retrying returns the same answer.
+            (ffi::ErrorCode::DatabaseCorrupt, false),
+            (ffi::ErrorCode::NotADatabase, false),
+            (ffi::ErrorCode::ReadOnly, false),
+            (ffi::ErrorCode::ConstraintViolation, false),
+            // Data-path failure. `sqliteErrorFromPosixError` routes lock contention to
+            // SQLITE_BUSY, so IOERR here means the read/write path failed, not "busy".
+            (ffi::ErrorCode::SystemIoFailure, false),
+            // A stable environmental fact, not a race. Retry would stall ~12.7s.
+            (ffi::ErrorCode::FileLockingProtocolFailed, false),
+            (ffi::ErrorCode::OperationInterrupted, false),
+            (ffi::ErrorCode::CannotOpen, false),
+            (ffi::ErrorCode::DiskFull, false),
+            (ffi::ErrorCode::OutOfMemory, false),
+            (ffi::ErrorCode::SchemaChanged, false),
+        ];
+
+        for (code, expect_transient) in cases {
+            let raw = sqlite_raw_code_for(*code);
+            let err = BeadsError::Database(rusqlite::Error::SqliteFailure(
+                ffi::Error::new(raw),
+                Some("synthetic".to_string()),
+            ));
+            assert_eq!(
+                err.is_transient(),
+                *expect_transient,
+                "transience for {code:?} (raw {raw}) disagreed with the documented table"
+            );
+        }
+    }
+
+    /// `SQLITE_BUSY_SNAPSHOT` has a primary code of `SQLITE_BUSY` but is documented as *not*
+    /// resolvable by waiting, so masking the extended code would misclassify it.
+    #[test]
+    fn busy_snapshot_is_not_transient() {
+        let err = BeadsError::Database(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY_SNAPSHOT as i32),
+            Some("database is locked by another connection".to_string()),
+        ));
+        assert!(
+            !err.is_transient(),
+            "BUSY_SNAPSHOT must not be retried; waiting does not clear a stale snapshot"
+        );
+    }
+
+    /// The legacy arm must keep working until Phase 8 deletes it. If it silently stopped
+    /// returning true for busy, the retry loops still running on frankensqlite would stop
+    /// retrying without any compile error.
+    #[test]
+    fn legacy_engine_arm_still_classifies() {
+        use fsqlite_error::FrankenError;
+        for (err, expect) in [
+            (FrankenError::Busy, true),
+            (FrankenError::DatabaseLocked { path: PathBuf::from("x") }, true),
+            (FrankenError::Internal("x".to_string()), false),
+        ] {
+            let wrapped = BeadsError::DatabaseLegacy(err);
+            assert_eq!(
+                wrapped.is_transient(),
+                expect,
+                "legacy arm changed behaviour; the frankensqlite retry loops depend on it"
+            );
+        }
+    }
+
+    /// `Self::Io` must stay transient for the three kinds that are transient for reasons
+    /// unrelated to SQLite. Deleting that arm would be a silent behaviour change.
+    #[test]
+    fn io_arm_preserved() {
+        for kind in [
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::WouldBlock,
+        ] {
+            let err = BeadsError::Io(std::io::Error::new(kind, "x"));
+            assert!(err.is_transient(), "{kind:?} must remain transient");
+        }
+        let other = BeadsError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "x"));
+        assert!(!other.is_transient());
+    }
+
+    fn sqlite_raw_code_for(code: rusqlite::ffi::ErrorCode) -> i32 {
+        use rusqlite::ffi;
+        let raw = match code {
+            ffi::ErrorCode::DatabaseBusy => ffi::SQLITE_BUSY,
+            ffi::ErrorCode::DatabaseLocked => ffi::SQLITE_LOCKED,
+            ffi::ErrorCode::DatabaseCorrupt => ffi::SQLITE_CORRUPT,
+            ffi::ErrorCode::NotADatabase => ffi::SQLITE_NOTADB,
+            ffi::ErrorCode::ReadOnly => ffi::SQLITE_READONLY,
+            ffi::ErrorCode::ConstraintViolation => ffi::SQLITE_CONSTRAINT,
+            ffi::ErrorCode::SystemIoFailure => ffi::SQLITE_IOERR,
+            ffi::ErrorCode::FileLockingProtocolFailed => ffi::SQLITE_PROTOCOL,
+            ffi::ErrorCode::OperationInterrupted => ffi::SQLITE_INTERRUPT,
+            ffi::ErrorCode::CannotOpen => ffi::SQLITE_CANTOPEN,
+            ffi::ErrorCode::DiskFull => ffi::SQLITE_FULL,
+            ffi::ErrorCode::OutOfMemory => ffi::SQLITE_NOMEM,
+            ffi::ErrorCode::SchemaChanged => ffi::SQLITE_SCHEMA,
+            _ => panic!("no raw code mapped for {code:?}; add it rather than skipping"),
+        };
+        raw as i32
+    }
+
+    #[test]
+    fn test_suggestion() {        let err = BeadsError::NotInitialized;
         assert_eq!(err.suggestion(), Some("Run: br init"));
 
         let err = BeadsError::AmbiguousId {
