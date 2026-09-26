@@ -58,6 +58,17 @@ impl SqlValue {
         Self(value)
     }
 
+    /// Bind an optional value: `None` becomes SQL `NULL`, `Some` binds the value itself.
+    ///
+    /// A blanket `impl<T: Into<SqlValue>> From<Option<T>>` is not available -- it would overlap
+    /// with the `From<T>` impls below, and coherence rejects the overlap. A named constructor is
+    /// the honest way to express "nullable column", and it keeps the NULL decision visible at
+    /// the call site rather than implicit in a type conversion.
+    #[must_use]
+    pub fn from_nullable<T: Into<Self>>(value: Option<T>) -> Self {
+        value.map_or_else(Self::null, Into::into)
+    }
+
     /// SQL `NULL`.
     ///
     /// The direct analogue of `fsqlite_types::SqliteValue::Null`, which appears at ~71 sites
@@ -247,6 +258,62 @@ pub fn query_row_values(stmt: &mut Statement<'_>) -> rusqlite::Result<Option<Vec
 /// Run a statement that returns no rows.
 pub fn db_exec(conn: &Connection, sql: &str) -> rusqlite::Result<usize> {
     conn.execute(sql, [])
+}
+
+/// The direct replacements for the four frankensqlite call shapes.
+///
+/// These exist so that converting a call site is a *textual* rewrite -- `conn.execute_with_params(
+/// sql, &[..])` becomes `exec_with(&conn, sql, &[..])` -- rather than a multi-line edit that
+/// has to bind the converted parameter vector to a local. That matters at this scale: the array
+/// literal may itself contain nested brackets and commas, so any brace-matching transformation
+/// has to be bracket-aware, and a simpler-looking inline form
+/// (`conn.execute(sql, params_from(&[..]).as_slice())`) does not borrow-check, because the
+/// temporary array dies at the end of the statement.
+///
+/// The `[..]` argument is an ordinary temporary, so it lives to the end of the call and the
+/// borrow inside is fine. No `unsafe`, no `'static` requirement, no clone of the values.
+pub fn exec_with(
+    conn: &Connection,
+    sql: &str,
+    values: &[SqlValue],
+) -> rusqlite::Result<usize> {
+    conn.execute(sql, params_from(values).as_slice())
+}
+
+/// `conn.query_with_params(sql, &[..])` returning `Vec<Row>`.
+pub fn query_rows_with(
+    conn: &Connection,
+    sql: &str,
+    values: &[SqlValue],
+) -> rusqlite::Result<Vec<Vec<SqlValue>>> {
+    let mut stmt = conn.prepare(sql)?;
+    query_rows_with_params(&mut stmt, params_from(values).as_slice())
+}
+
+/// `conn.query_row_with_params(sql, &[..])` returning the row, or `None` when it matched
+/// nothing.
+///
+/// `None` rather than an error, because that is what the frankensqlite call sites expect: a
+/// metadata row that is simply not there is an ordinary outcome for them, not a failure.
+pub fn query_row_with(
+    conn: &Connection,
+    sql: &str,
+    values: &[SqlValue],
+) -> rusqlite::Result<Option<Vec<SqlValue>>> {
+    let mut stmt = conn.prepare(sql)?;
+    query_row_values_with_params(&mut stmt, params_from(values).as_slice())
+}
+
+/// `conn.query(sql)` returning `Vec<Row>`.
+pub fn query_all(conn: &Connection, sql: &str) -> rusqlite::Result<Vec<Vec<SqlValue>>> {
+    let mut stmt = conn.prepare(sql)?;
+    query_rows(&mut stmt)
+}
+
+/// `conn.query_row(sql)` returning the row, or `None` when it matched nothing.
+pub fn query_row_all(conn: &Connection, sql: &str) -> rusqlite::Result<Option<Vec<SqlValue>>> {
+    let mut stmt = conn.prepare(sql)?;
+    query_row_values(&mut stmt)
 }
 
 /// Borrow a `&[SqlValue]` as the `&[&dyn ToSql]` rusqlite's parameter APIs take.

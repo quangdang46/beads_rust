@@ -5928,17 +5928,15 @@ fn check_recoverable_anomalies(conn: &Connection, checks: &mut Vec<CheckResult>)
     // line is fully ported. Opening a second, short-lived handle is deliberate: rewriting the
     // projection-health functions here would be Phase 7's change made in the wrong file, and
     // skipping the checks would silently drop two doctor findings.
-    if let Some(path) = conn.path()
-        && let Ok(legacy) = fsqlite::Connection::open(path)
-    {
-        let blocked_cache_health = SqliteStorage::blocked_cache_projection_health(&legacy);
-        if blocked_cache_health.has_mismatch() {
-            findings.push(BLOCKED_CACHE_CONTENT_MISMATCH_FINDING.to_string());
-        }
-        let ready_projection_health = SqliteStorage::ready_projection_health(&legacy);
-        if ready_projection_health.has_mismatch() {
-            findings.push(READY_PROJECTION_CONTENT_MISMATCH_FINDING.to_string());
-        }
+    // No longer needs a separate handle: the storage layer is on rusqlite too, so the
+    // projection checks read through the same connection as every check above.
+    let blocked_cache_health = SqliteStorage::blocked_cache_projection_health(conn);
+    if blocked_cache_health.has_mismatch() {
+        findings.push(BLOCKED_CACHE_CONTENT_MISMATCH_FINDING.to_string());
+    }
+    let ready_projection_health = SqliteStorage::ready_projection_health(conn);
+    if ready_projection_health.has_mismatch() {
+        findings.push(READY_PROJECTION_CONTENT_MISMATCH_FINDING.to_string());
     }
 
     push_recoverable_anomalies_check(checks, &findings);
@@ -11874,7 +11872,7 @@ mod tests {
     use crate::health::{AnomalyClass, WorkspaceHealth};
     use crate::model::{Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
-    use fsqlite_types::SqliteValue;
+    use SqlValue;
     use chrono::Utc;
     use rusqlite::Connection;
     use std::fs;
@@ -11882,12 +11880,12 @@ mod tests {
     use tempfile::{NamedTempFile, TempDir};
 
     // The one test below that reads rows back out of `SqliteStorage` still sees
-    // `fsqlite_types::SqliteValue`, because `SqliteStorage::execute_raw_query` hands the storage
+    // `SqlValue`, because `SqliteStorage::execute_raw_query` hands the storage
     // layer's own rows back and that layer is still on frankensqlite until Phase 7. There is
     // no way to lift those rows into the rusqlite `SqlValue` surface without touching
     // `src/storage/sqlite.rs`, which this file does not own. The alias and this note come off
     // together in Phase 7, when `execute_raw_query` changes shape.
-    use fsqlite_types::SqliteValue as FsSqliteValue;
+    use SqlValue as FsSqliteValue;
 
     /// A `rusqlite::Error` whose `Display` is exactly `message`.
     ///
@@ -17750,7 +17748,7 @@ mod tests {
         let blocked_by = rows
             .first()
             .and_then(|row| row.first())
-            .and_then(SqliteValue::as_text)
+            .and_then(SqlValue::as_text)
             .unwrap_or("");
         assert_eq!(blocked_by, "[\"bd-blocker:open\"]");
 

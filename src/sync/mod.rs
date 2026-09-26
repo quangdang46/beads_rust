@@ -20,7 +20,7 @@ pub use path::{
 use crate::error::{BeadsError, Result};
 use crate::model::{Comment, Dependency, Issue};
 use crate::storage::SqliteStorage;
-use fsqlite_types::SqliteValue;
+use crate::storage::db::SqlValue;
 use crate::sync::history::HistoryConfig;
 use crate::util::id::{IdConfig, IdGenerator, parse_id};
 use crate::util::progress::{create_progress_bar, create_spinner};
@@ -1681,7 +1681,7 @@ fn export_issue_ids(storage: &SqliteStorage) -> Result<Vec<String>> {
 
     Ok(rows
         .iter()
-        .filter_map(|row| row.first().and_then(SqliteValue::as_text).map(String::from))
+        .filter_map(|row| row.first().and_then(SqlValue::as_text).map(String::from))
         .collect())
 }
 
@@ -2970,7 +2970,7 @@ fn restore_foreign_keys_after_import(
         })?
         .first()
         .and_then(|row| row.first())
-        .and_then(SqliteValue::as_integer)
+        .and_then(SqlValue::as_integer)
         .unwrap_or(0);
 
     if foreign_keys_enabled != 1 {
@@ -6791,14 +6791,14 @@ mod tests {
         assert_eq!(
             child_counters[0]
                 .first()
-                .and_then(SqliteValue::as_text)
+                .and_then(SqlValue::as_text)
                 .unwrap_or(""),
             "bd-orphan.6"
         );
         assert_eq!(
             child_counters[0]
                 .get(1)
-                .and_then(SqliteValue::as_integer)
+                .and_then(SqlValue::as_integer)
                 .unwrap_or_default(),
             1
         );
@@ -7325,7 +7325,7 @@ mod tests {
             .unwrap()
             .first()
             .and_then(|row| row.first())
-            .and_then(SqliteValue::as_integer)
+            .and_then(SqlValue::as_integer)
             .unwrap_or(0);
         assert_eq!(fk_enabled, 1, "foreign key enforcement should be restored");
     }
@@ -7354,7 +7354,7 @@ mod tests {
             .unwrap()
             .first()
             .and_then(|row| row.first())
-            .and_then(SqliteValue::as_integer)
+            .and_then(SqlValue::as_integer)
             .unwrap_or(0);
         assert_eq!(fk_enabled, 1, "foreign key enforcement should be restored");
     }
@@ -7519,7 +7519,7 @@ mod tests {
         assert_eq!(
             export_hash_rows[0]
                 .first()
-                .and_then(SqliteValue::as_text)
+                .and_then(SqlValue::as_text)
                 .unwrap_or(""),
             "test-existing"
         );
