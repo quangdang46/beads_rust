@@ -634,18 +634,18 @@ pub(crate) fn apply_runtime_pragmas(conn: &Connection) -> Result<()> {
 pub(crate) fn table_exists(conn: &Connection, table: &str) -> bool {
     let escaped_table = table.replace('\'', "''");
     let sql = format!("SELECT 1 FROM sqlite_master WHERE type='table' AND name='{escaped_table}'");
-    query_all(conn, &sql).is_ok_and(|rows| !rows.is_empty())
+    query_all(&conn, &sql).is_ok_and(|rows| !rows.is_empty())
 }
 
 fn index_exists(conn: &Connection, index: &str) -> bool {
     let escaped_index = index.replace('\'', "''");
     let sql = format!("SELECT 1 FROM sqlite_master WHERE type='index' AND name='{escaped_index}'");
-    query_all(conn, &sql).is_ok_and(|rows| !rows.is_empty())
+    query_all(&conn, &sql).is_ok_and(|rows| !rows.is_empty())
 }
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
     let sql = format!("PRAGMA table_info('{table}')");
-    query_all(conn, &sql).is_ok_and(|rows| {
+    query_all(&conn, &sql).is_ok_and(|rows| {
         rows.iter()
             .any(|row| row.get(1).and_then(SqlValue::as_text) == Some(column))
     })
@@ -902,7 +902,7 @@ fn issues_column_order_matches(conn: &Connection) -> bool {
     // single query.  Avoid querying sqlite_master separately because
     // fsqlite's in-memory sqlite_master can return inconsistent results
     // when queried multiple times within the same connection session.
-    let Ok(rows) = query_all(conn, "PRAGMA table_info(issues)") else {
+    let Ok(rows) = query_all(&conn, "PRAGMA table_info(issues)") else {
         return false;
     };
 
@@ -926,7 +926,7 @@ fn issues_column_order_matches(conn: &Connection) -> bool {
 }
 
 fn issues_filter_columns_require_v3_rebuild(conn: &Connection) -> bool {
-    let Ok(rows) = query_all(conn, "PRAGMA table_info('issues')") else {
+    let Ok(rows) = query_all(&conn, "PRAGMA table_info('issues')") else {
         return true;
     };
 
@@ -996,7 +996,7 @@ fn finish_foreign_key_suppressed_result<T>(
 ///   3. Drop old table
 ///   4. Rename new table
 fn rebuild_issues_table(conn: &Connection) -> Result<()> {
-    let existing_rows = query_all(conn, "PRAGMA table_info('issues')")?;
+    let existing_rows = query_all(&conn, "PRAGMA table_info('issues')")?;
     let existing_columns: Vec<String> = existing_rows
         .iter()
         .filter_map(|row| row.get(1).and_then(SqlValue::as_text).map(String::from))
@@ -1192,7 +1192,7 @@ fn kv_table_uses_primary_key(conn: &Connection, table: &str) -> bool {
     // the `key` column is declared as PRIMARY KEY.  fsqlite's in-memory
     // sqlite_master can return inconsistent results across queries.
     let sql = format!("PRAGMA table_info('{table}')");
-    let Ok(rows) = query_all(conn, &sql) else {
+    let Ok(rows) = query_all(&conn, &sql) else {
         return false;
     };
 
@@ -1208,8 +1208,7 @@ fn kv_table_uses_primary_key(conn: &Connection, table: &str) -> bool {
 fn kv_table_needs_canonical_rebuild(conn: &Connection, table: &str, expected_index: &str) -> bool {
     // Use PRAGMA table_info for the existence check instead of sqlite_master,
     // which can return inconsistent results in fsqlite.
-    let table_has_rows = conn
-        .query(&format!("PRAGMA table_info('{table}')"))
+    let table_has_rows = query_all(&conn, &format!("PRAGMA table_info('{table}')"))
         .is_ok_and(|rows| !rows.is_empty());
     table_has_rows
         && (!index_exists(conn, expected_index) || kv_table_uses_primary_key(conn, table))
@@ -2188,7 +2187,7 @@ mod tests {
 
         // Verify a few tables exist
         let tables: Vec<String> =
-            query_all(conn, "SELECT name FROM sqlite_master WHERE type='table'")
+            query_all(&conn, "SELECT name FROM sqlite_master WHERE type='table'")
             .unwrap()
             .iter()
             .filter_map(|row| row.get(0).and_then(|v| v.as_text()).map(String::from))
@@ -2620,7 +2619,7 @@ mod tests {
         // === ISSUES TABLE ===
         // Verify column defaults
         let issues_cols: Vec<(String, String, i32, Option<String>)> =
-            query_all(conn, "PRAGMA table_info(issues)")
+            query_all(&conn, "PRAGMA table_info(issues)")
             .unwrap()
             .iter()
             .map(|row| {
@@ -2685,7 +2684,7 @@ mod tests {
 
         // === VERIFY KEY INDEXES EXIST ===
         let indexes: HashSet<String> =
-            query_all(conn, "SELECT name FROM sqlite_master WHERE type='index' AND sql IS NOT NULL")
+            query_all(&conn, "SELECT name FROM sqlite_master WHERE type='index' AND sql IS NOT NULL")
             .unwrap()
             .iter()
             .filter_map(|row| row.get(0).and_then(|v| v.as_text()).map(String::from))
@@ -2765,7 +2764,7 @@ mod tests {
 
         // === DEPENDENCIES TABLE ===
         let deps_cols: Vec<(String, Option<String>)> =
-            query_all(conn, "PRAGMA table_info(dependencies)")
+            query_all(&conn, "PRAGMA table_info(dependencies)")
             .unwrap()
             .iter()
             .map(|row| {
@@ -2835,7 +2834,7 @@ mod tests {
         );
 
         // === BLOCKED_ISSUES_CACHE TABLE ===
-        let cache_cols: Vec<String> = query_all(conn, "PRAGMA table_info(blocked_issues_cache)")
+        let cache_cols: Vec<String> = query_all(&conn, "PRAGMA table_info(blocked_issues_cache)")
             .unwrap()
             .iter()
             .filter_map(|row| row.get(1).and_then(|v| v.as_text()).map(String::from))
@@ -2959,7 +2958,7 @@ mod tests {
         run_migrations(&conn, false).unwrap();
 
         // Verify columns were updated
-        let cols: Vec<String> = query_all(conn, "PRAGMA table_info(blocked_issues_cache)")
+        let cols: Vec<String> = query_all(&conn, "PRAGMA table_info(blocked_issues_cache)")
             .unwrap()
             .iter()
             .filter_map(|row| row.get(1).and_then(|v| v.as_text()).map(String::from))
@@ -3041,7 +3040,7 @@ mod tests {
         // Apply full schema (includes pre-migrations)
         apply_schema(&conn).unwrap();
 
-        let cols: Vec<String> = query_all(conn, "PRAGMA table_info(blocked_issues_cache)")
+        let cols: Vec<String> = query_all(&conn, "PRAGMA table_info(blocked_issues_cache)")
             .unwrap()
             .iter()
             .filter_map(|row| row.get(1).and_then(|v| v.as_text()).map(String::from))
@@ -3084,7 +3083,7 @@ mod tests {
 
         apply_schema(&conn).unwrap();
 
-        let cols: Vec<String> = query_all(conn, "PRAGMA table_info('issues')")
+        let cols: Vec<String> = query_all(&conn, "PRAGMA table_info('issues')")
             .unwrap()
             .iter()
             .filter_map(|row| row.get(1).and_then(|v| v.as_text()).map(String::from))
@@ -3190,7 +3189,7 @@ mod tests {
         apply_schema(&conn).unwrap();
 
         assert!(
-            query_all(conn, "PRAGMA table_info('dependencies')")
+            query_all(&conn, "PRAGMA table_info('dependencies')")
                 .unwrap()
                 .iter()
                 .filter_map(|row| row.get(1).and_then(|v| v.as_text()).map(String::from))
@@ -3226,7 +3225,7 @@ mod tests {
         // key column should no longer be PRIMARY KEY in rebuilt tables.
         // Use PRAGMA table_info (not the table-valued function form) since
         // fsqlite does not support pragma_table_info as a table-valued function.
-        let config_key_pk = query_all(conn, "PRAGMA table_info('config')")
+        let config_key_pk = query_all(&conn, "PRAGMA table_info('config')")
             .unwrap()
             .iter()
             .find(|row| row.get(1).and_then(SqlValue::as_text) == Some("key"))
@@ -3234,7 +3233,7 @@ mod tests {
             .unwrap_or(0);
         assert_eq!(config_key_pk, 0);
 
-        let metadata_key_pk = query_all(conn, "PRAGMA table_info('metadata')")
+        let metadata_key_pk = query_all(&conn, "PRAGMA table_info('metadata')")
             .unwrap()
             .iter()
             .find(|row| row.get(1).and_then(SqlValue::as_text) == Some("key"))
@@ -3253,14 +3252,14 @@ mod tests {
             Some("new")
         );
 
-        let metadata_latest = conn
-            .query_row_with_params(
-                "SELECT value FROM metadata WHERE key = ?1",
-                &[SqlValue::from("project")],
-            )
-            .unwrap();
+        let metadata_values = [SqlValue::from("project")];
+        let metadata_latest = crate::storage::db::query_row_values_with_params(
+            &mut conn.prepare("SELECT value FROM metadata WHERE key = ?1").unwrap(),
+            crate::storage::db::params_from(&metadata_values).as_slice(),
+        )
+        .unwrap();
         assert_eq!(
-            metadata_latest.get(0).and_then(SqlValue::as_text),
+            metadata_latest.as_ref().and_then(|r| r.first()).and_then(SqlValue::as_text),
             Some("new")
         );
     }
@@ -3302,7 +3301,7 @@ mod tests {
         apply_schema(&conn).expect("schema");
 
         let plan_rows = query_all(
-            conn,
+            &conn,
             "EXPLAIN QUERY PLAN
                  SELECT id, priority, created_at
                  FROM issues
