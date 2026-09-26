@@ -364,9 +364,13 @@ fn should_attempt_mutation_jsonl_recovery(
     operation_err: &BeadsError,
     probe_err: Option<&BeadsError>,
 ) -> bool {
-    matches!(operation_err, BeadsError::Database(_))
+    // Both engine payloads. A guard that matched only `Database` would silently switch off
+    // JSONL mutation recovery for every frankensqlite error, with no compile error and no
+    // test failure -- the feature would simply stop firing. `DatabaseLegacy` is deleted in
+    // Phase 8, at which point this collapses back to a single variant.
+    operation_err.is_database_error()
         && (storage_ctx.should_attempt_jsonl_recovery(operation_err)
-            || probe_err.is_some_and(|err| storage_ctx.should_attempt_jsonl_recovery(err)))
+        || probe_err.is_some_and(|err| storage_ctx.should_attempt_jsonl_recovery(err)))
 }
 
 pub(super) fn auto_import_storage_ctx_if_stale(
@@ -572,7 +576,9 @@ where
     match operation(&mut storage_ctx.storage) {
         Ok(value) => Ok(value),
         Err(operation_err) => {
-            if !allow_recovery || !matches!(operation_err, BeadsError::Database(_)) {
+            // Both engine payloads, for the same reason as in
+            // `should_attempt_mutation_jsonl_recovery` above.
+            if !allow_recovery || !operation_err.is_database_error() {
                 return Err(operation_err);
             }
 
@@ -870,7 +876,7 @@ mod tests {
             |_storage| {
                 attempts += 1;
                 if attempts == 1 {
-                    Err(BeadsError::Database(FrankenError::DatabaseCorrupt {
+                    Err(BeadsError::DatabaseLegacy(FrankenError::DatabaseCorrupt {
                         detail: "synthetic corruption".to_string(),
                     }))
                 } else {
@@ -919,7 +925,7 @@ mod tests {
                 if attempts == 1 {
                     // First attempt: a recoverable corruption error that does NOT
                     // commit. The staged attribution must NOT be consumed.
-                    Err(BeadsError::Database(FrankenError::DatabaseCorrupt {
+                    Err(BeadsError::DatabaseLegacy(FrankenError::DatabaseCorrupt {
                         detail: "synthetic corruption".to_string(),
                     }))
                 } else {
@@ -956,10 +962,10 @@ mod tests {
     #[test]
     fn mutation_recovery_can_be_signaled_by_probe_after_constraint_style_error() {
         let (_temp, storage_ctx) = storage_ctx_with_exported_issue();
-        let operation_err = BeadsError::Database(FrankenError::Internal(
+        let operation_err = BeadsError::DatabaseLegacy(FrankenError::Internal(
             "constraint verification failed".to_string(),
         ));
-        let probe_err = BeadsError::Database(FrankenError::Internal(
+        let probe_err = BeadsError::DatabaseLegacy(FrankenError::Internal(
             "database disk image is malformed".to_string(),
         ));
 

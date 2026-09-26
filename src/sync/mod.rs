@@ -4736,7 +4736,7 @@ fn process_import_action(
 fn insert_new_import_issue(storage: &SqliteStorage, issue: &Issue) -> Result<bool> {
     match storage.insert_new_issue_for_import(issue) {
         Ok(_) => Ok(true),
-        Err(BeadsError::Database(
+        Err(BeadsError::DatabaseLegacy(
             fsqlite_error::FrankenError::PrimaryKeyViolation
             | fsqlite_error::FrankenError::UniqueViolation { .. },
         )) => {
@@ -8014,10 +8014,7 @@ mod tests {
             &output_path,
         )
         .unwrap_err();
-        assert!(
-            matches!(err, BeadsError::Database(_)),
-            "unexpected error: {err:?}"
-        );
+        assert!(err.is_database_error(), "unexpected error: {err:?}");
 
         assert_eq!(
             storage.get_dirty_issue_ids().unwrap(),

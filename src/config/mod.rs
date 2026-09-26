@@ -1052,9 +1052,16 @@ fn should_attempt_jsonl_recovery(open_err: &BeadsError, db_path: &Path, jsonl_pa
         return false;
     }
 
-    matches!(
+    // Legacy frankensqlite variants. `DatabaseLegacy` until Phase 8.
+    //
+    // NOTE: this gate already rebuilds from JSONL, and the JSONL does NOT contain the
+    // `events` audit log -- a rebuild therefore produces an empty events table. That property
+    // predates the engine migration; the migration neither introduces nor fixes it. Filed
+    // separately so the audit-log loss is decided on its own merits rather than as a
+    // side effect of an engine swap.
+    if matches!(
         open_err,
-        BeadsError::Database(
+        BeadsError::DatabaseLegacy(
             FrankenError::DatabaseCorrupt { .. }
                 | FrankenError::NotADatabase { .. }
                 | FrankenError::WalCorrupt { .. }
@@ -1062,10 +1069,32 @@ fn should_attempt_jsonl_recovery(open_err: &BeadsError, db_path: &Path, jsonl_pa
                 | FrankenError::TableExists { .. }
                 | FrankenError::IndexExists { .. }
         )
-    ) || matches!(
+    ) {
+        return true;
+    }
+    if matches!(
         open_err,
-        BeadsError::Database(FrankenError::Internal(detail))
+        BeadsError::DatabaseLegacy(FrankenError::Internal(detail))
             if is_recoverable_database_internal_error(detail)
+    ) {
+        return true;
+    }
+
+    // C engine equivalents. frankensqlite had distinct `WalCorrupt` and `ShortRead`
+    // variants; C SQLite has no such variants, and both conditions surface as one of the
+    // three codes below. Without this arm the self-heal would silently disappear in Phase 7
+    // and present as "br doctor no longer recovers my workspace".
+    matches!(
+        open_err,
+        BeadsError::Database(e)
+            if matches!(
+                e.sqlite_error_code(),
+                Some(
+                    rusqlite::ffi::ErrorCode::DatabaseCorrupt
+                        | rusqlite::ffi::ErrorCode::NotADatabase
+                        | rusqlite::ffi::ErrorCode::SystemIoFailure
+                )
+            )
     )
 }
 
@@ -1077,7 +1106,7 @@ fn should_attempt_jsonl_recovery_after_open(
     should_attempt_jsonl_recovery(probe_err, db_path, jsonl_path)
         || matches!(
             probe_err,
-            BeadsError::Database(FrankenError::QueryReturnedMultipleRows)
+            BeadsError::DatabaseLegacy(FrankenError::QueryReturnedMultipleRows)
         )
 }
 
@@ -6356,28 +6385,28 @@ routing:
         fs::write(&jsonl_path, "{}\n").expect("write jsonl");
 
         assert!(should_attempt_jsonl_recovery(
-            &BeadsError::Database(FrankenError::DatabaseCorrupt {
+            &BeadsError::DatabaseLegacy(FrankenError::DatabaseCorrupt {
                 detail: "bad page".to_string()
             }),
             &db_path,
             &jsonl_path
         ));
         assert!(should_attempt_jsonl_recovery(
-            &BeadsError::Database(FrankenError::NotADatabase {
+            &BeadsError::DatabaseLegacy(FrankenError::NotADatabase {
                 path: db_path.clone()
             }),
             &db_path,
             &jsonl_path
         ));
         assert!(should_attempt_jsonl_recovery(
-            &BeadsError::Database(FrankenError::WalCorrupt {
+            &BeadsError::DatabaseLegacy(FrankenError::WalCorrupt {
                 detail: "bad wal".to_string()
             }),
             &db_path,
             &jsonl_path
         ));
         assert!(should_attempt_jsonl_recovery(
-            &BeadsError::Database(FrankenError::ShortRead {
+            &BeadsError::DatabaseLegacy(FrankenError::ShortRead {
                 expected: 4096,
                 actual: 12
             }),
@@ -6385,21 +6414,21 @@ routing:
             &jsonl_path
         ));
         assert!(should_attempt_jsonl_recovery(
-            &BeadsError::Database(FrankenError::TableExists {
+            &BeadsError::DatabaseLegacy(FrankenError::TableExists {
                 name: "blocked_issues_cache".to_string()
             }),
             &db_path,
             &jsonl_path
         ));
         assert!(should_attempt_jsonl_recovery(
-            &BeadsError::Database(FrankenError::IndexExists {
+            &BeadsError::DatabaseLegacy(FrankenError::IndexExists {
                 name: "idx_blocked_cache_blocked_at".to_string()
             }),
             &db_path,
             &jsonl_path
         ));
         assert!(should_attempt_jsonl_recovery(
-            &BeadsError::Database(FrankenError::Internal(
+            &BeadsError::DatabaseLegacy(FrankenError::Internal(
                 "malformed database schema (blocked_issues_cache) - table \"blocked_issues_cache\" already exists"
                     .to_string()
             )),
@@ -6407,14 +6436,14 @@ routing:
             &jsonl_path
         ));
         assert!(should_attempt_jsonl_recovery(
-            &BeadsError::Database(FrankenError::Internal(
+            &BeadsError::DatabaseLegacy(FrankenError::Internal(
                 "database disk image is malformed".to_string()
             )),
             &db_path,
             &jsonl_path
         ));
         assert!(should_attempt_jsonl_recovery(
-            &BeadsError::Database(FrankenError::Internal(
+            &BeadsError::DatabaseLegacy(FrankenError::Internal(
                 "row 13 missing from index idx_issues_list_active_order".to_string()
             )),
             &db_path,
@@ -6422,24 +6451,24 @@ routing:
         ));
 
         assert!(!should_attempt_jsonl_recovery(
-            &BeadsError::Database(FrankenError::SchemaChanged),
+            &BeadsError::DatabaseLegacy(FrankenError::SchemaChanged),
             &db_path,
             &jsonl_path
         ));
         assert!(!should_attempt_jsonl_recovery(
-            &BeadsError::Database(FrankenError::CannotOpen {
+            &BeadsError::DatabaseLegacy(FrankenError::CannotOpen {
                 path: db_path.clone()
             }),
             &db_path,
             &jsonl_path
         ));
         assert!(!should_attempt_jsonl_recovery(
-            &BeadsError::Database(FrankenError::Busy),
+            &BeadsError::DatabaseLegacy(FrankenError::Busy),
             &db_path,
             &jsonl_path
         ));
         assert!(!should_attempt_jsonl_recovery(
-            &BeadsError::Database(FrankenError::Internal(
+            &BeadsError::DatabaseLegacy(FrankenError::Internal(
                 "constraint verification failed".to_string()
             )),
             &db_path,
@@ -8041,8 +8070,8 @@ routing:
         let err =
             open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect_err("should fail");
         assert!(
-            matches!(err, BeadsError::Database(_)),
-            "invalid JSONL should preserve the original database open error"
+            err.is_database_error(),
+            "invalid JSONL should preserve the original database open error, got: {err:?}"
         );
         assert!(
             db_path.is_file(),

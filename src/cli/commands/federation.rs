@@ -125,7 +125,9 @@ fn open_connection() -> Result<Connection> {
     let path_str = db_path.to_str().ok_or_else(|| BeadsError::Internal {
         message: "invalid beads directory path".to_string(),
     })?;
-    Connection::open(path_str).map_err(BeadsError::Database)
+    // `DatabaseLegacy` because this still opens through frankensqlite; Phase 8 deletes that
+    // variant once no `src/` file imports fsqlite. See the variant's doc comment.
+    Connection::open(path_str).map_err(BeadsError::DatabaseLegacy)
 }
 
 /// Insert a new federation peer using parameterized queries.
@@ -152,7 +154,7 @@ fn federation_peers_insert(
             SqliteValue::from(peer.updated_at.as_str()),
         ],
     )
-    .map_err(BeadsError::Database)?;
+    .map_err(BeadsError::DatabaseLegacy)?;
     Ok(())
 }
 
@@ -165,7 +167,7 @@ fn federation_peers_list(conn: &Connection) -> Result<Vec<FederationPeer>> {
              FROM federation_peers
              ORDER BY name",
         )
-        .map_err(BeadsError::Database)?;
+        .map_err(BeadsError::DatabaseLegacy)?;
     Ok(rows.iter().map(FederationPeer::from_row).collect())
 }
 
@@ -179,7 +181,7 @@ fn federation_peers_get(conn: &Connection, name: &str) -> Result<Option<Federati
              WHERE name = ?1",
             &[SqliteValue::from(name)],
         )
-        .map_err(BeadsError::Database)?;
+        .map_err(BeadsError::DatabaseLegacy)?;
     Ok(rows.first().map(|r| FederationPeer::from_row(r)))
 }
 
@@ -189,7 +191,7 @@ fn federation_peers_delete(conn: &Connection, name: &str) -> Result<()> {
         "DELETE FROM federation_peers WHERE name = ?1",
         &[SqliteValue::from(name)],
     )
-    .map_err(BeadsError::Database)?;
+    .map_err(BeadsError::DatabaseLegacy)?;
     Ok(())
 }
 
@@ -439,7 +441,7 @@ fn cmd_sync(conn: &Connection, args: &FederationSyncArgs, ctx: &OutputContext) -
             SqliteValue::from(args.name.as_str()),
         ],
     )
-    .map_err(BeadsError::Database)?;
+    .map_err(BeadsError::DatabaseLegacy)?;
 
     if ctx.is_json() {
         println!(
