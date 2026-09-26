@@ -12,8 +12,9 @@
 //! - [`schema`] - Database schema definitions
 //! - [`sqlite`] - Main `SQLite` storage implementation
 
-/// TEMPORARY, deleted in Phase 8 with the rest of the engine migration. See this module's
-/// docs for the deletion gate.
+/// Value and row access over `rusqlite`. Permanent: the helpers work around a
+/// borrow-checking constraint in rusqlite's parameter API, not around the engine
+/// swap. See the module docs.
 pub mod db;
 pub mod events;
 pub mod schema;

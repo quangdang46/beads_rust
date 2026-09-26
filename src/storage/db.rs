@@ -1,15 +1,30 @@
-//! Shape-compat adapter between the frankensqlite value/row API and `rusqlite`'s.
+//! Value and row access for the storage layer, on top of `rusqlite`.
 //!
-//! # THIS FILE IS DELETED BEFORE THE MIGRATION MERGES
+//! # This module is permanent
 //!
-//! It exists only to make the port mechanical. `main` must never carry it.
+//! An earlier version of this file described itself as a migration scaffold to be
+//! deleted before the merge, on the grounds that the adapter was only absorbing a
+//! shape difference between two engines. That is no longer accurate, and the
+//! deletion gate in `docs/RUSQLITE_MIGRATION_PLAN_2026_09_25.md` (section 6) has
+//! been amended to match.
 //!
-//! **If this file still exists when Phase 8 opens, Phase 8 does not merge.** That is the same
-//! deletion gate the plan already sets on the `DatabaseLegacy` error variant and on nothing
-//! else. It is not a compatibility shim in the sense `AGENTS.md` forbids: it wraps nothing
-//! deprecated, and it provides no backwards compatibility for any caller. It absorbs the
-//! shape difference between two engines during a single atomic change, and it is deleted
-//! before that change lands on `main`.
+//! The file is load-bearing because of a borrow-checking constraint in rusqlite,
+//! not because of the port. `Connection::execute` takes `&[&dyn ToSql]`, and
+//! converting a `&[Value]` into that form produces borrows of the source slice.
+//! Written inline as an argument, the temporary is dropped at the end of its block
+//! while `execute` is still using it, which is `E0597: dropped here while still
+//! borrowed`.
+//!
+//! Passing the values as an argument instead -- an ordinary `&[..]` temporary, which
+//! lives to the end of the full expression -- is what the helpers here do, and it
+//! compiles.
+//!
+//! So the alternative to this module is not "call rusqlite directly" but 443
+//! hand-written multi-line blocks, each with its own opportunity to be subtly wrong.
+//! Five helpers cover 391 of the 443 call sites.
+//!
+//! It is not a compatibility shim in the sense `AGENTS.md` forbids: it wraps
+//! nothing deprecated, and it provides no backwards compatibility for any caller.
 //!
 //! # Why it exists
 //!
@@ -29,10 +44,10 @@
 //!
 //! # What it deliberately does NOT abstract
 //!
-//! - **`Row`.** `doctor.rs:23` and `federation.rs:90` take `&Row` / `&fsqlite::Row` as a named
-//!   type. rusqlite's `Row` borrows from its `Statement` and is not `'static`, so those
-//!   signatures need owned-row collection rather than a type rename. `query_rows` is the
-//!   mechanism; it is not a `Row` replacement and does not pretend to be one.
+//! - **`Row`.** rusqlite's `Row` borrows from its `Statement` and is not `'static`, so there
+//!   is no owned `Vec<Row>` to hand back. `query_rows` returns owned column values instead,
+//!   which is what the call sites actually read; it is not a `Row` replacement and does not
+//!   pretend to be one.
 //! - **Storage classes.** SQLite is dynamically typed, and a typed `get` compiles even when a
 //!   column's stored class shifts. The adapter cannot detect that; the byte-identical golden
 //!   comparison in Phase 6 is what detects it. Do not add a conversion that "helpfully"
@@ -411,6 +426,35 @@ mod tests {
         c.execute_batch("CREATE TABLE t (a INTEGER, b TEXT, c REAL, d BLOB, e)")
             .expect("create table");
         c
+    }
+
+    /// The array literal is passed as a call argument, so it lives to the end of the
+    /// full expression and the borrows `execute` takes out of it stay valid.
+    ///
+    /// This is the whole justification for the module, so it is asserted rather than
+    /// described. The inline alternative — building the `Vec<&dyn ToSql>` inside the
+    /// argument list — does not compile (`E0597: dropped here while still borrowed`),
+    /// because a block-scoped temporary is released before `execute` returns. That is
+    /// why 443 call sites route through these helpers instead of calling rusqlite
+    /// directly, and why the plan's deletion gate was amended.
+    #[test]
+    fn exec_with_accepts_an_array_literal_temporary() {
+        let c = conn();
+        let rows = exec_with(
+            &c,
+            "INSERT INTO t (a, b) VALUES (?1, ?2)",
+            &[SqlValue::from(1), SqlValue::from("two")],
+        );
+        assert!(rows.is_ok(), "inline array literal must borrow-check: {rows:?}");
+
+        let mut stmt = c.prepare("SELECT a, b FROM t").expect("prepare");
+        let out = query_rows(&mut stmt).expect("read back");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].first().and_then(SqlValue::as_integer), Some(1));
+        assert_eq!(
+            out[0].get(1).and_then(SqlValue::as_text),
+            Some("two")
+        );
     }
 
     /// The `From` set is the whole point of this type. A missing impl turns 674 call sites
