@@ -1,12 +1,12 @@
 //! Database schema definitions and migration logic.
 
 use chrono::Utc;
-use fsqlite::Connection;
-use fsqlite_types::SqliteValue;
+use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
 use crate::error::{BeadsError, Result};
 use crate::model::{IssueType, Priority, Status};
+use crate::storage::db::{self, SqlValue, db_err};
 use crate::util::content_hash_from_parts;
 
 pub const CURRENT_SCHEMA_VERSION: i32 = 21;
@@ -52,8 +52,8 @@ pub const SCHEMA_SQL: &str = r"
         ephemeral INTEGER NOT NULL DEFAULT 0,
         pinned INTEGER NOT NULL DEFAULT 0,
         is_template INTEGER NOT NULL DEFAULT 0,
-        -- source_repo_path is appended at the end (after is_template) to match
-        -- the position SQLite assigns to ALTER TABLE ADD COLUMN on existing DBs.
+        -- Appended at the end (after is_template) to match the position SQLite
+        -- assigns to ALTER TABLE ADD COLUMN on existing DBs.
         -- This keeps `EXPECTED_ISSUE_COLUMN_ORDER` consistent for both freshly-
         -- created and migrated databases. See #289 for context.
         source_repo_path TEXT,
@@ -386,164 +386,47 @@ pub const SCHEMA_SQL: &str = r"
     );
 ";
 
-/// Split a SQL script into individual statements, respecting string literals,
-/// quoted identifiers, and comments.
+/// Run a query and collect every row as owned column values.
 ///
-/// A naive `split(';')` breaks when SQL string literals contain semicolons
-/// (e.g., `INSERT INTO t(v) VALUES('a;b')`). This function uses a small state
-/// machine to track whether the current position is inside:
-/// - A single-quoted string literal (`'...'`, with `''` as escape)
-/// - A double-quoted identifier (`"..."`, with `""` as escape)
-/// - A line comment (`-- ...`)
-/// - A block comment (`/* ... */`)
-///
-/// Only semicolons at the top level (outside all of the above) are treated as
-/// statement terminators.
-fn split_sql_statements(sql: &str) -> Vec<&str> {
-    let bytes = sql.as_bytes();
-    let len = bytes.len();
-    let mut stmts = Vec::new();
-    let mut start = 0; // byte offset where the current statement begins
-    let mut i = 0;
-
-    // State flags — at most one is true at a time.
-    let mut in_single_quote = false;
-    let mut in_double_quote = false;
-    let mut in_line_comment = false;
-    let mut in_block_comment = false;
-
-    while i < len {
-        let b = bytes[i];
-
-        // --- Line comment state ---
-        if in_line_comment {
-            if b == b'\n' {
-                in_line_comment = false;
-            }
-            i += 1;
-            continue;
-        }
-
-        // --- Block comment state ---
-        if in_block_comment {
-            if b == b'*' && i + 1 < len && bytes[i + 1] == b'/' {
-                in_block_comment = false;
-                i += 2;
-            } else {
-                i += 1;
-            }
-            continue;
-        }
-
-        // --- Single-quoted string state ---
-        if in_single_quote {
-            if b == b'\'' {
-                // '' is an escaped quote inside a string literal
-                if i + 1 < len && bytes[i + 1] == b'\'' {
-                    i += 2;
-                } else {
-                    in_single_quote = false;
-                    i += 1;
-                }
-            } else {
-                i += 1;
-            }
-            continue;
-        }
-
-        // --- Double-quoted identifier state ---
-        if in_double_quote {
-            if b == b'"' {
-                if i + 1 < len && bytes[i + 1] == b'"' {
-                    i += 2;
-                } else {
-                    in_double_quote = false;
-                    i += 1;
-                }
-            } else {
-                i += 1;
-            }
-            continue;
-        }
-
-        // --- Top-level parsing ---
-        if b == b'\'' {
-            in_single_quote = true;
-            i += 1;
-        } else if b == b'"' {
-            in_double_quote = true;
-            i += 1;
-        } else if b == b'-' && i + 1 < len && bytes[i + 1] == b'-' {
-            in_line_comment = true;
-            i += 2;
-        } else if b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
-            in_block_comment = true;
-            i += 2;
-        } else if b == b';' {
-            // Statement terminator at top level.
-            let stmt = &sql[start..i];
-            if !stmt.trim().is_empty() {
-                stmts.push(stmt.trim());
-            }
-            start = i + 1;
-            i += 1;
-        } else {
-            i += 1;
-        }
-    }
-
-    // Trailing statement without a final semicolon.
-    if start < len {
-        let stmt = &sql[start..len];
-        if !stmt.trim().is_empty() {
-            stmts.push(stmt.trim());
-        }
-    }
-
-    stmts
+/// A collected row is a `Vec<SqlValue>`, so `row.get(i)` is the same lenient
+/// lookup `fsqlite::Row::get` was and the `SqliteValue::as_*` accessors carry
+/// over unchanged.
+fn query_all(conn: &Connection, sql: &str) -> rusqlite::Result<Vec<Vec<SqlValue>>> {
+    conn.prepare(sql)
+        .and_then(|mut stmt| db::query_rows(&mut stmt))
 }
 
-/// Execute multiple SQL statements separated by semicolons.
+/// Read the first column of the single row `sql` returns.
 ///
-/// fsqlite does not support `execute_batch`, so we split the SQL script
-/// into individual statements (respecting string literals and comments)
-/// and execute each one individually.
-pub(crate) fn execute_batch(conn: &Connection, sql: &str) -> Result<()> {
-    for stmt in split_sql_statements(sql) {
-        let res = conn.execute(stmt);
-        if let Err(e) = res {
-            // fsqlite's in-memory schema cache may not update after
-            // ALTER TABLE RENAME during table rebuilds, causing CREATE INDEX
-            // to fail with "no such column".  These indexes will be retried
-            // on the next open, so we can safely skip them here.
-            // Strip SQL line-comments to get at the real statement.
-            let stripped: String = stmt
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty() && !l.starts_with("--"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            let upper = stripped.trim().to_ascii_uppercase();
-            let is_index =
-                upper.starts_with("CREATE INDEX") || upper.starts_with("CREATE UNIQUE INDEX");
-            let is_stale_schema = e.to_string().contains("no such column");
-            if is_index && is_stale_schema {
-                continue;
-            }
-            eprintln!(
-                "execute_batch failed on statement: {}\nError: {:?}",
-                stmt, e
-            );
-            return Err(BeadsError::Database(e));
-        }
-    }
-    Ok(())
+/// frankensqlite's `Connection::query_row(sql) -> Row` is rusqlite's three-argument
+/// form with an identity column extractor, so every call site that used to chain
+/// `.get(0)` off the returned row now matches on the returned value instead. The
+/// no-row case stays an error rather than becoming a sentinel value: several callers
+/// branch on it (`.ok()`) and one propagates it with `?`.
+fn query_first_value(conn: &Connection, sql: &str) -> rusqlite::Result<SqlValue> {
+    conn.query_row(sql, [], |row| db::row_value(row, 0))
+}
+
+/// Apply a `PRAGMA` assignment.
+///
+/// A PRAGMA that RETURNS a row cannot go through `execute`. rusqlite steps the
+/// statement exactly once and rejects `SQLITE_ROW` as `Error::ExecuteReturnedResults`,
+/// whereas frankensqlite tolerated it. Whether a given setter hands back its new value
+/// is a per-pragma property of the engine — `journal_mode`, `journal_size_limit`,
+/// `wal_autocheckpoint` and `wal_checkpoint` all do, while `foreign_keys`, `synchronous`,
+/// `temp_store`, `cache_size` and `user_version` do not — and the bundled SQLite is not
+/// ours to pin, so every PRAGMA setter goes through `execute_batch` here rather than
+/// splitting the two kinds by hand. `execute_batch` steps each statement once and
+/// discards whatever it produced, which makes it correct for both; this is also exactly
+/// what rusqlite's own `Connection::pragma_update` does.
+fn set_pragma(conn: &Connection, sql: &str) -> rusqlite::Result<()> {
+    conn.execute_batch(sql)
 }
 
 /// Apply the schema to the database.
 ///
-/// This splits the DDL script into individual statements and executes them.
-/// It is idempotent because all statements use `IF NOT EXISTS`.
+/// This runs the DDL script as one batch, letting the engine walk it statement
+/// by statement. It is idempotent because all statements use `IF NOT EXISTS`.
 ///
 /// # Errors
 ///
@@ -557,23 +440,32 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
     let is_fresh = !table_exists(conn, "issues");
 
     // Run pre-schema migrations first to fix any incompatible old tables
-    // This must run BEFORE execute_batch because the batch includes CREATE INDEX
+    // This must run BEFORE the SCHEMA_SQL batch because the batch includes CREATE INDEX
     // statements that will fail if old tables have missing columns
     let issues_rebuilt = run_pre_schema_migrations(conn).map_err(|e| {
         eprintln!("run_pre_schema_migrations failed: {:?}", e);
         e
     })?;
 
-    execute_batch(conn, SCHEMA_SQL)?;
+    // The local statement splitter and its `is_index && is_stale_schema` skip are
+    // gone with `execute_batch`: the skip absorbed a frankensqlite defect, where the
+    // engine's in-memory schema cache could go stale after ALTER TABLE RENAME and make
+    // a following CREATE INDEX fail with "no such column". rusqlite compiles every
+    // statement against the database itself, so that failure cannot arise. A batch that
+    // hits a genuine "no such column" now surfaces the error instead of silently leaving
+    // the database without the index — the same DDL reaching a DB that genuinely lacks
+    // the column is a real fault, not one to absorb.
+    conn.execute_batch(SCHEMA_SQL).map_err(db_err)?;
 
     if is_fresh {
         // Fresh database: SCHEMA_SQL already created everything at the
         // current version. Skip migrations and stamp user_version directly.
-        conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
-            .map_err(|e| {
+        set_pragma(conn, &format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")).map_err(
+            |e| {
                 eprintln!("PRAGMA user_version failed: {:?}", e);
-                BeadsError::Database(e)
-            })?;
+                db_err(e)
+            },
+        )?;
     } else {
         // Existing database: run migrations for schema upgrades.
         // If the issues table was rebuilt from scratch, skip migration checks
@@ -585,11 +477,12 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
         })?;
 
         // Mark schema as applied so future opens can skip DDL/migration work.
-        conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
-            .map_err(|e| {
+        set_pragma(conn, &format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")).map_err(
+            |e| {
                 eprintln!("PRAGMA user_version failed: {:?}", e);
-                BeadsError::Database(e)
-            })?;
+                db_err(e)
+            },
+        )?;
     }
 
     apply_runtime_pragmas(conn).map_err(|e| {
@@ -609,7 +502,7 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
     // corruption" — issue #237) are addressed via VACUUM in the rebuild
     // path and `br doctor --repair`, not here.  Running VACUUM here would
     // conflict with connections opened immediately after init.
-    if is_fresh && let Err(e) = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)") {
+    if is_fresh && let Err(e) = set_pragma(conn, "PRAGMA wal_checkpoint(TRUNCATE)") {
         tracing::debug!(
             error = %e,
             "wal_checkpoint(TRUNCATE) after fresh bootstrap failed (non-fatal)"
@@ -651,13 +544,9 @@ pub fn run_migrations_atomic(conn: &Connection, from: u32, target_version: u32) 
     // already did one read against a separate connection; doing it
     // again here closes the TOCTOU window between the chokepoint's read
     // and this call's migration connection).
-    let row = conn.query_row("PRAGMA user_version")?;
-    let current = row
-        .get(0)
-        .and_then(|v| match v {
-            fsqlite_types::value::SqliteValue::Integer(n) => u32::try_from(*n).ok(),
-            _ => None,
-        })
+    let current = query_first_value(conn, "PRAGMA user_version")?
+        .as_integer()
+        .and_then(|n| u32::try_from(n).ok())
         .unwrap_or(0);
     if current != from {
         return Err(BeadsError::internal(format!(
@@ -675,20 +564,15 @@ pub fn run_migrations_atomic(conn: &Connection, from: u32, target_version: u32) 
     // net: on any error here, the caller restores the DB file from
     // the snapshot before returning.
     run_migrations(conn, false)?;
-    conn.execute(&format!("PRAGMA user_version = {target_version}"))
-        .map_err(BeadsError::Database)?;
+    set_pragma(conn, &format!("PRAGMA user_version = {target_version}")).map_err(db_err)?;
 
     // Post-state verification: `user_version` must reflect the target.
     // If fsqlite raced its own PRAGMA cache and didn't persist the
     // stamp, the chokepoint will see the mismatch and restore from
     // the pre-migrate snapshot.
-    let post = conn
-        .query_row("PRAGMA user_version")?
-        .get(0)
-        .and_then(|v| match v {
-            fsqlite_types::value::SqliteValue::Integer(n) => u32::try_from(*n).ok(),
-            _ => None,
-        })
+    let post = query_first_value(conn, "PRAGMA user_version")?
+        .as_integer()
+        .and_then(|n| u32::try_from(n).ok())
         .unwrap_or(0);
     if post != target_version {
         return Err(BeadsError::internal(format!(
@@ -702,10 +586,9 @@ pub fn run_migrations_atomic(conn: &Connection, from: u32, target_version: u32) 
 pub(crate) fn apply_runtime_compatible_schema(conn: &Connection) -> Result<()> {
     // The table layouts are already safe to operate on, so we can skip the
     // heavier pre-schema rebuilds and just restore any missing canonical DDL.
-    execute_batch(conn, SCHEMA_SQL)?;
+    conn.execute_batch(SCHEMA_SQL).map_err(db_err)?;
     run_migrations(conn, false)?;
-    conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
-        .map_err(BeadsError::Database)?;
+    set_pragma(conn, &format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")).map_err(db_err)?;
     apply_runtime_pragmas(conn)?;
     Ok(())
 }
@@ -713,38 +596,37 @@ pub(crate) fn apply_runtime_compatible_schema(conn: &Connection) -> Result<()> {
 pub(crate) fn apply_runtime_pragmas(conn: &Connection) -> Result<()> {
     // New databases should opt into WAL, but steady-state opens should not
     // reassert the current mode and turn a read path into a write-like one.
-    let journal_mode = conn
-        .query_row("PRAGMA journal_mode")
+    let journal_mode = query_first_value(conn, "PRAGMA journal_mode")
         .ok()
-        .and_then(|row| row.get(0).and_then(SqliteValue::as_text).map(str::to_owned))
+        .and_then(|value| value.as_text().map(str::to_owned))
         .unwrap_or_default();
     if !journal_mode.eq_ignore_ascii_case("wal") {
-        conn.execute("PRAGMA journal_mode = WAL")?;
+        set_pragma(conn, "PRAGMA journal_mode = WAL")?;
     }
 
     // Enable foreign keys
-    conn.execute("PRAGMA foreign_keys = ON")?;
+    set_pragma(conn, "PRAGMA foreign_keys = ON")?;
 
     // Performance PRAGMAs (safe with WAL mode)
     // NORMAL synchronous is safe with WAL: committed data survives OS crash
-    conn.execute("PRAGMA synchronous = NORMAL")?;
+    set_pragma(conn, "PRAGMA synchronous = NORMAL")?;
     // Use memory for temp tables/indexes instead of disk
-    conn.execute("PRAGMA temp_store = MEMORY")?;
+    set_pragma(conn, "PRAGMA temp_store = MEMORY")?;
     // 8MB page cache (default is ~2MB), improves read-heavy workloads
-    conn.execute("PRAGMA cache_size = -8000")?;
+    set_pragma(conn, "PRAGMA cache_size = -8000")?;
 
     // Issue #219: Limit WAL file size to 32MB.  Without this, concurrent
     // writers can cause unbounded WAL growth, which slows reads and
     // increases checkpoint contention.  SQLite will attempt to keep the WAL
     // file at or below this size after each checkpoint.
-    conn.execute("PRAGMA journal_size_limit = 33554432")?;
+    set_pragma(conn, "PRAGMA journal_size_limit = 33554432")?;
 
     // Issue #219: Disable the automatic WAL checkpoint that fires after
     // every 1000 pages of WAL growth.  The auto-checkpoint uses PASSIVE
     // mode internally but can still cause unexpected latency spikes during
     // write-heavy concurrent operations.  We handle checkpointing manually
     // in with_write_transaction using PASSIVE mode at a controlled interval.
-    conn.execute("PRAGMA wal_autocheckpoint = 0")?;
+    set_pragma(conn, "PRAGMA wal_autocheckpoint = 0")?;
 
     Ok(())
 }
@@ -752,20 +634,20 @@ pub(crate) fn apply_runtime_pragmas(conn: &Connection) -> Result<()> {
 pub(crate) fn table_exists(conn: &Connection, table: &str) -> bool {
     let escaped_table = table.replace('\'', "''");
     let sql = format!("SELECT 1 FROM sqlite_master WHERE type='table' AND name='{escaped_table}'");
-    conn.query(&sql).is_ok_and(|rows| !rows.is_empty())
+    query_all(&conn, &sql).is_ok_and(|rows| !rows.is_empty())
 }
 
 fn index_exists(conn: &Connection, index: &str) -> bool {
     let escaped_index = index.replace('\'', "''");
     let sql = format!("SELECT 1 FROM sqlite_master WHERE type='index' AND name='{escaped_index}'");
-    conn.query(&sql).is_ok_and(|rows| !rows.is_empty())
+    query_all(&conn, &sql).is_ok_and(|rows| !rows.is_empty())
 }
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
     let sql = format!("PRAGMA table_info('{table}')");
-    conn.query(&sql).is_ok_and(|rows| {
+    query_all(&conn, &sql).is_ok_and(|rows| {
         rows.iter()
-            .any(|row| row.get(1).and_then(SqliteValue::as_text) == Some(column))
+            .any(|row| row.get(1).and_then(SqlValue::as_text) == Some(column))
     })
 }
 
@@ -859,7 +741,7 @@ fn ensure_columns(conn: &Connection, table: &str, columns: &[(&str, &str)]) -> R
     for (name, definition) in columns {
         if !column_exists(conn, table, name) {
             let sql = format!("ALTER TABLE {table} ADD COLUMN {name} {definition}");
-            conn.execute(&sql)?;
+            conn.execute(&sql, [])?;
         }
     }
 
@@ -874,9 +756,10 @@ fn table_has_columns(conn: &Connection, table: &str, required_columns: &[&str]) 
 }
 
 fn current_schema_version_declared(conn: &Connection) -> bool {
-    conn.query_row("PRAGMA user_version")
+    query_first_value(conn, "PRAGMA user_version")
         .ok()
-        .and_then(|row| row.get(0).and_then(SqliteValue::as_integer))
+        .as_ref()
+        .and_then(SqlValue::as_integer)
         .is_some_and(|version| version >= i64::from(CURRENT_SCHEMA_VERSION))
 }
 
@@ -892,10 +775,10 @@ fn hash_sql(sql: &str) -> String {
 /// Idempotent: INSERT OR REPLACE against the migration's version key.
 fn record_migration_hash(conn: &Connection, version: i32, sql: &str) -> Result<()> {
     let hash = hash_sql(sql);
-    conn.execute_with_params(
+    conn.execute(
         "INSERT OR REPLACE INTO schema_migration_hashes (version, content_hash, applied_at)
          VALUES (?1, ?2, datetime('now'))",
-        &[SqliteValue::from(version), SqliteValue::from(hash)],
+        db::params_from(&[SqlValue::from(version), SqlValue::from(hash)]).as_slice(),
     )?;
     Ok(())
 }
@@ -921,10 +804,10 @@ pub fn check_schema_skew(conn: &Connection, is_read_only: bool, ignore_skew: boo
         return Ok(());
     }
 
-    let db_version = conn
-        .query_row("PRAGMA user_version")
+    let db_version = query_first_value(conn, "PRAGMA user_version")
         .ok()
-        .and_then(|row| row.get(0).and_then(SqliteValue::as_integer))
+        .as_ref()
+        .and_then(SqlValue::as_integer)
         .map(|v| v as i32)
         .unwrap_or(0);
 
@@ -1019,13 +902,13 @@ fn issues_column_order_matches(conn: &Connection) -> bool {
     // single query.  Avoid querying sqlite_master separately because
     // fsqlite's in-memory sqlite_master can return inconsistent results
     // when queried multiple times within the same connection session.
-    let Ok(rows) = conn.query("PRAGMA table_info(issues)") else {
+    let Ok(rows) = query_all(&conn, "PRAGMA table_info(issues)") else {
         return false;
     };
 
     let actual_columns: Vec<String> = rows
         .iter()
-        .filter_map(|row| row.get(1).and_then(SqliteValue::as_text).map(String::from))
+        .filter_map(|row| row.get(1).and_then(SqlValue::as_text).map(String::from))
         .collect();
 
     if actual_columns.is_empty() {
@@ -1043,19 +926,19 @@ fn issues_column_order_matches(conn: &Connection) -> bool {
 }
 
 fn issues_filter_columns_require_v3_rebuild(conn: &Connection) -> bool {
-    let Ok(rows) = conn.query("PRAGMA table_info('issues')") else {
+    let Ok(rows) = query_all(&conn, "PRAGMA table_info('issues')") else {
         return true;
     };
 
     for column in ["ephemeral", "pinned", "is_template"] {
         let Some(row) = rows
             .iter()
-            .find(|row| row.get(1).and_then(SqliteValue::as_text) == Some(column))
+            .find(|row| row.get(1).and_then(SqlValue::as_text) == Some(column))
         else {
             return true;
         };
 
-        let not_null = row.get(3).and_then(SqliteValue::as_integer).unwrap_or(0);
+        let not_null = row.get(3).and_then(SqlValue::as_integer).unwrap_or(0);
         if not_null == 0 {
             return true;
         }
@@ -1065,13 +948,14 @@ fn issues_filter_columns_require_v3_rebuild(conn: &Connection) -> bool {
 }
 
 fn foreign_keys_enabled(conn: &Connection) -> Result<bool> {
-    let row = conn.query_row("PRAGMA foreign_keys")?;
-    Ok(row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0) == 1)
+    Ok(query_first_value(conn, "PRAGMA foreign_keys")?
+        .as_integer()
+        .unwrap_or(0)
+        == 1)
 }
 
 fn restore_foreign_keys(conn: &Connection, operation: &str) -> Result<()> {
-    conn.execute("PRAGMA foreign_keys = ON")
-        .map_err(BeadsError::Database)?;
+    set_pragma(conn, "PRAGMA foreign_keys = ON").map_err(db_err)?;
 
     if foreign_keys_enabled(conn)? {
         return Ok(());
@@ -1112,10 +996,10 @@ fn finish_foreign_key_suppressed_result<T>(
 ///   3. Drop old table
 ///   4. Rename new table
 fn rebuild_issues_table(conn: &Connection) -> Result<()> {
-    let existing_rows = conn.query("PRAGMA table_info('issues')")?;
+    let existing_rows = query_all(&conn, "PRAGMA table_info('issues')")?;
     let existing_columns: Vec<String> = existing_rows
         .iter()
-        .filter_map(|row| row.get(1).and_then(SqliteValue::as_text).map(String::from))
+        .filter_map(|row| row.get(1).and_then(SqlValue::as_text).map(String::from))
         .collect();
 
     if existing_columns.is_empty() {
@@ -1125,20 +1009,20 @@ fn rebuild_issues_table(conn: &Connection) -> Result<()> {
     // Disable foreign keys during the rebuild because we'll be dropping
     // and recreating the issues table which is referenced by other tables.
     // This property is connection-scoped.
-    conn.execute("PRAGMA foreign_keys = OFF")?;
+    set_pragma(conn, "PRAGMA foreign_keys = OFF")?;
 
     let result = (|| -> Result<()> {
         // Wrap the entire rebuild in a transaction so a crash between DROP TABLE
         // and RENAME cannot lose data.
-        conn.execute("BEGIN EXCLUSIVE")?;
+        conn.execute("BEGIN EXCLUSIVE", [])?;
 
         if let Err(e) = rebuild_issues_table_inner(conn, &existing_columns) {
-            let _ = conn.execute("ROLLBACK");
+            let _ = conn.execute("ROLLBACK", []);
             return Err(e);
         }
 
-        if let Err(e) = conn.execute("COMMIT") {
-            let _ = conn.execute("ROLLBACK");
+        if let Err(e) = conn.execute("COMMIT", []) {
+            let _ = conn.execute("ROLLBACK", []);
             return Err(e.into());
         }
 
@@ -1152,11 +1036,13 @@ fn rebuild_issues_table(conn: &Connection) -> Result<()> {
 /// inside an already-open transaction.
 fn rebuild_issues_table_inner(conn: &Connection, existing_columns: &[String]) -> Result<()> {
     // Drop all indexes on the issues table first (they'll be recreated by SCHEMA_SQL)
-    let index_rows =
-        conn.query("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='issues' AND sql IS NOT NULL")?;
+    let index_rows = query_all(
+        conn,
+        "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='issues' AND sql IS NOT NULL",
+    )?;
     for row in &index_rows {
-        if let Some(name) = row.get(0).and_then(SqliteValue::as_text) {
-            conn.execute(&format!("DROP INDEX IF EXISTS \"{name}\""))?;
+        if let Some(name) = row.get(0).and_then(SqlValue::as_text) {
+            conn.execute(&format!("DROP INDEX IF EXISTS \"{name}\""), [])?;
         }
     }
 
@@ -1168,7 +1054,7 @@ fn rebuild_issues_table_inner(conn: &Connection, existing_columns: &[String]) ->
 
     // Create the new table with canonical column order
     // Use a temporary name to avoid conflicts
-    conn.execute("DROP TABLE IF EXISTS issues_rebuild_tmp")?;
+    conn.execute("DROP TABLE IF EXISTS issues_rebuild_tmp", [])?;
 
     // Build CREATE TABLE for the new table with only columns that exist in the old table
     // plus any missing columns with defaults
@@ -1199,7 +1085,7 @@ fn rebuild_issues_table_inner(conn: &Connection, existing_columns: &[String]) ->
         "CREATE TABLE issues_rebuild_tmp ({})",
         create_cols.join(", ")
     );
-    conn.execute(&create_sql)?;
+    conn.execute(&create_sql, [])?;
 
     // Copy only columns that exist in the source table so SQLite can apply
     // declared defaults for newer columns that are absent in legacy schemas.
@@ -1221,23 +1107,23 @@ fn rebuild_issues_table_inner(conn: &Connection, existing_columns: &[String]) ->
         "INSERT INTO issues_rebuild_tmp ({cols}) SELECT {cols} FROM issues",
         cols = projected_columns.join(", ")
     );
-    conn.execute(&copy_out_sql)?;
+    conn.execute(&copy_out_sql, [])?;
 
     // Drop the original table, then CREATE it fresh (not via RENAME) so
     // that fsqlite's in-memory schema cache registers all columns.
-    conn.execute("DROP TABLE issues")?;
+    conn.execute("DROP TABLE issues", [])?;
 
     let create_canonical = format!("CREATE TABLE issues ({})", create_cols.join(", "));
-    conn.execute(&create_canonical)?;
+    conn.execute(&create_canonical, [])?;
 
     // Copy data back.
     let copy_back_sql = format!(
         "INSERT INTO issues ({cols}) SELECT {cols} FROM issues_rebuild_tmp",
         cols = projected_columns.join(", ")
     );
-    conn.execute(&copy_back_sql)?;
+    conn.execute(&copy_back_sql, [])?;
 
-    conn.execute("DROP TABLE issues_rebuild_tmp")?;
+    conn.execute("DROP TABLE issues_rebuild_tmp", [])?;
 
     Ok(())
 }
@@ -1290,7 +1176,7 @@ fn backfill_storage_null_in_default_columns(conn: &Connection) {
         }
         let sql =
             format!("UPDATE {table} SET {column} = {default} WHERE typeof({column}) = 'null'");
-        if let Err(err) = conn.execute(&sql) {
+        if let Err(err) = conn.execute(&sql, []) {
             tracing::warn!(
                 table = table,
                 column = column,
@@ -1306,15 +1192,15 @@ fn kv_table_uses_primary_key(conn: &Connection, table: &str) -> bool {
     // the `key` column is declared as PRIMARY KEY.  fsqlite's in-memory
     // sqlite_master can return inconsistent results across queries.
     let sql = format!("PRAGMA table_info('{table}')");
-    let Ok(rows) = conn.query(&sql) else {
+    let Ok(rows) = query_all(&conn, &sql) else {
         return false;
     };
 
     // In PRAGMA table_info output, column index 5 is the `pk` flag.
     // If `key` column has pk > 0, the table uses PRIMARY KEY.
     rows.iter().any(|row| {
-        let col_name = row.get(1).and_then(SqliteValue::as_text);
-        let pk_flag = row.get(5).and_then(SqliteValue::as_integer).unwrap_or(0);
+        let col_name = row.get(1).and_then(SqlValue::as_text);
+        let pk_flag = row.get(5).and_then(SqlValue::as_integer).unwrap_or(0);
         col_name == Some("key") && pk_flag > 0
     })
 }
@@ -1322,8 +1208,7 @@ fn kv_table_uses_primary_key(conn: &Connection, table: &str) -> bool {
 fn kv_table_needs_canonical_rebuild(conn: &Connection, table: &str, expected_index: &str) -> bool {
     // Use PRAGMA table_info for the existence check instead of sqlite_master,
     // which can return inconsistent results in fsqlite.
-    let table_has_rows = conn
-        .query(&format!("PRAGMA table_info('{table}')"))
+    let table_has_rows = query_all(&conn, &format!("PRAGMA table_info('{table}')"))
         .is_ok_and(|rows| !rows.is_empty());
     table_has_rows
         && (!index_exists(conn, expected_index) || kv_table_uses_primary_key(conn, table))
@@ -1332,40 +1217,46 @@ fn kv_table_needs_canonical_rebuild(conn: &Connection, table: &str, expected_ind
 fn rebuild_kv_table_without_unique(conn: &Connection, table: &str) -> Result<()> {
     let tmp_table = format!("{table}_rebuild_tmp");
 
-    conn.execute("BEGIN EXCLUSIVE")?;
+    conn.execute("BEGIN EXCLUSIVE", [])?;
 
     let result = (|| -> Result<()> {
-        conn.execute(&format!("DROP TABLE IF EXISTS {tmp_table}"))?;
-        conn.execute(&format!(
-            "CREATE TABLE {tmp_table} (
+        conn.execute(&format!("DROP TABLE IF EXISTS {tmp_table}"), [])?;
+        conn.execute(
+            &format!(
+                "CREATE TABLE {tmp_table} (
                 key TEXT NOT NULL,
                 value TEXT NOT NULL
             )"
-        ))?;
+            ),
+            [],
+        )?;
 
-        conn.execute(&format!(
-            "INSERT INTO {tmp_table} (key, value)
+        conn.execute(
+            &format!(
+                "INSERT INTO {tmp_table} (key, value)
              SELECT key, value
              FROM {table}"
-        ))?;
+            ),
+            [],
+        )?;
 
-        conn.execute(&format!("DROP TABLE {table}"))?;
-        conn.execute(&format!("ALTER TABLE {tmp_table} RENAME TO {table}"))?;
+        conn.execute(&format!("DROP TABLE {table}"), [])?;
+        conn.execute(&format!("ALTER TABLE {tmp_table} RENAME TO {table}"), [])?;
         Ok(())
     })();
 
     if let Err(err) = result {
-        let _ = conn.execute("ROLLBACK");
+        let _ = conn.execute("ROLLBACK", []);
         return Err(err);
     }
 
-    conn.execute("COMMIT")?;
+    conn.execute("COMMIT", [])?;
     Ok(())
 }
 
 /// Run pre-schema migrations to fix incompatible old tables.
 ///
-/// This must run BEFORE `execute_batch(SCHEMA_SQL)` because the schema includes
+/// This must run BEFORE `conn.execute_batch(SCHEMA_SQL)` because the schema includes
 /// CREATE INDEX statements that will fail if old tables have missing columns.
 /// Returns `true` if the issues table was rebuilt during pre-migrations.
 fn run_pre_schema_migrations(conn: &Connection) -> Result<bool> {
@@ -1387,7 +1278,7 @@ fn run_pre_schema_migrations(conn: &Connection) -> Result<bool> {
         let has_issue_id = column_exists(conn, "blocked_issues_cache", "issue_id");
 
         if !has_blocked_at || !has_blocked_by || !has_issue_id {
-            conn.execute("DROP TABLE IF EXISTS blocked_issues_cache")?;
+            conn.execute("DROP TABLE IF EXISTS blocked_issues_cache", [])?;
         }
     }
 
@@ -1515,35 +1406,31 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
     if !has_blocked_by || !has_blocked_at || !has_issue_id {
         // Table needs update - drop and recreate (it's a cache, data is regenerated)
         // Wrap in transaction so concurrent opens don't see a partially migrated state
-        conn.execute("BEGIN IMMEDIATE")?;
+        conn.execute("BEGIN IMMEDIATE", [])?;
         let result = (|| -> Result<()> {
-            conn.execute("DROP TABLE IF EXISTS blocked_issues_cache")?;
+            conn.execute("DROP TABLE IF EXISTS blocked_issues_cache", [])?;
             conn.execute(
                 "CREATE TABLE blocked_issues_cache (
                     issue_id TEXT PRIMARY KEY,
                     blocked_by TEXT NOT NULL,
                     blocked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
-                )",
-            )?;
+                )", [])?;
             conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_blocked_cache_blocked_at ON blocked_issues_cache(blocked_at)",
-            )?;
+                "CREATE INDEX IF NOT EXISTS idx_blocked_cache_blocked_at ON blocked_issues_cache(blocked_at)", [])?;
             Ok(())
         })();
 
         if let Err(e) = result {
-            let _ = conn.execute("ROLLBACK");
+            let _ = conn.execute("ROLLBACK", []);
             return Err(e);
         }
-        conn.execute("COMMIT")?;
+        conn.execute("COMMIT", [])?;
     }
 
     // Migration: Ensure filter columns are NOT NULL (v3)
-    let user_version = conn
-        .query_row("PRAGMA user_version")?
-        .get(0)
-        .and_then(SqliteValue::as_integer)
+    let user_version = query_first_value(conn, "PRAGMA user_version")?
+        .as_integer()
         .unwrap_or(0);
 
     // Skip v3/v4 migration when the issues table was just rebuilt from scratch
@@ -1557,15 +1444,15 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
         {
             tracing::info!("Migrating database to schema version 3 (NOT NULL filter columns)");
             // 1. Backfill NULL values
-            conn.execute("UPDATE issues SET ephemeral = 0 WHERE ephemeral IS NULL")?;
-            conn.execute("UPDATE issues SET pinned = 0 WHERE pinned IS NULL")?;
-            conn.execute("UPDATE issues SET is_template = 0 WHERE is_template IS NULL")?;
+            conn.execute("UPDATE issues SET ephemeral = 0 WHERE ephemeral IS NULL", [])?;
+            conn.execute("UPDATE issues SET pinned = 0 WHERE pinned IS NULL", [])?;
+            conn.execute("UPDATE issues SET is_template = 0 WHERE is_template IS NULL", [])?;
 
             // 2. Rebuild the table to apply NOT NULL constraints
             rebuild_issues_table(conn)?;
 
             // 3. Recreate the optimized ready index
-            conn.execute("DROP INDEX IF EXISTS idx_issues_ready")?;
+            conn.execute("DROP INDEX IF EXISTS idx_issues_ready", [])?;
             conn.execute(
                 "CREATE INDEX idx_issues_ready
                  ON issues(status, priority, created_at)
@@ -1573,12 +1460,13 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
                  AND ephemeral = 0
                  AND pinned = 0
                  AND is_template = 0",
+                [],
             )?;
         }
 
         if user_version < 4 && table_exists(conn, "issues") {
             tracing::info!("Migrating database to schema version 4 (ready excludes in_progress)");
-            conn.execute("DROP INDEX IF EXISTS idx_issues_ready")?;
+            conn.execute("DROP INDEX IF EXISTS idx_issues_ready", [])?;
             conn.execute(
                 "CREATE INDEX idx_issues_ready
                  ON issues(status, priority, created_at)
@@ -1586,6 +1474,7 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
                  AND ephemeral = 0
                  AND pinned = 0
                  AND is_template = 0",
+                [],
             )?;
         }
 
@@ -1601,7 +1490,7 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
             tracing::info!(
                 "Migrating database to schema version 5 (remove DESC from active list index)"
             );
-            conn.execute("DROP INDEX IF EXISTS idx_issues_list_active_order")?;
+            conn.execute("DROP INDEX IF EXISTS idx_issues_list_active_order", [])?;
         }
 
         // v6: Repair datetime columns and legacy status values.
@@ -1645,8 +1534,7 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
         tracing::info!(
             "Migrating database to schema version 9 (close_metadata table for policy gates)"
         );
-        execute_batch(
-            conn,
+        conn.execute_batch(
             r"
             CREATE TABLE IF NOT EXISTS close_metadata (
                 issue_id TEXT PRIMARY KEY,
@@ -1709,7 +1597,7 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
         tracing::info!(
             "Migrating database to schema version 10 (source_repo_path on issues - beads_rust#289)"
         );
-        conn.execute("ALTER TABLE issues ADD COLUMN source_repo_path TEXT")?;
+        conn.execute("ALTER TABLE issues ADD COLUMN source_repo_path TEXT", [])?;
     }
 
     // Migration v10 -> v11 (beads_rust#297): add `agent_context TEXT` to
@@ -1727,7 +1615,7 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
         tracing::info!(
             "Migrating database to schema version 11 (agent_context on issues - beads_rust#297)"
         );
-        conn.execute("ALTER TABLE issues ADD COLUMN agent_context TEXT")?;
+        conn.execute("ALTER TABLE issues ADD COLUMN agent_context TEXT", [])?;
     }
 
     // Migration v11 -> v12 (beads_rust#319): add the `gate_results` table for
@@ -1740,8 +1628,7 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
         tracing::info!(
             "Migrating database to schema version 12 (gate_results table - beads_rust#319)"
         );
-        execute_batch(
-            conn,
+        conn.execute_batch(
             r"
             CREATE TABLE IF NOT EXISTS gate_results (
                 issue_id TEXT NOT NULL,
@@ -1781,8 +1668,7 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
         tracing::info!(
             "Migrating database to schema version 14 (custom_statuses and custom_types tables - beads_rust#5)"
         );
-        execute_batch(
-            conn,
+        conn.execute_batch(
             r"
             CREATE TABLE IF NOT EXISTS custom_statuses (
                 name VARCHAR(64) PRIMARY KEY,
@@ -1794,14 +1680,11 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
         ",
         )?;
         // Backfill built-in statuses as custom entries for parity
-        let existing_status_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM custom_statuses")?
-            .get(0)
-            .and_then(SqliteValue::as_integer)
+        let existing_status_count: i64 = query_first_value(conn, "SELECT COUNT(*) FROM custom_statuses")?
+            .as_integer()
             .unwrap_or(0);
         if existing_status_count == 0 {
-            execute_batch(
-                conn,
+            conn.execute_batch(
                 r#"
                 INSERT OR IGNORE INTO custom_statuses (name, category) VALUES ('open', 'active');
                 INSERT OR IGNORE INTO custom_statuses (name, category) VALUES ('in_progress', 'wip');
@@ -1817,14 +1700,11 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
             tracing::info!("Backfilled built-in statuses into custom_statuses");
         }
 
-        let existing_type_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM custom_types")?
-            .get(0)
-            .and_then(SqliteValue::as_integer)
+        let existing_type_count: i64 = query_first_value(conn, "SELECT COUNT(*) FROM custom_types")?
+            .as_integer()
             .unwrap_or(0);
         if existing_type_count == 0 {
-            execute_batch(
-                conn,
+            conn.execute_batch(
                 r#"
                 INSERT OR IGNORE INTO custom_types (name) VALUES ('task');
                 INSERT OR IGNORE INTO custom_types (name) VALUES ('bug');
@@ -1850,8 +1730,7 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
     // Pure additive — new table, no existing-row rewrite.
     if user_version < 15 {
         tracing::info!("Migrating database to schema version 15 (repo_mtimes table - Issue #39)");
-        execute_batch(
-            conn,
+        conn.execute_batch(
             r"
             CREATE TABLE IF NOT EXISTS repo_mtimes (
                 repo_path TEXT PRIMARY KEY,
@@ -1869,8 +1748,7 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
         tracing::info!(
             "Migrating database to schema version 17 (remaining missing tables - Issue #36)"
         );
-        execute_batch(
-            conn,
+        conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS routes (
                 prefix TEXT PRIMARY KEY,
@@ -1930,15 +1808,14 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
         && !column_exists(conn, "issues", "points")
     {
         tracing::info!("Migrating database to schema version 20 (points on issues)");
-        conn.execute("ALTER TABLE issues ADD COLUMN points INTEGER")?;
+        conn.execute("ALTER TABLE issues ADD COLUMN points INTEGER", [])?;
     }
 
     // Migration v20 -> v21: drop snapshot tables (Issue #38 compaction rework).
     // Safe to run repeatedly — DROP TABLE IF EXISTS is idempotent.
     if user_version < 21 {
         tracing::info!("Migrating database to schema version 21 (drop snapshot tables)");
-        execute_batch(
-            conn,
+        conn.execute_batch(
             r"
             DROP TABLE IF EXISTS compaction_snapshots;
             DROP TABLE IF EXISTS issue_snapshots;
@@ -1948,8 +1825,7 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
 
     // Migration: Add missing indexes for bd parity
     // These use IF NOT EXISTS so they're safe to run multiple times
-    execute_batch(
-        conn,
+    conn.execute_batch(
         r"
         -- Export/sync patterns
         CREATE INDEX IF NOT EXISTS idx_issues_content_hash ON issues(content_hash);
@@ -1988,8 +1864,7 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
     )?;
 
     // Drop legacy index names (safe if absent)
-    execute_batch(
-        conn,
+    conn.execute_batch(
         r"
         DROP INDEX IF EXISTS idx_dependencies_issue_id;
         DROP INDEX IF EXISTS idx_dependencies_depends_on_id;
@@ -1999,14 +1874,12 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
     )?;
 
     if table_exists(conn, "dependencies") {
-        execute_batch(
-            conn,
+        conn.execute_batch(
             r"
             CREATE INDEX IF NOT EXISTS idx_dependencies_issue ON dependencies(issue_id);
             CREATE INDEX IF NOT EXISTS idx_dependencies_depends_on ON dependencies(depends_on_id);
             CREATE INDEX IF NOT EXISTS idx_dependencies_type ON dependencies(type);
             CREATE INDEX IF NOT EXISTS idx_dependencies_depends_on_type ON dependencies(depends_on_id, type);
-            CREATE INDEX IF NOT EXISTS idx_dependencies_thread ON dependencies(thread_id) WHERE thread_id != '';
             -- Composite for blocking lookups
             CREATE INDEX IF NOT EXISTS idx_dependencies_blocking
                 ON dependencies(depends_on_id, issue_id)
@@ -2014,16 +1887,22 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
         ",
         )?;
 
+        // `thread_id` is a recent addition, so a database created before it
+        // has a `dependencies` table without the column. Creating an index over
+        // a missing column aborts the whole batch, which would take the
+        // remaining index creation down with it -- so this one is gated on the
+        // column actually existing. The other four indexes above only reference
+        // columns present since the first schema version.
         if column_exists(conn, "dependencies", "thread_id") {
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_dependencies_thread ON dependencies(thread_id) WHERE thread_id != ''",
+                [],
             )?;
         }
     }
 
     if table_exists(conn, "labels") {
-        execute_batch(
-            conn,
+        conn.execute_batch(
             r"
             CREATE INDEX IF NOT EXISTS idx_labels_label ON labels(label);
             CREATE INDEX IF NOT EXISTS idx_labels_issue ON labels(issue_id);
@@ -2032,12 +1911,11 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
     }
 
     if table_exists(conn, "comments") {
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_comments_issue ON comments(issue_id)")?;
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_comments_issue ON comments(issue_id)", [])?;
     }
 
     if table_exists(conn, "events") {
-        execute_batch(
-            conn,
+        conn.execute_batch(
             r"
             CREATE INDEX IF NOT EXISTS idx_events_issue ON events(issue_id);
             CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
@@ -2093,7 +1971,7 @@ fn repair_integer_datetime_columns(conn: &Connection) -> Result<()> {
                 END, 'unixepoch') \
              WHERE typeof({column}) = 'integer'"
         );
-        conn.execute(&sql)?;
+        conn.execute(&sql, [])?;
     }
     Ok(())
 }
@@ -2108,12 +1986,14 @@ fn repair_legacy_status_values(conn: &Connection) -> Result<()> {
          SET closed_at = COALESCE(closed_at, updated_at, created_at), \
              status = 'closed' \
          WHERE LOWER(status) IN ('done', 'complete', 'completed', 'finished', 'resolved')",
+        [],
     )?;
     Ok(())
 }
 
 fn rebuild_content_hashes_for_go_parity(conn: &Connection) -> Result<usize> {
-    let rows = conn.query(
+    let rows = query_all(
+        conn,
         "SELECT id, title, description, design, acceptance_criteria, notes, \
                 status, priority, issue_type, assignee, owner, created_by, \
                 external_ref, source_system, pinned, is_template \
@@ -2124,7 +2004,7 @@ fn rebuild_content_hashes_for_go_parity(conn: &Connection) -> Result<usize> {
         return Ok(0);
     }
 
-    conn.execute("BEGIN IMMEDIATE")?;
+    conn.execute("BEGIN IMMEDIATE", [])?;
     let result = (|| -> Result<usize> {
         let mut updated = 0;
         // Pre-compute once outside the loop and pass explicitly: legacy DBs
@@ -2143,7 +2023,7 @@ fn rebuild_content_hashes_for_go_parity(conn: &Connection) -> Result<usize> {
             let status_raw = row_text(row, 6).unwrap_or_else(|| Status::default().as_str().into());
             let priority = Priority(
                 row.get(7)
-                    .and_then(SqliteValue::as_integer)
+                    .and_then(SqlValue::as_integer)
                     .and_then(|value| i32::try_from(value).ok())
                     .unwrap_or_else(|| Priority::default().0),
             );
@@ -2206,29 +2086,31 @@ fn rebuild_content_hashes_for_go_parity(conn: &Connection) -> Result<usize> {
                 None, // payload
             );
 
-            conn.execute_with_params(
+            conn.execute(
                 "UPDATE issues SET content_hash = ?1 WHERE id = ?2",
-                &[
-                    SqliteValue::from(content_hash.as_str()),
-                    SqliteValue::from(id.as_str()),
-                ],
+                db::params_from(&[
+                    SqlValue::from(content_hash.as_str()),
+                    SqlValue::from(id.as_str()),
+                ])
+                .as_slice(),
             )?;
-            conn.execute_with_params(
+            conn.execute(
                 "DELETE FROM dirty_issues WHERE issue_id = ?1",
-                &[SqliteValue::from(id.as_str())],
+                db::params_from(&[SqlValue::from(id.as_str())]).as_slice(),
             )?;
-            conn.execute_with_params(
+            conn.execute(
                 "INSERT INTO dirty_issues (issue_id, marked_at) VALUES (?1, ?2)",
-                &[
-                    SqliteValue::from(id.as_str()),
-                    SqliteValue::from(now_str.as_str()),
-                ],
+                db::params_from(&[
+                    SqlValue::from(id.as_str()),
+                    SqlValue::from(now_str.as_str()),
+                ])
+                .as_slice(),
             )?;
             updated += 1;
         }
 
         if table_exists(conn, "export_hashes") {
-            conn.execute("DELETE FROM export_hashes")?;
+            conn.execute("DELETE FROM export_hashes", [])?;
         }
 
         Ok(updated)
@@ -2236,27 +2118,27 @@ fn rebuild_content_hashes_for_go_parity(conn: &Connection) -> Result<usize> {
 
     match result {
         Ok(updated) => {
-            conn.execute("COMMIT")?;
+            conn.execute("COMMIT", [])?;
             Ok(updated)
         }
         Err(error) => {
-            let _ = conn.execute("ROLLBACK");
+            let _ = conn.execute("ROLLBACK", []);
             Err(error)
         }
     }
 }
 
-fn row_text(row: &fsqlite::Row, index: usize) -> Option<String> {
+fn row_text(row: &[SqlValue], index: usize) -> Option<String> {
     row.get(index)
-        .and_then(SqliteValue::as_text)
+        .and_then(SqlValue::as_text)
         .map(str::to_string)
 }
 
-fn row_optional_text(row: &fsqlite::Row, index: usize) -> Option<String> {
+fn row_optional_text(row: &[SqlValue], index: usize) -> Option<String> {
     row_text(row, index).filter(|value| !value.is_empty())
 }
 
-fn row_bool(row: &fsqlite::Row, index: usize) -> bool {
+fn row_bool(row: &[SqlValue], index: usize) -> bool {
     row.get(index).is_some_and(|value| {
         value.as_integer().map_or_else(
             || value.as_text().is_some_and(|text| text != "0"),
@@ -2269,9 +2151,37 @@ fn row_bool(row: &fsqlite::Row, index: usize) -> bool {
 mod tests {
     use super::*;
     use crate::error::BeadsError;
-    use fsqlite::Connection;
+    use rusqlite::Connection;
     use std::collections::HashSet;
     use tempfile::TempDir;
+
+    /// frankensqlite's `Connection::query_row(sql) -> Row` for the fixtures below.
+    ///
+    /// rusqlite's `Connection::query_row` takes a column extractor and returns that
+    /// column, not the row, and a rusqlite `Row` borrows from its `Statement` so it
+    /// cannot outlive it. Collecting the row's values is the owned shape these
+    /// assertions want: they read columns, and `Vec<SqlValue>::get` is the same
+    /// lenient lookup `Row::get` was.
+    fn query_one_row(conn: &Connection, sql: &str) -> Vec<SqlValue> {
+        conn.prepare(sql)
+            .and_then(|mut stmt| db::query_row_values(&mut stmt))
+            .expect("query_row")
+            .expect("row")
+    }
+
+    /// [`query_one_row`] for a statement that binds parameters.
+    fn query_one_row_with_params(
+        conn: &Connection,
+        sql: &str,
+        params: &[SqlValue],
+    ) -> Vec<SqlValue> {
+        conn.prepare(sql)
+            .and_then(|mut stmt| {
+                db::query_row_values_with_params(&mut stmt, db::params_from(params).as_slice())
+            })
+            .expect("query_row_with_params")
+            .expect("row")
+    }
 
     #[test]
     fn test_apply_schema() {
@@ -2281,8 +2191,8 @@ mod tests {
         apply_schema(&conn).expect("Failed to apply schema");
 
         // Verify a few tables exist
-        let tables: Vec<String> = conn
-            .query("SELECT name FROM sqlite_master WHERE type='table'")
+        let tables: Vec<String> =
+            query_all(&conn, "SELECT name FROM sqlite_master WHERE type='table'")
             .unwrap()
             .iter()
             .filter_map(|row| row.get(0).and_then(|v| v.as_text()).map(String::from))
@@ -2294,7 +2204,7 @@ mod tests {
         assert!(tables.contains(&"dirty_issues".to_string()));
 
         // Verify pragmas
-        let row = conn.query_row("PRAGMA journal_mode").unwrap();
+        let row = query_one_row(&conn, "PRAGMA journal_mode");
         let journal_mode = row
             .get(0)
             .and_then(|v| v.as_text())
@@ -2303,8 +2213,8 @@ mod tests {
         // In-memory DBs use MEMORY journaling, regardless of what we set
         assert!(journal_mode.to_uppercase() == "WAL" || journal_mode.to_uppercase() == "MEMORY");
 
-        let row = conn.query_row("PRAGMA foreign_keys").unwrap();
-        let foreign_keys = row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0);
+        let row = query_one_row(&conn, "PRAGMA foreign_keys");
+        let foreign_keys = row.get(0).and_then(SqlValue::as_integer).unwrap_or(0);
         assert_eq!(foreign_keys, 1);
     }
 
@@ -2331,23 +2241,21 @@ mod tests {
                 "INSERT INTO issues (id, title, status, priority, issue_type, created_at, updated_at, closed_at, close_reason) \
                  VALUES ('{id}', 'legacy', 'closed', 2, 'task', '2026-04-19T21:34:04.000000000Z', {epoch}, {epoch}, 'Completed')"
             );
-            conn.execute(&stmt).expect("seed integer datetime row");
+            conn.execute(&stmt, []).expect("seed integer datetime row");
         }
 
         // Sanity: every updated_at/closed_at must be integer-typed pre-repair.
         for (id, _) in rows {
-            let row = conn
-                .query_row(&format!(
+            let row = query_one_row(&conn, &format!(
                     "SELECT typeof(updated_at), typeof(closed_at) FROM issues WHERE id='{id}'"
-                ))
-                .unwrap();
+                ));
             assert_eq!(
-                row.get(0).and_then(SqliteValue::as_text),
+                row.get(0).and_then(SqlValue::as_text),
                 Some("integer"),
                 "{id} updated_at should be integer pre-repair"
             );
             assert_eq!(
-                row.get(1).and_then(SqliteValue::as_text),
+                row.get(1).and_then(SqlValue::as_text),
                 Some("integer"),
                 "{id} closed_at should be integer pre-repair"
             );
@@ -2356,26 +2264,24 @@ mod tests {
         repair_integer_datetime_columns(&conn).expect("repair should succeed");
 
         for (id, _) in rows {
-            let row = conn
-                .query_row(&format!(
+            let row = query_one_row(&conn, &format!(
                     "SELECT typeof(updated_at), updated_at, typeof(closed_at), closed_at FROM issues WHERE id='{id}'"
-                ))
-                .unwrap();
+                ));
             assert_eq!(
-                row.get(0).and_then(SqliteValue::as_text),
+                row.get(0).and_then(SqlValue::as_text),
                 Some("text"),
                 "{id} updated_at must be TEXT after repair"
             );
             let updated_at = row
                 .get(1)
-                .and_then(SqliteValue::as_text)
+                .and_then(SqlValue::as_text)
                 .expect("updated_at text");
             assert!(
                 updated_at.starts_with("2026-04-20T02:18:08"),
                 "{id}: expected 2026-04-20 timestamp, got {updated_at}"
             );
             assert_eq!(
-                row.get(2).and_then(SqliteValue::as_text),
+                row.get(2).and_then(SqlValue::as_text),
                 Some("text"),
                 "{id} closed_at must be TEXT after repair"
             );
@@ -2383,10 +2289,8 @@ mod tests {
 
         // Idempotency: a second pass is a no-op and leaves the rows TEXT.
         repair_integer_datetime_columns(&conn).expect("second pass should succeed");
-        let row = conn
-            .query_row("SELECT typeof(updated_at) FROM issues WHERE id='bug-us'")
-            .unwrap();
-        assert_eq!(row.get(0).and_then(SqliteValue::as_text), Some("text"));
+        let row = query_one_row(&conn, "SELECT typeof(updated_at) FROM issues WHERE id='bug-us'");
+        assert_eq!(row.get(0).and_then(SqlValue::as_text), Some("text"));
     }
 
     #[test]
@@ -2404,28 +2308,28 @@ mod tests {
         conn.execute(
             "INSERT INTO issues (id, title, status, priority, issue_type, created_at, updated_at) \
              VALUES ('legacy-done', 'bd legacy', 'done', 2, 'task', '2026-04-02T20:00:00Z', '2026-04-03T01:00:00Z')",
+            [],
         ).unwrap();
         conn.execute(
             "INSERT INTO issues (id, title, status, priority, issue_type, created_at, updated_at) \
              VALUES ('legacy-resolved', 'bd legacy', 'Resolved', 2, 'task', '2026-04-02T20:00:00Z', '2026-04-03T01:00:00Z')",
+            [],
         ).unwrap();
 
         repair_legacy_status_values(&conn).expect("repair should succeed");
 
         for id in ["legacy-done", "legacy-resolved"] {
-            let row = conn
-                .query_row(&format!(
+            let row = query_one_row(&conn, &format!(
                     "SELECT status, closed_at FROM issues WHERE id='{id}'"
-                ))
-                .unwrap();
+                ));
             assert_eq!(
-                row.get(0).and_then(SqliteValue::as_text),
+                row.get(0).and_then(SqlValue::as_text),
                 Some("closed"),
                 "{id} should be closed"
             );
             let closed_at = row
                 .get(1)
-                .and_then(SqliteValue::as_text)
+                .and_then(SqlValue::as_text)
                 .unwrap_or_default();
             assert!(!closed_at.is_empty(), "{id} closed_at should be populated");
         }
@@ -2442,35 +2346,31 @@ mod tests {
         conn.execute(
             "INSERT INTO issues (id, content_hash, title, status, priority, issue_type, created_at, updated_at) \
              VALUES ('bd-hash', 'old-rust-hash', 'Test', 'open', 2, 'task', '2026-04-02T20:00:00Z', '2026-04-03T01:00:00Z')",
+            [],
         ).unwrap();
         conn.execute(
             "INSERT INTO export_hashes (issue_id, content_hash, exported_at) \
              VALUES ('bd-hash', 'old-rust-hash', '2026-04-03T01:00:00Z')",
+            [],
         )
         .unwrap();
-        conn.execute("DELETE FROM dirty_issues").unwrap();
-        conn.execute("PRAGMA user_version = 6").unwrap();
+        conn.execute("DELETE FROM dirty_issues", []).unwrap();
+        set_pragma(&conn, "PRAGMA user_version = 6").unwrap();
 
         run_migrations(&conn, false).expect("v7 migration should succeed");
 
-        let row = conn
-            .query_row("SELECT content_hash FROM issues WHERE id = 'bd-hash'")
-            .unwrap();
+        let row = query_one_row(&conn, "SELECT content_hash FROM issues WHERE id = 'bd-hash'");
         assert_eq!(
-            row.get(0).and_then(SqliteValue::as_text),
+            row.get(0).and_then(SqlValue::as_text),
             Some("c8e7e2783cc1fbb37322ae61efcf0e5c7d79a2cc6203e878fa6556c41742398d"),
             "v7 should rewrite stored issue hashes to Go bd canonical values"
         );
 
-        let dirty_row = conn
-            .query_row("SELECT COUNT(*) FROM dirty_issues WHERE issue_id = 'bd-hash'")
-            .unwrap();
-        assert_eq!(dirty_row.get(0).and_then(SqliteValue::as_integer), Some(1));
+        let dirty_row = query_one_row(&conn, "SELECT COUNT(*) FROM dirty_issues WHERE issue_id = 'bd-hash'");
+        assert_eq!(dirty_row.get(0).and_then(SqlValue::as_integer), Some(1));
 
-        let export_row = conn
-            .query_row("SELECT COUNT(*) FROM export_hashes")
-            .unwrap();
-        assert_eq!(export_row.get(0).and_then(SqliteValue::as_integer), Some(0));
+        let export_row = query_one_row(&conn, "SELECT COUNT(*) FROM export_hashes");
+        assert_eq!(export_row.get(0).and_then(SqlValue::as_integer), Some(0));
     }
 
     /// Regression for beads_rust#290: legacy DBs that pre-date the
@@ -2489,29 +2389,29 @@ mod tests {
 
         // Re-create dirty_issues without the DEFAULT to mirror what
         // a DB initialized under the pre-v7 schema looks like in the wild.
-        conn.execute("DROP TABLE dirty_issues").unwrap();
+        conn.execute("DROP TABLE dirty_issues", []).unwrap();
         conn.execute(
             "CREATE TABLE dirty_issues (
                  issue_id TEXT PRIMARY KEY,
                  marked_at TEXT NOT NULL
              )",
+            [],
         )
         .unwrap();
 
         conn.execute(
             "INSERT INTO issues (id, content_hash, title, status, priority, issue_type, created_at, updated_at) \
              VALUES ('bd-legacy', 'old-rust-hash', 'Legacy', 'open', 2, 'task', '2026-04-02T20:00:00Z', '2026-04-03T01:00:00Z')",
+            [],
         ).unwrap();
-        conn.execute("PRAGMA user_version = 6").unwrap();
+        set_pragma(&conn, "PRAGMA user_version = 6").unwrap();
 
         run_migrations(&conn, false)
             .expect("v7 migration must succeed against legacy dirty_issues schema");
 
-        let dirty_row = conn
-            .query_row("SELECT COUNT(*) FROM dirty_issues WHERE issue_id = 'bd-legacy'")
-            .unwrap();
+        let dirty_row = query_one_row(&conn, "SELECT COUNT(*) FROM dirty_issues WHERE issue_id = 'bd-legacy'");
         assert_eq!(
-            dirty_row.get(0).and_then(SqliteValue::as_integer),
+            dirty_row.get(0).and_then(SqlValue::as_integer),
             Some(1),
             "issue must be flagged dirty after v7 even on legacy table shape"
         );
@@ -2532,6 +2432,7 @@ mod tests {
         conn.execute(
             "INSERT INTO issues (id, title, status, priority, issue_type, created_at, updated_at) \
              VALUES ('bd-null', 'legacy null row', 'open', 2, 'task', '2026-04-30T00:00:00Z', '2026-04-30T00:00:00Z')",
+            [],
         )
         .expect("seed row");
 
@@ -2555,7 +2456,7 @@ mod tests {
         for column in columns_to_null {
             let _ = conn.execute(&format!(
                 "UPDATE issues SET {column} = NULL WHERE id = 'bd-null'"
-            ));
+            ), []);
         }
 
         // Run the v8 migration directly so this test stays focused on the
@@ -2566,12 +2467,10 @@ mod tests {
         // storage class after the backfill, regardless of which UPDATE-to-
         // NULL succeeded above.
         for column in columns_to_null {
-            let row = conn
-                .query_row(&format!(
+            let row = query_one_row(&conn, &format!(
                     "SELECT typeof({column}) FROM issues WHERE id = 'bd-null'"
-                ))
-                .unwrap();
-            let actual_type = row.get(0).and_then(SqliteValue::as_text);
+                ));
+            let actual_type = row.get(0).and_then(SqlValue::as_text);
             assert_ne!(
                 actual_type,
                 Some("null"),
@@ -2581,10 +2480,8 @@ mod tests {
 
         // Second pass is a no-op (the UPDATEs touch zero rows).
         backfill_storage_null_in_default_columns(&conn);
-        let row = conn
-            .query_row("SELECT typeof(notes) FROM issues WHERE id = 'bd-null'")
-            .unwrap();
-        assert_ne!(row.get(0).and_then(SqliteValue::as_text), Some("null"));
+        let row = query_one_row(&conn, "SELECT typeof(notes) FROM issues WHERE id = 'bd-null'");
+        assert_ne!(row.get(0).and_then(SqlValue::as_text), Some("null"));
     }
 
     #[test]
@@ -2605,8 +2502,7 @@ mod tests {
         // Hand-build the canonical v9 issues table: all the columns that
         // existed before #289 landed, in the canonical EXPECTED order, but
         // intentionally missing the source_repo_path tail column.
-        execute_batch(
-            &conn,
+        conn.execute_batch(
             r"
             CREATE TABLE issues (
                 id TEXT PRIMARY KEY,
@@ -2648,7 +2544,7 @@ mod tests {
 
         // Stamp the legacy version so the open-path would otherwise
         // short-circuit and skip migrations.
-        conn.execute("PRAGMA user_version = 9")
+        set_pragma(&conn, "PRAGMA user_version = 9")
             .expect("stamp legacy user_version");
 
         assert!(
@@ -2668,9 +2564,11 @@ mod tests {
         // step specifically (run_migrations_atomic above used target=10), so
         // the assertion stays at 10 even as CURRENT_SCHEMA_VERSION advances.
         let stamped = conn
-            .query_row("PRAGMA user_version")
+            .prepare("PRAGMA user_version")
+            .and_then(|mut stmt| db::query_row_values(&mut stmt))
             .ok()
-            .and_then(|row| row.get(0).and_then(SqliteValue::as_integer))
+            .flatten()
+            .and_then(|row| row.first().and_then(SqlValue::as_integer))
             .unwrap_or(-1);
         assert_eq!(
             stamped, 10,
@@ -2686,33 +2584,28 @@ mod tests {
 
         apply_schema(&conn).expect("Failed to apply schema");
 
-        let row = conn
-            .query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name='issues'")
-            .expect("issues table should exist");
-        let issues_sql = row
-            .get(0)
-            .and_then(SqliteValue::as_text)
-            .expect("issues table SQL should be present");
+        // Assert on the parsed table rather than on substrings of the DDL text.
+        // A substring count cannot tell a column declaration from a comment that
+        // merely mentions the column, so any editorial change to a neighbouring
+        // comment would fail this test while the schema stayed correct. A
+        // duplicate column is what actually matters, and PRAGMA table_info
+        // reports the real column list.
+        let columns: Vec<String> = query_all(
+            &conn,
+            "SELECT name FROM pragma_table_info('issues')",
+        )
+        .expect("read issues columns")
+        .iter()
+        .filter_map(|row| row.first().and_then(|v| v.as_text()).map(str::to_owned))
+        .collect();
 
-        // Use trailing space to disambiguate from `source_repo_path` (which
-        // contains `source_repo` as a prefix). The column declaration is
-        // `source_repo TEXT ...`, so the space-suffixed form matches the
-        // canonical declaration site exactly once.
-        assert_eq!(
-            issues_sql.matches("source_repo ").count(),
-            1,
-            "issues table SQL should define source_repo exactly once"
-        );
-        assert_eq!(
-            issues_sql.matches("source_repo_path ").count(),
-            1,
-            "issues table SQL should define source_repo_path exactly once"
-        );
-        assert_eq!(
-            issues_sql.matches("is_template").count(),
-            1,
-            "issues table SQL should define is_template exactly once"
-        );
+        for name in ["source_repo", "source_repo_path", "is_template"] {
+            let count = columns.iter().filter(|c| c.as_str() == name).count();
+            assert_eq!(
+                count, 1,
+                "issues table should define {name} exactly once; columns: {columns:?}"
+            );
+        }
     }
 
     /// Conformance test: Verify schema matches bd (Go) for interoperability.
@@ -2727,8 +2620,8 @@ mod tests {
 
         // === ISSUES TABLE ===
         // Verify column defaults
-        let issues_cols: Vec<(String, String, i32, Option<String>)> = conn
-            .query("PRAGMA table_info(issues)")
+        let issues_cols: Vec<(String, String, i32, Option<String>)> =
+            query_all(&conn, "PRAGMA table_info(issues)")
             .unwrap()
             .iter()
             .map(|row| {
@@ -2743,7 +2636,7 @@ mod tests {
                         .to_string(),
                     #[allow(clippy::cast_possible_truncation)]
                     {
-                        row.get(3).and_then(SqliteValue::as_integer).unwrap_or(0) as i32
+                        row.get(3).and_then(SqlValue::as_integer).unwrap_or(0) as i32
                     },
                     row.get(4).and_then(|v| v.as_text()).map(String::from),
                 )
@@ -2792,8 +2685,8 @@ mod tests {
         );
 
         // === VERIFY KEY INDEXES EXIST ===
-        let indexes: HashSet<String> = conn
-            .query("SELECT name FROM sqlite_master WHERE type='index' AND sql IS NOT NULL")
+        let indexes: HashSet<String> =
+            query_all(&conn, "SELECT name FROM sqlite_master WHERE type='index' AND sql IS NOT NULL")
             .unwrap()
             .iter()
             .filter_map(|row| row.get(0).and_then(|v| v.as_text()).map(String::from))
@@ -2872,8 +2765,8 @@ mod tests {
         );
 
         // === DEPENDENCIES TABLE ===
-        let deps_cols: Vec<(String, Option<String>)> = conn
-            .query("PRAGMA table_info(dependencies)")
+        let deps_cols: Vec<(String, Option<String>)> =
+            query_all(&conn, "PRAGMA table_info(dependencies)")
             .unwrap()
             .iter()
             .map(|row| {
@@ -2943,8 +2836,7 @@ mod tests {
         );
 
         // === BLOCKED_ISSUES_CACHE TABLE ===
-        let cache_cols: Vec<String> = conn
-            .query("PRAGMA table_info(blocked_issues_cache)")
+        let cache_cols: Vec<String> = query_all(&conn, "PRAGMA table_info(blocked_issues_cache)")
             .unwrap()
             .iter()
             .filter_map(|row| row.get(1).and_then(|v| v.as_text()).map(String::from))
@@ -2977,7 +2869,7 @@ mod tests {
 
         // === TEST CLOSED-AT CONSTRAINT ===
         // Insert an issue with defaults (will get status='open', closed_at=NULL)
-        conn.execute("INSERT INTO issues (id, title) VALUES ('test-1', 'Test Issue')")
+        conn.execute("INSERT INTO issues (id, title) VALUES ('test-1', 'Test Issue')", [])
             .expect("Should allow open issue without closed_at");
 
         // Try to insert closed issue without closed_at — CHECK constraint
@@ -2985,22 +2877,25 @@ mod tests {
         // so we accept either outcome.
         let result = conn.execute(
             "INSERT INTO issues (id, title, status) VALUES ('test-2', 'Closed', 'closed')",
+            [],
         );
         if result.is_ok() {
             // fsqlite: CHECK not enforced — clean up the row so later assertions
             // are not affected by the extra row.
-            let _ = conn.execute("DELETE FROM issues WHERE id = 'test-2'");
+            let _ = conn.execute("DELETE FROM issues WHERE id = 'test-2'", []);
         }
 
         // Insert closed issue with closed_at - should succeed
         conn.execute(
             "INSERT INTO issues (id, title, status, closed_at) VALUES ('test-3', 'Closed', 'closed', CURRENT_TIMESTAMP)",
+            [],
         )
         .expect("Should allow closed issue with closed_at");
 
         // Insert tombstone without closed_at - should succeed (tombstones exempt)
         conn.execute(
             "INSERT INTO issues (id, title, status) VALUES ('test-4', 'Tombstone', 'tombstone')",
+            [],
         )
         .expect("Should allow tombstone without closed_at");
     }
@@ -3014,8 +2909,7 @@ mod tests {
 
         // Create old-style blocked_issues_cache with blocked_by_json
         // Using a complete issues table schema so index migrations succeed
-        execute_batch(
-            &conn,
+        conn.execute_batch(
             r"
             CREATE TABLE issues (
                 id TEXT PRIMARY KEY,
@@ -3066,8 +2960,7 @@ mod tests {
         run_migrations(&conn, false).unwrap();
 
         // Verify columns were updated
-        let cols: Vec<String> = conn
-            .query("PRAGMA table_info(blocked_issues_cache)")
+        let cols: Vec<String> = query_all(&conn, "PRAGMA table_info(blocked_issues_cache)")
             .unwrap()
             .iter()
             .filter_map(|row| row.get(1).and_then(|v| v.as_text()).map(String::from))
@@ -3096,8 +2989,7 @@ mod tests {
 
         // Old-style cache table with 'id' column instead of 'issue_id'
         // Using a complete issues table schema so index migrations succeed
-        execute_batch(
-            &conn,
+        conn.execute_batch(
             r"
             CREATE TABLE issues (
                 id TEXT PRIMARY KEY,
@@ -3150,8 +3042,7 @@ mod tests {
         // Apply full schema (includes pre-migrations)
         apply_schema(&conn).unwrap();
 
-        let cols: Vec<String> = conn
-            .query("PRAGMA table_info(blocked_issues_cache)")
+        let cols: Vec<String> = query_all(&conn, "PRAGMA table_info(blocked_issues_cache)")
             .unwrap()
             .iter()
             .filter_map(|row| row.get(1).and_then(|v| v.as_text()).map(String::from))
@@ -3182,8 +3073,7 @@ mod tests {
         let db_path = temp.path().join("beads.db");
         let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
 
-        execute_batch(
-            &conn,
+        conn.execute_batch(
             r"
             CREATE TABLE issues (
                 id TEXT PRIMARY KEY,
@@ -3195,8 +3085,7 @@ mod tests {
 
         apply_schema(&conn).unwrap();
 
-        let cols: Vec<String> = conn
-            .query("PRAGMA table_info('issues')")
+        let cols: Vec<String> = query_all(&conn, "PRAGMA table_info('issues')")
             .unwrap()
             .iter()
             .filter_map(|row| row.get(1).and_then(|v| v.as_text()).map(String::from))
@@ -3234,8 +3123,7 @@ mod tests {
         let db_path = temp.path().join("beads.db");
         let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
 
-        execute_batch(
-            &conn,
+        conn.execute_batch(
             r"
             CREATE TABLE issues (
                 legacy_only TEXT
@@ -3257,12 +3145,12 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("locked-rebuild.db");
         let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
-        conn.execute("PRAGMA busy_timeout=0").unwrap();
+        set_pragma(&conn, "PRAGMA busy_timeout=0").unwrap();
         apply_schema(&conn).unwrap();
 
         let lock_conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
-        lock_conn.execute("PRAGMA busy_timeout=0").unwrap();
-        lock_conn.execute("BEGIN IMMEDIATE").unwrap();
+        set_pragma(&lock_conn, "PRAGMA busy_timeout=0").unwrap();
+        lock_conn.execute("BEGIN IMMEDIATE", []).unwrap();
 
         assert!(foreign_keys_enabled(&conn).unwrap());
         let err = rebuild_issues_table(&conn).expect_err("exclusive rebuild should hit busy lock");
@@ -3275,7 +3163,7 @@ mod tests {
             "failed rebuild must restore foreign key enforcement"
         );
 
-        lock_conn.execute("ROLLBACK").unwrap();
+        lock_conn.execute("ROLLBACK", []).unwrap();
     }
 
     /// Migration: add missing dependency type column for older schemas.
@@ -3285,8 +3173,7 @@ mod tests {
         let db_path = temp.path().join("beads.db");
         let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
 
-        execute_batch(
-            &conn,
+        conn.execute_batch(
             r"
             CREATE TABLE issues (
                 id TEXT PRIMARY KEY,
@@ -3304,7 +3191,7 @@ mod tests {
         apply_schema(&conn).unwrap();
 
         assert!(
-            conn.query("PRAGMA table_info('dependencies')")
+            query_all(&conn, "PRAGMA table_info('dependencies')")
                 .unwrap()
                 .iter()
                 .filter_map(|row| row.get(1).and_then(|v| v.as_text()).map(String::from))
@@ -3319,8 +3206,7 @@ mod tests {
         let db_path = temp.path().join("beads.db");
         let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
 
-        execute_batch(
-            &conn,
+        conn.execute_batch(
             r"
             CREATE TABLE config (
                 key TEXT PRIMARY KEY,
@@ -3341,44 +3227,41 @@ mod tests {
         // key column should no longer be PRIMARY KEY in rebuilt tables.
         // Use PRAGMA table_info (not the table-valued function form) since
         // fsqlite does not support pragma_table_info as a table-valued function.
-        let config_key_pk = conn
-            .query("PRAGMA table_info('config')")
+        let config_key_pk = query_all(&conn, "PRAGMA table_info('config')")
             .unwrap()
             .iter()
-            .find(|row| row.get(1).and_then(SqliteValue::as_text) == Some("key"))
-            .and_then(|row| row.get(5).and_then(SqliteValue::as_integer))
+            .find(|row| row.get(1).and_then(SqlValue::as_text) == Some("key"))
+            .and_then(|row| row.get(5).and_then(SqlValue::as_integer))
             .unwrap_or(0);
         assert_eq!(config_key_pk, 0);
 
-        let metadata_key_pk = conn
-            .query("PRAGMA table_info('metadata')")
+        let metadata_key_pk = query_all(&conn, "PRAGMA table_info('metadata')")
             .unwrap()
             .iter()
-            .find(|row| row.get(1).and_then(SqliteValue::as_text) == Some("key"))
-            .and_then(|row| row.get(5).and_then(SqliteValue::as_integer))
+            .find(|row| row.get(1).and_then(SqlValue::as_text) == Some("key"))
+            .and_then(|row| row.get(5).and_then(SqlValue::as_integer))
             .unwrap_or(0);
         assert_eq!(metadata_key_pk, 0);
 
         // Migration should preserve existing values.
-        let config_latest = conn
-            .query_row_with_params(
-                "SELECT value FROM config WHERE key = ?1",
-                &[SqliteValue::from("issue_prefix")],
-            )
-            .unwrap();
+        let config_latest = query_one_row_with_params(
+            &conn,
+            "SELECT value FROM config WHERE key = ?1",
+            &[SqlValue::from("issue_prefix")],
+        );
         assert_eq!(
-            config_latest.get(0).and_then(SqliteValue::as_text),
+            config_latest.get(0).and_then(SqlValue::as_text),
             Some("new")
         );
 
-        let metadata_latest = conn
-            .query_row_with_params(
-                "SELECT value FROM metadata WHERE key = ?1",
-                &[SqliteValue::from("project")],
-            )
-            .unwrap();
+        let metadata_values = [SqlValue::from("project")];
+        let metadata_latest = crate::storage::db::query_row_values_with_params(
+            &mut conn.prepare("SELECT value FROM metadata WHERE key = ?1").unwrap(),
+            crate::storage::db::params_from(&metadata_values).as_slice(),
+        )
+        .unwrap();
         assert_eq!(
-            metadata_latest.get(0).and_then(SqliteValue::as_text),
+            metadata_latest.as_ref().and_then(|r| r.first()).and_then(SqlValue::as_text),
             Some("new")
         );
     }
@@ -3391,16 +3274,16 @@ mod tests {
             let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
             apply_schema(&conn).expect("schema");
 
-            conn.execute("DROP INDEX IF EXISTS idx_config_key")
+            conn.execute("DROP INDEX IF EXISTS idx_config_key", [])
                 .expect("drop config index");
-            conn.execute("DROP TABLE config").expect("drop config");
-            conn.execute("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            conn.execute("DROP TABLE config", []).expect("drop config");
+            conn.execute("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL)", [])
                 .expect("recreate legacy config");
 
-            conn.execute("DROP INDEX IF EXISTS idx_metadata_key")
+            conn.execute("DROP INDEX IF EXISTS idx_metadata_key", [])
                 .expect("drop metadata index");
-            conn.execute("DROP TABLE metadata").expect("drop metadata");
-            conn.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            conn.execute("DROP TABLE metadata", []).expect("drop metadata");
+            conn.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)", [])
                 .expect("recreate legacy metadata");
         }
 
@@ -3419,9 +3302,9 @@ mod tests {
         let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
         apply_schema(&conn).expect("schema");
 
-        let plan_rows = conn
-            .query(
-                "EXPLAIN QUERY PLAN
+        let plan_rows = query_all(
+            &conn,
+            "EXPLAIN QUERY PLAN
                  SELECT id, priority, created_at
                  FROM issues
                  WHERE status NOT IN ('closed', 'tombstone')
@@ -3449,104 +3332,14 @@ mod tests {
         );
     }
 
-    // ---- split_sql_statements tests ----
-
-    #[test]
-    fn test_split_normal_multi_statement() {
-        let sql = "CREATE TABLE a (id INT); CREATE TABLE b (id INT); INSERT INTO a VALUES (1)";
-        let stmts = split_sql_statements(sql);
-        assert_eq!(stmts.len(), 3);
-        assert_eq!(stmts[0], "CREATE TABLE a (id INT)");
-        assert_eq!(stmts[1], "CREATE TABLE b (id INT)");
-        assert_eq!(stmts[2], "INSERT INTO a VALUES (1)");
-    }
-
-    #[test]
-    fn test_split_semicolon_inside_single_quoted_string() {
-        let sql = "INSERT INTO t(v) VALUES('a;b'); SELECT 1";
-        let stmts = split_sql_statements(sql);
-        assert_eq!(stmts.len(), 2);
-        assert_eq!(stmts[0], "INSERT INTO t(v) VALUES('a;b')");
-        assert_eq!(stmts[1], "SELECT 1");
-    }
-
-    #[test]
-    fn test_split_semicolon_inside_double_quoted_identifier() {
-        let sql = r#"CREATE TABLE "weird;name" (id INT); SELECT 1"#;
-        let stmts = split_sql_statements(sql);
-        assert_eq!(stmts.len(), 2);
-        assert_eq!(stmts[0], r#"CREATE TABLE "weird;name" (id INT)"#);
-        assert_eq!(stmts[1], "SELECT 1");
-    }
-
-    #[test]
-    fn test_split_escaped_quotes_in_string() {
-        // SQL escapes single quotes by doubling them: 'it''s'
-        let sql = "INSERT INTO t(v) VALUES('it''s;here'); SELECT 2";
-        let stmts = split_sql_statements(sql);
-        assert_eq!(stmts.len(), 2);
-        assert_eq!(stmts[0], "INSERT INTO t(v) VALUES('it''s;here')");
-        assert_eq!(stmts[1], "SELECT 2");
-    }
-
-    #[test]
-    fn test_split_empty_statements() {
-        let sql = "SELECT 1;; ; SELECT 2";
-        let stmts = split_sql_statements(sql);
-        assert_eq!(stmts.len(), 2);
-        assert_eq!(stmts[0], "SELECT 1");
-        assert_eq!(stmts[1], "SELECT 2");
-    }
-
-    #[test]
-    fn test_split_trailing_semicolon() {
-        let sql = "SELECT 1; SELECT 2;";
-        let stmts = split_sql_statements(sql);
-        assert_eq!(stmts.len(), 2);
-        assert_eq!(stmts[0], "SELECT 1");
-        assert_eq!(stmts[1], "SELECT 2");
-    }
-
-    #[test]
-    fn test_split_line_comment_with_semicolon() {
-        let sql = "SELECT 1; -- this is a comment; not a split\nSELECT 2";
-        let stmts = split_sql_statements(sql);
-        assert_eq!(stmts.len(), 2);
-        assert_eq!(stmts[0], "SELECT 1");
-        assert_eq!(stmts[1], "-- this is a comment; not a split\nSELECT 2");
-    }
-
-    #[test]
-    fn test_split_block_comment_with_semicolon() {
-        let sql = "SELECT 1; /* comment; with; semicolons */ SELECT 2";
-        let stmts = split_sql_statements(sql);
-        assert_eq!(stmts.len(), 2);
-        assert_eq!(stmts[0], "SELECT 1");
-        assert_eq!(stmts[1], "/* comment; with; semicolons */ SELECT 2");
-    }
-
-    #[test]
-    fn test_split_empty_input() {
-        assert!(split_sql_statements("").is_empty());
-        assert!(split_sql_statements("   ").is_empty());
-        assert!(split_sql_statements("  ;  ;  ").is_empty());
-    }
-
-    #[test]
-    fn test_split_single_statement_no_semicolon() {
-        let stmts = split_sql_statements("SELECT 42");
-        assert_eq!(stmts.len(), 1);
-        assert_eq!(stmts[0], "SELECT 42");
-    }
-
     #[test]
     fn test_check_schema_skew_forward() {
-        let conn = Connection::open(":memory:").unwrap();
+        let conn = Connection::open_in_memory().unwrap();
         // Set user_version to CURRENT + 1 to simulate forward skew
-        conn.execute(&format!(
-            "PRAGMA user_version = {}",
-            CURRENT_SCHEMA_VERSION + 1
-        ))
+        set_pragma(
+            &conn,
+            &format!("PRAGMA user_version = {}", CURRENT_SCHEMA_VERSION + 1),
+        )
         .unwrap();
         let err = check_schema_skew(&conn, false, false).unwrap_err();
         assert!(
@@ -3558,9 +3351,9 @@ mod tests {
 
     #[test]
     fn test_check_schema_skew_behind_readonly() {
-        let conn = Connection::open(":memory:").unwrap();
+        let conn = Connection::open_in_memory().unwrap();
         // Set user_version to 1 (< CURRENT)
-        conn.execute("PRAGMA user_version = 1").unwrap();
+        set_pragma(&conn, "PRAGMA user_version = 1").unwrap();
         let err = check_schema_skew(&conn, true, false).unwrap_err();
         assert!(
             matches!(&err, BeadsError::SchemaSkewBehind { db_version, binary_version }
@@ -3571,28 +3364,27 @@ mod tests {
 
     #[test]
     fn test_check_schema_skew_behind_readwrite_ok() {
-        let conn = Connection::open(":memory:").unwrap();
-        conn.execute("PRAGMA user_version = 1").unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        set_pragma(&conn, "PRAGMA user_version = 1").unwrap();
         // Read-write should NOT error on behind skew (migration will happen)
         assert!(check_schema_skew(&conn, false, false).is_ok());
     }
 
     #[test]
     fn test_check_schema_skew_current_version_ok() {
-        let conn = Connection::open(":memory:").unwrap();
-        conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
-            .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        set_pragma(&conn, &format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")).unwrap();
         assert!(check_schema_skew(&conn, false, false).is_ok());
         assert!(check_schema_skew(&conn, true, false).is_ok());
     }
 
     #[test]
     fn test_check_schema_skew_ignore_flag() {
-        let conn = Connection::open(":memory:").unwrap();
-        conn.execute(&format!(
-            "PRAGMA user_version = {}",
-            CURRENT_SCHEMA_VERSION + 10
-        ))
+        let conn = Connection::open_in_memory().unwrap();
+        set_pragma(
+            &conn,
+            &format!("PRAGMA user_version = {}", CURRENT_SCHEMA_VERSION + 10),
+        )
         .unwrap();
         // Without ignore flag, should error
         assert!(check_schema_skew(&conn, false, false).is_err());
@@ -3603,7 +3395,7 @@ mod tests {
 
     #[test]
     fn test_check_schema_skew_fresh_db_no_user_version() {
-        let conn = Connection::open(":memory:").unwrap();
+        let conn = Connection::open_in_memory().unwrap();
         // Fresh :memory: DB has PRAGMA user_version = 0
         assert!(check_schema_skew(&conn, false, false).is_ok());
         // Read-only should also pass (0 means no schema yet)
@@ -3633,7 +3425,7 @@ mod tests {
 
     #[test]
     fn test_record_migration_hash() {
-        let conn = Connection::open(":memory:").unwrap();
+        let conn = Connection::open_in_memory().unwrap();
         // Create the table manually (apply_schema would do this)
         conn.execute(
             "CREATE TABLE IF NOT EXISTS schema_migration_hashes (
@@ -3641,6 +3433,7 @@ mod tests {
                 content_hash TEXT NOT NULL,
                 applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
             )",
+            [],
         )
         .unwrap();
 
@@ -3648,19 +3441,18 @@ mod tests {
         record_migration_hash(&conn, CURRENT_SCHEMA_VERSION, &sql_19).unwrap();
 
         // Verify the row
-        let row = conn
-            .query_row_with_params(
-                "SELECT version, content_hash FROM schema_migration_hashes WHERE version = ?1",
-                &[SqliteValue::from(CURRENT_SCHEMA_VERSION)],
-            )
-            .unwrap();
+        let row = query_one_row_with_params(
+            &conn,
+            "SELECT version, content_hash FROM schema_migration_hashes WHERE version = ?1",
+            &[SqlValue::from(CURRENT_SCHEMA_VERSION)],
+        );
         assert_eq!(
-            row.get(0).and_then(SqliteValue::as_integer),
+            row.get(0).and_then(SqlValue::as_integer),
             Some(i64::from(CURRENT_SCHEMA_VERSION))
         );
         let expected_hash = hash_sql(&sql_19);
         assert_eq!(
-            row.get(1).and_then(SqliteValue::as_text),
+            row.get(1).and_then(SqlValue::as_text),
             Some(expected_hash.as_str())
         );
 

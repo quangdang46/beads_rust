@@ -84,8 +84,17 @@ static HOME_PATH_RE: LazyLock<Regex> =
 static USERS_PATH_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"/Users/[a-zA-Z0-9_-]+").expect("users path regex"));
 static TMP_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?:/data)?/tmp/[A-Za-z0-9_-]*/?\.tmp[a-zA-Z0-9]+|/var/folders/[a-zA-Z0-9/_-]+")
-        .expect("tmp path regex")
+    // The macOS branch must also swallow the `tempfile` component that follows
+    // the per-user temp root (`/var/folders/<xx>/<hash>/T/.tmpAbC123`), otherwise
+    // normalization stops at the root and every golden retains a per-run random
+    // segment, which no committed snapshot can match. macOS also resolves temp
+    // dirs through the `/private` prefix (`/var` is a symlink to `/private/var`),
+    // and the harness canonicalizes before logging, so the prefix must be
+    // consumed on every branch or goldens keep a platform-specific segment.
+    Regex::new(
+        r"(?:/private)?(?:(?:/data)?/tmp/[A-Za-z0-9_-]*/?\.tmp[a-zA-Z0-9]+|/var/folders/[a-zA-Z0-9/_-]+/?(?:\.tmp[a-zA-Z0-9]+)?)",
+    )
+    .expect("tmp path regex")
 });
 /// Compact timestamp format used in backup filenames: `YYYYMMDD_HHMMSS_nano`.
 /// Produced by `sync::history` when writing rotation backups; differs run-to-run

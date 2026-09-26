@@ -4,25 +4,23 @@ use beads_rust::model::{DependencyType, Issue, IssueType, Priority, Status};
 use beads_rust::storage::{ListFilters, ReadyFilters, ReadySortPolicy};
 use chrono::{Duration, Utc};
 use common::{fixtures, test_db, test_db_with_dir};
-use fsqlite::Connection;
-use fsqlite_types::SqliteValue;
+use beads_rust::storage::db::query_all;
+use rusqlite::Connection;
 use std::collections::HashSet;
 
 fn table_names(conn: &Connection) -> HashSet<String> {
-    let rows = conn
-        .query("SELECT name FROM sqlite_master WHERE type = 'table'")
+    let rows = query_all(conn, "SELECT name FROM sqlite_master WHERE type = 'table'")
         .expect("query table list");
     rows.iter()
-        .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(String::from))
+        .filter_map(|row| row.first().and_then(|v| v.as_text()).map(String::from))
         .collect()
 }
 
 fn column_names(conn: &Connection, table: &str) -> HashSet<String> {
-    let rows = conn
-        .query(&format!("PRAGMA table_info({table})"))
+    let rows = query_all(conn, &format!("PRAGMA table_info({table})"))
         .expect("query table info");
     rows.iter()
-        .filter_map(|row| row.get(1).and_then(SqliteValue::as_text).map(String::from))
+        .filter_map(|row| row.get(1).and_then(|v| v.as_text()).map(String::from))
         .collect()
 }
 
@@ -36,7 +34,7 @@ fn schema_tables_and_columns_exist() {
     let db_path = dir.path().join(".beads").join("beads.db");
 
     drop(storage);
-    let conn = Connection::open(db_path.to_string_lossy().into_owned()).expect("open db");
+    let conn = Connection::open(db_path.to_string_lossy().as_ref()).expect("open db");
 
     let tables = table_names(&conn);
     for table in [

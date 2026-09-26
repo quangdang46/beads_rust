@@ -1012,7 +1012,7 @@ fn restore_one(
 /// All snapshots inside ONE record are replayed inside ONE transaction
 /// so the restore is atomic across tables.
 fn restore_db_exec(repo_root: &Path, record: &StoredActionRecord, target: PathBuf) -> UndoStep {
-    use fsqlite::Connection;
+    use rusqlite::Connection;
 
     if record.db_snapshots.is_empty() {
         return UndoStep {
@@ -1057,7 +1057,7 @@ fn restore_db_exec(repo_root: &Path, record: &StoredActionRecord, target: PathBu
             };
         }
     };
-    if let Err(e) = conn.execute("BEGIN IMMEDIATE") {
+    if let Err(e) = conn.execute("BEGIN IMMEDIATE", []) {
         let _ = conn.close();
         return UndoStep {
             path: record.path.clone(),
@@ -1146,7 +1146,7 @@ fn validate_db_snapshot_envelopes(
 }
 
 fn replay_db_snapshot_envelopes(
-    conn: &fsqlite::Connection,
+    conn: &rusqlite::Connection,
     envelopes: &[DbSnapshotEnvelope],
 ) -> std::result::Result<(), String> {
     for env in envelopes {
@@ -1157,7 +1157,7 @@ fn replay_db_snapshot_envelopes(
 }
 
 fn delete_db_snapshot_region(
-    conn: &fsqlite::Connection,
+    conn: &rusqlite::Connection,
     env: &DbSnapshotEnvelope,
 ) -> std::result::Result<(), String> {
     let predicate = env.predicate.as_deref().unwrap_or("").trim();
@@ -1167,16 +1167,16 @@ fn delete_db_snapshot_region(
     } else {
         format!("DELETE FROM {table_ident} WHERE {predicate}")
     };
-    conn.execute(&delete_sql)
+    conn.execute(&delete_sql, [])
         .map(|_| ())
         .map_err(|e| format!("delete:{e}"))
 }
 
 fn insert_db_snapshot_rows(
-    conn: &fsqlite::Connection,
+    conn: &rusqlite::Connection,
     env: &DbSnapshotEnvelope,
 ) -> std::result::Result<(), String> {
-    use fsqlite_types::value::SqliteValue;
+    use crate::storage::db::SqlValue;
 
     if env.rows.is_empty() {
         return Ok(());
@@ -1194,24 +1194,30 @@ fn insert_db_snapshot_rows(
         placeholders.join(", ")
     );
     for row in &env.rows {
-        let mut bound: Vec<SqliteValue> = Vec::with_capacity(env.columns.len());
+        let mut bound: Vec<SqlValue> = Vec::with_capacity(env.columns.len());
         for col in &env.columns {
             let val = row.get(col).cloned().unwrap_or(serde_json::Value::Null);
             bound.push(json_to_sqlite_value(&val).map_err(|e| format!("bind:{e}"))?);
         }
-        conn.execute_with_params(&insert_sql, &bound)
+        // `bound` is a `Vec<SqlValue>`, and rusqlite binds from an
+        // iterator of `ToSql` rather than from a frankensqlite parameter
+        // slice. `&SqlValue` is `ToSql` through rusqlite's blanket
+        // reference impl, so passing the row's own borrow keeps the
+        // positional order of `?` against `env.columns` exactly as it
+        // was.
+        conn.execute(&insert_sql, rusqlite::params_from_iter(bound.iter()))
             .map_err(|e| format!("insert:{e}"))?;
     }
     Ok(())
 }
 
 fn finish_db_replay(
-    conn: fsqlite::Connection,
+    conn: rusqlite::Connection,
     record: &StoredActionRecord,
     replay_result: std::result::Result<(), String>,
 ) -> UndoStep {
     match replay_result {
-        Ok(()) => match conn.execute("COMMIT") {
+        Ok(()) => match conn.execute("COMMIT", []) {
             Ok(_) => {
                 let _ = conn.close();
                 UndoStep {
@@ -1222,7 +1228,7 @@ fn finish_db_replay(
                 }
             }
             Err(e) => {
-                let _ = conn.execute("ROLLBACK");
+                let _ = conn.execute("ROLLBACK", []);
                 let _ = conn.close();
                 UndoStep {
                     path: record.path.clone(),
@@ -1233,7 +1239,7 @@ fn finish_db_replay(
             }
         },
         Err(e) => {
-            let _ = conn.execute("ROLLBACK");
+            let _ = conn.execute("ROLLBACK", []);
             let _ = conn.close();
             UndoStep {
                 path: record.path.clone(),
@@ -1339,30 +1345,35 @@ fn workspace_relative_path(repo_root: &Path, rel: &str) -> std::result::Result<P
     Ok(repo_root.join(path))
 }
 
-/// Convert one JSON value back into an `SqliteValue` for re-binding.
+/// Convert one JSON value back into an `SqlValue` for re-binding.
 /// Mirrors the inverse of `mutate.rs::sqlite_value_to_json`.
+///
+/// The JSON -> storage-class mapping is unchanged by the engine swap and
+/// must stay that way: it is the other half of the round trip against
+/// the snapshot writer, so a drifting case here would make undo write a
+/// value of a different class than the one that was captured.
 fn json_to_sqlite_value(
     val: &serde_json::Value,
-) -> std::result::Result<fsqlite_types::value::SqliteValue, String> {
-    use fsqlite_types::value::SqliteValue;
+) -> std::result::Result<crate::storage::db::SqlValue, String> {
+    use crate::storage::db::SqlValue;
     match val {
-        serde_json::Value::Null => Ok(SqliteValue::Null),
-        serde_json::Value::Bool(b) => Ok(SqliteValue::Integer(i64::from(*b))),
+        serde_json::Value::Null => Ok(SqlValue::new(rusqlite::types::Value::Null)),
+        serde_json::Value::Bool(b) => Ok(SqlValue::from(i64::from(*b))),
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
-                Ok(SqliteValue::Integer(i))
+                Ok(SqlValue::from(i))
             } else if let Some(f) = n.as_f64() {
-                Ok(SqliteValue::Float(f))
+                Ok(SqlValue::from(f))
             } else {
                 Err(format!("non-finite number {n}"))
             }
         }
-        serde_json::Value::String(s) => Ok(SqliteValue::Text(s.clone().into())),
+        serde_json::Value::String(s) => Ok(SqlValue::from(s.clone())),
         serde_json::Value::Object(map) => {
             // {"$blob_hex": "..."} encoding from the snapshot writer.
             if let Some(serde_json::Value::String(hex)) = map.get("$blob_hex") {
                 let bytes = decode_hex(hex).map_err(|e| format!("blob hex decode: {e}"))?;
-                return Ok(SqliteValue::Blob(bytes.into()));
+                return Ok(SqlValue::from(bytes));
             }
             Err(format!("unsupported object shape in snapshot: {map:?}"))
         }

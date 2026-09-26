@@ -2,6 +2,7 @@
 
 use crate::cli::{EpicCloseEligibleArgs, EpicCommands, EpicStatusArgs};
 use crate::config;
+use crate::storage::db::{self, SqlValue};
 use crate::error::Result;
 use crate::format::sanitize_terminal_inline;
 use crate::model::{EpicStatus, EventType, IssueType};
@@ -9,7 +10,6 @@ use crate::output::{OutputContext, OutputMode};
 use crate::storage::{ListFilters, SqliteStorage};
 use chrono::Utc;
 use crossterm::style::Stylize;
-use fsqlite_types::value::SqliteValue;
 use rich_rust::prelude::*;
 use serde::Serialize;
 
@@ -185,13 +185,14 @@ fn execute_close_eligible(
         for epic_status in &epics {
             let id = &epic_status.epic.id;
 
-            let rows = conn.execute_with_params(
+            let rows = db::exec_with(
+                conn,
                 "UPDATE issues SET status = 'closed', updated_at = ?, closed_at = ?, close_reason = ? WHERE id = ? AND status != 'closed'",
                 &[
-                    SqliteValue::from(now_str.as_str()),
-                    SqliteValue::from(now_str.as_str()),
-                    SqliteValue::from(reason),
-                    SqliteValue::from(id.as_str()),
+                    SqlValue::from(now_str.as_str()),
+                    SqlValue::from(now_str.as_str()),
+                    SqlValue::from(reason),
+                    SqlValue::from(id.as_str()),
                 ],
             )?;
 

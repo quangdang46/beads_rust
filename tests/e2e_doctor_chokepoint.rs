@@ -32,7 +32,8 @@ use assert_cmd::Command;
 use beads_rust::cli::commands::doctor_subsystems::mutate::{
     Capabilities, DbArg, MutateContext, Op, mutate,
 };
-use fsqlite::Connection;
+use beads_rust::storage::db::query_all;
+use rusqlite::Connection;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -167,19 +168,23 @@ fn parse_trailing_json(stdout: &str) -> Value {
 }
 
 fn seed_blocked_cache_db(db_path: &Path, blocked_by: &str) {
-    let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+    let conn = Connection::open(db_path.to_string_lossy().as_ref()).unwrap();
     conn.execute(
         "CREATE TABLE blocked_issues_cache (
             issue_id TEXT PRIMARY KEY,
             blocked_by TEXT NOT NULL,
             blocked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
         )",
+        [],
     )
     .unwrap();
-    conn.execute(&format!(
-        "INSERT INTO blocked_issues_cache(issue_id, blocked_by, blocked_at) \
-         VALUES ('bd-1', '{blocked_by}', '2026-05-01 00:00:00')"
-    ))
+    conn.execute(
+        &format!(
+            "INSERT INTO blocked_issues_cache(issue_id, blocked_by, blocked_at) \
+             VALUES ('bd-1', '{blocked_by}', '2026-05-01 00:00:00')"
+        ),
+        [],
+    )
     .unwrap();
     let _ = conn.close();
 }
@@ -240,22 +245,20 @@ fn mutate_cache_rebuild(ctx: &MutateContext, db_path: &Path) {
 }
 
 fn single_cache_row(db_path: &Path) -> (String, String) {
-    let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
-    let rows = conn
-        .query("SELECT issue_id, blocked_by FROM blocked_issues_cache")
-        .unwrap();
+    let conn = Connection::open(db_path.to_string_lossy().as_ref()).unwrap();
+    let rows = query_all(&conn, "SELECT issue_id, blocked_by FROM blocked_issues_cache").unwrap();
     assert_eq!(
         rows.len(),
         1,
         "expected exactly one cache row, got {}",
         rows.len()
     );
-    let issue_id = match rows[0].get(0) {
-        Some(fsqlite_types::value::SqliteValue::Text(s)) => s.to_string(),
+    let issue_id = match rows[0].get(0).and_then(|v| v.as_text()) {
+        Some(s) => s.to_string(),
         other => panic!("unexpected issue_id value: {other:?}"),
     };
-    let blocked_by = match rows[0].get(1) {
-        Some(fsqlite_types::value::SqliteValue::Text(s)) => s.to_string(),
+    let blocked_by = match rows[0].get(1).and_then(|v| v.as_text()) {
+        Some(s) => s.to_string(),
         other => panic!("unexpected blocked_by value: {other:?}"),
     };
     let _ = conn.close();
@@ -467,7 +470,7 @@ fn chokepoint_round_trip_gitignore() {
 //   - the legacy DB-rebuild path (config.rs `Rebuilding SQLite database
 //     from JSONL`) executes regardless of `--dry-run` because it
 //     predates the chokepoint and routes its own writes directly through
-//     fsqlite.
+//     the engine.
 //
 // The dry-run contract is part of the WP3+WP4 mutate() chokepoint plan;
 // landing it requires (a) honoring `dry_run` in the legacy
@@ -709,7 +712,7 @@ fn chokepoint_robot_triage_envelope_v1() {
         .expect("robot-triage spawned");
     let exit = out.status.code().unwrap_or(-1);
     // A freshly-initialized workspace currently emits one P2 finding
-    // (`db.sidecars` — WAL-without-SHM is "expected for frankensqlite"
+    // (`db.sidecars` — WAL-without-SHM just means "no open connection"
     // per the detector's own message). The triage exit code is 0
     // because no errors were raised, just warnings.
     assert!(
@@ -791,7 +794,7 @@ fn chokepoint_db_exec_round_trip() {
     let actions_path = run_dir.join("actions.jsonl");
 
     // Forward path: rebuild the cache via DELETE + INSERT inside the
-    // chokepoint. We do TWO DbExec ops because fsqlite's executor only
+    // chokepoint. We do TWO DbExec ops because the engine's executor only
     // accepts one statement per call.
     mutate_cache_rebuild(&ctx, &db_path);
 

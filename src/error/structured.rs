@@ -551,6 +551,9 @@ impl StructuredError {
                 ErrorCode::SchemaMismatch,
                 Some(json!({"expected": expected, "found": found})),
             ),
+            // One code for every database failure, regardless of SQLite result code. The
+            // exit-code table is a shipped Go-parity contract, so the mapping must not vary
+            // with which underlying condition happened to fire.
             BeadsError::Database(_) => (ErrorCode::DatabaseError, None),
             BeadsError::NotInitialized => (ErrorCode::NotInitialized, None),
             BeadsError::AlreadyInitialized { path } => (

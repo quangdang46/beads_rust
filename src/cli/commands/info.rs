@@ -2,14 +2,13 @@
 
 use crate::cli::InfoArgs;
 use crate::config;
+use crate::storage::db::{self, SqlValue};
 use crate::error::Result;
 use crate::format::sanitize_terminal_inline;
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::SqliteStorage;
 use crate::util::parse_id;
-use fsqlite::Connection;
-use fsqlite::compat::{OpenFlags, open_with_flags};
-use fsqlite_types::SqliteValue;
+use rusqlite::{Connection, OpenFlags};
 use rich_rust::prelude::*;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -207,9 +206,9 @@ fn load_info_snapshot_without_recovery(
     }
 
     match config::with_database_family_snapshot(&paths.db_path, |snapshot_db_path| {
-        let conn = Connection::open(snapshot_db_path.to_string_lossy().into_owned())?;
+        let conn = Connection::open(&snapshot_db_path)?;
         let snapshot = collect_info_snapshot(args, &conn);
-        conn.close()?;
+        conn.close().map_err(|(_, e)| e)?;
         Ok(snapshot)
     }) {
         Ok(snapshot) => snapshot,
@@ -231,12 +230,12 @@ fn db_path_is_symlink(db_path: &Path) -> bool {
 }
 
 fn load_info_snapshot_direct_read_only(args: &InfoArgs, db_path: &Path) -> Result<InfoSnapshot> {
-    let conn = open_with_flags(
+    let conn = Connection::open_with_flags(
         db_path.to_string_lossy().as_ref(),
         OpenFlags::SQLITE_OPEN_READ_ONLY,
     )?;
     let snapshot = collect_info_snapshot(args, &conn);
-    conn.close()?;
+    conn.close().map_err(|(_, e)| e)?;
     Ok(snapshot)
 }
 
@@ -265,21 +264,21 @@ fn collect_info_snapshot(args: &InfoArgs, conn: &Connection) -> InfoSnapshot {
 }
 
 fn query_issue_count(conn: &Connection) -> Option<usize> {
-    conn.query_row("SELECT COUNT(*) FROM issues")
+    db::query_row_all(&conn, "SELECT COUNT(*) FROM issues")
         .ok()
-        .and_then(|row| row.get(0).and_then(SqliteValue::as_integer))
+        .and_then(|row| row.as_ref().and_then(|r| r.first()).and_then(SqlValue::as_integer))
         .and_then(|count| usize::try_from(count).ok())
 }
 
 fn load_config_map(conn: &Connection) -> Option<HashMap<String, String>> {
-    let rows = conn.query("SELECT key, value FROM config").ok()?;
+    let rows = db::query_all(&conn, "SELECT key, value FROM config").ok()?;
     let mut config_map = HashMap::new();
 
     for row in rows {
-        let Some(key) = row.get(0).and_then(SqliteValue::as_text) else {
+        let Some(key) = row.get(0).and_then(SqlValue::as_text) else {
             continue;
         };
-        let Some(value) = row.get(1).and_then(SqliteValue::as_text) else {
+        let Some(value) = row.get(1).and_then(SqlValue::as_text) else {
             continue;
         };
         config_map.insert(key.to_string(), value.to_string());
@@ -353,14 +352,15 @@ fn combined_projection_parity_status(blocked_status: &str, ready_status: &str) -
 }
 
 fn metadata_value(conn: &Connection, key: &str) -> Option<String> {
-    conn.query_row_with_params(
+    db::query_row_with(&conn, 
         "SELECT value FROM metadata WHERE key = ?1 ORDER BY rowid DESC LIMIT 1",
-        &[SqliteValue::from(key)],
+        &[SqlValue::from(key)],
     )
     .ok()
     .and_then(|row| {
-        row.get(0)
-            .and_then(SqliteValue::as_text)
+        row.as_ref()
+            .and_then(|r| r.first())
+            .and_then(SqlValue::as_text)
             .map(str::to_string)
     })
 }
@@ -373,9 +373,9 @@ fn projection_row_count(conn: &Connection, table: &str) -> Option<usize> {
         _ => return None,
     };
 
-    conn.query_row(sql)
+    db::query_row_all(&conn, sql)
         .ok()
-        .and_then(|row| row.get(0).and_then(SqliteValue::as_integer))
+        .and_then(|row| row.as_ref().and_then(|r| r.first()).and_then(SqlValue::as_integer))
         .and_then(|count| usize::try_from(count).ok())
 }
 
@@ -385,14 +385,13 @@ fn build_schema_info(
     detected_prefix: Option<String>,
 ) -> SchemaInfo {
     let tables = actual_table_names(conn);
-    let sample_issue_ids: Vec<String> = conn
-        .query("SELECT id FROM issues ORDER BY id LIMIT 3")
+    let sample_issue_ids: Vec<String> = db::query_all(&conn, "SELECT id FROM issues ORDER BY id LIMIT 3")
         .ok()
         .map(|rows| {
             rows.into_iter()
                 .filter_map(|row| {
                     row.get(0)
-                        .and_then(SqliteValue::as_text)
+                        .and_then(SqlValue::as_text)
                         .map(str::to_string)
                 })
                 .collect()
@@ -415,12 +414,12 @@ fn detect_prefix(
     config_map
         .and_then(config::configured_issue_prefix_from_map)
         .or_else(|| {
-            conn.query("SELECT id FROM issues ORDER BY id LIMIT 1")
+            db::query_all(&conn, "SELECT id FROM issues ORDER BY id LIMIT 1")
                 .ok()
                 .and_then(|rows| rows.first().cloned())
                 .and_then(|row| {
                     row.get(0)
-                        .and_then(SqliteValue::as_text)
+                        .and_then(SqlValue::as_text)
                         .map(str::to_string)
                 })
                 .and_then(|id| parse_id(&id).ok().map(|parsed| parsed.prefix))
@@ -428,7 +427,7 @@ fn detect_prefix(
 }
 
 fn actual_table_names(conn: &Connection) -> Vec<String> {
-    conn.query(
+    db::query_all(&conn, 
         "SELECT name FROM sqlite_master \
          WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
          ORDER BY name",
@@ -438,7 +437,7 @@ fn actual_table_names(conn: &Connection) -> Vec<String> {
         rows.into_iter()
             .filter_map(|row| {
                 row.get(0)
-                    .and_then(SqliteValue::as_text)
+                    .and_then(SqlValue::as_text)
                     .map(str::to_string)
             })
             .collect()
@@ -447,9 +446,9 @@ fn actual_table_names(conn: &Connection) -> Vec<String> {
 }
 
 fn actual_schema_version(conn: &Connection) -> String {
-    conn.query_row("PRAGMA user_version")
+    db::query_row_all(&conn, "PRAGMA user_version")
         .ok()
-        .and_then(|row| row.get(0).and_then(SqliteValue::as_integer))
+        .and_then(|row| row.as_ref().and_then(|r| r.first()).and_then(SqlValue::as_integer))
         .map_or_else(|| "unknown".to_string(), |version| version.to_string())
 }
 
@@ -1260,9 +1259,9 @@ mod tests {
 
         let db_path = beads_dir.join("beads.db");
         let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
-        conn.execute("CREATE TABLE issues (id TEXT PRIMARY KEY)")
+        conn.execute("CREATE TABLE issues (id TEXT PRIMARY KEY)", [])
             .unwrap();
-        conn.execute("PRAGMA user_version = 1").unwrap();
+        conn.execute("PRAGMA user_version = 1", []).unwrap();
 
         let _guard = DirGuard::new(temp.path());
 

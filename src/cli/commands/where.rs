@@ -6,10 +6,10 @@ use crate::error::BeadsError;
 use crate::error::Result;
 use crate::format::sanitize_terminal_inline;
 use crate::output::OutputContext;
+use crate::storage::db::{SqlValue, db_err, query_row_values};
 use crate::util::parse_id;
-use fsqlite::Connection;
-use fsqlite_types::SqliteValue;
 use rich_rust::prelude::*;
+use rusqlite::Connection;
 use serde::Serialize;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -114,7 +114,7 @@ fn configured_prefix_from_db_without_recovery(db_path: &Path) -> Option<String> 
         let conn = Connection::open(snapshot_db_path.to_string_lossy().into_owned())?;
 
         let prefix = conn
-            .query(
+            .prepare(
                 "SELECT value FROM config \
                  WHERE key IN ('issue_prefix', 'issue-prefix', 'prefix') \
                  ORDER BY CASE key \
@@ -124,16 +124,13 @@ fn configured_prefix_from_db_without_recovery(db_path: &Path) -> Option<String> 
                  END \
                  LIMIT 1",
             )
+            .and_then(|mut stmt| query_row_values(&mut stmt))
             .ok()
-            .and_then(|rows| rows.first().cloned())
-            .and_then(|row| {
-                row.get(0)
-                    .and_then(SqliteValue::as_text)
-                    .map(str::to_string)
-            })
+            .flatten()
+            .and_then(|row| row.first().and_then(SqlValue::as_text).map(str::to_string))
             .map(|prefix| prefix.trim().to_string())
             .filter(|prefix| !prefix.is_empty());
-        conn.close()?;
+        conn.close().map_err(|(_, err)| db_err(err))?;
         Ok(prefix)
     })
     .ok()
@@ -149,16 +146,13 @@ fn prefix_from_db_without_recovery(db_path: &Path) -> Option<String> {
         config::with_database_family_snapshot(db_path, |snapshot_db_path| {
             let conn = Connection::open(snapshot_db_path.to_string_lossy().into_owned())?;
             let prefix = conn
-                .query("SELECT id FROM issues ORDER BY rowid LIMIT 1")
+                .prepare("SELECT id FROM issues ORDER BY rowid LIMIT 1")
+                .and_then(|mut stmt| query_row_values(&mut stmt))
                 .ok()
-                .and_then(|rows| rows.first().cloned())
-                .and_then(|row| {
-                    row.get(0)
-                        .and_then(SqliteValue::as_text)
-                        .map(str::to_string)
-                })
+                .flatten()
+                .and_then(|row| row.first().and_then(SqlValue::as_text).map(str::to_string))
                 .and_then(|id| parse_id(&id).ok().map(|parsed| parsed.prefix));
-            conn.close()?;
+            conn.close().map_err(|(_, err)| db_err(err))?;
             Ok(prefix)
         })
         .ok()
