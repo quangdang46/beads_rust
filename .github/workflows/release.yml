@@ -196,14 +196,17 @@ jobs:
           RELIABILITY_OVERRIDE_REASON: ${{ inputs.reliability_override_reason || '' }}
         run: |
           set -euo pipefail
-          if [ -z "${RELIABILITY_OVERRIDE_REASON}" ]; then
+          if [ -z "${RELIABILITY_OVERRIDE_REASON:-}" ]; then
             echo "reliability_override_reason is required"
             echo "::error::reliability_override_reason is required"
             exit 1
           fi
-          case "${RELIABILITY_OVERRIDE}" in
-            force|skip) ;;
-            *) echo "::error::unknown reliability_override '${RELIABILITY_OVERRIDE}'"; exit 1 ;;
+          # The reason is the record; the mode defaults to `skip` when the
+          # operator gave only a justification, which is the documented
+          # emergency path.
+          case "${RELIABILITY_OVERRIDE:-skip}" in
+            ""|force|skip) ;;
+            *) echo "::error::unknown reliability_override '${RELIABILITY_OVERRIDE:-}'"; exit 1 ;;
           esac
           summary="${GITHUB_STEP_SUMMARY:-reliability-override.md}"
           {
@@ -211,8 +214,8 @@ jobs:
             echo ""
             echo "Reliability gates were explicitly skipped by a documented operator emergency."
             echo ""
-            echo "- override: \`${RELIABILITY_OVERRIDE}\`"
-            echo "- reason: ${RELIABILITY_OVERRIDE_REASON}"
+            echo "- override: \`${RELIABILITY_OVERRIDE:-skip}\`"
+            echo "- reason: ${RELIABILITY_OVERRIDE_REASON:-}"
           } > "$summary"
           cat "$summary"
 

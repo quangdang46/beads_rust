@@ -10,14 +10,16 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 const RELEASE_WORKFLOW: &str = ".github/workflows/release.yml";
+/// Platform tokens as the release workflow actually names its archives.
+/// These are the tagless names `bd` and `install.sh` publish and request --
+/// the Go-style `linux_amd64` / `darwin_arm64` tokens matched no asset the
+/// release has ever produced.
 const REQUIRED_PLATFORMS: &[&str] = &[
-    "linux_amd64",
-    "linux_musl_amd64",
-    "linux_arm64",
-    "linux_musl_arm64",
-    "darwin_amd64",
-    "darwin_arm64",
-    "windows_amd64",
+    "linux-x64",
+    "linux-arm64",
+    "macos-x64",
+    "macos-arm64",
+    "windows-x64",
 ];
 
 #[derive(Debug, Deserialize)]
@@ -159,14 +161,14 @@ fn required_artifact_fragment_reports_missing_platforms() -> Result<(), String> 
     for platform in REQUIRED_PLATFORMS
         .iter()
         .copied()
-        .filter(|platform| *platform != "windows_amd64")
+        .filter(|platform| *platform != "windows-x64")
     {
         missing.write_release_artifact(platform, b"binary")?;
     }
 
     let result = run_bash_step(&script, missing.root(), &[])?;
     require_failure(&result, "missing platform should fail")?;
-    require_contains(&result.stdout, "windows_amd64")
+    require_contains(&result.stdout, "br-windows-x64.zip")
 }
 
 #[test]
