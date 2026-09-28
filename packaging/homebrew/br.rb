@@ -1,10 +1,10 @@
 # frozen_string_literal: true
 
 # Homebrew formula for br - Agent-first issue tracker
-# Repository: https://github.com/quangdang46/br
+# Repository: https://github.com/quangdang46/beads_rust
 #
 # To install:
-#   brew install quangdang46/br/br
+#   brew install quangdang46/beads_rust/br
 #
 # Asset names and the checksum values are produced by the release pipeline, not
 # by hand. `.github/workflows/release.yml` builds a single-file `br` binary per
@@ -17,28 +17,28 @@
 
 class Br < Formula
   desc "Agent-first issue tracker (SQLite + JSONL)"
-  homepage "https://github.com/quangdang46/br"
+  homepage "https://github.com/quangdang46/beads_rust"
   license "MIT"
   version "0.1.3"
 
   on_macos do
     on_arm do
-      url "https://github.com/quangdang46/br/releases/download/v#{version}/br-macos-arm64.tar.gz"
+      url "https://github.com/quangdang46/beads_rust/releases/download/v#{version}/br-macos-arm64.tar.gz"
       sha256 "REWRITTEN_AT_RELEASE_TIME_br-macos-arm64"
     end
     on_intel do
-      url "https://github.com/quangdang46/br/releases/download/v#{version}/br-macos-x64.tar.gz"
+      url "https://github.com/quangdang46/beads_rust/releases/download/v#{version}/br-macos-x64.tar.gz"
       sha256 "REWRITTEN_AT_RELEASE_TIME_br-macos-x64"
     end
   end
 
   on_linux do
     on_intel do
-      url "https://github.com/quangdang46/br/releases/download/v#{version}/br-linux-x64.tar.gz"
+      url "https://github.com/quangdang46/beads_rust/releases/download/v#{version}/br-linux-x64.tar.gz"
       sha256 "REWRITTEN_AT_RELEASE_TIME_br-linux-x64"
     end
     on_arm do
-      url "https://github.com/quangdang46/br/releases/download/v#{version}/br-linux-arm64.tar.gz"
+      url "https://github.com/quangdang46/beads_rust/releases/download/v#{version}/br-linux-arm64.tar.gz"
       sha256 "REWRITTEN_AT_RELEASE_TIME_br-linux-arm64"
     end
   end

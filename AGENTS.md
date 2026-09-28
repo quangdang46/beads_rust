@@ -81,7 +81,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 | Crate | Purpose |
 |-------|---------|
 | `clap` | CLI parsing with derive macros + shell completions |
-| `fsqlite` + `fsqlite-types` + `fsqlite-error` | SQLite engine facade plus shared storage types/errors (path dependencies) |
+| `rusqlite` | SQLite engine (bundled); the `fsqlite`/`franken` stack was removed — see the migration branch |
 | `serde` + `serde_json` | Issue serialization and JSONL export |
 | `schemars` | JSON Schema generation for robot output |
 | `chrono` | Timestamp parsing and RFC3339 formatting |
@@ -93,7 +93,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 | `regex` | Pattern matching for search and validation |
 | `semver` | Semantic version parsing |
 | `tracing` | Structured logging and diagnostics |
-| `self_update` | Self-update from GitHub releases (optional, feature-gated) |
+| `sha2` | Content hashing for deduplication (byte-identical to Go `bd`'s `ComputeContentHash`) |
 
 ### Release Profile
 
@@ -236,7 +236,7 @@ CLI (clap derive)
     ├── Commands ────── 35+ subcommands (create, list, show, close, dep, sync, ...)
     │                       │
     │                       ▼
-    ├── Storage ─────── SQLite (fsqlite stack)
+    ├── Storage ─────── SQLite (rusqlite)
     │                       │
     │                       ├── Schema (migrations, JSONL ↔ SQLite sync)
     │                       ├── Events (append-only audit log)
@@ -351,9 +351,12 @@ beads_rust/
 
 ```toml
 [features]
-default = ["self_update"]
-self_update = ["dep:self_update"]   # Self-update from GitHub releases (rustls TLS, signature verification)
+default = ["web"]
+mcp = ["dep:fastmcp-rust"]   # MCP server (`br serve`) for agent tool use
+web = ["dep:axum", "dep:tokio", "dep:tower-http", "dep:rust-embed"]   # embedded web UI (`br web`)
 ```
+
+Self-update was removed; there is no `self_update` feature and no `upgrade` command.
 
 ### Core Types Quick Reference
 

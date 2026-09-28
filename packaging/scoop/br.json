@@ -2,22 +2,22 @@
     "$schema": "https://raw.githubusercontent.com/ScoopInstaller/Scoop/HEAD/schema.json",
     "version": "0.1.3",
     "description": "Agent-first issue tracker (SQLite + JSONL)",
-    "homepage": "https://github.com/quangdang46/br",
+    "homepage": "https://github.com/quangdang46/beads_rust",
     "license": "MIT",
     "architecture": {
         "64bit": {
-            "url": "https://github.com/quangdang46/br/releases/download/v0.2.10/br-windows-x64.zip",
+            "url": "https://github.com/quangdang46/beads_rust/releases/download/v0.1.3/br-windows-x64.zip",
             "hash": "REWRITTEN_AT_RELEASE_TIME_br-windows-x64"
         }
     },
     "bin": "br.exe",
     "checkver": {
-        "github": "https://github.com/quangdang46/br"
+        "github": "https://github.com/quangdang46/beads_rust"
     },
     "autoupdate": {
         "architecture": {
             "64bit": {
-                "url": "https://github.com/quangdang46/br/releases/download/v$version/br-windows-x64.zip"
+                "url": "https://github.com/quangdang46/beads_rust/releases/download/v$version/br-windows-x64.zip"
             }
         }
     }

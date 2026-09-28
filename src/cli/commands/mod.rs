@@ -129,18 +129,6 @@ pub(crate) fn github_latest_release_api_url() -> String {
     format!("https://api.github.com/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/releases/latest")
 }
 
-#[cfg(feature = "self_update")]
-#[must_use]
-pub(crate) fn github_releases_url() -> String {
-    format!("https://github.com/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/releases")
-}
-
-#[cfg(feature = "self_update")]
-#[must_use]
-pub(crate) fn github_raw_main_url(path: &str) -> String {
-    format!("https://raw.githubusercontent.com/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/main/{path}")
-}
-
 /// Report a post-mutation auto-flush failure without corrupting command stdout.
 ///
 /// The data mutation has already succeeded by the time this is called. The
