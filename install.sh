@@ -619,9 +619,6 @@ detect_platform() {
                 *[Mm]usl*) libc="musl" ;;
             esac
         fi
-        if [ "$libc" = "musl" ] && [ "$arch" != "x64" ] && [ "$arch" != "arm64" ]; then
-            libc=""
-        fi
     fi
 
     if [ -n "$libc" ]; then
@@ -1394,10 +1391,15 @@ download_release() {
         release_tag="$(release_download_tag "$VERSION")"
         asset_version="$(release_asset_version "$VERSION")"
         local archive_ext="tar.gz"
+        # `detect_platform` emits `windows-x64` (hyphen), and the linux release
+        # assets are tagless and libc-agnostic: the workflow publishes
+        # br-linux-x64 / br-linux-arm64 built with musl, which run on glibc too.
+        # So match the hyphenated form and drop any `-musl` segment.
         case "$platform" in
-            windows_*) archive_ext="zip" ;;
+            windows-*) archive_ext="zip" ;;
         esac
-        archive_name="br-${platform}.${archive_ext}"
+        local asset_platform="${platform/musl-/}"
+        archive_name="br-${asset_platform}.${archive_ext}"
         url="https://github.com/${OWNER}/${REPO}/releases/download/${release_tag}/${archive_name}"
     fi
 
