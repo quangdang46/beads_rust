@@ -327,10 +327,15 @@ jobs:
             fi
             echo "### Reliability"
             if [ -f reliability-override.md ]; then
+              # The override step wrote the operator's justification. Spell the
+              # outcome out here too, so the release note reads unambiguously
+              # whether a human reviewed this release or waived the gates.
+              echo "Reliability gates were explicitly skipped by a documented operator emergency."
+              echo ""
               cat reliability-override.md
               echo ""
             else
-              echo "Reliability gates were not skipped."
+              echo "Reliability gates were explicitly not skipped for this release."
               echo ""
             fi
             echo "Release reliability gates completed before artifacts were built."
