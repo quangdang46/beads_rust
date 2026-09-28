@@ -172,11 +172,15 @@ fn read_interactions(workspace: &BrWorkspace) -> Vec<Value> {
         .collect()
 }
 
-fn parse_error_json(stderr: &str) -> Option<Value> {
-    serde_json::from_str(stderr).ok().or_else(|| {
-        stderr
+/// Pull the structured error payload out of a `--json` run's stdout.
+///
+/// Under `--json` the structured error is written to stdout so agents can parse
+/// it; stderr carries only log lines and human-readable notes.
+fn parse_error_json(stdout: &str) -> Option<Value> {
+    serde_json::from_str(stdout).ok().or_else(|| {
+        stdout
             .find('{')
-            .and_then(|start| stderr.get(start..))
+            .and_then(|start| stdout.get(start..))
             .and_then(|payload| serde_json::from_str(payload).ok())
     })
 }
@@ -441,7 +445,7 @@ fn coordination_status_invalid_snapshot_fails_structured() {
 
     assert!(!result.status.success(), "invalid snapshot should fail");
     assert_eq!(result.status.code(), Some(4));
-    let json = parse_error_json(&result.stderr).expect("structured error json");
+    let json = parse_error_json(&result.stdout).expect("structured error json");
     assert_eq!(json["error"]["code"], "VALIDATION_FAILED");
     assert!(
         json["error"]["message"]

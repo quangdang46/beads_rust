@@ -392,7 +392,13 @@ pub fn discover_beads_dir_with_cli(cli: &CliOverrides) -> Result<PathBuf> {
     let beads_dir = discover_beads_dir_with_cli_from(None, cli, None, None)?;
 
     if cli.require_local {
-        ensure_beads_dir_is_local(&beads_dir)?;
+        // An explicit `--db` is a deliberate statement of intent, and
+        // discover_beads_dir_with_cli's contract already promises that a
+        // `--db` under `.beads/` works "from any directory". Without the
+        // carve-out below the locality guard rejected exactly that case for
+        // every mutating command, while read-only commands (which do not set
+        // require_local) kept working.
+        ensure_beads_dir_is_local(&beads_dir, cli.db.is_some())?;
     }
 
     Ok(beads_dir)
@@ -406,11 +412,17 @@ pub fn discover_beads_dir_with_cli(cli: &CliOverrides) -> Result<PathBuf> {
 /// `/tmp`) from silently writing to a global database resolved via
 /// `BEADS_DIR`, `--db`, or the git-worktree fallback.
 ///
+/// When `explicit_db_target` is set the caller passed `--db` on the command
+/// line, and a workspace nested *below* CWD is also accepted. The cases this
+/// guard exists to stop are all *outward* targets -- a global or unrelated
+/// database reached implicitly -- whereas a descendant lives inside the tree
+/// the user is already standing in and was named by them explicitly.
+///
 /// # Errors
 ///
 /// Returns `BeadsError::Config` with a descriptive message when the
 /// workspace is not local.
-fn ensure_beads_dir_is_local(beads_dir: &Path) -> Result<()> {
+fn ensure_beads_dir_is_local(beads_dir: &Path, explicit_db_target: bool) -> Result<()> {
     let cwd = env::current_dir()?;
 
     // Canonicalize to resolve symlinks.
@@ -424,6 +436,17 @@ fn ensure_beads_dir_is_local(beads_dir: &Path) -> Result<()> {
     // workspace was found by walking up from CWD.
     if canonical_cwd.starts_with(&canonical_parent) {
         return Ok(());
+    }
+
+    // The workspace sits inside CWD's own tree. Only honoured for an explicit
+    // `--db`; an implicitly resolved one must not be able to reach in either.
+    if explicit_db_target {
+        let canonical_dir = beads_dir
+            .canonicalize()
+            .unwrap_or_else(|_| beads_dir.to_path_buf());
+        if canonical_dir.starts_with(&canonical_cwd) {
+            return Ok(());
+        }
     }
 
     // Slower path: CWD is inside a git worktree whose main repository

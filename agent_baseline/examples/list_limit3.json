@@ -1,51 +1,60 @@
 {
-  "has_more": false,
   "issues": [
     {
-      "created_at": "<TIMESTAMP>",
-      "created_by": "<ACTOR>",
-      "dependency_count": 0,
-      "dependent_count": 0,
       "id": "<ISSUE_ID>",
-      "issue_type": "bug",
-      "priority": 0,
-      "source_repo": "<SOURCE_REPO>",
-      "source_repo_path": "<SOURCE_REPO>",
-      "status": "open",
       "title": "Two",
-      "updated_at": "<TIMESTAMP>"
-    },
-    {
+      "status": "open",
+      "priority": 0,
+      "issue_type": "bug",
       "created_at": "<TIMESTAMP>",
       "created_by": "<ACTOR>",
-      "dependency_count": 0,
-      "dependent_count": 0,
-      "id": "<ISSUE_ID>",
-      "issue_type": "feature",
-      "priority": 1,
+      "updated_at": "<TIMESTAMP>",
       "source_repo": "<SOURCE_REPO>",
       "source_repo_path": "<SOURCE_REPO>",
-      "status": "open",
+      "mol_type": "",
+      "work_type": "",
+      "wisp_type": "",
+      "dependency_count": 0,
+      "dependent_count": 0
+    },
+    {
+      "id": "<ISSUE_ID>",
       "title": "Three",
-      "updated_at": "<TIMESTAMP>"
-    },
-    {
+      "status": "open",
+      "priority": 1,
+      "issue_type": "feature",
       "created_at": "<TIMESTAMP>",
       "created_by": "<ACTOR>",
-      "dependency_count": 0,
-      "dependent_count": 0,
-      "description": "Short desc",
-      "id": "<ISSUE_ID>",
-      "issue_type": "task",
-      "priority": 2,
+      "updated_at": "<TIMESTAMP>",
       "source_repo": "<SOURCE_REPO>",
       "source_repo_path": "<SOURCE_REPO>",
-      "status": "open",
+      "mol_type": "",
+      "work_type": "",
+      "wisp_type": "",
+      "dependency_count": 0,
+      "dependent_count": 0
+    },
+    {
+      "id": "<ISSUE_ID>",
       "title": "One",
-      "updated_at": "<TIMESTAMP>"
+      "description": "Short desc",
+      "status": "open",
+      "priority": 2,
+      "issue_type": "task",
+      "created_at": "<TIMESTAMP>",
+      "created_by": "<ACTOR>",
+      "updated_at": "<TIMESTAMP>",
+      "source_repo": "<SOURCE_REPO>",
+      "source_repo_path": "<SOURCE_REPO>",
+      "mol_type": "",
+      "work_type": "",
+      "wisp_type": "",
+      "dependency_count": 0,
+      "dependent_count": 0
     }
   ],
+  "total": 3,
   "limit": 3,
   "offset": 0,
-  "total": 3
+  "has_more": false
 }

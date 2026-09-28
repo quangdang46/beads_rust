@@ -41,12 +41,19 @@ fn br_cmd() -> Command {
     Command::new(assert_cmd::cargo::cargo_bin!("br"))
 }
 
+/// Fixed attribution so the rendered panels do not depend on the machine's
+/// git `user.name` / `USER`. `br comments add` resolves its author from
+/// `BD_ACTOR` first, then `USER`/`LOGNAME`, then git config, so without this a
+/// golden recorded on one machine fails on another.
+const TEST_ACTOR: &str = "br-golden";
+
 fn run_setup_br(root: &Path, args: &[&str]) -> String {
     let mut cmd = br_cmd();
     cmd.current_dir(root);
     cmd.args(args);
     clear_inherited_br_env(&mut cmd);
     cmd.env("HOME", root);
+    cmd.env("BD_ACTOR", TEST_ACTOR);
     cmd.env("NO_COLOR", "1");
     cmd.env("RUST_LOG", "error");
     cmd.env("RUST_BACKTRACE", "1");
@@ -173,7 +180,10 @@ fn run_rich_br(root: &Path, width: usize, args: &[&str]) -> String {
 
     let mut cmd = Command::new("script");
     cmd.current_dir(root);
-    cmd.args(["-q", "-e", "-c", &command_line, "/dev/null"]);
+    // `script [file [command ...]]` is the form both BSD/macOS and util-linux
+    // accept. The `-c` flag exists only in util-linux, so the GNU form fails on
+    // macOS with "script: illegal option -- c".
+    cmd.args(["-q", "/dev/null", "sh", "-c", &command_line]);
     clear_inherited_br_env(&mut cmd);
     cmd.env("HOME", root);
     cmd.env("COLUMNS", width.to_string());
@@ -255,7 +265,12 @@ fn replace_preserving_width(input: &str, regex: &Regex, placeholder: &str) -> St
 
 fn normalize_rich_output(raw: &str) -> String {
     let normalized_newlines = raw.replace("\r\n", "\n").replace('\r', "\n");
-    let without_script_markers = normalized_newlines
+    // BSD `script` on macOS prefixes its output with the caret notation of EOT
+    // ("^D") plus a backspace, and leaves backspaces in the stream. util-linux
+    // emits neither, so strip both or the same golden cannot pass on both.
+    let without_terminal_noise = normalized_newlines.replace('\u{8}', "");
+    let without_eof_marker = without_terminal_noise.replacen("^D", "", 1);
+    let without_script_markers = without_eof_marker
         .lines()
         .filter(|line| !line.starts_with("Script started") && !line.starts_with("Script done"))
         .collect::<Vec<_>>()

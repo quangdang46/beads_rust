@@ -108,13 +108,13 @@ schemas:
       is_template.type: boolean
       mol_type:
         "$ref": #/$defs/MolType
-        default: work
+        default: ""
       work_type:
         "$ref": #/$defs/WorkType
-        default: mutex
+        default: ""
       wisp_type:
         "$ref": #/$defs/WispType
-        default: none
+        default: ""
       spec_id.type[2]: string,"null"
       points:
         type[2]: integer,"null"
@@ -193,8 +193,8 @@ schemas:
           - type: string
       MolType:
         description: MolType categorizes molecule types for swarm coordination.
-        anyOf[4]:
-          - description: Regular assigned work (default).
+        anyOf[5]:
+          - description: Regular assigned work.
             type: string
             const: work
           - description: "Swarm molecule: coordinated multi-worker work."
@@ -205,10 +205,12 @@ schemas:
             const: patrol
           - description: User-defined mol type.
             type: string
+          - description: Unset (empty string).
+            type: string
       WorkType:
         description: WorkType categorizes how work assignment operates for a bead.
-        anyOf[3]:
-          - description: "One worker, exclusive assignment (default)."
+        anyOf[4]:
+          - description: "One worker, exclusive assignment."
             type: string
             const: mutex
           - description: "Many submit, buyer picks."
@@ -216,9 +218,11 @@ schemas:
             const: open_competition
           - description: User-defined work type.
             type: string
+          - description: "Unset (empty string). See `MolType::Unset`."
+            type: string
       WispType:
         description: WispType categorizes ephemeral wisps for TTL-based compaction.
-        anyOf[9]:
+        anyOf[10]:
           - description: Default (no specific wisp type).
             type: string
             const: none
@@ -244,6 +248,8 @@ schemas:
             type: string
             const: escalation
           - description: User-defined wisp type.
+            type: string
+          - description: Unset (empty string).
             type: string
       BondRef:
         description: "BondRef tracks compound molecule lineage.\nWhen protos or molecules are bonded together, BondRefs record\nwhich sources were combined and how they were attached."
@@ -1090,13 +1096,13 @@ schemas:
       is_template.type: boolean
       mol_type:
         "$ref": #/$defs/MolType
-        default: work
+        default: ""
       work_type:
         "$ref": #/$defs/WorkType
-        default: mutex
+        default: ""
       wisp_type:
         "$ref": #/$defs/WispType
-        default: none
+        default: ""
       spec_id.type[2]: string,"null"
       points:
         type[2]: integer,"null"
@@ -1168,8 +1174,8 @@ schemas:
           - type: string
       MolType:
         description: MolType categorizes molecule types for swarm coordination.
-        anyOf[4]:
-          - description: Regular assigned work (default).
+        anyOf[5]:
+          - description: Regular assigned work.
             type: string
             const: work
           - description: "Swarm molecule: coordinated multi-worker work."
@@ -1180,10 +1186,12 @@ schemas:
             const: patrol
           - description: User-defined mol type.
             type: string
+          - description: Unset (empty string).
+            type: string
       WorkType:
         description: WorkType categorizes how work assignment operates for a bead.
-        anyOf[3]:
-          - description: "One worker, exclusive assignment (default)."
+        anyOf[4]:
+          - description: "One worker, exclusive assignment."
             type: string
             const: mutex
           - description: "Many submit, buyer picks."
@@ -1191,9 +1199,11 @@ schemas:
             const: open_competition
           - description: User-defined work type.
             type: string
+          - description: "Unset (empty string). See `MolType::Unset`."
+            type: string
       WispType:
         description: WispType categorizes ephemeral wisps for TTL-based compaction.
-        anyOf[9]:
+        anyOf[10]:
           - description: Default (no specific wisp type).
             type: string
             const: none
@@ -1219,6 +1229,8 @@ schemas:
             type: string
             const: escalation
           - description: User-defined wisp type.
+            type: string
+          - description: Unset (empty string).
             type: string
       BondRef:
         description: "BondRef tracks compound molecule lineage.\nWhen protos or molecules are bonded together, BondRefs record\nwhich sources were combined and how they were attached."
@@ -1439,13 +1451,13 @@ schemas:
       is_template.type: boolean
       mol_type:
         "$ref": #/$defs/MolType
-        default: work
+        default: ""
       work_type:
         "$ref": #/$defs/WorkType
-        default: mutex
+        default: ""
       wisp_type:
         "$ref": #/$defs/WispType
-        default: none
+        default: ""
       spec_id.type[2]: string,"null"
       points:
         type[2]: integer,"null"
@@ -1526,8 +1538,8 @@ schemas:
           - type: string
       MolType:
         description: MolType categorizes molecule types for swarm coordination.
-        anyOf[4]:
-          - description: Regular assigned work (default).
+        anyOf[5]:
+          - description: Regular assigned work.
             type: string
             const: work
           - description: "Swarm molecule: coordinated multi-worker work."
@@ -1538,10 +1550,12 @@ schemas:
             const: patrol
           - description: User-defined mol type.
             type: string
+          - description: Unset (empty string).
+            type: string
       WorkType:
         description: WorkType categorizes how work assignment operates for a bead.
-        anyOf[3]:
-          - description: "One worker, exclusive assignment (default)."
+        anyOf[4]:
+          - description: "One worker, exclusive assignment."
             type: string
             const: mutex
           - description: "Many submit, buyer picks."
@@ -1549,9 +1563,11 @@ schemas:
             const: open_competition
           - description: User-defined work type.
             type: string
+          - description: "Unset (empty string). See `MolType::Unset`."
+            type: string
       WispType:
         description: WispType categorizes ephemeral wisps for TTL-based compaction.
-        anyOf[9]:
+        anyOf[10]:
           - description: Default (no specific wisp type).
             type: string
             const: none
@@ -1577,6 +1593,8 @@ schemas:
             type: string
             const: escalation
           - description: User-defined wisp type.
+            type: string
+          - description: Unset (empty string).
             type: string
       BondRef:
         description: "BondRef tracks compound molecule lineage.\nWhen protos or molecules are bonded together, BondRefs record\nwhich sources were combined and how they were attached."
@@ -1836,13 +1854,13 @@ schemas:
       is_template.type: boolean
       mol_type:
         "$ref": #/$defs/MolType
-        default: work
+        default: ""
       work_type:
         "$ref": #/$defs/WorkType
-        default: mutex
+        default: ""
       wisp_type:
         "$ref": #/$defs/WispType
-        default: none
+        default: ""
       spec_id.type[2]: string,"null"
       points:
         type[2]: integer,"null"
@@ -1922,8 +1940,8 @@ schemas:
           - type: string
       MolType:
         description: MolType categorizes molecule types for swarm coordination.
-        anyOf[4]:
-          - description: Regular assigned work (default).
+        anyOf[5]:
+          - description: Regular assigned work.
             type: string
             const: work
           - description: "Swarm molecule: coordinated multi-worker work."
@@ -1934,10 +1952,12 @@ schemas:
             const: patrol
           - description: User-defined mol type.
             type: string
+          - description: Unset (empty string).
+            type: string
       WorkType:
         description: WorkType categorizes how work assignment operates for a bead.
-        anyOf[3]:
-          - description: "One worker, exclusive assignment (default)."
+        anyOf[4]:
+          - description: "One worker, exclusive assignment."
             type: string
             const: mutex
           - description: "Many submit, buyer picks."
@@ -1945,9 +1965,11 @@ schemas:
             const: open_competition
           - description: User-defined work type.
             type: string
+          - description: "Unset (empty string). See `MolType::Unset`."
+            type: string
       WispType:
         description: WispType categorizes ephemeral wisps for TTL-based compaction.
-        anyOf[9]:
+        anyOf[10]:
           - description: Default (no specific wisp type).
             type: string
             const: none
@@ -1973,6 +1995,8 @@ schemas:
             type: string
             const: escalation
           - description: User-defined wisp type.
+            type: string
+          - description: Unset (empty string).
             type: string
       BondRef:
         description: "BondRef tracks compound molecule lineage.\nWhen protos or molecules are bonded together, BondRefs record\nwhich sources were combined and how they were attached."

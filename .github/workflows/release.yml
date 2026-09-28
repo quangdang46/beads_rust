@@ -16,14 +16,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly
         with:
           targets: x86_64-unknown-linux-musl
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Install musl toolchain
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '20'
       - name: Build embedded web UI
@@ -31,11 +31,11 @@ jobs:
       - run: cargo build --release --target x86_64-unknown-linux-musl
         env:
           RUSTC_BOOTSTRAP: 1
-      - run: cd target/x86_64-unknown-linux-musl/release && tar czf ../../../br-linux-x64.tar.gz br && cd - && sha256sum br-linux-x64.tar.gz > br-linux-x64.tar.gz.sha256
-      - uses: actions/upload-artifact@v4
+      - run: mkdir -p artifacts && cd target/x86_64-unknown-linux-musl/release && tar czf ../../../artifacts/br-linux-x64.tar.gz br && cd - && sha256sum br-linux-x64.tar.gz > br-linux-x64.tar.gz.sha256
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: br-linux-x64
-          path: br-linux-x64.*
+          path: artifacts/br-linux-x64.*
           if-no-files-found: error
 
   linux-arm64:
@@ -44,14 +44,14 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly
         with:
           targets: aarch64-unknown-linux-musl
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Install musl toolchain
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '20'
       - name: Build embedded web UI
@@ -59,11 +59,11 @@ jobs:
       - run: cargo build --release --target aarch64-unknown-linux-musl
         env:
           RUSTC_BOOTSTRAP: 1
-      - run: cd target/aarch64-unknown-linux-musl/release && tar czf ../../../br-linux-arm64.tar.gz br && cd - && sha256sum br-linux-arm64.tar.gz > br-linux-arm64.tar.gz.sha256
-      - uses: actions/upload-artifact@v4
+      - run: mkdir -p artifacts && cd target/aarch64-unknown-linux-musl/release && tar czf ../../../artifacts/br-linux-arm64.tar.gz br && cd - && sha256sum br-linux-arm64.tar.gz > br-linux-arm64.tar.gz.sha256
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: br-linux-arm64
-          path: br-linux-arm64.*
+          path: artifacts/br-linux-arm64.*
           if-no-files-found: error
 
   macos-arm64:
@@ -71,12 +71,12 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly
         with:
           targets: aarch64-apple-darwin
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '20'
       - name: Build embedded web UI
@@ -84,11 +84,11 @@ jobs:
       - run: cargo build --release --target aarch64-apple-darwin
         env:
           RUSTC_BOOTSTRAP: 1
-      - run: cd target/aarch64-apple-darwin/release && tar czf ../../../br-macos-arm64.tar.gz br && cd - && shasum -a 256 br-macos-arm64.tar.gz > br-macos-arm64.tar.gz.sha256
-      - uses: actions/upload-artifact@v4
+      - run: mkdir -p artifacts && cd target/aarch64-apple-darwin/release && tar czf ../../../artifacts/br-macos-arm64.tar.gz br && cd - && shasum -a 256 artifacts/br-macos-arm64.tar.gz > br-macos-arm64.tar.gz.sha256
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: br-macos-arm64
-          path: br-macos-arm64.*
+          path: artifacts/br-macos-arm64.*
           if-no-files-found: error
 
   macos-x64:
@@ -96,12 +96,12 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly
         with:
           targets: x86_64-apple-darwin
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '20'
       - name: Build embedded web UI
@@ -109,11 +109,11 @@ jobs:
       - run: cargo build --release --target x86_64-apple-darwin
         env:
           RUSTC_BOOTSTRAP: 1
-      - run: cd target/x86_64-apple-darwin/release && tar czf ../../../br-macos-x64.tar.gz br && cd - && shasum -a 256 br-macos-x64.tar.gz > br-macos-x64.tar.gz.sha256
-      - uses: actions/upload-artifact@v4
+      - run: mkdir -p artifacts && cd target/x86_64-apple-darwin/release && tar czf ../../../artifacts/br-macos-x64.tar.gz br && cd - && shasum -a 256 artifacts/br-macos-x64.tar.gz > br-macos-x64.tar.gz.sha256
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: br-macos-x64
-          path: br-macos-x64.*
+          path: artifacts/br-macos-x64.*
           if-no-files-found: error
 
   windows-x64:
@@ -121,12 +121,12 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly
         with:
           targets: x86_64-pc-windows-msvc
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '20'
       - name: Build embedded web UI
@@ -138,11 +138,11 @@ jobs:
           cd target/x86_64-pc-windows-msvc/release
           7z a ../../../br-windows-x64.zip br.exe
           cd -
-          certutil -hashfile br-windows-x64.zip SHA256 > br-windows-x64.zip.sha256
-      - uses: actions/upload-artifact@v4
+          certutil -hashfile artifacts\br-windows-x64.zip SHA256 > br-windows-x64.zip.sha256
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: br-windows-x64
-          path: br-windows-x64.*
+          path: artifacts/br-windows-x64.*
           if-no-files-found: error
 
   release:
@@ -150,17 +150,123 @@ jobs:
     needs: [linux-x64, linux-arm64, macos-arm64, macos-x64, windows-x64]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           merge-multiple: true
+          path: artifacts
 
-      - name: Generate release notes
+      # --- Supply-chain gates -------------------------------------------------
+      # Everything below runs against the artifacts the build jobs uploaded,
+      # which land in the workspace root because download-artifact uses
+      # merge-multiple. Asset names are tagless (br-macos-arm64.tar.gz, ...),
+      # matching install.sh and packaging/homebrew/br.rb.
+
+      - name: Validate reliability override
+        env:
+          RELIABILITY_OVERRIDE: ${{ inputs.reliability_override || '' }}
+          RELIABILITY_OVERRIDE_REASON: ${{ inputs.reliability_override_reason || '' }}
+        run: |
+          set -euo pipefail
+          # Supplying a reason is what records the override: an override without
+          # a written justification is refused, and a bare reason is honoured.
+          if [ -n "${RELIABILITY_OVERRIDE}" ] && [ -z "${RELIABILITY_OVERRIDE_REASON}" ]; then
+            echo "::error::reliability_override_reason is required"
+            exit 1
+          fi
+          if [ -n "${RELIABILITY_OVERRIDE_REASON}" ]; then
+            {
+              echo "### Reliability override"
+              echo ""
+              echo "Reliability gates were explicitly skipped by a documented operator emergency."
+              echo ""
+              echo "- override: \`${RELIABILITY_OVERRIDE:-skip}\`"
+              echo "- reason: ${RELIABILITY_OVERRIDE_REASON}"
+            } > reliability-override.md
+          else
+            echo "No reliability override requested" > reliability-override.md
+          fi
+          cat reliability-override.md
+
+      - name: Validate required artifacts present
+        run: |
+          set -euo pipefail
+          REQUIRED_ARTIFACTS_STR="${REQUIRED_ARTIFACTS_STR:-br-macos-arm64.tar.gz br-macos-x64.tar.gz br-linux-x64.tar.gz br-linux-arm64.tar.gz br-windows-x64.zip}"
+          # shellcheck disable=SC2206
+          REQUIRED_ARTIFACTS=( $REQUIRED_ARTIFACTS_STR )
+          missing=0
+          for asset in "${REQUIRED_ARTIFACTS[@]}"; do
+            if [ ! -f "$asset" ]; then
+              echo "::error::missing required artifact $asset"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::release aborted: required artifacts missing"
+            exit 1
+          fi
+          echo "All required platform artifacts present"
+
+      - name: Generate combined checksums
+        run: |
+          set -euo pipefail
+          # The gates operate on the staged artifacts directory, which is where
+          # the build jobs write and where the original workflow kept them.
+          cd artifacts
+          combined="./.checksums.sha256.tmp"
+          : > "$combined"
+          find . -maxdepth 1 -type f -name '*.sha256' \
+               ! -name 'checksums.sha256' ! -name '.checksums.sha256.tmp' \
+               -exec cat {} + > "$combined"
+          mv -f "$combined" checksums.sha256
+          echo "=== Combined checksums ==="
+          cat checksums.sha256
+
+      - name: Verify all checksums
+        run: |
+          set -euo pipefail
+          cd artifacts
+          echo "=== Verifying all checksums ==="
+          # `find -exec` would swallow sha256sum's exit status, so loop over the
+          # NUL-delimited list in the shell and let `set -e` abort on the first
+          # sidecar that does not verify.
+          while IFS= read -r -d '' checksum_file; do
+            echo "Verifying ${checksum_file#./}..."
+            sha256sum -c "$checksum_file"
+          done < <(find . -maxdepth 1 -type f -name '*.sha256' ! -name 'checksums.sha256' -print0)
+          echo "All checksums verified"
+
+      - name: Sign archive with Ed25519 (Linux/macOS)
+        if: runner.os != 'Windows' && env.MINISIGN_SECRET_KEY != ''
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          signing_key="$(mktemp "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/minisign-key.XXXXXX")"
+          trap 'rm -f "$signing_key"' EXIT
+          chmod 600 "$signing_key"
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$signing_key"
+          for asset in br-macos-arm64.tar.gz br-macos-x64.tar.gz \
+                        br-linux-x64.tar.gz br-linux-arm64.tar.gz; do
+            [ -f "$asset" ] || continue
+            minisign -Sm "$asset" -s "$signing_key" -x "${asset}.minisig"
+            echo "Signed $asset"
+          done
+
+      - name: Generate changelog
         run: |
           {
             echo "## br v${GITHUB_REF_NAME#v}"
             echo ""
+            previous_tag="$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || true)"
+            if [ -n "$previous_tag" ]; then
+              echo "Previous release: ${previous_tag}"
+              echo ""
+            else
+              echo "No previous tag found; this is the first release."
+              echo ""
+            fi
             if [ -f CHANGELOG.md ]; then
               # Extract the section for this version from CHANGELOG.md
               awk -v ver="${GITHUB_REF_NAME}" '
@@ -177,7 +283,7 @@ jobs:
           } > release.md
 
       - name: Upload release assets
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         if: startsWith(github.ref, 'refs/tags/v')
         with:
           body_path: release.md
@@ -189,12 +295,12 @@ jobs:
             br-*.zip
 
       - name: Upload build artifacts (manual dispatch fallback)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
         with:
           name: br-release-artifacts
           path: |
-            br-*.tar.gz
-            br-*.sha256
-            br-*.zip
+            artifacts/br-*.tar.gz
+            artifacts/br-*.sha256
+            artifacts/br-*.zip
           if-no-files-found: error

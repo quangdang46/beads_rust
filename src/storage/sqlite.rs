@@ -11289,7 +11289,8 @@ fn parse_issue_type(s: Option<&str>) -> IssueType {
 }
 
 fn parse_wisp_type(s: Option<&str>) -> WispType {
-    match s.unwrap_or("none") {
+    match s.unwrap_or_default() {
+        "" => WispType::Unset,
         "none" => WispType::None,
         "heartbeat" => WispType::Heartbeat,
         "ping" => WispType::Ping,
@@ -11303,7 +11304,12 @@ fn parse_wisp_type(s: Option<&str>) -> WispType {
 }
 
 fn parse_mol_type(s: Option<&str>) -> MolType {
-    match s.unwrap_or("work") {
+    // An absent or empty column is Go `bd`'s zero value, which is what an
+    // issue created without `--mol-type` carries. Substituting the named
+    // default here would make every issue read back from the database hash
+    // differently from the same issue in `bd`.
+    match s.unwrap_or_default() {
+        "" => MolType::Unset,
         "work" => MolType::Work,
         "swarm" => MolType::Swarm,
         "patrol" => MolType::Patrol,
@@ -11312,7 +11318,8 @@ fn parse_mol_type(s: Option<&str>) -> MolType {
 }
 
 fn parse_work_type(s: Option<&str>) -> WorkType {
-    match s.unwrap_or("mutex") {
+    match s.unwrap_or_default() {
+        "" => WorkType::Unset,
         "mutex" => WorkType::Mutex,
         "open_competition" => WorkType::OpenCompetition,
         custom => WorkType::Custom(custom.to_string()),
@@ -12934,7 +12941,17 @@ impl SqliteStorage {
             issue
                 .agent_context
                 .as_deref()
-                .map_or(SqlValue::null(), SqlValue::from),
+                .map_or_else(SqlValue::null, SqlValue::from),
+            // Write metadata explicitly, like create_issue does. Leaving it out
+            // of the column list lets the schema default '{}' apply, so an
+            // imported issue would carry '{}' where a directly created one
+            // carries NULL. `metadata` is one of the fields the content hash
+            // covers, so the two paths hashed the same issue differently and
+            // the exported JSONL was not byte-identical.
+            issue
+                .metadata
+                .as_deref()
+                .map_or_else(SqlValue::null, SqlValue::from),
         ]
     }
 
@@ -12955,9 +12972,9 @@ impl SqliteStorage {
                 due_at, defer_until, external_ref, source_system, source_repo, source_repo_path,
                 deleted_at, deleted_by, delete_reason, original_type,
                 sender, ephemeral,
-                pinned, is_template, agent_context
+                pinned, is_template, agent_context, metadata
             ) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )",
             &insert_params,
         )?;
@@ -12982,7 +12999,8 @@ impl SqliteStorage {
                 external_ref = ?, source_system = ?, source_repo = ?, source_repo_path = ?,
                 deleted_at = ?, deleted_by = ?, delete_reason = ?, original_type = ?,
                 sender = ?,
-                ephemeral = ?, pinned = ?, is_template = ?, agent_context = ?
+                ephemeral = ?, pinned = ?, is_template = ?, agent_context = ?,
+                metadata = ?
               WHERE id = ?",
             &params,
         )?;

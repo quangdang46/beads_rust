@@ -123,8 +123,19 @@ fn optional_text_strategy() -> impl Strategy<Value = Option<String>> {
     proptest::option::of("\\PC{0,80}")
 }
 
+/// Independent mirror of Go `bd`'s `ComputeContentHash`.
+///
+/// Field order and each writer's semantics are taken from
+/// `internal/types/types.go` in `steveyegge/beads` and were checked field by
+/// field against a real Go run. This used to drift: it omitted `spec_id`,
+/// `metadata`, `mol_type`, `work_type` and the four event fields, invented
+/// `quality_score`/`crystallizes` fields Go does not have, and then padded the
+/// count with a `for _ in 0..12` loop to make a digest line up. That is exactly
+/// the kind of fudge this property test exists to catch, so the model is spelled
+/// out in full here instead.
 fn go_bd_reference_content_hash(issue: &Issue) -> String {
     let mut hasher = Sha256::new();
+    // Core fields, in Go's stable order.
     push_go_field(&mut hasher, &issue.title);
     push_go_field(&mut hasher, issue.description.as_deref().unwrap_or(""));
     push_go_field(&mut hasher, issue.design.as_deref().unwrap_or(""));
@@ -133,25 +144,55 @@ fn go_bd_reference_content_hash(issue: &Issue) -> String {
         issue.acceptance_criteria.as_deref().unwrap_or(""),
     );
     push_go_field(&mut hasher, issue.notes.as_deref().unwrap_or(""));
+    push_go_field(&mut hasher, issue.spec_id.as_deref().unwrap_or(""));
     push_go_field(&mut hasher, issue.status.as_str());
     push_go_field(&mut hasher, &issue.priority.0.to_string());
     push_go_field(&mut hasher, issue.issue_type.as_str());
     push_go_field(&mut hasher, issue.assignee.as_deref().unwrap_or(""));
     push_go_field(&mut hasher, issue.owner.as_deref().unwrap_or(""));
     push_go_field(&mut hasher, issue.created_by.as_deref().unwrap_or(""));
+    // Go's `strPtr` writes the value when present and the null separator either
+    // way, which is exactly what pushing the empty string does.
     push_go_field(&mut hasher, issue.external_ref.as_deref().unwrap_or(""));
     push_go_field(&mut hasher, issue.source_system.as_deref().unwrap_or(""));
     push_go_field(&mut hasher, if issue.pinned { "pinned" } else { "" });
+    push_go_field(&mut hasher, issue.metadata.as_deref().unwrap_or(""));
     push_go_field(&mut hasher, if issue.is_template { "template" } else { "" });
-    push_go_field(&mut hasher, ""); // quality_score nil
-    push_go_field(&mut hasher, ""); // crystallizes false
-    push_go_field(&mut hasher, ""); // await_type
-    push_go_field(&mut hasher, ""); // await_id
-    push_go_field(&mut hasher, "0"); // timeout duration
-    for _ in 0..12 {
-        push_go_field(&mut hasher, "");
+    // Bonded molecules: three fields per entry, zero entries for most issues.
+    for bond in &issue.bonded_from {
+        push_go_field(&mut hasher, &bond.source_id);
+        push_go_field(&mut hasher, &bond.bond_type);
+        push_go_field(&mut hasher, bond.bond_point.as_deref().unwrap_or(""));
     }
+    // Gate fields for async coordination.
+    push_go_field(&mut hasher, issue.await_type.as_deref().unwrap_or(""));
+    push_go_field(&mut hasher, issue.await_id.as_deref().unwrap_or(""));
+    // Go's `duration` writer emits nanoseconds.
+    push_go_field(&mut hasher, &timeout_nanos(issue.timeout_seconds));
+    for waiter in &issue.waiters {
+        push_go_field(&mut hasher, waiter);
+    }
+    // Go leaves mol/work type unset unless explicitly requested, so an unset
+    // value must contribute "" here and not a named default.
+    push_go_field(&mut hasher, issue.mol_type.as_str());
+    push_go_field(&mut hasher, issue.work_type.as_str());
+    // Event fields.
+    push_go_field(&mut hasher, issue.event_kind.as_deref().unwrap_or(""));
+    // Go hashes `i.Actor`, but `Issue` in this crate has no `actor` field, so
+    // the value is structurally always empty here. Pushing "" keeps the field
+    // count and positions aligned with Go for every issue br can represent.
+    push_go_field(&mut hasher, "");
+    push_go_field(&mut hasher, issue.target.as_deref().unwrap_or(""));
+    push_go_field(&mut hasher, issue.payload.as_deref().unwrap_or(""));
     beads_rust::util::hex_encode(&hasher.finalize())
+}
+
+/// Go stores the timeout as a `time.Duration`, i.e. nanoseconds.
+fn timeout_nanos(timeout_seconds: Option<i64>) -> String {
+    match timeout_seconds {
+        Some(secs) => secs.saturating_mul(1_000_000_000).to_string(),
+        None => "0".to_string(),
+    }
 }
 
 fn push_go_field(hasher: &mut Sha256, value: &str) {

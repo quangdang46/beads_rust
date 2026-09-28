@@ -372,9 +372,17 @@ pub fn validate_sync_path(path: &Path, beads_dir: &Path) -> PathValidation {
         }
     };
 
+    // `normalized_path` is only lexically normalized, so on macOS it can still
+    // read `/var/folders/...` while `canonical_beads` reads `/private/var/...`
+    // (or vice versa). Comparing a lexically-normalized path against a
+    // canonicalized directory therefore rejected perfectly legitimate paths.
+    // Compare the canonical form of both sides as well before refusing.
+    let canonical_path = dunce::canonicalize(&normalized_path).unwrap_or_else(|_| normalized_path.clone());
+
     if had_parent_dir
         && !normalized_path.starts_with(beads_dir)
         && !normalized_path.starts_with(&canonical_beads)
+        && !canonical_path.starts_with(&canonical_beads)
     {
         let result = PathValidation::TraversalAttempt {
             path: path.to_path_buf(),

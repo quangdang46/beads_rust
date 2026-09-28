@@ -68,9 +68,13 @@ pub const SCHEMA_SQL: &str = r"
         metadata TEXT DEFAULT '{}',
         -- beads_rust#48: wisp/coordination fields
         no_history INTEGER NOT NULL DEFAULT 0,
-        wisp_type TEXT NOT NULL DEFAULT 'none',
-        mol_type TEXT NOT NULL DEFAULT 'none',
-        work_type TEXT NOT NULL DEFAULT 'none',
+        -- wisp_type/mol_type/work_type default to the empty string, which is
+        -- Go `bd`'s zero value for all three. A non-empty default here would
+        -- put a value in the data that the other tool cannot produce, and for
+        -- mol_type/work_type it would also change the content hash.
+        wisp_type TEXT NOT NULL DEFAULT '',
+        mol_type TEXT NOT NULL DEFAULT '',
+        work_type TEXT NOT NULL DEFAULT '',
         started_at DATETIME,
         spec_id TEXT,
         points INTEGER,
@@ -697,9 +701,10 @@ const ISSUE_COLUMNS: &[(&str, &str)] = &[
     // beads_rust#48: wisp/coordination columns appended at end so ALTER TABLE
     // ADD COLUMN on existing DBs matches fresh SCHEMA_SQL column order.
     ("no_history", "INTEGER NOT NULL DEFAULT 0"),
-    ("wisp_type", "TEXT NOT NULL DEFAULT 'none'"),
-    ("mol_type", "TEXT NOT NULL DEFAULT 'none'"),
-    ("work_type", "TEXT NOT NULL DEFAULT 'none'"),
+    // See the SCHEMA_SQL note: '' is Go `bd`'s zero value for all three.
+    ("wisp_type", "TEXT NOT NULL DEFAULT ''"),
+    ("mol_type", "TEXT NOT NULL DEFAULT ''"),
+    ("work_type", "TEXT NOT NULL DEFAULT ''"),
     ("started_at", "DATETIME"),
     ("spec_id", "TEXT"),
     ("points", "INTEGER"),

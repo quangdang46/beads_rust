@@ -62,15 +62,43 @@ fn release_workflow_exposes_expected_fragment_steps() -> Result<(), String> {
 fn release_workflow_uses_tagless_asset_file_names() -> Result<(), String> {
     let workflow = read_to_string(Path::new(RELEASE_WORKFLOW))?;
 
-    require_contains(&workflow, r#"ASSET_VERSION="${GITHUB_REF_NAME#v}""#)?;
-    require_contains(
+    // The protection this test exists for: an asset name that embeds a version
+    // breaks the moment the tag is moved, and a name built straight from
+    // `github.ref_name` is the usual way that happens. `bd` and `install.sh`
+    // both publish and request *tagless* archives -- `br-macos-arm64.tar.gz` --
+    // so the workflow has to do the same.
+    require_not_contains(
         &workflow,
-        "br-${{ steps.asset_version.outputs.asset_version }}-${{ matrix.name }}",
+        "br-${{ github.ref_name }}-${{ matrix.name }}",
     )?;
-    require_contains(&workflow, "artifacts/br-${ASSET_VERSION}-${platform}.*")?;
-    require_not_contains(&workflow, "br-${{ github.ref_name }}-${{ matrix.name }}")?;
     require_not_contains(&workflow, "artifacts/br-${{ github.ref_name }}-*")?;
 
+    // Every published archive is `br-<platform>.<ext>` with no version segment,
+    // and every reference to one goes through the `artifacts/` staging dir.
+    let mut published = Vec::new();
+    for line in workflow.lines() {
+        let trimmed = line.trim();
+        let Some(idx) = trimmed.find("tar czf ../../../artifacts/") else {
+            continue;
+        };
+        let rest = &trimmed[idx + "tar czf ../../../artifacts/".len()..];
+        if let Some(name) = rest.split_whitespace().next() {
+            published.push(name.to_string());
+        }
+    }
+    if published.is_empty() {
+        return Err("release.yml publishes no archives into artifacts/".to_string());
+    }
+    for name in &published {
+        if !name.starts_with("br-") {
+            return Err(format!("unexpected archive name {name}"));
+        }
+        if name.contains("GITHUB_REF_NAME") || name.contains("VERSION") {
+            return Err(format!(
+                "archive {name} embeds a version; release assets must be tagless"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -344,7 +372,7 @@ impl WorkflowFixture {
     }
 
     fn write_release_artifact(&self, platform: &str, bytes: &[u8]) -> Result<(), String> {
-        let mut name = String::from("br-9.9.9-");
+        let mut name = String::from("br-");
         name.push_str(platform);
         name.push_str(".tar.gz");
         self.write_artifact(&name, bytes)
