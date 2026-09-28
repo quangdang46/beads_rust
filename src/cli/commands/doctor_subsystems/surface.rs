@@ -1057,7 +1057,19 @@ fn restore_db_exec(repo_root: &Path, record: &StoredActionRecord, target: PathBu
             };
         }
     };
+    // A db snapshot is a verbatim copy of the rows that existed, *including*
+    // rows that already violate a foreign key -- an orphaned comment whose
+    // parent issue is gone is exactly the condition `doctor` exists to report,
+    // so it can legitimately be in the snapshot. Re-validating those rows on
+    // the way back in would drop them and make undo silently lossy. Turn
+    // enforcement off for the replay and back on before returning.
+    //
+    // `PRAGMA foreign_keys` is a no-op inside a transaction, so it has to be
+    // set before BEGIN.
+    let _ = conn.execute("PRAGMA foreign_keys = OFF", []);
+
     if let Err(e) = conn.execute("BEGIN IMMEDIATE", []) {
+        let _ = conn.execute("PRAGMA foreign_keys = ON", []);
         let _ = conn.close();
         return UndoStep {
             path: record.path.clone(),
@@ -1068,6 +1080,7 @@ fn restore_db_exec(repo_root: &Path, record: &StoredActionRecord, target: PathBu
     }
 
     let replay_result = replay_db_snapshot_envelopes(&conn, &envelopes);
+    let _ = conn.execute("PRAGMA foreign_keys = ON", []);
     finish_db_replay(conn, record, replay_result)
 }
 
