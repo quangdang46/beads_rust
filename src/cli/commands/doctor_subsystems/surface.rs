@@ -1342,7 +1342,21 @@ fn quote_sql_ident(s: &str) -> String {
 
 fn workspace_relative_path(repo_root: &Path, rel: &str) -> std::result::Result<PathBuf, String> {
     let path = Path::new(rel);
+    // Accept an absolute recorded path only when it still lands inside the
+    // workspace. The chokepoint records whatever the repair touched, which is
+    // absolute whenever the repo root cannot be joined relatively; rejecting
+    // every absolute path made undo refuse its own recording, so the repair
+    // could never be rolled back. Canonicalizing both sides first means a
+    // workspace reached through a symlink (on macOS `/var` -> `/private/var`)
+    // still compares correctly.
     if path.is_absolute() {
+        let canonical_root = dunce::canonicalize(repo_root)
+            .map_err(|e| format!("failed_canonicalize_repo_root:{e}"))?;
+        let canonical_path = canonicalize_existing_or_parent(path)
+            .map_err(|e| format!("failed_canonicalize_action_path:{e}"))?;
+        if canonical_path.starts_with(&canonical_root) {
+            return Ok(path.to_path_buf());
+        }
         return Err("absolute".to_string());
     }
     if path.components().any(|component| {
@@ -1476,9 +1490,13 @@ fn restore_rename(
         };
     };
 
+    // A rename moves the file, so its bytes survive at `rename_to` and are
+    // re-read and hash-checked just below. The chokepoint writes no separate
+    // backup for a move, so demanding one here failed every rename undo with
+    // `failed_no_backup` and left the repair permanently un-undoable.
     let backup_bytes = match read_verified_backup(record, backup) {
-        Ok(bytes) => bytes,
-        Err(step) => return step,
+        Ok(bytes) => Some(bytes),
+        Err(_) => None,
     };
 
     let from = match validate_rename_source_path(repo_root, run_dir_path, rt) {
@@ -1494,7 +1512,7 @@ fn restore_rename(
     };
     if !from.exists() {
         if let Ok(live) = fs::read(&target)
-            && live == backup_bytes
+            && backup_bytes.as_deref() == Some(live.as_slice())
         {
             return UndoStep {
                 path: record.path.clone(),
@@ -1511,7 +1529,19 @@ fn restore_rename(
             ctx,
             &target,
             Op::WriteFile {
-                content: backup_bytes,
+                // No backup and no rename source left to copy from. Report it
+                // rather than writing empty bytes over the workspace file.
+                content: match backup_bytes {
+                    Some(bytes) => bytes,
+                    None => {
+                        return UndoStep {
+                            path: record.path.clone(),
+                            op: record.op.clone(),
+                            status: "failed_no_backup_and_no_rename_source".to_string(),
+                            backup_used: None,
+                        };
+                    }
+                },
                 mode,
             },
         ) {
