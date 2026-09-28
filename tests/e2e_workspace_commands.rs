@@ -362,7 +362,19 @@ fn e2e_doctor_healthy_workspace() {
     assert!(init.status.success(), "init failed: {}", init.stderr);
 
     // Run doctor on healthy workspace
-    let doctor = run_br(&workspace, ["doctor"], "doctor");
+    // `doctor` warns (and exits non-zero) when more than one `br` is on $PATH,
+    // and it treats a debug-level RUST_LOG as unhealthy -- the e2e harness
+    // sets the latter for every run. Pin both so the assertion is about the
+    // workspace, not about the host.
+    let doctor = run_br_with_env(
+        &workspace,
+        ["doctor"],
+        [
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+            ("RUST_LOG".to_string(), "error".to_string()),
+        ],
+        "doctor",
+    );
     assert!(
         doctor.status.success(),
         "doctor failed on healthy workspace: {}",
@@ -398,8 +410,18 @@ fn e2e_doctor_json_output() {
     let init = run_br(&workspace, ["init"], "init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
 
-    // Doctor with --json
-    let doctor = run_br(&workspace, ["doctor", "--json"], "doctor_json");
+    // Doctor with --json. Same hermetic env as e2e_doctor_healthy_workspace:
+    // br_path_dupes and the debug RUST_LOG both make doctor exit non-zero and
+    // neither has anything to do with the workspace under test.
+    let doctor = run_br_with_env(
+        &workspace,
+        ["doctor", "--json"],
+        [
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+            ("RUST_LOG".to_string(), "error".to_string()),
+        ],
+        "doctor_json",
+    );
     assert!(
         doctor.status.success(),
         "doctor --json failed: {}",
@@ -442,7 +464,16 @@ fn e2e_doctor_detects_issues() {
     // This may fail, which is expected
 
     // Run doctor
-    let doctor = run_br(&workspace, ["doctor"], "doctor_check");
+    // Hermetic env for the same reason as e2e_doctor_healthy_workspace.
+    let doctor = run_br_with_env(
+        &workspace,
+        ["doctor"],
+        [
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+            ("RUST_LOG".to_string(), "error".to_string()),
+        ],
+        "doctor_check",
+    );
     assert!(doctor.status.success(), "doctor failed: {}", doctor.stderr);
 }
 
@@ -1310,8 +1341,18 @@ fn e2e_full_workspace_lifecycle() {
     let info = run_br(&workspace, ["info"], "info");
     assert!(info.status.success());
 
-    // 6. Doctor should pass
-    let doctor = run_br(&workspace, ["doctor"], "doctor");
+    // 6. Doctor should pass. Hermetic env for the same reason as
+    // e2e_doctor_healthy_workspace: br_path_dupes and the debug RUST_LOG would
+    // otherwise fail it for reasons unrelated to this workspace.
+    let doctor = run_br_with_env(
+        &workspace,
+        ["doctor"],
+        [
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+            ("RUST_LOG".to_string(), "error".to_string()),
+        ],
+        "doctor",
+    );
     assert!(doctor.status.success());
 
     // 7. Config should be accessible

@@ -307,7 +307,7 @@ fn e2e_update_tombstone_rejected() {
     assert!(!update.status.success(), "tombstone update should fail");
     assert_eq!(update.status.code(), Some(4), "exit code should be 4");
 
-    let json = parse_error_json(&update.stderr).expect("should be valid error json");
+    let json = parse_error_json(&update.stdout).expect("should be valid error json");
     assert!(verify_error_structure(&json), "missing required fields");
     assert_eq!(json["error"]["code"], "VALIDATION_FAILED");
     assert!(
@@ -1405,9 +1405,12 @@ fn e2e_sync_rename_prefix_failed_import_restores_original_corrupt_db_family() {
         !result.status.success(),
         "malformed JSONL should fail explicit import after deferred recovery"
     );
+    // `--json` writes the structured error to stdout; stderr holds only logs.
+    let json = parse_error_json(&result.stdout).expect("structured error json");
+    let message = json["error"]["message"].as_str().unwrap_or_default();
     assert!(
-        result.stderr.contains("Invalid JSON"),
-        "unexpected stderr: {}",
+        message.contains("Invalid JSON"),
+        "unexpected error message: {message} (stderr={})",
         result.stderr
     );
 
@@ -1610,9 +1613,12 @@ fn e2e_sync_rename_prefix_import_failure_does_not_leave_missing_db_created() {
         !result.status.success(),
         "malformed JSONL should fail explicit import after deferred recovery"
     );
+    // `--json` writes the structured error to stdout; stderr holds only logs.
+    let json = parse_error_json(&result.stdout).expect("structured error json");
+    let message = json["error"]["message"].as_str().unwrap_or_default();
     assert!(
-        result.stderr.contains("Invalid JSON"),
-        "unexpected stderr: {}",
+        message.contains("Invalid JSON"),
+        "unexpected error message: {message} (stderr={})",
         result.stderr
     );
     assert!(
@@ -1967,16 +1973,21 @@ fn e2e_lint_skips_types_without_required_sections() {
 
 /// Parse structured error JSON from stderr.
 /// This handles the case where log lines may precede the JSON output.
-fn parse_error_json(stderr: &str) -> Option<Value> {
-    // First try parsing the whole stderr as JSON
-    if let Ok(json) = serde_json::from_str(stderr) {
+/// Pull the structured error payload out of a `--json` run's stdout.
+///
+/// In JSON mode `br` writes the structured error to stdout so agents can parse
+/// one stream, and stderr carries only log lines. Every caller here runs with
+/// `--json`, so the payload is read from stdout.
+fn parse_error_json(stdout: &str) -> Option<Value> {
+    // First try parsing the whole stdout as JSON
+    if let Ok(json) = serde_json::from_str(stdout) {
         return Some(json);
     }
 
     // If that fails, look for a JSON object starting with '{'
     // This handles cases where log lines precede the JSON output
-    if let Some(start) = stderr.find('{') {
-        let json_part = &stderr[start..];
+    if let Some(start) = stdout.find('{') {
+        let json_part = &stdout[start..];
         if let Ok(json) = serde_json::from_str(json_part) {
             return Some(json);
         }
@@ -2009,7 +2020,7 @@ fn e2e_structured_error_not_initialized() {
     assert!(!result.status.success());
     assert_eq!(result.status.code(), Some(2), "exit code should be 2");
 
-    let json = parse_error_json(&result.stderr).expect("should be valid JSON");
+    let json = parse_error_json(&result.stdout).expect("should be valid JSON");
     assert!(verify_error_structure(&json), "missing required fields");
 
     let error = &json["error"];
@@ -2034,7 +2045,7 @@ fn e2e_structured_error_issue_not_found() {
     assert!(!result.status.success());
     assert_eq!(result.status.code(), Some(3), "exit code should be 3");
 
-    let json = parse_error_json(&result.stderr).expect("should be valid JSON");
+    let json = parse_error_json(&result.stdout).expect("should be valid JSON");
     assert!(verify_error_structure(&json), "missing required fields");
 
     let error = &json["error"];
@@ -2073,7 +2084,7 @@ fn e2e_structured_error_cycle_detected() {
     assert!(!result.status.success());
     assert_eq!(result.status.code(), Some(5), "exit code should be 5");
 
-    let json = parse_error_json(&result.stderr).expect("should be valid JSON");
+    let json = parse_error_json(&result.stdout).expect("should be valid JSON");
     assert!(verify_error_structure(&json), "missing required fields");
 
     let error = &json["error"];
@@ -2102,7 +2113,7 @@ fn e2e_structured_error_self_dependency() {
     assert!(!result.status.success());
     assert_eq!(result.status.code(), Some(5), "exit code should be 5");
 
-    let json = parse_error_json(&result.stderr).expect("should be valid JSON");
+    let json = parse_error_json(&result.stdout).expect("should be valid JSON");
     assert!(verify_error_structure(&json), "missing required fields");
 
     let error = &json["error"];
@@ -2161,7 +2172,7 @@ fn e2e_structured_error_ambiguous_id() {
     assert!(!result.status.success());
     assert_eq!(result.status.code(), Some(3), "exit code should be 3");
 
-    let json = parse_error_json(&result.stderr).expect("should be valid JSON");
+    let json = parse_error_json(&result.stdout).expect("should be valid JSON");
     assert!(verify_error_structure(&json), "missing required fields");
 
     let error = &json["error"];
@@ -2197,7 +2208,7 @@ fn e2e_structured_error_jsonl_parse() {
     );
 
     // The error output should be valid JSON
-    let json = parse_error_json(&result.stderr);
+    let json = parse_error_json(&result.stdout);
     if let Some(json) = json {
         assert!(verify_error_structure(&json), "missing required fields");
     }
@@ -2228,10 +2239,13 @@ fn e2e_structured_error_conflict_markers() {
     );
     assert!(!result.status.success());
 
-    // Should detect conflict markers
+    // Should detect conflict markers. `--json` writes the structured error to
+    // stdout (stderr stays empty), so read it from there.
+    let json = parse_error_json(&result.stdout).expect("structured error json");
+    let message = json["error"]["message"].as_str().unwrap_or_default();
     assert!(
-        result.stderr.contains("conflict") || result.stderr.contains("CONFLICT"),
-        "should detect conflict markers"
+        message.to_lowercase().contains("conflict"),
+        "should detect conflict markers, got: {message}"
     );
 }
 
@@ -2298,10 +2312,12 @@ fn e2e_sync_flush_refuses_to_overwrite_conflict_markers() {
         exit_code == 6 || exit_code == 7,
         "conflict-marker flush refusal should be a sync/config error, got {exit_code}"
     );
+    // `--json` routes the structured error to stdout; stderr is empty.
+    let json = parse_error_json(&refused_flush.stdout).expect("structured error json");
+    let message = json["error"]["message"].as_str().unwrap_or_default();
     assert!(
-        refused_flush.stderr.contains("conflict") || refused_flush.stderr.contains("CONFLICT"),
-        "flush error should explain the unresolved conflict markers: {}",
-        refused_flush.stderr
+        message.to_lowercase().contains("conflict"),
+        "flush error should explain the unresolved conflict markers, got: {message}"
     );
 
     let after_refusal = fs::read_to_string(&issues_path).expect("read refused jsonl");
@@ -2361,7 +2377,7 @@ fn e2e_structured_error_invalid_priority() {
     assert!(!result.status.success());
     assert_eq!(result.status.code(), Some(4), "exit code should be 4");
 
-    let json = parse_error_json(&result.stderr).expect("should be valid JSON");
+    let json = parse_error_json(&result.stdout).expect("should be valid JSON");
     assert!(verify_error_structure(&json), "missing required fields");
 
     let error = &json["error"];
@@ -2428,7 +2444,7 @@ fn e2e_error_text_vs_json_parity() {
     );
 
     // JSON mode should produce valid structured error
-    let json = parse_error_json(&json_result.stderr).expect("JSON mode should produce valid JSON");
+    let json = parse_error_json(&json_result.stdout).expect("JSON mode should produce valid JSON");
     assert!(
         verify_error_structure(&json),
         "JSON error should have required fields"
@@ -2530,7 +2546,7 @@ fn e2e_structured_error_label_validation() {
     assert!(!result.status.success());
     assert_eq!(result.status.code(), Some(4), "exit code should be 4");
 
-    let json = parse_error_json(&result.stderr).expect("should be valid JSON");
+    let json = parse_error_json(&result.stdout).expect("should be valid JSON");
     assert!(verify_error_structure(&json), "missing required fields");
 
     let error = &json["error"];
@@ -2565,7 +2581,7 @@ fn e2e_structured_error_label_too_long() {
     assert!(!result.status.success());
     assert_eq!(result.status.code(), Some(4), "exit code should be 4");
 
-    let json = parse_error_json(&result.stderr).expect("should be valid JSON");
+    let json = parse_error_json(&result.stdout).expect("should be valid JSON");
     assert!(verify_error_structure(&json), "missing required fields");
 
     let error = &json["error"];
@@ -2598,7 +2614,7 @@ fn e2e_structured_error_dependency_target_not_found() {
         "exit code should be 3 (issue not found)"
     );
 
-    let json = parse_error_json(&result.stderr).expect("should be valid JSON");
+    let json = parse_error_json(&result.stdout).expect("should be valid JSON");
     assert!(verify_error_structure(&json), "missing required fields");
 
     let error = &json["error"];
@@ -3223,7 +3239,7 @@ fn e2e_error_text_json_parity_validation() {
     );
 
     // JSON mode should produce valid structured error
-    let json = parse_error_json(&json_result.stderr).expect("JSON mode should produce valid JSON");
+    let json = parse_error_json(&json_result.stdout).expect("JSON mode should produce valid JSON");
     assert!(
         verify_error_structure(&json),
         "JSON error should have required fields"

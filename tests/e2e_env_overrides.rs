@@ -455,8 +455,16 @@ fn e2e_beads_jsonl_env_overrides_metadata() {
     let metadata_json = r#"{"database":"beads.db","jsonl_export":"custom.jsonl"}"#;
     fs::write(&metadata_path, metadata_json).expect("write metadata");
 
-    // Env should override metadata
-    let env_jsonl = workspace.root.join(".beads").join("env.jsonl");
+    // Env should override metadata. Canonicalize: macOS resolves `/var` to
+    // `/private/var`, and the path allowlist check compares the given path
+    // against canonicalized ones, so a raw TempDir path reads as "outside
+    // .beads". See commit 615c991a for the same trap elsewhere.
+    let env_jsonl = workspace
+        .root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.root.clone())
+        .join(".beads")
+        .join("env.jsonl");
     let env_vars = vec![("BEADS_JSONL", env_jsonl.to_str().unwrap())];
 
     let sync = run_br_with_env(

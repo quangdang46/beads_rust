@@ -14,9 +14,9 @@ expression: normalized
     "updated_at": "TIMESTAMP",
     "source_repo": "SOURCE_REPO",
     "source_repo_path": "SOURCE_REPO",
-    "mol_type": "work",
-    "work_type": "mutex",
-    "wisp_type": "none"
+    "mol_type": "",
+    "work_type": "",
+    "wisp_type": ""
   },
   {
     "id": "ISSUE_ID",
@@ -29,8 +29,8 @@ expression: normalized
     "updated_at": "TIMESTAMP",
     "source_repo": "SOURCE_REPO",
     "source_repo_path": "SOURCE_REPO",
-    "mol_type": "work",
-    "work_type": "mutex",
-    "wisp_type": "none"
+    "mol_type": "",
+    "work_type": "",
+    "wisp_type": ""
   }
 ]

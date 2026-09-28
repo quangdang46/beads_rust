@@ -357,11 +357,17 @@ fn defer_until_invalid_error() {
         !defer.status.success(),
         "defer with invalid time should fail"
     );
+    // Same as above: `--json` routes the structured error to stdout.
+    let payload = extract_json_payload(&defer.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("structured error json");
+    let message = json["error"]["message"].as_str().unwrap_or_default();
+    let lowered = message.to_lowercase();
     assert!(
-        defer.stderr.to_lowercase().contains("invalid")
-            || defer.stderr.to_lowercase().contains("parse")
-            || defer.stderr.to_lowercase().contains("unrecognized"),
-        "error should mention invalid time format"
+        lowered.contains("invalid")
+            || lowered.contains("parse")
+            || lowered.contains("unrecognized"),
+        "error should mention invalid time format, got: {message} (stderr={})",
+        defer.stderr
     );
     info!("defer_until_invalid_error: assertions passed");
 }
@@ -612,9 +618,18 @@ fn defer_nonexistent_error() {
         "defer_nonexistent",
     );
 
-    // Should fail with not found
+    // Should fail with not found. Under `--json` the structured error is
+    // written to stdout so agents can parse it, so read the payload from there
+    // rather than from stderr.
     assert!(!defer.status.success());
-    assert!(defer.stderr.contains("not found") || defer.stderr.contains("matching"));
+    let payload = extract_json_payload(&defer.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("structured error json");
+    let message = json["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("not found") || message.contains("matching"),
+        "unexpected error message: {message} (stderr={})",
+        defer.stderr
+    );
     info!("defer_nonexistent_error: assertions passed");
 }
 

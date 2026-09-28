@@ -132,23 +132,27 @@ fn e2e_installer_platform_detection_linux_x64() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let platform = stdout.trim();
 
-        // Verify platform format: os_arch or os_libc_arch (the libc segment
-        // is only emitted on Linux when a non-glibc libc is detected — see
-        // detect_platform in install.sh and #284).
+        // Verify the format `detect_platform` actually emits: `os[-libc]-arch`,
+        // hyphen-separated. The libc segment only appears on Linux for a
+        // non-glibc libc (see detect_platform in install.sh and #284).
+        //
+        // These values are the ones the release workflow uses for asset names
+        // (`.github/workflows/release.yml` publishes `br-macos-arm64.tar.gz`),
+        // so they must not drift to Go `bd`'s `darwin_arm64`/`amd64` spelling.
         assert!(
-            platform.contains('_'),
-            "Platform should be os[_libc]_arch format, got: {platform}"
+            platform.contains('-'),
+            "Platform should be os[-libc]-arch format, got: {platform}"
         );
 
-        let parts: Vec<&str> = platform.split('_').collect();
+        let parts: Vec<&str> = platform.split('-').collect();
         assert!(
             parts.len() == 2 || parts.len() == 3,
             "Platform should have 2 or 3 parts, got {parts:?}"
         );
 
-        let valid_os = ["linux", "darwin", "windows"];
+        let valid_os = ["linux", "macos", "windows"];
         let valid_libc = ["musl"];
-        let valid_arch = ["amd64", "arm64", "armv7"];
+        let valid_arch = ["x64", "arm64"];
 
         assert!(
             valid_os.contains(&parts[0]),
@@ -203,18 +207,21 @@ fn e2e_installer_detects_system_platform() {
         .trim()
         .to_lowercase();
 
-    // Map expected values
+    // Map expected values, mirroring detect_platform in install.sh. Darwin is
+    // deliberately reported as `macos` and x86_64 as `x64` -- those are the
+    // names the release workflow publishes assets under
+    // (`br-macos-arm64.tar.gz`), so deriving them from `uname` alone would
+    // assert Go `bd`'s spelling instead of this project's.
     let expected_os = match os_raw.as_str() {
         s if s.starts_with("linux") => "linux",
-        s if s.starts_with("darwin") => "darwin",
+        s if s.starts_with("darwin") => "macos",
         s if s.contains("mingw") || s.contains("msys") || s.contains("cygwin") => "windows",
         _ => &os_raw,
     };
 
     let expected_arch = match arch_raw.as_str() {
-        "x86_64" | "amd64" => "amd64",
+        "x86_64" | "amd64" => "x64",
         "aarch64" | "arm64" => "arm64",
-        s if s.starts_with("armv7") => "armv7",
         _ => &arch_raw,
     };
 
@@ -224,8 +231,8 @@ fn e2e_installer_detects_system_platform() {
         // Accept either the 2-part (glibc / non-Linux) or 3-part (musl) form.
         // The exact libc segment depends on the host's libc — we don't try to
         // probe it here, only verify that the os/arch alignment is correct.
-        let two_part = format!("{expected_os}_{expected_arch}");
-        let three_part_musl = format!("{expected_os}_musl_{expected_arch}");
+        let two_part = format!("{expected_os}-{expected_arch}");
+        let three_part_musl = format!("{expected_os}-musl-{expected_arch}");
 
         assert!(
             detected == two_part || detected == three_part_musl,
@@ -297,12 +304,13 @@ fn e2e_installer_uses_tagless_release_asset_names() {
 
     let script = install_script_contents();
     let download_release = shell_function_section(&script, "download_release");
-    assert!(
-        download_release
-            .contains(r#"archive_name="br-${asset_version}-${platform}.${archive_ext}""#)
-    );
+    // Asset names are tagless: the release workflow publishes
+    // `br-macos-arm64.tar.gz`, so the archive name must be built from the
+    // platform alone. A version segment here would 404 on every download.
+    assert!(download_release.contains(r#"archive_name="br-${platform}.${archive_ext}""#));
     assert!(download_release.contains(r"/releases/download/${release_tag}/${archive_name}"));
     assert!(!download_release.contains(r#"archive_name="br-${VERSION}-${platform}"#));
+    assert!(!download_release.contains(r#"archive_name="br-${asset_version}-${platform}"#));
 }
 
 #[test]

@@ -43,6 +43,7 @@ struct ShellOutput {
 }
 
 #[test]
+#[ignore = "notify-acfs.yml was deliberately removed in d86d1b98 ('chore: remove stale workflows (conformance, doctor, e2e, acfs, package-manifests)'); restore the workflow to re-enable"]
 fn notify_workflow_exposes_expected_steps_and_main_trigger() -> Result<(), String> {
     let raw = read_to_string(Path::new(WORKFLOW_PATH))?;
     require_contains(&raw, "branches: [main]")?;
@@ -65,6 +66,7 @@ fn notify_workflow_exposes_expected_steps_and_main_trigger() -> Result<(), Strin
 }
 
 #[test]
+#[ignore = "notify-acfs.yml was deliberately removed in d86d1b98 ('chore: remove stale workflows (conformance, doctor, e2e, acfs, package-manifests)'); restore the workflow to re-enable"]
 fn checksum_fragment_records_current_installer_hash() -> Result<(), String> {
     let script = rendered_step_script(
         "Compute SHA256",
@@ -89,6 +91,7 @@ fn checksum_fragment_records_current_installer_hash() -> Result<(), String> {
 }
 
 #[test]
+#[ignore = "notify-acfs.yml was deliberately removed in d86d1b98 ('chore: remove stale workflows (conformance, doctor, e2e, acfs, package-manifests)'); restore the workflow to re-enable"]
 fn previous_checksum_fragment_handles_previous_and_missing_versions() -> Result<(), String> {
     let script = rendered_step_script(
         "Get previous checksum",
@@ -128,6 +131,7 @@ fn previous_checksum_fragment_handles_previous_and_missing_versions() -> Result<
 }
 
 #[test]
+#[ignore = "notify-acfs.yml was deliberately removed in d86d1b98 ('chore: remove stale workflows (conformance, doctor, e2e, acfs, package-manifests)'); restore the workflow to re-enable"]
 fn compare_fragment_reports_changed_and_unchanged_states() -> Result<(), String> {
     let changed_script = rendered_step_script(
         "Compare checksums",
@@ -164,6 +168,7 @@ fn compare_fragment_reports_changed_and_unchanged_states() -> Result<(), String>
 }
 
 #[test]
+#[ignore = "notify-acfs.yml was deliberately removed in d86d1b98 ('chore: remove stale workflows (conformance, doctor, e2e, acfs, package-manifests)'); restore the workflow to re-enable"]
 fn dry_run_and_dispatch_conditions_cover_changed_force_and_token_paths() -> Result<(), String> {
     let dry_run = workflow_step("Notify ACFS (dry run)")?;
     let token = workflow_step("Check for ACFS_NOTIFY_TOKEN")?;
@@ -191,6 +196,7 @@ fn dry_run_and_dispatch_conditions_cover_changed_force_and_token_paths() -> Resu
 }
 
 #[test]
+#[ignore = "notify-acfs.yml was deliberately removed in d86d1b98 ('chore: remove stale workflows (conformance, doctor, e2e, acfs, package-manifests)'); restore the workflow to re-enable"]
 fn dry_run_fragment_reports_intended_notification() -> Result<(), String> {
     let script = rendered_step_script(
         "Notify ACFS (dry run)",
@@ -209,6 +215,7 @@ fn dry_run_fragment_reports_intended_notification() -> Result<(), String> {
 }
 
 #[test]
+#[ignore = "notify-acfs.yml was deliberately removed in d86d1b98 ('chore: remove stale workflows (conformance, doctor, e2e, acfs, package-manifests)'); restore the workflow to re-enable"]
 fn missing_token_fragment_is_notice_not_failure() -> Result<(), String> {
     let script = workflow_step_script("Check for ACFS_NOTIFY_TOKEN")?;
     let fixture = NotifyFixture::new()?;
@@ -232,6 +239,7 @@ fn missing_token_fragment_is_notice_not_failure() -> Result<(), String> {
 }
 
 #[test]
+#[ignore = "notify-acfs.yml was deliberately removed in d86d1b98 ('chore: remove stale workflows (conformance, doctor, e2e, acfs, package-manifests)'); restore the workflow to re-enable"]
 fn dispatch_payload_shape_is_secret_free_and_complete() -> Result<(), String> {
     let dispatch = workflow_step("Notify ACFS")?;
     let uses = dispatch
@@ -269,6 +277,7 @@ fn dispatch_payload_shape_is_secret_free_and_complete() -> Result<(), String> {
 }
 
 #[test]
+#[ignore = "notify-acfs.yml was deliberately removed in d86d1b98 ('chore: remove stale workflows (conformance, doctor, e2e, acfs, package-manifests)'); restore the workflow to re-enable"]
 fn summary_fragment_records_workflow_outcome() -> Result<(), String> {
     let script = rendered_step_script(
         "Summary",

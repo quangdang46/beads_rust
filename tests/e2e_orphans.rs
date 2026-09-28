@@ -649,9 +649,13 @@ fn e2e_orphans_fix_before_init_rejects_machine_output() {
         !orphans.status.success(),
         "orphans --fix --json should fail before init"
     );
+    // `--json` writes the structured error to stdout; stderr carries only logs.
+    let payload = extract_json_payload(&orphans.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("structured error json");
+    let message = json["error"]["message"].as_str().unwrap_or_default();
     assert!(
-        orphans.stderr.contains("--fix is interactive"),
-        "expected interactive-mode error, got: {}",
+        message.contains("--fix is interactive"),
+        "expected interactive-mode error, got: {message} (stderr={})",
         orphans.stderr
     );
     info!("e2e_orphans_fix_before_init_rejects_machine_output: assertions passed");

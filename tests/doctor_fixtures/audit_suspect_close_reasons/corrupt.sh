@@ -29,8 +29,7 @@ cur.execute("""
     INSERT INTO issues (
         id, title, description, status, priority, issue_type,
         created_at, updated_at, closed_at, close_reason,
-        source_repo, compaction_level,
-        original_size, content_hash, ephemeral, pinned, is_template
+        source_repo, content_hash, ephemeral, pinned, is_template
     ) VALUES (
         'br-suspect01',
         'Suspect closed bead',
@@ -43,7 +42,6 @@ cur.execute("""
         '2026-04-01T00:00:00Z',
         'Forced close due to cycle.',
         '.',
-        0, 0,
         'deadbeef',
         0, 0, 0
     )
