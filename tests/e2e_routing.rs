@@ -257,9 +257,9 @@ fn e2e_routing_routes_jsonl_malformed_line() {
     // Either succeeds with local fallback or fails with clear error
     if !create.status.success() {
         assert!(
-            create.stderr.contains("Invalid route")
-                || create.stderr.contains("invalid")
-                || create.stderr.contains("JSON"),
+            create.stdout.contains("Invalid route")
+                || create.stdout.contains("invalid")
+                || create.stdout.contains("JSON"),
             "Expected clear error message for malformed routes.jsonl, got: {}",
             create.stderr
         );
@@ -380,7 +380,7 @@ fn e2e_routing_external_target_lock_blocks_routed_access() {
         routed_show
             .stderr
             .contains("Routed external workspace is busy")
-            || routed_show.stderr.contains("target write lock"),
+            || routed_show.stdout.contains("target write lock"),
         "expected target lock diagnostic, got stderr: {}",
         routed_show.stderr
     );
@@ -1851,7 +1851,7 @@ fn e2e_routing_dep_add_rejects_direct_cross_project_target() {
         "dep add should reject bare cross-project targets"
     );
     assert!(
-        dep_add.stderr.contains("different projects") && dep_add.stderr.contains("external:"),
+        dep_add.stdout.contains("different projects") && dep_add.stdout.contains("external:"),
         "unexpected stderr: {}",
         dep_add.stderr
     );
@@ -2261,9 +2261,14 @@ fn e2e_routing_label_add_failure_does_not_mutate_earlier_batches() {
         !label_add.status.success(),
         "expected routed label add with missing external issue to fail"
     );
+    // The point is "no partial success output", not "no output": under --json
+    // the structured error is written to stdout by design, so assert that what
+    // is there is an error payload and carries no success result.
+    let payload: Value = serde_json::from_str(label_add.stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout should be one JSON document ({e}): {}", label_add.stdout));
     assert!(
-        label_add.stdout.trim().is_empty(),
-        "failing routed label add should not emit partial success output: {}",
+        payload.get("error").is_some() && payload.get("added").is_none(),
+        "failing routed label add should emit only an error, got: {}",
         label_add.stdout
     );
 
@@ -3113,11 +3118,11 @@ fn e2e_routing_redirect_missing_target() {
     // Check that error messaging is clear when redirect/route fails
     if !show.status.success() {
         assert!(
-            show.stderr.contains("not found")
-                || show.stderr.contains("Redirect")
-                || show.stderr.contains("redirect")
-                || show.stderr.contains("Issue")
-                || show.stderr.contains("route"),
+            show.stdout.contains("not found")
+                || show.stdout.contains("Redirect")
+                || show.stdout.contains("redirect")
+                || show.stdout.contains("Issue")
+                || show.stdout.contains("route"),
             "Expected clear error about routing/redirect, got: {}",
             show.stderr
         );
@@ -3405,9 +3410,14 @@ fn e2e_routing_path_normalization() {
     );
     assert!(init.status.success(), "init failed: {}", init.stderr);
 
-    // Use path with .. components that normalizes to a valid path
+    // Use path with .. components that normalizes to a valid path. Start from
+    // the canonicalized root: macOS resolves `/var` to `/private/var`, and the
+    // sync path allowlist compares against canonical paths, so a raw TempDir
+    // path is rejected before normalization is even considered.
     let db_with_dotdot = workspace
         .root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.root.clone())
         .join("actual")
         .join("subdir")
         .join("..")
@@ -3443,9 +3453,9 @@ fn e2e_routing_not_initialized_error() {
         "Expected failure when not initialized"
     );
     assert!(
-        list.stderr.contains("not initialized")
-            || list.stderr.contains("br init")
-            || list.stderr.contains("NotInitialized"),
+        list.stdout.contains("not initialized")
+            || list.stdout.contains("br init")
+            || list.stdout.contains("NotInitialized"),
         "Expected clear error about initialization, got: {}",
         list.stderr
     );
@@ -3469,10 +3479,10 @@ fn e2e_routing_invalid_beads_dir_env() {
     );
     // Should fall back to discovery and fail with not initialized
     assert!(
-        list.stderr.contains("not initialized")
-            || list.stderr.contains("br init")
-            || list.stderr.contains("NotInitialized")
-            || list.stderr.contains("not found"),
+        list.stdout.contains("not initialized")
+            || list.stdout.contains("br init")
+            || list.stdout.contains("NotInitialized")
+            || list.stdout.contains("not found"),
         "Expected clear error, got: {}",
         list.stderr
     );
@@ -3522,10 +3532,10 @@ fn e2e_routing_show_external_issue_not_found() {
         "Expected failure for nonexistent issue"
     );
     assert!(
-        show.stderr.contains("not found")
-            || show.stderr.contains("Issue")
-            || show.stderr.contains("ext-nonexistent")
-            || show.stderr.contains("No issue"),
+        show.stdout.contains("not found")
+            || show.stdout.contains("Issue")
+            || show.stdout.contains("ext-nonexistent")
+            || show.stdout.contains("No issue"),
         "Expected clear error about missing issue, got: {}",
         show.stderr
     );

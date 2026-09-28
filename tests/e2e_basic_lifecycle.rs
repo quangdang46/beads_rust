@@ -5,7 +5,7 @@ use beads_rust::storage::SqliteStorage;
 use chrono::Utc;
 use common::cli::{
     BrRun, BrWorkspace, extract_json_payload, parse_json_value, parse_list_issues, run_br,
-    run_br_smoke_at_root_with_env,
+    run_br_smoke_at_root_with_env, run_br_with_env,
 };
 use common::isolated_workspace_failure_fixture;
 use serde_json::Value;
@@ -300,11 +300,14 @@ fn e2e_basic_lifecycle() {
         "show text missing title"
     );
 
+    // Terminal-state transitions go through `br close`, not `br update
+    // --status closed`: the update path rejects them so close-policy (reason /
+    // attribution) cannot be bypassed. See beads_rust#301.
     let close_args = vec![
-        "update".to_string(),
+        "close".to_string(),
         id,
-        "--status".to_string(),
-        "closed".to_string(),
+        "--reason".to_string(),
+        "done".to_string(),
     ];
     let close = run_br(&workspace, close_args, "close");
     assert!(close.status.success(), "close failed: {}", close.stderr);
@@ -364,7 +367,16 @@ fn e2e_non_hermetic_smoke_existing_workspace_preserves_env_sensitive_paths() {
     let runner_root = fixture.root.join("ambient-env-smoke");
     fs::create_dir_all(&runner_root).expect("create smoke runner root");
 
-    let external_beads_dir = fixture.root.join(".beads");
+    // macOS resolves `/var` to `/private/var`, so a TempDir path and the path
+    // `br` reports are different strings for the same directory. Canonicalize
+    // the root -- which exists -- and join onto that, because `.beads` has not
+    // been created yet and canonicalizing it would fail. Same approach as the
+    // other path tests (`tests/common/harness.rs`); see commit 615c991a.
+    let canonical_root = fixture
+        .root
+        .canonicalize()
+        .unwrap_or_else(|_| fixture.root.clone());
+    let external_beads_dir = canonical_root.join(".beads");
     let external_beads_dir_str = external_beads_dir.display().to_string();
     let custom_db_str = external_beads_dir.join("custom.db").display().to_string();
     let custom_jsonl_str = external_beads_dir
@@ -1748,8 +1760,29 @@ fn e2e_doctor_json() {
     let init = run_br(&workspace, ["init"], "init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
 
-    let doctor = run_br(&workspace, ["doctor", "--json"], "doctor_json");
-    assert!(doctor.status.success(), "doctor failed: {}", doctor.stderr);
+    // Two doctor checks are warnings that make it exit non-zero, and both would
+    // otherwise depend on the host rather than on the code under test:
+    //   * `br_path_dupes` -- warns when more than one `br` is on $PATH. The
+    //     binary under test is invoked by absolute path, so $PATH is not needed
+    //     to find it; pin it to the system dirs.
+    //   * `rust_log` -- warns on any debug-level RUST_LOG, and the e2e harness
+    //     sets `beads_rust=debug` for every run. `error` is the quiet level the
+    //     check treats as healthy.
+    let doctor = run_br_with_env(
+        &workspace,
+        ["doctor", "--json"],
+        [
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+            ("RUST_LOG".to_string(), "error".to_string()),
+        ],
+        "doctor_json",
+    );
+    assert!(
+        doctor.status.success(),
+        "doctor failed: stderr={} stdout={}",
+        doctor.stderr,
+        doctor.stdout
+    );
     let payload = extract_json_payload(&doctor.stdout);
     let doctor_json: Value = serde_json::from_str(&payload).expect("doctor json");
     assert!(doctor_json["checks"].is_array(), "doctor checks missing");

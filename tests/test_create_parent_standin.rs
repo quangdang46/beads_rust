@@ -9,6 +9,10 @@ fn test_create_parent_standin() {
 
     // Initialize the beads directory
     let mut cmd = Command::cargo_bin("br").unwrap();
+    // Run inside the temp workspace: the sync path allowlist and the
+    // locality guard both refuse a beads dir outside the cwd, and this
+    // test means to operate in that temp workspace.
+    cmd.current_dir(temp.path());
     cmd.arg("init")
         .env("BEADS_DIR", &beads_dir)
         .assert()
@@ -32,6 +36,10 @@ epic1
     .unwrap();
 
     let mut cmd = Command::cargo_bin("br").unwrap();
+    // Run inside the temp workspace: the sync path allowlist and the
+    // locality guard both refuse a beads dir outside the cwd, and this
+    // test means to operate in that temp workspace.
+    cmd.current_dir(temp.path());
     let imported = cmd
         .arg("create")
         .arg("-f")
@@ -76,6 +84,10 @@ fn test_create_parent_standin_forward_reference() {
     let beads_dir = temp.path().join(".beads");
 
     let mut cmd = Command::cargo_bin("br").unwrap();
+    // Run inside the temp workspace: the sync path allowlist and the
+    // locality guard both refuse a beads dir outside the cwd, and this
+    // test means to operate in that temp workspace.
+    cmd.current_dir(temp.path());
     cmd.arg("init")
         .env("BEADS_DIR", &beads_dir)
         .assert()
@@ -99,6 +111,10 @@ epic
     .unwrap();
 
     let mut cmd = Command::cargo_bin("br").unwrap();
+    // Run inside the temp workspace: the sync path allowlist and the
+    // locality guard both refuse a beads dir outside the cwd, and this
+    // test means to operate in that temp workspace.
+    cmd.current_dir(temp.path());
     let imported = cmd
         .arg("create")
         .arg("-f")

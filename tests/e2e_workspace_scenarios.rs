@@ -249,7 +249,17 @@ fn scenario_doctor_healthy_workspace() {
     init.assert_success();
 
     // Doctor on healthy workspace should pass
-    let doctor = ws.run_br(["doctor"], "doctor");
+    // `doctor` exits non-zero on br_path_dupes (more than one `br` on $PATH)
+    // and on a debug-level RUST_LOG, which this harness sets for every run.
+    // Neither is about the workspace, so pin both.
+    let doctor = ws.run_br_env(
+        ["doctor"],
+        [
+            ("PATH", "/usr/bin:/bin"),
+            ("RUST_LOG", "error"),
+        ],
+        "doctor",
+    );
     doctor.assert_success();
     let stdout = doctor.stdout.to_ascii_lowercase();
     assert!(
@@ -268,7 +278,15 @@ fn scenario_doctor_json_output() {
     let init = ws.run_br(["init"], "init");
     init.assert_success();
 
-    let doctor = ws.run_br(["doctor", "--json"], "doctor_json");
+    // Same hermetic env as scenario_doctor_healthy_workspace.
+    let doctor = ws.run_br_env(
+        ["doctor", "--json"],
+        [
+            ("PATH", "/usr/bin:/bin"),
+            ("RUST_LOG", "error"),
+        ],
+        "doctor_json",
+    );
     doctor.assert_success();
 
     let json = parse_json_stdout(&doctor.stdout, "doctor");
@@ -282,7 +300,15 @@ fn scenario_doctor_no_workspace() {
     let mut ws = TestWorkspace::new("e2e_workspace", "doctor_no_workspace");
     // Do NOT init
 
-    let doctor = ws.run_br(["doctor"], "doctor_no_init");
+    // Hermetic env, same reason as scenario_doctor_healthy_workspace.
+    let doctor = ws.run_br_env(
+        ["doctor"],
+        [
+            ("PATH", "/usr/bin:/bin"),
+            ("RUST_LOG", "error"),
+        ],
+        "doctor_no_init",
+    );
     // Should fail or warn about missing workspace
     // (behavior may vary - just verify it doesn't crash)
     assert!(

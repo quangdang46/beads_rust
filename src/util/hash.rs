@@ -151,12 +151,18 @@ pub fn content_hash_from_parts_v15(
         None,
         None, // await_type, await_id, timeout_seconds
         &[],  // waiters
-        &MolType::default(),
-        &WorkType::default(),
-        None,
-        None,
-        None,
-        None, // event_kind, actor, target, payload
+        // Go's zero value for these is the empty string, NOT the named default.
+        // `bd` leaves `MolType`/`WorkType` unset on most issues, and
+        // `ComputeContentHash` hashes whatever the field holds -- so a caller
+        // that has not set them must contribute "" to the digest. Using
+        // `MolType::default()` here would hash "work" and diverge from Go for
+        // every issue.
+        &MolType::Custom(String::new()),
+        &WorkType::Custom(String::new()),
+        None, // event_kind
+        None, // actor
+        None, // target
+        None, // payload
     )
 }
 

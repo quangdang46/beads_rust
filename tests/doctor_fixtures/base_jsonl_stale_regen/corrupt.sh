@@ -28,14 +28,24 @@ cat > .beads/beads.base.jsonl <<'STALE'
 STALE
 cp .beads/beads.base.jsonl .fixture_baseline_stale
 
+# `stat -c` and `touch -d` are GNU coreutils spellings; BSD/macOS use `-f %m`
+# and `-t`. Pick per platform so the fixture runs on both. Define before use.
+if stat -c '%Y' .beads/beads.base.jsonl >/dev/null 2>&1; then
+    mtime_of() { stat -c '%Y' "$1"; }
+    set_anchor_time() { touch -m -d '2025-01-01 00:00:00' "$1"; }
+else
+    mtime_of() { stat -f '%m' "$1"; }
+    set_anchor_time() { touch -m -t 202501010000 "$1"; }
+fi
+
 # Backdate the anchor mtime so it predates issues.jsonl. Use a year-old
 # epoch to leave wide margin even on filesystems with second-only
 # resolution.
-touch -m -d '2025-01-01 00:00:00' .beads/beads.base.jsonl
+set_anchor_time .beads/beads.base.jsonl
 
 # Sanity: live JSONL is newer than the anchor.
-base_mtime=$(stat -c '%Y' .beads/beads.base.jsonl)
-live_mtime=$(stat -c '%Y' .beads/issues.jsonl)
+base_mtime=$(mtime_of .beads/beads.base.jsonl)
+live_mtime=$(mtime_of .beads/issues.jsonl)
 if [ "$base_mtime" -ge "$live_mtime" ]; then
     echo "corrupt.sh: anchor mtime ($base_mtime) is not older than live ($live_mtime)" >&2
     exit 1

@@ -1648,7 +1648,7 @@ mod tests {
 
         let err = create_issue_impl(&mut storage, &child, &config).unwrap_err();
         assert!(
-            matches!(err, BeadsError::Database(_)),
+            err.is_database_error(),
             "expected database error, got: {err:?}"
         );
         info!("test_create_issue_with_parent_propagates_storage_error: assertions passed");

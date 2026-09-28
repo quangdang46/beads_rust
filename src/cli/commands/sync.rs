@@ -667,7 +667,21 @@ fn validate_sync_paths(
         )));
     }
 
-    let is_external = !jsonl_path.starts_with(&canonical_beads);
+    // Compare against BOTH the raw and canonical beads directory. The
+    // operator-supplied path is deliberately not canonicalized here (see the
+    // comment above: that would let symlinks bypass the checks below), so on
+    // macOS it still reads `/var/...` while `canonical_beads` is
+    // `/private/var/...` and a plain `starts_with` would call an ordinary
+    // in-workspace path "external".
+    // Compare against both spellings of the beads directory. `jsonl_path` is
+    // deliberately not canonicalized (doing so would let a symlink bypass the
+    // checks below), so on macOS it still reads `/var/...` while
+    // `canonical_beads` is `/private/var/...`.
+    let is_external = !jsonl_path.starts_with(&canonical_beads)
+        && !jsonl_path.starts_with(beads_dir)
+        && !dunce::canonicalize(&jsonl_path)
+            .map(|c| c.starts_with(&canonical_beads))
+            .unwrap_or(false);
     if is_external && !allow_external_jsonl {
         warn!(
             path = %jsonl_path.display(),
@@ -773,8 +787,24 @@ fn validate_operator_requested_sync_path(beads_dir: &Path, jsonl_path: &Path) ->
                 .unwrap_or_else(|| Path::new(""))
                 .join(target)
         };
+        // Reconstruct where the *full* jsonl path really lands, not just the
+        // link's own target. On macOS `/var` is a symlink to `/private/var`, so
+        // comparing `/private/var` against the canonical beads directory with
+        // `starts_with` always failed and every temp-directory workspace was
+        // refused. Rejoining the remainder of the path and canonicalizing the
+        // result resolves the whole chain, so a workspace reached through such a
+        // link is recognised as being inside it. A link that genuinely points
+        // outside still fails this check.
+        let tail = operator_path
+            .strip_prefix(&candidate)
+            .unwrap_or_else(|_| Path::new(""));
+        let resolved = absolute_target.join(tail);
+        // `resolved` may not exist yet (this is the "missing internal parent
+        // directory" case), in which case canonicalization fails. Fall back to
+        // the lexical path, which is still comparable against `canonical_beads`
+        // because `beads_dir` was already canonicalized above.
         let canonical_target =
-            dunce::canonicalize(&absolute_target).unwrap_or_else(|_| absolute_target.clone());
+            dunce::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
         if !canonical_target.starts_with(&canonical_beads) {
             return Err(BeadsError::Config(format!(
                 "Refusing to use JSONL path through symlink escaping .beads: {} -> {}",

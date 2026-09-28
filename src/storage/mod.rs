@@ -12,6 +12,10 @@
 //! - [`schema`] - Database schema definitions
 //! - [`sqlite`] - Main `SQLite` storage implementation
 
+/// Value and row access over `rusqlite`. Permanent: the helpers work around a
+/// borrow-checking constraint in rusqlite's parameter API, not around the engine
+/// swap. See the module docs.
+pub mod db;
 pub mod events;
 pub mod schema;
 pub mod sqlite;

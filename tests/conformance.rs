@@ -412,13 +412,48 @@ fn conformance_content_hash_matches_go_bd_fixture() {
         Some("pane6"),
         Some("github:org/repo#123"),
         Some("github"),
+        true,   // pinned
+        false,  // is_template
+
+    );
+
+    assert_eq!(
+        hash, "2f156d4a4f91a0d24189332705ecf75afdc915a3ed9434c46719d8466c15474c",
+        "content_hash must match the Go bd ComputeContentHash fixture"
+    );
+}
+
+/// The `is_template` flag contributes the literal label "template" in place of
+/// an empty field, exactly as Go's `hashFieldWriter.flag` does.
+///
+/// The expected value was produced by running Go `bd`'s own
+/// `ComputeContentHash` on this input (gastownhall/beads,
+/// `internal/types/types.go`), not derived from the Rust implementation.
+#[test]
+fn conformance_content_hash_template_flag_matches_go() {
+    use beads_rust::model::{IssueType, Priority, Status};
+
+    let hash = beads_rust::util::content_hash_from_parts_v15(
+        "Fix authentication bug",
+        Some("Users are getting logged out unexpectedly"),
+        Some("Use token refresh"),
+        Some("Session survives refresh"),
+        Some("Check logs"),
+        &Status::InProgress,
+        &Priority::HIGH,
+        &IssueType::Bug,
+        Some("bob"),
+        Some("alice"),
+        Some("pane6"),
+        Some("github:org/repo#123"),
+        Some("github"),
         true,
         true,
     );
 
     assert_eq!(
-        hash, "ad16572b6b2e1a60df3520b2b91d181246707390f487a73caa24082dcd24e00e",
-        "content_hash must match the Go bd ComputeContentHash fixture"
+        hash, "02a1cffaefd79087f6d5394088bf98fbd743fff0bcf2198d479a6e12325ed7ac",
+        "a templated issue must hash differently, and must match Go"
     );
 }
 

@@ -210,9 +210,9 @@ pub enum Op {
 }
 
 /// Lightweight stand-in for a SQL bind value. WP4 wires this through
-/// the chokepoint by converting to [`fsqlite_types::value::SqliteValue`]
+/// the chokepoint by converting to [`crate::storage::db::SqlValue`]
 /// at the SQL boundary; callers can therefore stay independent of the
-/// fsqlite type stack.
+/// engine type stack.
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum DbArg {
@@ -229,17 +229,17 @@ pub enum DbArg {
 }
 
 impl DbArg {
-    /// Convert into the `fsqlite` type system. Used at the chokepoint's
+    /// Convert into the SQL engine's value type. Used at the chokepoint's
     /// SQL boundary; not exposed publicly because it leaks the
     /// underlying engine type.
-    fn to_sqlite_value(&self) -> fsqlite_types::value::SqliteValue {
-        use fsqlite_types::value::SqliteValue;
+    fn to_sql_value(&self) -> crate::storage::db::SqlValue {
+        use crate::storage::db::SqlValue;
         match self {
-            Self::Null => SqliteValue::Null,
-            Self::I64(n) => SqliteValue::Integer(*n),
-            Self::F64(f) => SqliteValue::Float(*f),
-            Self::Text(s) => SqliteValue::Text(s.as_str().into()),
-            Self::Blob(b) => SqliteValue::Blob(std::sync::Arc::from(b.as_slice())),
+            Self::Null => SqlValue::new(rusqlite::types::Value::Null),
+            Self::I64(n) => SqlValue::from(*n),
+            Self::F64(f) => SqlValue::from(*f),
+            Self::Text(s) => SqlValue::from(s.clone()),
+            Self::Blob(b) => SqlValue::from(b.clone()),
         }
     }
 }
@@ -746,8 +746,8 @@ fn mutate_db(
             let predicate_for_snapshot = affected_predicate.clone();
             let tables_for_snapshot = affected_tables.clone();
             let sql_owned = sql.clone();
-            let args_owned: Vec<fsqlite_types::value::SqliteValue> =
-                args.iter().map(DbArg::to_sqlite_value).collect();
+            let args_owned: Vec<crate::storage::db::SqlValue> =
+                args.iter().map(DbArg::to_sql_value).collect();
 
             run_db_exec(
                 path,
@@ -891,11 +891,11 @@ fn run_db_exec(
     db_path: &Path,
     backups_db: &Path,
     sql: &str,
-    args: &[fsqlite_types::value::SqliteValue],
+    args: &[crate::storage::db::SqlValue],
     affected_tables: &[String],
     affected_predicate: Option<&str>,
 ) -> Result<Vec<DbSnapshotArtifact>, BeadsError> {
-    use fsqlite::Connection;
+    use rusqlite::Connection;
 
     // Pre-flight identifier validation so we fail fast before opening
     // the DB connection. Mirrors the protection on the SELECT path.
@@ -908,8 +908,8 @@ fn run_db_exec(
     // Single connection for the entire snapshot+mutate transaction.
     // Acquire BEGIN IMMEDIATE *before* the SELECTs so the writer lock
     // is held for the snapshot read as well as the mutating SQL.
-    let conn = Connection::open(db_path.to_string_lossy().into_owned())?;
-    if let Err(e) = conn.execute("BEGIN IMMEDIATE") {
+    let conn = Connection::open(db_path)?;
+    if let Err(e) = conn.execute("BEGIN IMMEDIATE", []) {
         let _ = conn.close();
         return Err(e.into());
     }
@@ -921,7 +921,7 @@ fn run_db_exec(
         let artifact = match snapshot_db_table(&conn, backups_db, table, affected_predicate) {
             Ok(a) => a,
             Err(e) => {
-                let _ = conn.execute("ROLLBACK");
+                let _ = conn.execute("ROLLBACK", []);
                 let _ = conn.close();
                 scrub_orphan_snapshots(
                     &snapshot_artifacts
@@ -940,15 +940,18 @@ fn run_db_exec(
     // snapshots — a snapshot with no corresponding actions.jsonl entry
     // is dead weight that would only confuse forensic tooling.
     let exec_outcome = if args.is_empty() {
-        conn.execute(sql).map(|_| ())
+        conn.execute(sql, []).map(|_| ())
     } else {
-        conn.execute_with_params(sql, args).map(|_| ())
+        // rusqlite implements `Params` for a SLICE of `&dyn ToSql`, not a Vec, so the
+        // converted vector has to be bound before the call rather than passed inline.
+        let params = crate::storage::db::params_from(args);
+        conn.execute(sql, params.as_slice()).map(|_| ())
     };
 
     match exec_outcome {
         Ok(()) => {
-            if let Err(e) = conn.execute("COMMIT") {
-                let _ = conn.execute("ROLLBACK");
+            if let Err(e) = conn.execute("COMMIT", []) {
+                let _ = conn.execute("ROLLBACK", []);
                 let _ = conn.close();
                 scrub_orphan_snapshots(
                     &snapshot_artifacts
@@ -960,7 +963,7 @@ fn run_db_exec(
             }
         }
         Err(e) => {
-            let _ = conn.execute("ROLLBACK");
+            let _ = conn.execute("ROLLBACK", []);
             let _ = conn.close();
             scrub_orphan_snapshots(
                 &snapshot_artifacts
@@ -989,7 +992,7 @@ pub(crate) struct DbSnapshotArtifact {
 }
 
 fn snapshot_db_table(
-    conn: &fsqlite::Connection,
+    conn: &rusqlite::Connection,
     backups_db: &Path,
     table: &str,
     affected_predicate: Option<&str>,
@@ -1002,17 +1005,17 @@ fn snapshot_db_table(
     };
 
     let column_names = collect_column_names(conn, table)?;
-    let stmt = conn.prepare(&select_sql)?;
-    let rows = stmt.query()?;
-    let mut json_rows: Vec<serde_json::Value> = Vec::with_capacity(rows.len());
-    for row in &rows {
+    let mut stmt = conn.prepare(&select_sql)?;
+    let mut json_rows: Vec<serde_json::Value> = Vec::new();
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
         let mut obj = serde_json::Map::new();
         for (i, name) in column_names.iter().enumerate() {
-            let val = row
-                .get(i)
-                .cloned()
-                .unwrap_or(fsqlite_types::value::SqliteValue::Null);
-            obj.insert(name.clone(), sqlite_value_to_json(&val));
+            // A column that cannot be read is recorded as NULL rather than aborting the
+            // snapshot, which is what the previous `.get(i).cloned().unwrap_or(Null)` did.
+            let val = crate::storage::db::row_value(row, i)
+                .unwrap_or_else(|_| crate::storage::db::SqlValue::null());
+            obj.insert(name.clone(), sql_value_to_json(&val));
         }
         json_rows.push(serde_json::Value::Object(obj));
     }
@@ -1110,47 +1113,53 @@ fn validate_identifier(ident: &str) -> Result<(), BeadsError> {
 /// Resolve the column-name vector for `table` via `PRAGMA
 /// table_info`. Returns an error if the table does not exist.
 fn collect_column_names(
-    conn: &fsqlite::Connection,
+    conn: &rusqlite::Connection,
     table: &str,
 ) -> Result<Vec<String>, BeadsError> {
-    use fsqlite_types::value::SqliteValue;
     validate_identifier(table)?;
-    let rows = conn.query(&format!("PRAGMA table_info({table})"))?;
-    if rows.is_empty() {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut names: Vec<String> = Vec::new();
+    // PRAGMA table_info: cid, name, type, notnull, dflt_value, pk
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        // The accessor does not coerce, so a non-text column name is an error rather than
+        // something to stringify. That is the same check the old pattern match performed.
+        match crate::storage::db::row_value(row, 1)?.as_text() {
+            Some(name) => names.push(name.to_string()),
+            None => {
+                return Err(BeadsError::internal(format!(
+                    "doctor: PRAGMA table_info({table}) returned non-text column name"
+                )));
+            }
+        }
+    }
+    if names.is_empty() {
         return Err(BeadsError::internal(format!(
             "doctor: table '{table}' has no columns (does it exist?)"
         )));
     }
-    let mut names = Vec::with_capacity(rows.len());
-    // PRAGMA table_info: cid, name, type, notnull, dflt_value, pk
-    for row in &rows {
-        if let Some(SqliteValue::Text(name)) = row.get(1) {
-            names.push(name.to_string());
-        } else {
-            return Err(BeadsError::internal(format!(
-                "doctor: PRAGMA table_info({table}) returned non-text column name"
-            )));
-        }
-    }
     Ok(names)
 }
 
-/// JSON-encode a single `SqliteValue`. NULL→null, Integer→number,
-/// Float→number, Text→string, Blob→`{"$blob_b64": "..."}` to keep the
+/// JSON-encode a single bind value. NULL→null, Integer→number,
+/// Real→number, Text→string, Blob→`{"$blob_hex": "..."}` to keep the
 /// JSON faithful.
-fn sqlite_value_to_json(val: &fsqlite_types::value::SqliteValue) -> serde_json::Value {
-    use fsqlite_types::value::SqliteValue;
-    match val {
-        SqliteValue::Null => serde_json::Value::Null,
-        SqliteValue::Integer(n) => serde_json::Value::from(*n),
-        SqliteValue::Float(f) => serde_json::Number::from_f64(*f)
+///
+/// The variant names follow rusqlite's `Value`, which calls the float variant `Real`
+/// where frankensqlite called it `Float`. The JSON output is unchanged.
+fn sql_value_to_json(val: &crate::storage::db::SqlValue) -> serde_json::Value {
+    use rusqlite::types::Value;
+    match val.value() {
+        Value::Null => serde_json::Value::Null,
+        Value::Integer(n) => serde_json::Value::from(*n),
+        Value::Real(f) => serde_json::Number::from_f64(*f)
             .map_or(serde_json::Value::Null, serde_json::Value::Number),
-        SqliteValue::Text(s) => serde_json::Value::String(s.to_string()),
-        SqliteValue::Blob(b) => {
+        Value::Text(s) => serde_json::Value::String(s.clone()),
+        Value::Blob(b) => {
             // Hex-encode rather than base64 so the snapshot has no
             // additional dependency on a base64 crate. Restore is via
-            // hex-decode → SqliteValue::Blob.
-            serde_json::json!({ "$blob_hex": hex_encode(b.as_ref()) })
+            // hex-decode → blob.
+            serde_json::json!({ "$blob_hex": hex_encode(b.as_slice()) })
         }
     }
 }
@@ -1175,8 +1184,7 @@ fn run_db_migrate(
     from: u32,
     to: u32,
 ) -> Result<Option<()>, BeadsError> {
-    use fsqlite::Connection;
-    use fsqlite_types::value::SqliteValue;
+    use rusqlite::Connection;
 
     if to <= from {
         return Err(BeadsError::internal(format!(
@@ -1199,14 +1207,10 @@ fn run_db_migrate(
     // (2) Verify PRAGMA user_version matches `from`. If the precondition
     //     gate fails we discard the snapshot and refuse — leaving no
     //     backup behind keeps undo from trying to "restore" a no-op.
-    let conn = Connection::open(db_path.to_string_lossy().into_owned())?;
-    let row = conn.query_row("PRAGMA user_version")?;
-    let current = row
-        .get(0)
-        .and_then(|v| match v {
-            SqliteValue::Integer(n) => u32::try_from(*n).ok(),
-            _ => None,
-        })
+    let conn = Connection::open(db_path)?;
+    let current: u32 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))?
+        .try_into()
         .unwrap_or(0);
     let _ = conn.close();
     if current != from {
@@ -1223,7 +1227,8 @@ fn run_db_migrate(
     //     `PRAGMA user_version = to`. On any failure the chokepoint's
     //     recovery path can restore from the pre-migrate snapshot we
     //     wrote in step (1).
-    let migrate_conn = Connection::open(db_path.to_string_lossy().into_owned())?;
+    // Phase 4 ported the migration runner, so this handle no longer needs the legacy engine.
+    let migrate_conn = Connection::open(db_path)?;
     let migration_result = crate::storage::schema::run_migrations_atomic(&migrate_conn, from, to);
     let _ = migrate_conn.close();
     match migration_result {
@@ -1507,7 +1512,7 @@ where
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use fsqlite::Connection;
+    use rusqlite::Connection;
     use std::io::BufRead;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
@@ -1822,13 +1827,14 @@ mod tests {
         let beads_dir = tmp.join(".beads");
         fs::create_dir_all(&beads_dir).unwrap();
         let db = beads_dir.join("beads.db");
-        let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+        let conn = Connection::open(&db).unwrap();
         conn.execute(
             "CREATE TABLE IF NOT EXISTS sample_widgets (
                 id INTEGER PRIMARY KEY,
                 name TEXT NOT NULL UNIQUE,
                 value INTEGER NOT NULL DEFAULT 0
             )",
+            [],
         )
         .unwrap();
         let _ = conn.close();
@@ -1917,11 +1923,14 @@ mod tests {
         );
 
         // Post-state: row is in the DB.
-        let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
-        let rows = conn
-            .query("SELECT name, value FROM sample_widgets")
-            .unwrap();
-        assert_eq!(rows.len(), 1);
+        let conn = Connection::open(&db).unwrap();
+        let row_count = {
+            let mut stmt = conn
+                .prepare("SELECT name, value FROM sample_widgets")
+                .unwrap();
+            crate::storage::db::query_rows(&mut stmt).unwrap().len()
+        };
+        assert_eq!(row_count, 1);
         let _ = conn.close();
 
         // actions.jsonl carries one DbExec line.
@@ -1945,9 +1954,12 @@ mod tests {
 
         // Seed an existing row so a duplicate INSERT trips UNIQUE.
         {
-            let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
-            conn.execute("INSERT INTO sample_widgets(name, value) VALUES ('dup', 1)")
-                .unwrap();
+            let conn = Connection::open(&db).unwrap();
+            conn.execute(
+                "INSERT INTO sample_widgets(name, value) VALUES ('dup', 1)",
+                [],
+            )
+            .unwrap();
             let _ = conn.close();
         }
 
@@ -1980,14 +1992,12 @@ mod tests {
         // exactly one row (the seed). We do not compare DB file bytes
         // because fsqlite touches header counters even on a rolled-back
         // transaction; the row-level invariant is what matters.
-        let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
-        let rows = conn.query("SELECT COUNT(*) FROM sample_widgets").unwrap();
+        let conn = Connection::open(db).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sample_widgets", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(
-            rows[0].get(0).and_then(|v| match v {
-                fsqlite_types::value::SqliteValue::Integer(n) => Some(*n),
-                _ => None,
-            }),
-            Some(1),
+            count, 1,
             "rollback must leave only the seed row in the table"
         );
         let _ = conn.close();
@@ -2018,8 +2028,8 @@ mod tests {
 
         // Stamp user_version = 5 directly.
         {
-            let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
-            conn.execute("PRAGMA user_version = 5").unwrap();
+            let conn = Connection::open(&db).unwrap();
+            conn.execute("PRAGMA user_version = 5", []).unwrap();
             let _ = conn.close();
         }
 
@@ -2035,12 +2045,10 @@ mod tests {
 
         // PRAGMA user_version unchanged: this is the behavioral
         // invariant the precondition gate guarantees.
-        let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
-        let row = conn.query_row("PRAGMA user_version").unwrap();
-        let v = match row.get(0) {
-            Some(fsqlite_types::value::SqliteValue::Integer(n)) => *n,
-            _ => -1,
-        };
+        let conn = Connection::open(db).unwrap();
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(v, 5, "user_version must not change after refusal");
         let _ = conn.close();
 
@@ -2068,10 +2076,19 @@ mod tests {
         // user_version back to a pre-current value so the chokepoint
         // migration has a real upgrade to run.
         {
-            let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+            // The schema hooks are still on frankensqlite: `apply_schema` — and the
+            // `run_migrations_atomic` the chokepoint calls on the way out — take an
+            // `fsqlite::Connection` until the storage layer is ported. So the DDL half
+            // of this fixture keeps a frankensqlite handle while the assertion half
+            // below is rusqlite. Both engines read the same file, so this is a scoping
+            let conn = Connection::open(&db).unwrap();
             crate::storage::schema::apply_schema(&conn).expect("apply_schema on fresh test DB");
-            // Demote user_version so run_migrations_atomic has work to do.
-            conn.execute("PRAGMA user_version = 7").unwrap();
+            conn.close().map_err(|(_, e)| e).expect("close");
+        }
+        // Demote user_version so run_migrations_atomic has work to do.
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute("PRAGMA user_version = 7", []).unwrap();
             let _ = conn.close();
         }
 
@@ -2110,25 +2127,27 @@ mod tests {
         // The DDL actually ran: PRAGMA user_version is now CURRENT_SCHEMA_VERSION.
         let target = crate::storage::schema::CURRENT_SCHEMA_VERSION as u32;
         {
-            let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
-            let row = conn.query_row("PRAGMA user_version").unwrap();
-            let v = match row.get(0) {
-                Some(fsqlite_types::value::SqliteValue::Integer(n)) => u32::try_from(*n).unwrap(),
-                _ => 0,
-            };
+            let conn = Connection::open(db).unwrap();
+            let v: u32 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap()
+                .try_into()
+                .unwrap();
             assert_eq!(
                 v, target,
                 "post-migrate user_version should be CURRENT_SCHEMA_VERSION ({target})"
             );
             // v9 unconditionally adds close_metadata.
-            let rows = conn
-                .query(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name='close_metadata'",
-                )
-                .unwrap();
+            let close_metadata_rows = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name='close_metadata'",
+                    )
+                    .unwrap();
+                crate::storage::db::query_rows(&mut stmt).unwrap().len()
+            };
             assert_eq!(
-                rows.len(),
-                1,
+                close_metadata_rows, 1,
                 "v9 migration must have created close_metadata table"
             );
             let _ = conn.close();

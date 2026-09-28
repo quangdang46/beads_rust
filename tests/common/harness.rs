@@ -816,9 +816,12 @@ impl TestWorkspace {
         cmd.args(&args_vec);
 
         clear_inherited_br_env(&mut cmd);
+        // Set the harness default before `env_vars` so a test can override it.
+        // `br doctor` treats a debug-level RUST_LOG as a warning and exits
+        // non-zero, which would otherwise be impossible for a test to avoid.
+        cmd.env("RUST_LOG", "beads_rust=debug");
         cmd.envs(env_vars);
         cmd.env("NO_COLOR", "1");
-        cmd.env("RUST_LOG", "beads_rust=debug");
         cmd.env("RUST_BACKTRACE", "1");
         cmd.env("HOME", &self.root);
 
@@ -1260,9 +1263,10 @@ impl ConformanceWorkspace {
         cmd.args(&args_vec);
 
         clear_inherited_br_env(&mut cmd);
+        // Same ordering rule as above: harness default first, caller override after.
+        cmd.env("RUST_LOG", "beads_rust=debug");
         cmd.envs(env_vars);
         cmd.env("NO_COLOR", "1");
-        cmd.env("RUST_LOG", "beads_rust=debug");
         cmd.env("RUST_BACKTRACE", "1");
         cmd.env("HOME", cwd);
 

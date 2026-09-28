@@ -151,14 +151,21 @@
           ]
         },
         "source_repo": {
-          "description": "Source repository for multi-repo support \u2014 basename of the\ncanonicalized parent of `.beads/`. Stable across clones of the\nsame repo on different machines (different absolute paths\nproduce the same basename). See [`canonical_source_repo`] in\n`cli::commands::create`.",
+          "description": "Source repository for multi-repo support — basename of the\ncanonicalized parent of `.beads/`. Stable across clones of the\nsame repo on different machines (different absolute paths\nproduce the same basename). See [`canonical_source_repo`] in\n`cli::commands::create`.",
           "type": [
             "string",
             "null"
           ]
         },
         "source_repo_path": {
-          "description": "Absolute canonical path of the source repository. Distinct from\n`source_repo`: this field uniquely identifies the workspace on\nthe machine that produced the issue, which is what multi-repo\nfleet automation needs to route beads back to the right\ndirectory (see beads_rust#289). Two clones of the same repo\nunder `~/Developer/foo` vs `~/Developer/scratch/foo` collide on\n`source_repo` but disagree here. Optional \u2014 older databases and\nhand-edited JSONL records without this field are valid.",
+          "description": "Absolute canonical path of the source repository. Distinct from\n`source_repo`: this field uniquely identifies the workspace on\nthe machine that produced the issue, which is what multi-repo\nfleet automation needs to route beads back to the right\ndirectory (see beads_rust#289). Two clones of the same repo\nunder `~/Developer/foo` vs `~/Developer/scratch/foo` collide on\n`source_repo` but disagree here. Optional — older databases and\nhand-edited JSONL records without this field are valid.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agent_context": {
+          "description": "Canonical-JSON governing instructions inherited by descendant\nbeads (beads_rust#297). When set on an ancestor and the project\nhas `inherited_context.enabled = true` in `.beads/config.yaml`,\n`br update --status in_progress` / `--claim` and `br show` emit\nthe ancestor's `agent_context` alongside the child's normal\noutput so the working agent sees the constraints regardless of\ncontext compaction or cold-start lookups.\n\nStorage: TEXT column holding a JSON document (typically an\nobject with `skills`, `constraints`, `references`, `workflow`,\n`metadata` fields, but the schema is intentionally open).\n`None` means \"no inherited context\"; emission for descendants\nsilently skips ancestors with `None` (no error, no noise).\n\nNot displayed in `br list` / `br search` — this is per-bead\ngovernance metadata, not browsable content.",
           "type": [
             "string",
             "null"
@@ -189,19 +196,6 @@
             "null"
           ]
         },
-        "compacted_at": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "format": "date-time"
-        },
-        "compacted_at_commit": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "sender": {
           "type": [
             "string",
@@ -211,13 +205,163 @@
         "ephemeral": {
           "type": "boolean"
         },
+        "no_history": {
+          "type": "boolean"
+        },
         "pinned": {
           "type": "boolean"
         },
         "is_template": {
           "type": "boolean"
         },
+        "mol_type": {
+          "$ref": "#/$defs/MolType",
+          "default": ""
+        },
+        "work_type": {
+          "$ref": "#/$defs/WorkType",
+          "default": ""
+        },
+        "wisp_type": {
+          "$ref": "#/$defs/WispType",
+          "default": ""
+        },
+        "spec_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "points": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
+        },
+        "started_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "metadata": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_formula": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_location": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "await_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "await_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timeout_seconds": {
+          "description": "Gate timeout in seconds.\n\nThe Go `bd` tool serializes this as `\"timeout\"` with nanosecond precision.\nThe `alias` attribute allows br to import bd JSONL with `\"timeout\"` fields.\nExport always uses `\"timeout_seconds\"` (seconds, not nanoseconds).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "holder": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hook_bead": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role_bead": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agent_state": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rig": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "event_kind": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "target": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "payload": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "quality_score": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "crystallizes": {
+          "type": "boolean"
+        },
+        "bonded_from": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/BondRef"
+          }
+        },
         "labels": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "waiters": {
+          "description": "List of issue IDs waiting on this issue (coordination waiters).",
           "type": "array",
           "items": {
             "type": "string"
@@ -273,6 +417,11 @@
               ]
             },
             {
+              "description": "Claimed by an agent for exclusive execution (Go parity).\nAgent-claimed issues are excluded from `br ready` and have\nclaim-protection semantics — no other agent may claim them.",
+              "type": "string",
+              "const": "hooked"
+            },
+            {
               "type": "string"
             }
           ]
@@ -294,12 +443,149 @@
                 "epic",
                 "chore",
                 "docs",
-                "question"
+                "question",
+                "decision",
+                "message",
+                "molecule",
+                "gate",
+                "spike",
+                "story",
+                "milestone",
+                "event"
               ]
             },
             {
               "type": "string"
             }
+          ]
+        },
+        "MolType": {
+          "description": "MolType categorizes molecule types for swarm coordination.",
+          "anyOf": [
+            {
+              "description": "Regular assigned work.",
+              "type": "string",
+              "const": "work"
+            },
+            {
+              "description": "Swarm molecule: coordinated multi-worker work.",
+              "type": "string",
+              "const": "swarm"
+            },
+            {
+              "description": "Patrol molecule: recurring operational work.",
+              "type": "string",
+              "const": "patrol"
+            },
+            {
+              "description": "User-defined mol type.",
+              "type": "string"
+            },
+            {
+              "description": "Unset (empty string).",
+              "type": "string"
+            }
+          ]
+        },
+        "WorkType": {
+          "description": "WorkType categorizes how work assignment operates for a bead.",
+          "anyOf": [
+            {
+              "description": "One worker, exclusive assignment.",
+              "type": "string",
+              "const": "mutex"
+            },
+            {
+              "description": "Many submit, buyer picks.",
+              "type": "string",
+              "const": "open_competition"
+            },
+            {
+              "description": "User-defined work type.",
+              "type": "string"
+            },
+            {
+              "description": "Unset (empty string). See `MolType::Unset`.",
+              "type": "string"
+            }
+          ]
+        },
+        "WispType": {
+          "description": "WispType categorizes ephemeral wisps for TTL-based compaction.",
+          "anyOf": [
+            {
+              "description": "Default (no specific wisp type).",
+              "type": "string",
+              "const": "none"
+            },
+            {
+              "description": "Liveness pings (TTL: 6h).",
+              "type": "string",
+              "const": "heartbeat"
+            },
+            {
+              "description": "Health check ACKs (TTL: 6h).",
+              "type": "string",
+              "const": "ping"
+            },
+            {
+              "description": "Patrol cycle reports (TTL: 24h).",
+              "type": "string",
+              "const": "patrol"
+            },
+            {
+              "description": "Garbage collection reports (TTL: 24h).",
+              "type": "string",
+              "const": "gc_report"
+            },
+            {
+              "description": "Force-kill, recovery actions (TTL: 7d).",
+              "type": "string",
+              "const": "recovery"
+            },
+            {
+              "description": "Error reports (TTL: 7d).",
+              "type": "string",
+              "const": "error"
+            },
+            {
+              "description": "Human escalations (TTL: 7d).",
+              "type": "string",
+              "const": "escalation"
+            },
+            {
+              "description": "User-defined wisp type.",
+              "type": "string"
+            },
+            {
+              "description": "Unset (empty string).",
+              "type": "string"
+            }
+          ]
+        },
+        "BondRef": {
+          "description": "BondRef tracks compound molecule lineage.\nWhen protos or molecules are bonded together, BondRefs record\nwhich sources were combined and how they were attached.",
+          "type": "object",
+          "properties": {
+            "source_id": {
+              "description": "Source proto or molecule ID.",
+              "type": "string"
+            },
+            "bond_type": {
+              "description": "Type of bond: sequential, parallel, conditional.",
+              "type": "string"
+            },
+            "bond_point": {
+              "description": "Attachment site (issue ID or empty for root).",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "source_id",
+            "bond_type"
           ]
         },
         "Dependency": {
@@ -331,7 +617,7 @@
               ]
             },
             "metadata": {
-              "description": "Optional metadata (JSON).",
+              "description": "Optional metadata (JSON).\n\nA degenerate empty (or whitespace-only) string is coerced to `None` on\ndeserialization to tolerate legacy JSONL that wrote `\"metadata\":\"\"`\ninstead of omitting the field. See [`deserialize_optional_metadata`].",
               "type": [
                 "string",
                 "null"
@@ -356,20 +642,99 @@
           "description": "Dependency relationship type.",
           "anyOf": [
             {
+              "description": "A blocks B (B cannot proceed until A is closed).",
               "type": "string",
-              "enum": [
-                "blocks",
-                "parent-child",
-                "conditional-blocks",
-                "waits-for",
-                "related",
-                "discovered-from",
-                "replies-to",
-                "relates-to",
-                "duplicates",
-                "supersedes",
-                "caused-by"
-              ]
+              "const": "blocks"
+            },
+            {
+              "description": "A is a parent of B (B cannot be closed until A is closed).",
+              "type": "string",
+              "const": "parent-child"
+            },
+            {
+              "description": "B runs only if A fails.",
+              "type": "string",
+              "const": "conditional-blocks"
+            },
+            {
+              "description": "Fanout gate: wait for dynamic children.",
+              "type": "string",
+              "const": "waits-for"
+            },
+            {
+              "description": "A is related to B (informational).",
+              "type": "string",
+              "const": "related"
+            },
+            {
+              "description": "B was discovered from A (tracing).",
+              "type": "string",
+              "const": "discovered-from"
+            },
+            {
+              "description": "B is a reply to A (conversation threading).",
+              "type": "string",
+              "const": "replies-to"
+            },
+            {
+              "description": "B relates to A (loose knowledge graph edge).",
+              "type": "string",
+              "const": "relates-to"
+            },
+            {
+              "description": "B duplicates A (deduplication link).",
+              "type": "string",
+              "const": "duplicates"
+            },
+            {
+              "description": "B supersedes A (version chain link).",
+              "type": "string",
+              "const": "supersedes"
+            },
+            {
+              "description": "A is authored by B (creator relationship).",
+              "type": "string",
+              "const": "authored-by"
+            },
+            {
+              "description": "A is assigned to B (assignment relationship).",
+              "type": "string",
+              "const": "assigned-to"
+            },
+            {
+              "description": "A is approved by B (approval relationship).",
+              "type": "string",
+              "const": "approved-by"
+            },
+            {
+              "description": "A attests that B has a given skill/attribute.",
+              "type": "string",
+              "const": "attests"
+            },
+            {
+              "description": "A tracks B (convoy → issue tracking, non-blocking).",
+              "type": "string",
+              "const": "tracks"
+            },
+            {
+              "description": "A is active until B closes (e.g., muted until issue resolved).",
+              "type": "string",
+              "const": "until"
+            },
+            {
+              "description": "A is caused by B (triggered by target, audit trail).",
+              "type": "string",
+              "const": "caused-by"
+            },
+            {
+              "description": "A validates B (approval/validation relationship).",
+              "type": "string",
+              "const": "validates"
+            },
+            {
+              "description": "A is delegated from B (work handoff).",
+              "type": "string",
+              "const": "delegated-from"
             },
             {
               "type": "string"
@@ -526,6 +891,11 @@
               ]
             },
             {
+              "description": "Claimed by an agent for exclusive execution (Go parity).\nAgent-claimed issues are excluded from `br ready` and have\nclaim-protection semantics — no other agent may claim them.",
+              "type": "string",
+              "const": "hooked"
+            },
+            {
               "type": "string"
             }
           ]
@@ -547,7 +917,15 @@
                 "epic",
                 "chore",
                 "docs",
-                "question"
+                "question",
+                "decision",
+                "message",
+                "molecule",
+                "gate",
+                "spike",
+                "story",
+                "milestone",
+                "event"
               ]
             },
             {
@@ -1263,6 +1641,11 @@
               ]
             },
             {
+              "description": "Claimed by an agent for exclusive execution (Go parity).\nAgent-claimed issues are excluded from `br ready` and have\nclaim-protection semantics — no other agent may claim them.",
+              "type": "string",
+              "const": "hooked"
+            },
+            {
               "type": "string"
             }
           ]
@@ -1284,7 +1667,15 @@
                 "epic",
                 "chore",
                 "docs",
-                "question"
+                "question",
+                "decision",
+                "message",
+                "molecule",
+                "gate",
+                "spike",
+                "story",
+                "milestone",
+                "event"
               ]
             },
             {
@@ -1750,6 +2141,28 @@
         }
       }
     },
+    "CountGroup": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "CountGroup",
+      "description": "Row emitted inside `br count --by <field> --json` under `groups[]`.\n\nKeep this in sync with `cli::commands::count::CountGroup`.",
+      "type": "object",
+      "properties": {
+        "group": {
+          "description": "Group label, for example a status, priority, type, assignee, or label.",
+          "type": "string"
+        },
+        "count": {
+          "description": "Number of matching issues in this group.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "group",
+        "count"
+      ]
+    },
     "ErrorEnvelope": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "ErrorEnvelope",
@@ -1946,14 +2359,21 @@
           ]
         },
         "source_repo": {
-          "description": "Source repository for multi-repo support \u2014 basename of the\ncanonicalized parent of `.beads/`. Stable across clones of the\nsame repo on different machines (different absolute paths\nproduce the same basename). See [`canonical_source_repo`] in\n`cli::commands::create`.",
+          "description": "Source repository for multi-repo support — basename of the\ncanonicalized parent of `.beads/`. Stable across clones of the\nsame repo on different machines (different absolute paths\nproduce the same basename). See [`canonical_source_repo`] in\n`cli::commands::create`.",
           "type": [
             "string",
             "null"
           ]
         },
         "source_repo_path": {
-          "description": "Absolute canonical path of the source repository. Distinct from\n`source_repo`: this field uniquely identifies the workspace on\nthe machine that produced the issue, which is what multi-repo\nfleet automation needs to route beads back to the right\ndirectory (see beads_rust#289). Two clones of the same repo\nunder `~/Developer/foo` vs `~/Developer/scratch/foo` collide on\n`source_repo` but disagree here. Optional \u2014 older databases and\nhand-edited JSONL records without this field are valid.",
+          "description": "Absolute canonical path of the source repository. Distinct from\n`source_repo`: this field uniquely identifies the workspace on\nthe machine that produced the issue, which is what multi-repo\nfleet automation needs to route beads back to the right\ndirectory (see beads_rust#289). Two clones of the same repo\nunder `~/Developer/foo` vs `~/Developer/scratch/foo` collide on\n`source_repo` but disagree here. Optional — older databases and\nhand-edited JSONL records without this field are valid.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agent_context": {
+          "description": "Canonical-JSON governing instructions inherited by descendant\nbeads (beads_rust#297). When set on an ancestor and the project\nhas `inherited_context.enabled = true` in `.beads/config.yaml`,\n`br update --status in_progress` / `--claim` and `br show` emit\nthe ancestor's `agent_context` alongside the child's normal\noutput so the working agent sees the constraints regardless of\ncontext compaction or cold-start lookups.\n\nStorage: TEXT column holding a JSON document (typically an\nobject with `skills`, `constraints`, `references`, `workflow`,\n`metadata` fields, but the schema is intentionally open).\n`None` means \"no inherited context\"; emission for descendants\nsilently skips ancestors with `None` (no error, no noise).\n\nNot displayed in `br list` / `br search` — this is per-bead\ngovernance metadata, not browsable content.",
           "type": [
             "string",
             "null"
@@ -1984,19 +2404,6 @@
             "null"
           ]
         },
-        "compacted_at": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "format": "date-time"
-        },
-        "compacted_at_commit": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "sender": {
           "type": [
             "string",
@@ -2006,13 +2413,163 @@
         "ephemeral": {
           "type": "boolean"
         },
+        "no_history": {
+          "type": "boolean"
+        },
         "pinned": {
           "type": "boolean"
         },
         "is_template": {
           "type": "boolean"
         },
+        "mol_type": {
+          "$ref": "#/$defs/MolType",
+          "default": ""
+        },
+        "work_type": {
+          "$ref": "#/$defs/WorkType",
+          "default": ""
+        },
+        "wisp_type": {
+          "$ref": "#/$defs/WispType",
+          "default": ""
+        },
+        "spec_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "points": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
+        },
+        "started_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "metadata": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_formula": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_location": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "await_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "await_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timeout_seconds": {
+          "description": "Gate timeout in seconds.\n\nThe Go `bd` tool serializes this as `\"timeout\"` with nanosecond precision.\nThe `alias` attribute allows br to import bd JSONL with `\"timeout\"` fields.\nExport always uses `\"timeout_seconds\"` (seconds, not nanoseconds).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "holder": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hook_bead": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role_bead": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agent_state": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rig": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "event_kind": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "target": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "payload": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "quality_score": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "crystallizes": {
+          "type": "boolean"
+        },
+        "bonded_from": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/BondRef"
+          }
+        },
         "labels": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "waiters": {
+          "description": "List of issue IDs waiting on this issue (coordination waiters).",
           "type": "array",
           "items": {
             "type": "string"
@@ -2055,6 +2612,11 @@
               ]
             },
             {
+              "description": "Claimed by an agent for exclusive execution (Go parity).\nAgent-claimed issues are excluded from `br ready` and have\nclaim-protection semantics — no other agent may claim them.",
+              "type": "string",
+              "const": "hooked"
+            },
+            {
               "type": "string"
             }
           ]
@@ -2076,12 +2638,149 @@
                 "epic",
                 "chore",
                 "docs",
-                "question"
+                "question",
+                "decision",
+                "message",
+                "molecule",
+                "gate",
+                "spike",
+                "story",
+                "milestone",
+                "event"
               ]
             },
             {
               "type": "string"
             }
+          ]
+        },
+        "MolType": {
+          "description": "MolType categorizes molecule types for swarm coordination.",
+          "anyOf": [
+            {
+              "description": "Regular assigned work.",
+              "type": "string",
+              "const": "work"
+            },
+            {
+              "description": "Swarm molecule: coordinated multi-worker work.",
+              "type": "string",
+              "const": "swarm"
+            },
+            {
+              "description": "Patrol molecule: recurring operational work.",
+              "type": "string",
+              "const": "patrol"
+            },
+            {
+              "description": "User-defined mol type.",
+              "type": "string"
+            },
+            {
+              "description": "Unset (empty string).",
+              "type": "string"
+            }
+          ]
+        },
+        "WorkType": {
+          "description": "WorkType categorizes how work assignment operates for a bead.",
+          "anyOf": [
+            {
+              "description": "One worker, exclusive assignment.",
+              "type": "string",
+              "const": "mutex"
+            },
+            {
+              "description": "Many submit, buyer picks.",
+              "type": "string",
+              "const": "open_competition"
+            },
+            {
+              "description": "User-defined work type.",
+              "type": "string"
+            },
+            {
+              "description": "Unset (empty string). See `MolType::Unset`.",
+              "type": "string"
+            }
+          ]
+        },
+        "WispType": {
+          "description": "WispType categorizes ephemeral wisps for TTL-based compaction.",
+          "anyOf": [
+            {
+              "description": "Default (no specific wisp type).",
+              "type": "string",
+              "const": "none"
+            },
+            {
+              "description": "Liveness pings (TTL: 6h).",
+              "type": "string",
+              "const": "heartbeat"
+            },
+            {
+              "description": "Health check ACKs (TTL: 6h).",
+              "type": "string",
+              "const": "ping"
+            },
+            {
+              "description": "Patrol cycle reports (TTL: 24h).",
+              "type": "string",
+              "const": "patrol"
+            },
+            {
+              "description": "Garbage collection reports (TTL: 24h).",
+              "type": "string",
+              "const": "gc_report"
+            },
+            {
+              "description": "Force-kill, recovery actions (TTL: 7d).",
+              "type": "string",
+              "const": "recovery"
+            },
+            {
+              "description": "Error reports (TTL: 7d).",
+              "type": "string",
+              "const": "error"
+            },
+            {
+              "description": "Human escalations (TTL: 7d).",
+              "type": "string",
+              "const": "escalation"
+            },
+            {
+              "description": "User-defined wisp type.",
+              "type": "string"
+            },
+            {
+              "description": "Unset (empty string).",
+              "type": "string"
+            }
+          ]
+        },
+        "BondRef": {
+          "description": "BondRef tracks compound molecule lineage.\nWhen protos or molecules are bonded together, BondRefs record\nwhich sources were combined and how they were attached.",
+          "type": "object",
+          "properties": {
+            "source_id": {
+              "description": "Source proto or molecule ID.",
+              "type": "string"
+            },
+            "bond_type": {
+              "description": "Type of bond: sequential, parallel, conditional.",
+              "type": "string"
+            },
+            "bond_point": {
+              "description": "Attachment site (issue ID or empty for root).",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "source_id",
+            "bond_type"
           ]
         },
         "Dependency": {
@@ -2113,7 +2812,7 @@
               ]
             },
             "metadata": {
-              "description": "Optional metadata (JSON).",
+              "description": "Optional metadata (JSON).\n\nA degenerate empty (or whitespace-only) string is coerced to `None` on\ndeserialization to tolerate legacy JSONL that wrote `\"metadata\":\"\"`\ninstead of omitting the field. See [`deserialize_optional_metadata`].",
               "type": [
                 "string",
                 "null"
@@ -2138,20 +2837,99 @@
           "description": "Dependency relationship type.",
           "anyOf": [
             {
+              "description": "A blocks B (B cannot proceed until A is closed).",
               "type": "string",
-              "enum": [
-                "blocks",
-                "parent-child",
-                "conditional-blocks",
-                "waits-for",
-                "related",
-                "discovered-from",
-                "replies-to",
-                "relates-to",
-                "duplicates",
-                "supersedes",
-                "caused-by"
-              ]
+              "const": "blocks"
+            },
+            {
+              "description": "A is a parent of B (B cannot be closed until A is closed).",
+              "type": "string",
+              "const": "parent-child"
+            },
+            {
+              "description": "B runs only if A fails.",
+              "type": "string",
+              "const": "conditional-blocks"
+            },
+            {
+              "description": "Fanout gate: wait for dynamic children.",
+              "type": "string",
+              "const": "waits-for"
+            },
+            {
+              "description": "A is related to B (informational).",
+              "type": "string",
+              "const": "related"
+            },
+            {
+              "description": "B was discovered from A (tracing).",
+              "type": "string",
+              "const": "discovered-from"
+            },
+            {
+              "description": "B is a reply to A (conversation threading).",
+              "type": "string",
+              "const": "replies-to"
+            },
+            {
+              "description": "B relates to A (loose knowledge graph edge).",
+              "type": "string",
+              "const": "relates-to"
+            },
+            {
+              "description": "B duplicates A (deduplication link).",
+              "type": "string",
+              "const": "duplicates"
+            },
+            {
+              "description": "B supersedes A (version chain link).",
+              "type": "string",
+              "const": "supersedes"
+            },
+            {
+              "description": "A is authored by B (creator relationship).",
+              "type": "string",
+              "const": "authored-by"
+            },
+            {
+              "description": "A is assigned to B (assignment relationship).",
+              "type": "string",
+              "const": "assigned-to"
+            },
+            {
+              "description": "A is approved by B (approval relationship).",
+              "type": "string",
+              "const": "approved-by"
+            },
+            {
+              "description": "A attests that B has a given skill/attribute.",
+              "type": "string",
+              "const": "attests"
+            },
+            {
+              "description": "A tracks B (convoy → issue tracking, non-blocking).",
+              "type": "string",
+              "const": "tracks"
+            },
+            {
+              "description": "A is active until B closes (e.g., muted until issue resolved).",
+              "type": "string",
+              "const": "until"
+            },
+            {
+              "description": "A is caused by B (triggered by target, audit trail).",
+              "type": "string",
+              "const": "caused-by"
+            },
+            {
+              "description": "A validates B (approval/validation relationship).",
+              "type": "string",
+              "const": "validates"
+            },
+            {
+              "description": "A is delegated from B (work handoff).",
+              "type": "string",
+              "const": "delegated-from"
             },
             {
               "type": "string"
@@ -2339,14 +3117,21 @@
           ]
         },
         "source_repo": {
-          "description": "Source repository for multi-repo support \u2014 basename of the\ncanonicalized parent of `.beads/`. Stable across clones of the\nsame repo on different machines (different absolute paths\nproduce the same basename). See [`canonical_source_repo`] in\n`cli::commands::create`.",
+          "description": "Source repository for multi-repo support — basename of the\ncanonicalized parent of `.beads/`. Stable across clones of the\nsame repo on different machines (different absolute paths\nproduce the same basename). See [`canonical_source_repo`] in\n`cli::commands::create`.",
           "type": [
             "string",
             "null"
           ]
         },
         "source_repo_path": {
-          "description": "Absolute canonical path of the source repository. Distinct from\n`source_repo`: this field uniquely identifies the workspace on\nthe machine that produced the issue, which is what multi-repo\nfleet automation needs to route beads back to the right\ndirectory (see beads_rust#289). Two clones of the same repo\nunder `~/Developer/foo` vs `~/Developer/scratch/foo` collide on\n`source_repo` but disagree here. Optional \u2014 older databases and\nhand-edited JSONL records without this field are valid.",
+          "description": "Absolute canonical path of the source repository. Distinct from\n`source_repo`: this field uniquely identifies the workspace on\nthe machine that produced the issue, which is what multi-repo\nfleet automation needs to route beads back to the right\ndirectory (see beads_rust#289). Two clones of the same repo\nunder `~/Developer/foo` vs `~/Developer/scratch/foo` collide on\n`source_repo` but disagree here. Optional — older databases and\nhand-edited JSONL records without this field are valid.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agent_context": {
+          "description": "Canonical-JSON governing instructions inherited by descendant\nbeads (beads_rust#297). When set on an ancestor and the project\nhas `inherited_context.enabled = true` in `.beads/config.yaml`,\n`br update --status in_progress` / `--claim` and `br show` emit\nthe ancestor's `agent_context` alongside the child's normal\noutput so the working agent sees the constraints regardless of\ncontext compaction or cold-start lookups.\n\nStorage: TEXT column holding a JSON document (typically an\nobject with `skills`, `constraints`, `references`, `workflow`,\n`metadata` fields, but the schema is intentionally open).\n`None` means \"no inherited context\"; emission for descendants\nsilently skips ancestors with `None` (no error, no noise).\n\nNot displayed in `br list` / `br search` — this is per-bead\ngovernance metadata, not browsable content.",
           "type": [
             "string",
             "null"
@@ -2377,19 +3162,6 @@
             "null"
           ]
         },
-        "compacted_at": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "format": "date-time"
-        },
-        "compacted_at_commit": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "sender": {
           "type": [
             "string",
@@ -2399,13 +3171,163 @@
         "ephemeral": {
           "type": "boolean"
         },
+        "no_history": {
+          "type": "boolean"
+        },
         "pinned": {
           "type": "boolean"
         },
         "is_template": {
           "type": "boolean"
         },
+        "mol_type": {
+          "$ref": "#/$defs/MolType",
+          "default": ""
+        },
+        "work_type": {
+          "$ref": "#/$defs/WorkType",
+          "default": ""
+        },
+        "wisp_type": {
+          "$ref": "#/$defs/WispType",
+          "default": ""
+        },
+        "spec_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "points": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
+        },
+        "started_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "metadata": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_formula": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_location": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "await_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "await_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timeout_seconds": {
+          "description": "Gate timeout in seconds.\n\nThe Go `bd` tool serializes this as `\"timeout\"` with nanosecond precision.\nThe `alias` attribute allows br to import bd JSONL with `\"timeout\"` fields.\nExport always uses `\"timeout_seconds\"` (seconds, not nanoseconds).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "holder": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hook_bead": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role_bead": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agent_state": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rig": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "event_kind": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "target": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "payload": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "quality_score": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "crystallizes": {
+          "type": "boolean"
+        },
+        "bonded_from": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/BondRef"
+          }
+        },
         "labels": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "waiters": {
+          "description": "List of issue IDs waiting on this issue (coordination waiters).",
           "type": "array",
           "items": {
             "type": "string"
@@ -2466,6 +3388,11 @@
               ]
             },
             {
+              "description": "Claimed by an agent for exclusive execution (Go parity).\nAgent-claimed issues are excluded from `br ready` and have\nclaim-protection semantics — no other agent may claim them.",
+              "type": "string",
+              "const": "hooked"
+            },
+            {
               "type": "string"
             }
           ]
@@ -2487,12 +3414,149 @@
                 "epic",
                 "chore",
                 "docs",
-                "question"
+                "question",
+                "decision",
+                "message",
+                "molecule",
+                "gate",
+                "spike",
+                "story",
+                "milestone",
+                "event"
               ]
             },
             {
               "type": "string"
             }
+          ]
+        },
+        "MolType": {
+          "description": "MolType categorizes molecule types for swarm coordination.",
+          "anyOf": [
+            {
+              "description": "Regular assigned work.",
+              "type": "string",
+              "const": "work"
+            },
+            {
+              "description": "Swarm molecule: coordinated multi-worker work.",
+              "type": "string",
+              "const": "swarm"
+            },
+            {
+              "description": "Patrol molecule: recurring operational work.",
+              "type": "string",
+              "const": "patrol"
+            },
+            {
+              "description": "User-defined mol type.",
+              "type": "string"
+            },
+            {
+              "description": "Unset (empty string).",
+              "type": "string"
+            }
+          ]
+        },
+        "WorkType": {
+          "description": "WorkType categorizes how work assignment operates for a bead.",
+          "anyOf": [
+            {
+              "description": "One worker, exclusive assignment.",
+              "type": "string",
+              "const": "mutex"
+            },
+            {
+              "description": "Many submit, buyer picks.",
+              "type": "string",
+              "const": "open_competition"
+            },
+            {
+              "description": "User-defined work type.",
+              "type": "string"
+            },
+            {
+              "description": "Unset (empty string). See `MolType::Unset`.",
+              "type": "string"
+            }
+          ]
+        },
+        "WispType": {
+          "description": "WispType categorizes ephemeral wisps for TTL-based compaction.",
+          "anyOf": [
+            {
+              "description": "Default (no specific wisp type).",
+              "type": "string",
+              "const": "none"
+            },
+            {
+              "description": "Liveness pings (TTL: 6h).",
+              "type": "string",
+              "const": "heartbeat"
+            },
+            {
+              "description": "Health check ACKs (TTL: 6h).",
+              "type": "string",
+              "const": "ping"
+            },
+            {
+              "description": "Patrol cycle reports (TTL: 24h).",
+              "type": "string",
+              "const": "patrol"
+            },
+            {
+              "description": "Garbage collection reports (TTL: 24h).",
+              "type": "string",
+              "const": "gc_report"
+            },
+            {
+              "description": "Force-kill, recovery actions (TTL: 7d).",
+              "type": "string",
+              "const": "recovery"
+            },
+            {
+              "description": "Error reports (TTL: 7d).",
+              "type": "string",
+              "const": "error"
+            },
+            {
+              "description": "Human escalations (TTL: 7d).",
+              "type": "string",
+              "const": "escalation"
+            },
+            {
+              "description": "User-defined wisp type.",
+              "type": "string"
+            },
+            {
+              "description": "Unset (empty string).",
+              "type": "string"
+            }
+          ]
+        },
+        "BondRef": {
+          "description": "BondRef tracks compound molecule lineage.\nWhen protos or molecules are bonded together, BondRefs record\nwhich sources were combined and how they were attached.",
+          "type": "object",
+          "properties": {
+            "source_id": {
+              "description": "Source proto or molecule ID.",
+              "type": "string"
+            },
+            "bond_type": {
+              "description": "Type of bond: sequential, parallel, conditional.",
+              "type": "string"
+            },
+            "bond_point": {
+              "description": "Attachment site (issue ID or empty for root).",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "source_id",
+            "bond_type"
           ]
         },
         "Dependency": {
@@ -2524,7 +3588,7 @@
               ]
             },
             "metadata": {
-              "description": "Optional metadata (JSON).",
+              "description": "Optional metadata (JSON).\n\nA degenerate empty (or whitespace-only) string is coerced to `None` on\ndeserialization to tolerate legacy JSONL that wrote `\"metadata\":\"\"`\ninstead of omitting the field. See [`deserialize_optional_metadata`].",
               "type": [
                 "string",
                 "null"
@@ -2549,20 +3613,99 @@
           "description": "Dependency relationship type.",
           "anyOf": [
             {
+              "description": "A blocks B (B cannot proceed until A is closed).",
               "type": "string",
-              "enum": [
-                "blocks",
-                "parent-child",
-                "conditional-blocks",
-                "waits-for",
-                "related",
-                "discovered-from",
-                "replies-to",
-                "relates-to",
-                "duplicates",
-                "supersedes",
-                "caused-by"
-              ]
+              "const": "blocks"
+            },
+            {
+              "description": "A is a parent of B (B cannot be closed until A is closed).",
+              "type": "string",
+              "const": "parent-child"
+            },
+            {
+              "description": "B runs only if A fails.",
+              "type": "string",
+              "const": "conditional-blocks"
+            },
+            {
+              "description": "Fanout gate: wait for dynamic children.",
+              "type": "string",
+              "const": "waits-for"
+            },
+            {
+              "description": "A is related to B (informational).",
+              "type": "string",
+              "const": "related"
+            },
+            {
+              "description": "B was discovered from A (tracing).",
+              "type": "string",
+              "const": "discovered-from"
+            },
+            {
+              "description": "B is a reply to A (conversation threading).",
+              "type": "string",
+              "const": "replies-to"
+            },
+            {
+              "description": "B relates to A (loose knowledge graph edge).",
+              "type": "string",
+              "const": "relates-to"
+            },
+            {
+              "description": "B duplicates A (deduplication link).",
+              "type": "string",
+              "const": "duplicates"
+            },
+            {
+              "description": "B supersedes A (version chain link).",
+              "type": "string",
+              "const": "supersedes"
+            },
+            {
+              "description": "A is authored by B (creator relationship).",
+              "type": "string",
+              "const": "authored-by"
+            },
+            {
+              "description": "A is assigned to B (assignment relationship).",
+              "type": "string",
+              "const": "assigned-to"
+            },
+            {
+              "description": "A is approved by B (approval relationship).",
+              "type": "string",
+              "const": "approved-by"
+            },
+            {
+              "description": "A attests that B has a given skill/attribute.",
+              "type": "string",
+              "const": "attests"
+            },
+            {
+              "description": "A tracks B (convoy → issue tracking, non-blocking).",
+              "type": "string",
+              "const": "tracks"
+            },
+            {
+              "description": "A is active until B closes (e.g., muted until issue resolved).",
+              "type": "string",
+              "const": "until"
+            },
+            {
+              "description": "A is caused by B (triggered by target, audit trail).",
+              "type": "string",
+              "const": "caused-by"
+            },
+            {
+              "description": "A validates B (approval/validation relationship).",
+              "type": "string",
+              "const": "validates"
+            },
+            {
+              "description": "A is delegated from B (work handoff).",
+              "type": "string",
+              "const": "delegated-from"
             },
             {
               "type": "string"
@@ -2664,6 +3807,27 @@
             "created_at": {
               "type": "string",
               "format": "date-time"
+            },
+            "agent_name": {
+              "description": "Tier 1 attribution: self-reported agent name (issue #312, Layer 3\ncapture-only). Recorded as an audit trail; never gated/enforced on.\n`None` when the mutating command supplied no attribution.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "harness": {
+              "description": "Tier 1 attribution: self-reported harness identifier (capture-only).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "model": {
+              "description": "Tier 1 attribution: self-reported model identifier (capture-only).",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [
@@ -2828,14 +3992,21 @@
           ]
         },
         "source_repo": {
-          "description": "Source repository for multi-repo support \u2014 basename of the\ncanonicalized parent of `.beads/`. Stable across clones of the\nsame repo on different machines (different absolute paths\nproduce the same basename). See [`canonical_source_repo`] in\n`cli::commands::create`.",
+          "description": "Source repository for multi-repo support — basename of the\ncanonicalized parent of `.beads/`. Stable across clones of the\nsame repo on different machines (different absolute paths\nproduce the same basename). See [`canonical_source_repo`] in\n`cli::commands::create`.",
           "type": [
             "string",
             "null"
           ]
         },
         "source_repo_path": {
-          "description": "Absolute canonical path of the source repository. Distinct from\n`source_repo`: this field uniquely identifies the workspace on\nthe machine that produced the issue, which is what multi-repo\nfleet automation needs to route beads back to the right\ndirectory (see beads_rust#289). Two clones of the same repo\nunder `~/Developer/foo` vs `~/Developer/scratch/foo` collide on\n`source_repo` but disagree here. Optional \u2014 older databases and\nhand-edited JSONL records without this field are valid.",
+          "description": "Absolute canonical path of the source repository. Distinct from\n`source_repo`: this field uniquely identifies the workspace on\nthe machine that produced the issue, which is what multi-repo\nfleet automation needs to route beads back to the right\ndirectory (see beads_rust#289). Two clones of the same repo\nunder `~/Developer/foo` vs `~/Developer/scratch/foo` collide on\n`source_repo` but disagree here. Optional — older databases and\nhand-edited JSONL records without this field are valid.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agent_context": {
+          "description": "Canonical-JSON governing instructions inherited by descendant\nbeads (beads_rust#297). When set on an ancestor and the project\nhas `inherited_context.enabled = true` in `.beads/config.yaml`,\n`br update --status in_progress` / `--claim` and `br show` emit\nthe ancestor's `agent_context` alongside the child's normal\noutput so the working agent sees the constraints regardless of\ncontext compaction or cold-start lookups.\n\nStorage: TEXT column holding a JSON document (typically an\nobject with `skills`, `constraints`, `references`, `workflow`,\n`metadata` fields, but the schema is intentionally open).\n`None` means \"no inherited context\"; emission for descendants\nsilently skips ancestors with `None` (no error, no noise).\n\nNot displayed in `br list` / `br search` — this is per-bead\ngovernance metadata, not browsable content.",
           "type": [
             "string",
             "null"
@@ -2866,19 +4037,6 @@
             "null"
           ]
         },
-        "compacted_at": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "format": "date-time"
-        },
-        "compacted_at_commit": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "sender": {
           "type": [
             "string",
@@ -2888,13 +4046,163 @@
         "ephemeral": {
           "type": "boolean"
         },
+        "no_history": {
+          "type": "boolean"
+        },
         "pinned": {
           "type": "boolean"
         },
         "is_template": {
           "type": "boolean"
         },
+        "mol_type": {
+          "$ref": "#/$defs/MolType",
+          "default": ""
+        },
+        "work_type": {
+          "$ref": "#/$defs/WorkType",
+          "default": ""
+        },
+        "wisp_type": {
+          "$ref": "#/$defs/WispType",
+          "default": ""
+        },
+        "spec_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "points": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
+        },
+        "started_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "metadata": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_formula": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_location": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "await_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "await_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timeout_seconds": {
+          "description": "Gate timeout in seconds.\n\nThe Go `bd` tool serializes this as `\"timeout\"` with nanosecond precision.\nThe `alias` attribute allows br to import bd JSONL with `\"timeout\"` fields.\nExport always uses `\"timeout_seconds\"` (seconds, not nanoseconds).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "holder": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hook_bead": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role_bead": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agent_state": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rig": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "event_kind": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "target": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "payload": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "quality_score": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "crystallizes": {
+          "type": "boolean"
+        },
+        "bonded_from": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/BondRef"
+          }
+        },
         "labels": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "waiters": {
+          "description": "List of issue IDs waiting on this issue (coordination waiters).",
           "type": "array",
           "items": {
             "type": "string"
@@ -2949,6 +4257,11 @@
               ]
             },
             {
+              "description": "Claimed by an agent for exclusive execution (Go parity).\nAgent-claimed issues are excluded from `br ready` and have\nclaim-protection semantics — no other agent may claim them.",
+              "type": "string",
+              "const": "hooked"
+            },
+            {
               "type": "string"
             }
           ]
@@ -2970,12 +4283,149 @@
                 "epic",
                 "chore",
                 "docs",
-                "question"
+                "question",
+                "decision",
+                "message",
+                "molecule",
+                "gate",
+                "spike",
+                "story",
+                "milestone",
+                "event"
               ]
             },
             {
               "type": "string"
             }
+          ]
+        },
+        "MolType": {
+          "description": "MolType categorizes molecule types for swarm coordination.",
+          "anyOf": [
+            {
+              "description": "Regular assigned work.",
+              "type": "string",
+              "const": "work"
+            },
+            {
+              "description": "Swarm molecule: coordinated multi-worker work.",
+              "type": "string",
+              "const": "swarm"
+            },
+            {
+              "description": "Patrol molecule: recurring operational work.",
+              "type": "string",
+              "const": "patrol"
+            },
+            {
+              "description": "User-defined mol type.",
+              "type": "string"
+            },
+            {
+              "description": "Unset (empty string).",
+              "type": "string"
+            }
+          ]
+        },
+        "WorkType": {
+          "description": "WorkType categorizes how work assignment operates for a bead.",
+          "anyOf": [
+            {
+              "description": "One worker, exclusive assignment.",
+              "type": "string",
+              "const": "mutex"
+            },
+            {
+              "description": "Many submit, buyer picks.",
+              "type": "string",
+              "const": "open_competition"
+            },
+            {
+              "description": "User-defined work type.",
+              "type": "string"
+            },
+            {
+              "description": "Unset (empty string). See `MolType::Unset`.",
+              "type": "string"
+            }
+          ]
+        },
+        "WispType": {
+          "description": "WispType categorizes ephemeral wisps for TTL-based compaction.",
+          "anyOf": [
+            {
+              "description": "Default (no specific wisp type).",
+              "type": "string",
+              "const": "none"
+            },
+            {
+              "description": "Liveness pings (TTL: 6h).",
+              "type": "string",
+              "const": "heartbeat"
+            },
+            {
+              "description": "Health check ACKs (TTL: 6h).",
+              "type": "string",
+              "const": "ping"
+            },
+            {
+              "description": "Patrol cycle reports (TTL: 24h).",
+              "type": "string",
+              "const": "patrol"
+            },
+            {
+              "description": "Garbage collection reports (TTL: 24h).",
+              "type": "string",
+              "const": "gc_report"
+            },
+            {
+              "description": "Force-kill, recovery actions (TTL: 7d).",
+              "type": "string",
+              "const": "recovery"
+            },
+            {
+              "description": "Error reports (TTL: 7d).",
+              "type": "string",
+              "const": "error"
+            },
+            {
+              "description": "Human escalations (TTL: 7d).",
+              "type": "string",
+              "const": "escalation"
+            },
+            {
+              "description": "User-defined wisp type.",
+              "type": "string"
+            },
+            {
+              "description": "Unset (empty string).",
+              "type": "string"
+            }
+          ]
+        },
+        "BondRef": {
+          "description": "BondRef tracks compound molecule lineage.\nWhen protos or molecules are bonded together, BondRefs record\nwhich sources were combined and how they were attached.",
+          "type": "object",
+          "properties": {
+            "source_id": {
+              "description": "Source proto or molecule ID.",
+              "type": "string"
+            },
+            "bond_type": {
+              "description": "Type of bond: sequential, parallel, conditional.",
+              "type": "string"
+            },
+            "bond_point": {
+              "description": "Attachment site (issue ID or empty for root).",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "source_id",
+            "bond_type"
           ]
         },
         "Dependency": {
@@ -3007,7 +4457,7 @@
               ]
             },
             "metadata": {
-              "description": "Optional metadata (JSON).",
+              "description": "Optional metadata (JSON).\n\nA degenerate empty (or whitespace-only) string is coerced to `None` on\ndeserialization to tolerate legacy JSONL that wrote `\"metadata\":\"\"`\ninstead of omitting the field. See [`deserialize_optional_metadata`].",
               "type": [
                 "string",
                 "null"
@@ -3032,20 +4482,99 @@
           "description": "Dependency relationship type.",
           "anyOf": [
             {
+              "description": "A blocks B (B cannot proceed until A is closed).",
               "type": "string",
-              "enum": [
-                "blocks",
-                "parent-child",
-                "conditional-blocks",
-                "waits-for",
-                "related",
-                "discovered-from",
-                "replies-to",
-                "relates-to",
-                "duplicates",
-                "supersedes",
-                "caused-by"
-              ]
+              "const": "blocks"
+            },
+            {
+              "description": "A is a parent of B (B cannot be closed until A is closed).",
+              "type": "string",
+              "const": "parent-child"
+            },
+            {
+              "description": "B runs only if A fails.",
+              "type": "string",
+              "const": "conditional-blocks"
+            },
+            {
+              "description": "Fanout gate: wait for dynamic children.",
+              "type": "string",
+              "const": "waits-for"
+            },
+            {
+              "description": "A is related to B (informational).",
+              "type": "string",
+              "const": "related"
+            },
+            {
+              "description": "B was discovered from A (tracing).",
+              "type": "string",
+              "const": "discovered-from"
+            },
+            {
+              "description": "B is a reply to A (conversation threading).",
+              "type": "string",
+              "const": "replies-to"
+            },
+            {
+              "description": "B relates to A (loose knowledge graph edge).",
+              "type": "string",
+              "const": "relates-to"
+            },
+            {
+              "description": "B duplicates A (deduplication link).",
+              "type": "string",
+              "const": "duplicates"
+            },
+            {
+              "description": "B supersedes A (version chain link).",
+              "type": "string",
+              "const": "supersedes"
+            },
+            {
+              "description": "A is authored by B (creator relationship).",
+              "type": "string",
+              "const": "authored-by"
+            },
+            {
+              "description": "A is assigned to B (assignment relationship).",
+              "type": "string",
+              "const": "assigned-to"
+            },
+            {
+              "description": "A is approved by B (approval relationship).",
+              "type": "string",
+              "const": "approved-by"
+            },
+            {
+              "description": "A attests that B has a given skill/attribute.",
+              "type": "string",
+              "const": "attests"
+            },
+            {
+              "description": "A tracks B (convoy → issue tracking, non-blocking).",
+              "type": "string",
+              "const": "tracks"
+            },
+            {
+              "description": "A is active until B closes (e.g., muted until issue resolved).",
+              "type": "string",
+              "const": "until"
+            },
+            {
+              "description": "A is caused by B (triggered by target, audit trail).",
+              "type": "string",
+              "const": "caused-by"
+            },
+            {
+              "description": "A validates B (approval/validation relationship).",
+              "type": "string",
+              "const": "validates"
+            },
+            {
+              "description": "A is delegated from B (work handoff).",
+              "type": "string",
+              "const": "delegated-from"
             },
             {
               "type": "string"
@@ -3131,6 +4660,13 @@
         "issue_type": {
           "$ref": "#/$defs/IssueType"
         },
+        "labels": {
+          "description": "Labels attached to the issue.\n\nAlways emitted (as `[]` when empty) so downstream consumers can filter\n`br ready --json` output on labels the same way they filter\n`br list --json` (#309).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "notes": {
           "type": [
             "string",
@@ -3161,6 +4697,7 @@
         "created_at",
         "id",
         "issue_type",
+        "labels",
         "priority",
         "status",
         "title",
@@ -3179,7 +4716,15 @@
                 "epic",
                 "chore",
                 "docs",
-                "question"
+                "question",
+                "decision",
+                "message",
+                "molecule",
+                "gate",
+                "spike",
+                "story",
+                "milestone",
+                "event"
               ]
             },
             {
@@ -3207,6 +4752,11 @@
                 "tombstone",
                 "pinned"
               ]
+            },
+            {
+              "description": "Claimed by an agent for exclusive execution (Go parity).\nAgent-claimed issues are excluded from `br ready` and have\nclaim-protection semantics — no other agent may claim them.",
+              "type": "string",
+              "const": "hooked"
             },
             {
               "type": "string"
@@ -3273,7 +4823,15 @@
                 "epic",
                 "chore",
                 "docs",
-                "question"
+                "question",
+                "decision",
+                "message",
+                "molecule",
+                "gate",
+                "spike",
+                "story",
+                "milestone",
+                "event"
               ]
             },
             {
@@ -3301,6 +4859,11 @@
                 "tombstone",
                 "pinned"
               ]
+            },
+            {
+              "description": "Claimed by an agent for exclusive execution (Go parity).\nAgent-claimed issues are excluded from `br ready` and have\nclaim-protection semantics — no other agent may claim them.",
+              "type": "string",
+              "const": "hooked"
             },
             {
               "type": "string"
@@ -3594,7 +5157,15 @@
       "shape": "object",
       "jq_filter": ".count",
       "error_envelope_on_stderr": false,
-      "notes": "Scalar count under `.count`."
+      "notes": "Ungrouped `br count --json`; scalar count under `.count`. Grouped variants use the `count --by` entry."
+    },
+    "count --by": {
+      "shape": "object",
+      "jq_filter": ".groups[]",
+      "items_at": ".groups",
+      "item_schema": "CountGroup",
+      "error_envelope_on_stderr": false,
+      "notes": "For `br count --by <status|priority|type|assignee|label> --json`. The wrapper object also includes `total`."
     },
     "dep list": {
       "shape": "array",
@@ -3677,7 +5248,7 @@
       "jq_filter": ".",
       "item_schema": "Statistics",
       "error_envelope_on_stderr": false,
-      "notes": "Alias for `stats` \u2014 identical envelope."
+      "notes": "Alias for `stats` — identical envelope."
     }
   }
 }

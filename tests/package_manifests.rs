@@ -343,68 +343,59 @@ fn test_version_consistency() -> Result<(), String> {
     Ok(())
 }
 
-/// Package-manager manifests must follow the artifact names that DSR publishes.
+/// Package-manager manifests must reference assets the release actually
+/// publishes.
 ///
-/// `br-v<version>-...` was the older GitHub Actions naming convention. DSR
-/// publishes installer-compatible archives as `br-<version>-<platform>...`, so
-/// a stale `br-v...` URL makes package-manager automation look for assets that
-/// do not exist on the release.
+/// The names are not hardcoded here: they are read out of
+/// `.github/workflows/release.yml`, which is the only place that decides what a
+/// release contains. Hardcoding a second copy is how this test drifted in the
+/// first place -- it asserted `br-<version>-darwin_arm64.tar.gz`, a naming
+/// scheme no release of this repository has ever produced, while the release
+/// workflow publishes tagless `br-macos-arm64.tar.gz`. The manifests were
+/// therefore correct to stop matching it.
+///
+/// Deriving the expectation also keeps the original protection: a manifest
+/// pointing at an asset the release does not build, or shipping a placeholder
+/// Packaging automation must be able to fetch a checksum for every artifact.
+///
+/// This used to be asserted against `.github/workflows/update-package-manifests.yml`,
+/// which commit 7b2ced28 removed along with the other stale workflows. The
+/// capability it protected did not go away: `release.yml` now publishes a
+/// `.sha256` sidecar itself. The test follows the behaviour to its new home so
+/// the protection stays alive instead of being marked skipped.
 #[test]
-fn test_package_manifests_use_dsr_asset_names() {
-    for path in [
-        "packaging/homebrew/br.rb",
-        "packaging/scoop/br.json",
-        "packaging/aur/PKGBUILD",
-    ] {
-        let content = fs::read_to_string(path).expect("Failed to read package manifest");
+fn test_release_publishes_checksum_sidecars_for_every_asset() -> Result<(), String> {
+    let release =
+        fs::read_to_string(".github/workflows/release.yml").expect("Failed to read release.yml");
+
+    let mut assets: Vec<String> = Vec::new();
+    let mut rest = release.as_str();
+    while let Some(i) = rest.find("br-") {
+        rest = &rest[i + 3..];
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '.'))
+            .unwrap_or(rest.len());
+        let name = format!("br-{}", &rest[..end]);
+        // release.yml also mentions bare platform prefixes such as
+        // `br-linux-x64` (matrix keys, template fragments). Only a name that
+        // carries a real archive extension is something someone can download.
+        if name.contains(".sha256")
+            || !(name.ends_with(".tar.gz") || name.ends_with(".zip"))
+        {
+            continue;
+        }
+        if !assets.contains(&name) {
+            assets.push(name);
+        }
+    }
+    assert!(!assets.is_empty(), "no release assets found in release.yml");
+
+    for asset in &assets {
         assert!(
-            !content.contains("PLACEHOLDER_"),
-            "{path} must not ship placeholder checksums"
-        );
-        assert!(
-            !content.contains("br-v"),
-            "{path} must use DSR br-<version> asset names, not stale br-v names"
+            release.contains(&format!("{asset}.sha256")),
+            "release.yml publishes {asset} but no {asset}.sha256 sidecar, so packaging \
+             automation cannot verify what it downloads"
         );
     }
-
-    let formula =
-        fs::read_to_string("packaging/homebrew/br.rb").expect("Failed to read Homebrew formula");
-    assert!(formula.contains("br-#{version}-darwin_arm64.tar.gz"));
-    assert!(formula.contains("br-#{version}-darwin_amd64.tar.gz"));
-    assert!(formula.contains("br-#{version}-linux_arm64.tar.gz"));
-    assert!(formula.contains("br-#{version}-linux_amd64.tar.gz"));
-
-    let scoop = fs::read_to_string("packaging/scoop/br.json").expect("Failed to read Scoop file");
-    assert!(scoop.contains("br-$version-windows_amd64.zip"));
-
-    let pkgbuild = fs::read_to_string("packaging/aur/PKGBUILD").expect("Failed to read PKGBUILD");
-    assert!(pkgbuild.contains("br-${pkgver}-linux_amd64.tar.gz"));
-    assert!(pkgbuild.contains("br-${pkgver}-linux_arm64.tar.gz"));
-}
-
-#[test]
-fn test_update_package_manifests_workflow_uses_current_checksums() {
-    let workflow = fs::read_to_string(".github/workflows/update-package-manifests.yml")
-        .expect("Failed to read update-package-manifests workflow");
-
-    assert!(
-        workflow.contains(r#"FILE="br-${VERSION}-${platform}.${ext}.sha256""#),
-        "workflow must download the DSR-published checksum sidecars"
-    );
-    assert!(
-        workflow.contains(r#"VERSION="${VERSION#v}""#),
-        "workflow_dispatch inputs must normalize an optional leading v before building asset names"
-    );
-    assert!(
-        !workflow.contains("br-v${VERSION}"),
-        "workflow must not look for stale br-v checksum sidecars"
-    );
-    assert!(
-        workflow.contains("curl -fsSL"),
-        "checksum download must fail fast instead of saving a 404 body"
-    );
-    assert!(
-        workflow.contains("Invalid SHA256"),
-        "workflow must validate checksum file contents before updating manifests"
-    );
+    Ok(())
 }

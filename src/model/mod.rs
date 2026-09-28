@@ -555,7 +555,6 @@ impl JsonSchema for EventType {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WispType {
-    #[default]
     /// Default (no specific wisp type).
     None,
     /// Liveness pings (TTL: 6h).
@@ -575,6 +574,17 @@ pub enum WispType {
     /// User-defined wisp type.
     #[serde(untagged)]
     Custom(String),
+    // Unset matches Go `bd`, whose WispType zero value is the empty string.
+    // `bd` defines no "none" constant, so writing one here would put a value in
+    // the JSONL that the other tool cannot produce. See `MolType::Unset`.
+    //
+    // The doc comment stays one line on purpose: it is copied verbatim into the
+    // generated JSON Schema, which agents consume.
+    /// Unset (empty string).
+    #[default]
+    #[serde(untagged, serialize_with = "serialize_unset_as_empty")]
+    #[schemars(with = "String")]
+    Unset,
 }
 
 impl WispType {
@@ -590,6 +600,7 @@ impl WispType {
             Self::Error => "error",
             Self::Escalation => "escalation",
             Self::Custom(value) => value,
+            Self::Unset => "",
         }
     }
 
@@ -605,6 +616,7 @@ impl WispType {
                 | Self::Recovery
                 | Self::Error
                 | Self::Escalation
+                | Self::Unset
         )
     }
 }
@@ -619,8 +631,7 @@ impl fmt::Display for WispType {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MolType {
-    #[default]
-    /// Regular assigned work (default).
+    /// Regular assigned work.
     Work,
     /// Swarm molecule: coordinated multi-worker work.
     Swarm,
@@ -629,6 +640,29 @@ pub enum MolType {
     /// User-defined mol type.
     #[serde(untagged)]
     Custom(String),
+    // The empty variant IS the default. Go `bd` leaves `MolType` unset unless
+    // `--mol-type` is passed, so its zero value is the empty string, and
+    // `ComputeContentHash` hashes whatever the field holds. Defaulting to
+    // `Work` here made every issue hash differently from Go, which is the whole
+    // thing the content hash exists to guarantee across the two tools.
+    //
+    // The doc comment stays one line on purpose: it is copied verbatim into the
+    // generated JSON Schema, which agents consume.
+    /// Unset (empty string).
+    #[default]
+    #[serde(untagged, serialize_with = "serialize_unset_as_empty")]
+    #[schemars(with = "String")]
+    Unset,
+}
+
+/// Serialize the unset variant as `""` rather than `null`.
+///
+/// An untagged unit variant would otherwise encode as JSON `null`, which is a
+/// different shape from the `""` that `as_str` returns and from what the JSONL
+/// exporter writes. `bd` declares these fields as Go string types, so `""` is
+/// the value it both writes and expects to read back.
+fn serialize_unset_as_empty<S: serde::Serializer>(serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str("")
 }
 
 impl MolType {
@@ -639,12 +673,16 @@ impl MolType {
             Self::Swarm => "swarm",
             Self::Patrol => "patrol",
             Self::Custom(value) => value,
+            // Go's zero value. The content hash depends on this being the empty
+            // string and not the named default, so it is not spelled "work".
+            Self::Unset => "",
         }
     }
 
     #[must_use]
+    /// `Unset` is valid: it is what an issue without `--mol-type` carries.
     pub fn is_valid(&self) -> bool {
-        matches!(self, Self::Work | Self::Swarm | Self::Patrol)
+        matches!(self, Self::Work | Self::Swarm | Self::Patrol | Self::Unset)
     }
 }
 
@@ -659,6 +697,7 @@ impl std::str::FromStr for MolType {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
+            "" => Ok(Self::Unset),
             "work" => Ok(Self::Work),
             "swarm" => Ok(Self::Swarm),
             "patrol" => Ok(Self::Patrol),
@@ -671,14 +710,18 @@ impl std::str::FromStr for MolType {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkType {
-    #[default]
-    /// One worker, exclusive assignment (default).
+    /// One worker, exclusive assignment.
     Mutex,
     /// Many submit, buyer picks.
     OpenCompetition,
     /// User-defined work type.
     #[serde(untagged)]
     Custom(String),
+    /// Unset (empty string). See `MolType::Unset`.
+    #[default]
+    #[serde(untagged, serialize_with = "serialize_unset_as_empty")]
+    #[schemars(with = "String")]
+    Unset,
 }
 
 impl WorkType {
@@ -688,6 +731,8 @@ impl WorkType {
             Self::Mutex => "mutex",
             Self::OpenCompetition => "open_competition",
             Self::Custom(value) => value,
+            // Go's zero value; see `MolType::Unset`.
+            Self::Unset => "",
         }
     }
 

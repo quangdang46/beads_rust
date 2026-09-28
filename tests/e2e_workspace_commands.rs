@@ -6,7 +6,7 @@
 mod common;
 
 use common::cli::{BrWorkspace, extract_json_payload, parse_list_issues, run_br, run_br_with_env};
-use fsqlite::Connection;
+use rusqlite::Connection;
 use serde_json::Value;
 use std::fs;
 
@@ -362,7 +362,19 @@ fn e2e_doctor_healthy_workspace() {
     assert!(init.status.success(), "init failed: {}", init.stderr);
 
     // Run doctor on healthy workspace
-    let doctor = run_br(&workspace, ["doctor"], "doctor");
+    // `doctor` warns (and exits non-zero) when more than one `br` is on $PATH,
+    // and it treats a debug-level RUST_LOG as unhealthy -- the e2e harness
+    // sets the latter for every run. Pin both so the assertion is about the
+    // workspace, not about the host.
+    let doctor = run_br_with_env(
+        &workspace,
+        ["doctor"],
+        [
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+            ("RUST_LOG".to_string(), "error".to_string()),
+        ],
+        "doctor",
+    );
     assert!(
         doctor.status.success(),
         "doctor failed on healthy workspace: {}",
@@ -398,8 +410,18 @@ fn e2e_doctor_json_output() {
     let init = run_br(&workspace, ["init"], "init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
 
-    // Doctor with --json
-    let doctor = run_br(&workspace, ["doctor", "--json"], "doctor_json");
+    // Doctor with --json. Same hermetic env as e2e_doctor_healthy_workspace:
+    // br_path_dupes and the debug RUST_LOG both make doctor exit non-zero and
+    // neither has anything to do with the workspace under test.
+    let doctor = run_br_with_env(
+        &workspace,
+        ["doctor", "--json"],
+        [
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+            ("RUST_LOG".to_string(), "error".to_string()),
+        ],
+        "doctor_json",
+    );
     assert!(
         doctor.status.success(),
         "doctor --json failed: {}",
@@ -442,7 +464,16 @@ fn e2e_doctor_detects_issues() {
     // This may fail, which is expected
 
     // Run doctor
-    let doctor = run_br(&workspace, ["doctor"], "doctor_check");
+    // Hermetic env for the same reason as e2e_doctor_healthy_workspace.
+    let doctor = run_br_with_env(
+        &workspace,
+        ["doctor"],
+        [
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+            ("RUST_LOG".to_string(), "error".to_string()),
+        ],
+        "doctor_check",
+    );
     assert!(doctor.status.success(), "doctor failed: {}", doctor.stderr);
 }
 
@@ -465,10 +496,10 @@ fn e2e_doctor_repair_json_rebuilds_and_returns_single_payload() {
         "issues.jsonl should exist before repair test"
     );
 
-    let conn = Connection::open(db_path.to_string_lossy().into_owned()).expect("open beads db");
-    conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-a')")
+    let conn = Connection::open(db_path.to_string_lossy().as_ref()).expect("open beads db");
+    conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-a')", [])
         .expect("insert duplicate config row a");
-    conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-b')")
+    conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-b')", [])
         .expect("insert duplicate config row b");
 
     let pre_repair = run_br(&workspace, ["doctor", "--json"], "doctor_pre_repair_json");
@@ -574,11 +605,11 @@ fn e2e_startup_auto_recovery_preserves_unflushed_tombstones() {
     // the next `br` invocation tries to reopen the DB.
     let db_path = workspace.root.join(".beads").join("beads.db");
     {
-        let conn = Connection::open(db_path.to_string_lossy().into_owned())
+        let conn = Connection::open(db_path.to_string_lossy().as_ref())
             .expect("open beads db for anomaly injection");
-        conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-a')")
+        conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-a')", [])
             .expect("insert duplicate config row a");
-        conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-b')")
+        conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-b')", [])
             .expect("insert duplicate config row b");
     }
 
@@ -671,11 +702,11 @@ fn e2e_doctor_repair_preserves_unflushed_tombstones() {
     // fall-through to the JSONL rebuild path.
     let db_path = workspace.root.join(".beads").join("beads.db");
     {
-        let conn = Connection::open(db_path.to_string_lossy().into_owned())
+        let conn = Connection::open(db_path.to_string_lossy().as_ref())
             .expect("open beads db for anomaly injection");
-        conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-a')")
+        conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-a')", [])
             .expect("insert duplicate config row a");
-        conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-b')")
+        conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-b')", [])
             .expect("insert duplicate config row b");
     }
 
@@ -1310,8 +1341,18 @@ fn e2e_full_workspace_lifecycle() {
     let info = run_br(&workspace, ["info"], "info");
     assert!(info.status.success());
 
-    // 6. Doctor should pass
-    let doctor = run_br(&workspace, ["doctor"], "doctor");
+    // 6. Doctor should pass. Hermetic env for the same reason as
+    // e2e_doctor_healthy_workspace: br_path_dupes and the debug RUST_LOG would
+    // otherwise fail it for reasons unrelated to this workspace.
+    let doctor = run_br_with_env(
+        &workspace,
+        ["doctor"],
+        [
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+            ("RUST_LOG".to_string(), "error".to_string()),
+        ],
+        "doctor",
+    );
     assert!(doctor.status.success());
 
     // 7. Config should be accessible

@@ -4,7 +4,8 @@
 #
 # This is the *expected* default state for frankensqlite (which uses WAL but
 # eagerly removes SHM at session end), and the doctor reports it as
-# severity=warn rather than error: "expected for frankensqlite". We exercise
+# severity=warn rather than error: an orphaned WAL just means no connection is
+# open. We exercise
 # the BENIGN-warn detection path; `--repair` is a no-op for this variant
 # because removing the WAL would discard committed-but-not-checkpointed data.
 

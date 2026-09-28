@@ -12,4 +12,7 @@ expression: normalized
     created_by: fixture
     updated_at: "2026-02-02T00:00:00Z"
     source_repo: .
+    mol_type: ""
+    work_type: ""
+    wisp_type: ""
     labels[2]: agent,ops

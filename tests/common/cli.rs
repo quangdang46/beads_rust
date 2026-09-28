@@ -26,6 +26,11 @@ fn should_clear_inherited_br_env(key: &OsStr) -> bool {
                 | "TOON_DEFAULT_FORMAT"
                 | "TOON_STATS"
         )
+        // `br` falls back to USER/LOGNAME/USERNAME when attributing an action,
+        // so leaving them inherited makes recorded authors depend on the host
+        // account name and breaks any golden that renders one. Tests that want
+        // a specific author pass BD_ACTOR instead.
+        || matches!(key.as_ref(), "USER" | "LOGNAME" | "USERNAME")
 }
 
 fn should_preserve_smoke_env(key: &OsStr) -> bool {
@@ -193,9 +198,13 @@ where
     // mutation. Set before caller `env_vars` so a test can override this to
     // exercise the #313 snapshot throttle.
     cmd.env("BR_HISTORY_MIN_INTERVAL_SECS", "0");
+    // Same rule as above: the harness default goes in before `env_vars` so a
+    // test can override it. `br doctor` treats a debug-level RUST_LOG as a
+    // warning and exits non-zero, so `e2e_doctor_json` has to be able to ask
+    // for a quiet level.
+    cmd.env("RUST_LOG", "beads_rust=debug");
     cmd.envs(env_vars);
     cmd.env("NO_COLOR", "1");
-    cmd.env("RUST_LOG", "beads_rust=debug");
     cmd.env("RUST_BACKTRACE", "1");
     cmd.env("HOME", root);
 

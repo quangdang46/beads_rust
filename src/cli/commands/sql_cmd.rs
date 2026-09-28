@@ -5,10 +5,10 @@
 
 use crate::cli::{OutputFormatBasic, SqlArgs};
 use crate::config;
+use crate::storage::db::SqlValue;
 use crate::error::Result;
 use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
-use fsqlite_types::SqliteValue;
 use serde_json::Value as JsonValue;
 use std::borrow::Cow;
 
@@ -60,12 +60,15 @@ fn execute_inner(args: &SqlArgs, ctx: &OutputContext, storage: &SqliteStorage) -
 }
 
 /// Convert query results into a JSON array of column-keyed objects.
-fn rows_to_json(column_names: &[String], rows: &[Vec<SqliteValue>]) -> Vec<JsonValue> {
+fn rows_to_json(column_names: &[String], rows: &[Vec<SqlValue>]) -> Vec<JsonValue> {
     rows.iter()
         .map(|row| {
             let mut obj = serde_json::Map::with_capacity(column_names.len());
             for (i, col) in column_names.iter().enumerate() {
-                let val = row.get(i).map_or(JsonValue::Null, sqlite_value_to_json);
+                let val = match row.get(i) {
+                    Some(v) => sqlite_value_to_json(v),
+                    None => JsonValue::Null,
+                };
                 obj.insert(col.clone(), val);
             }
             JsonValue::Object(obj)
@@ -73,17 +76,17 @@ fn rows_to_json(column_names: &[String], rows: &[Vec<SqliteValue>]) -> Vec<JsonV
         .collect()
 }
 
-/// Convert a single [`SqliteValue`] to a [`serde_json::Value`].
-fn sqlite_value_to_json(val: &SqliteValue) -> JsonValue {
-    match val {
-        SqliteValue::Null => JsonValue::Null,
-        SqliteValue::Integer(n) => JsonValue::Number(serde_json::Number::from(*n)),
-        SqliteValue::Float(f) => {
+/// Convert a single stored value to a [`serde_json::Value`].
+fn sqlite_value_to_json(val: &SqlValue) -> JsonValue {
+    match val.value() {
+        rusqlite::types::Value::Null => JsonValue::Null,
+        rusqlite::types::Value::Integer(n) => JsonValue::Number(serde_json::Number::from(*n)),
+        rusqlite::types::Value::Real(f) => {
             // serde_json does not have f64 as a Number; use json! macro
             serde_json::json!(f)
         }
-        SqliteValue::Text(s) => JsonValue::String(s.to_string()),
-        SqliteValue::Blob(bytes) => {
+        rusqlite::types::Value::Text(s) => JsonValue::String(s.to_string()),
+        rusqlite::types::Value::Blob(bytes) => {
             // Blobs are hex-encoded for JSON compatibility.
             let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
             JsonValue::String(format!("\\x{hex}"))
@@ -92,7 +95,7 @@ fn sqlite_value_to_json(val: &SqliteValue) -> JsonValue {
 }
 
 /// Print a simple space-aligned table of query results.
-fn print_table(column_names: &[String], rows: &[Vec<SqliteValue>]) {
+fn print_table(column_names: &[String], rows: &[Vec<SqlValue>]) {
     // Build string representations so we can measure column widths.
     let headers: Vec<&str> = column_names.iter().map(String::as_str).collect();
     let mut cell_strings: Vec<Vec<Cow<'_, str>>> = Vec::with_capacity(rows.len());
@@ -153,14 +156,17 @@ fn print_table(column_names: &[String], rows: &[Vec<SqliteValue>]) {
     }
 }
 
-/// Render a [`SqliteValue`] as a human-readable string.
-fn value_to_string(val: &SqliteValue) -> String {
-    match val {
-        SqliteValue::Null => "NULL".to_string(),
-        SqliteValue::Integer(n) => n.to_string(),
-        SqliteValue::Float(f) => format!("{f}"),
-        SqliteValue::Text(s) => s.to_string(),
-        SqliteValue::Blob(bytes) => {
+/// Render a stored value as a human-readable string.
+///
+/// The storage classes are matched through `SqlValue::value()` because `SqlValue` is a newtype
+/// over `rusqlite::types::Value`, where the float variant is called `Real` rather than `Float`.
+fn value_to_string(val: &SqlValue) -> String {
+    match val.value() {
+        rusqlite::types::Value::Null => "NULL".to_string(),
+        rusqlite::types::Value::Integer(n) => n.to_string(),
+        rusqlite::types::Value::Real(f) => format!("{f}"),
+        rusqlite::types::Value::Text(s) => s.to_string(),
+        rusqlite::types::Value::Blob(bytes) => {
             // Show first few bytes as hex with a length indicator.
             let preview: String = bytes.iter().take(8).map(|b| format!("{b:02x}")).collect();
             let suffix = if bytes.len() > 8 { "..." } else { "" };

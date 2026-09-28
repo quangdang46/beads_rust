@@ -201,12 +201,13 @@ pub fn execute(
 *.db-journal
 *.db-shm
 *.db-wal
-# Explicit fsqlite sidecar families (ns-gate/ns-use, lock-pending/reserved/
-# shared, wal-cert chains) — covered implicitly by `*.db?*`-style wildcards
-# elsewhere, but listed explicitly for discoverability (#111).
-beads.db-*
+# Sidecars left behind by the retired frankensqlite engine. No code creates
+# these any more, but workspaces created before the migration to the C engine
+# still have them on disk, and they are zero-byte lock files that must not be
+# committed. Kept until every pre-migration workspace has been reinitialised.
 *-fsqlite-ns-gate
 *-fsqlite-ns-use
+beads.db-*
 
 # Lock files
 *.lock

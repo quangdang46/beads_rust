@@ -719,9 +719,23 @@ fn test_markdown_import_all_failed_returns_error() {
         !output.status.success(),
         "all-failed markdown import should return an error"
     );
+    // Under `--json` the structured error goes to stdout so agents can parse it;
+    // stderr carries only the per-issue "✗ Failed to create ..." lines. The
+    // summary reason therefore has to be read from the stdout payload.
+    let payload = extract_json_payload(&output.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("structured error json");
     assert!(
-        output.stderr.contains("failed to create any issues from"),
-        "expected summary failure, got: {}",
+        json["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("failed to create any issues from")),
+        "expected summary failure, got stdout={} stderr={}",
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        output.stderr.contains("Failed to create Broken One")
+            && output.stderr.contains("Failed to create Broken Two"),
+        "expected a per-issue reason on stderr, got: {}",
         output.stderr
     );
 
