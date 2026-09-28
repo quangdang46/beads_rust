@@ -307,8 +307,15 @@ fn e2e_installer_uses_tagless_release_asset_names() {
     // Asset names are tagless: the release workflow publishes
     // `br-macos-arm64.tar.gz`, so the archive name must be built from the
     // platform alone. A version segment here would 404 on every download.
-    assert!(download_release.contains(r#"archive_name="br-${platform}.${archive_ext}""#));
+    //
+    // The platform is normalised first -- `linux-musl-x64` becomes `linux-x64`,
+    // because the release publishes no musl-suffixed asset -- so the archive
+    // name is built from that derived platform, never from a version.
+    assert!(download_release.contains(r#"asset_platform="${platform/musl-/}""#));
+    assert!(download_release.contains(r#"archive_name="br-${asset_platform}.${archive_ext}""#));
     assert!(download_release.contains(r"/releases/download/${release_tag}/${archive_name}"));
+    // The Windows asset is a .zip, and the platform carries a hyphen.
+    assert!(download_release.contains("windows-*) archive_ext=\"zip\""));
     assert!(!download_release.contains(r#"archive_name="br-${VERSION}-${platform}"#));
     assert!(!download_release.contains(r#"archive_name="br-${asset_version}-${platform}"#));
 }
