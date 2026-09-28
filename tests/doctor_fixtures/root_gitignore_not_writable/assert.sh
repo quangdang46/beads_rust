@@ -8,6 +8,10 @@
 # `--repair` must NOT silently chmod it.
 
 set -euo pipefail
+# `stat -c` is GNU-only; BSD/macOS uses `stat -f %Lp`. Fixtures run on both.
+file_mode() {
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
+}
 target_dir="${1:?usage: assert.sh <target_dir> <stage>}"
 stage="${2:?usage: assert.sh <target_dir> <stage>}"
 tool_bin="${TOOL_BIN:-br}"
@@ -36,7 +40,7 @@ case "$stage" in
       exit 1
     }
     # Mode on disk must still be 0o444 after detect.
-    actual_mode=$(stat -c '%a' .gitignore)
+    actual_mode=$(file_mode .gitignore)
     if [ "$actual_mode" != "$EXPECTED_CORRUPT_MODE" ]; then
       echo "ASSERT FAIL[$stage]: planted mode 0o$EXPECTED_CORRUPT_MODE no longer in effect (got $actual_mode)" >&2
       exit 1
@@ -45,7 +49,7 @@ case "$stage" in
 
   post_repair)
     # SACRED INVARIANT: --repair must NOT chmod the operator-locked file.
-    actual_mode=$(stat -c '%a' .gitignore)
+    actual_mode=$(file_mode .gitignore)
     if [ "$actual_mode" != "$EXPECTED_CORRUPT_MODE" ]; then
       echo "ASSERT FAIL[$stage]: doctor silently chmod'd .gitignore (got 0o$actual_mode, expected 0o$EXPECTED_CORRUPT_MODE)" >&2
       exit 1
@@ -79,7 +83,7 @@ GITIGNORE
   post_undo)
     # Undo is a no-op for this detect-only FM. Verify the workspace is
     # unchanged (mode and content) since corruption.
-    actual_mode=$(stat -c '%a' .gitignore)
+    actual_mode=$(file_mode .gitignore)
     if [ "$actual_mode" != "$EXPECTED_CORRUPT_MODE" ]; then
       echo "ASSERT FAIL[$stage]: mode changed after undo (got 0o$actual_mode)" >&2
       exit 1

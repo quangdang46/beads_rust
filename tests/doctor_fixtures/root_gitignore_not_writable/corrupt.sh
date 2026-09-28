@@ -10,6 +10,10 @@
 # sacred).
 
 set -euo pipefail
+# `stat -c` is GNU-only; BSD/macOS uses `stat -f %Lp`. Fixtures run on both.
+file_mode() {
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
+}
 target_dir="${1:?usage: corrupt.sh <target_dir>}"
 tool_bin="${TOOL_BIN:-br}"
 
@@ -42,7 +46,7 @@ chmod 0444 .gitignore
 
 # Record the pre-corruption mode so post_undo can verify byte-deterministic
 # restoration by the chokepoint snapshot.
-stat -c '%a' .gitignore > .fixture_baseline_mode
+file_mode .gitignore > .fixture_baseline_mode
 
 if [ -e .fixture_baseline ]; then
   echo "fixture baseline already exists; expected a fresh workspace" >&2
