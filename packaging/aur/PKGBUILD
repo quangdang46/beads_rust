@@ -9,17 +9,19 @@ pkgver=0.1.3
 pkgrel=1
 pkgdesc="Agent-first issue tracker (SQLite + JSONL)"
 arch=('x86_64' 'aarch64')
-url="https://github.com/quangdang46/br"
+url="https://github.com/quangdang46/beads_rust"
 license=('MIT')
 provides=('br')
 conflicts=('br' 'br-git')
 depends=('gcc-libs')
 
-source_x86_64=("br-linux-x64.tar.gz::https://github.com/quangdang46/br/releases/download/v${pkgver}/br-${pkgver}-linux_amd64.tar.gz")
-source_aarch64=("br-linux-arm64.tar.gz::https://github.com/quangdang46/br/releases/download/v${pkgver}/br-${pkgver}-linux_arm64.tar.gz")
+# The release workflow publishes tagless archives (`br-linux-x64.tar.gz`, ...),
+# the same names install.sh requests.
+source_x86_64=("br-linux-x64.tar.gz::https://github.com/quangdang46/beads_rust/releases/download/v${pkgver}/br-linux-x64.tar.gz")
+source_aarch64=("br-linux-arm64.tar.gz::https://github.com/quangdang46/beads_rust/releases/download/v${pkgver}/br-linux-arm64.tar.gz")
 
-sha256sums_x86_64=('f6388af90de58d1a98af720db061237147d964eff8fa52fdc8a50441f851f730')
-sha256sums_aarch64=('11ed13cd0a5ed50042de5e3d946dba9844c97fcc862a820cfd9a120464bbd99d')
+sha256sums_x86_64=('REWRITTEN_AT_RELEASE_TIME_br-linux-x64')
+sha256sums_aarch64=('REWRITTEN_AT_RELEASE_TIME_br-linux-arm64')
 
 package() {
     install -Dm755 "${srcdir}/br" "${pkgdir}/usr/bin/br"

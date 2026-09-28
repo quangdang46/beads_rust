@@ -31,7 +31,12 @@ jobs:
       - run: cargo build --release --target x86_64-unknown-linux-musl
         env:
           RUSTC_BOOTSTRAP: 1
-      - run: mkdir -p artifacts && cd target/x86_64-unknown-linux-musl/release && tar czf ../../../artifacts/br-linux-x64.tar.gz br && cd - && sha256sum br-linux-x64.tar.gz > br-linux-x64.tar.gz.sha256
+      - run: |
+          mkdir -p artifacts
+          tar czf artifacts/br-linux-x64.tar.gz -C target/x86_64-unknown-linux-musl/release br
+          # The sidecar must name the bare file, not artifacts/<file>:
+          # the release job verifies it with `cd artifacts && sha256sum -c`.
+          (cd artifacts && sha256sum br-linux-x64.tar.gz > br-linux-x64.tar.gz.sha256)
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: br-linux-x64
@@ -59,7 +64,12 @@ jobs:
       - run: cargo build --release --target aarch64-unknown-linux-musl
         env:
           RUSTC_BOOTSTRAP: 1
-      - run: mkdir -p artifacts && cd target/aarch64-unknown-linux-musl/release && tar czf ../../../artifacts/br-linux-arm64.tar.gz br && cd - && sha256sum br-linux-arm64.tar.gz > br-linux-arm64.tar.gz.sha256
+      - run: |
+          mkdir -p artifacts
+          tar czf artifacts/br-linux-arm64.tar.gz -C target/aarch64-unknown-linux-musl/release br
+          # The sidecar must name the bare file, not artifacts/<file>:
+          # the release job verifies it with `cd artifacts && sha256sum -c`.
+          (cd artifacts && sha256sum br-linux-arm64.tar.gz > br-linux-arm64.tar.gz.sha256)
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: br-linux-arm64
@@ -84,7 +94,12 @@ jobs:
       - run: cargo build --release --target aarch64-apple-darwin
         env:
           RUSTC_BOOTSTRAP: 1
-      - run: mkdir -p artifacts && cd target/aarch64-apple-darwin/release && tar czf ../../../artifacts/br-macos-arm64.tar.gz br && cd - && shasum -a 256 artifacts/br-macos-arm64.tar.gz > br-macos-arm64.tar.gz.sha256
+      - run: |
+          mkdir -p artifacts
+          tar czf artifacts/br-macos-arm64.tar.gz -C target/aarch64-apple-darwin/release br
+          # The sidecar must name the bare file, not artifacts/<file>:
+          # the release job verifies it with `cd artifacts && sha256sum -c`.
+          (cd artifacts && shasum -a 256 br-macos-arm64.tar.gz > br-macos-arm64.tar.gz.sha256)
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: br-macos-arm64
@@ -109,7 +124,12 @@ jobs:
       - run: cargo build --release --target x86_64-apple-darwin
         env:
           RUSTC_BOOTSTRAP: 1
-      - run: mkdir -p artifacts && cd target/x86_64-apple-darwin/release && tar czf ../../../artifacts/br-macos-x64.tar.gz br && cd - && shasum -a 256 artifacts/br-macos-x64.tar.gz > br-macos-x64.tar.gz.sha256
+      - run: |
+          mkdir -p artifacts
+          tar czf artifacts/br-macos-x64.tar.gz -C target/x86_64-apple-darwin/release br
+          # The sidecar must name the bare file, not artifacts/<file>:
+          # the release job verifies it with `cd artifacts && sha256sum -c`.
+          (cd artifacts && shasum -a 256 br-macos-x64.tar.gz > br-macos-x64.tar.gz.sha256)
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: br-macos-x64
@@ -135,10 +155,14 @@ jobs:
         env:
           RUSTC_BOOTSTRAP: 1
       - run: |
-          cd target/x86_64-pc-windows-msvc/release
-          7z a ../../../br-windows-x64.zip br.exe
-          cd -
-          certutil -hashfile artifacts\br-windows-x64.zip SHA256 > br-windows-x64.zip.sha256
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          7z a artifacts\br-windows-x64.zip target\x86_64-pc-windows-msvc\release\br.exe
+          # certutil prints headers and a trailing status line; the sidecar has to
+          # be the bare "<64-hex>  <file>" form, because the release job verifies
+          # it with `cd artifacts && sha256sum -c`.
+          $hash = (certutil -hashfile artifacts\br-windows-x64.zip SHA256 |
+                   Select-String -Pattern '^[0-9a-fA-F]{64}$').ToString().Trim().ToLower()
+          "$hash  br-windows-x64.zip" | Out-File -Encoding ascii -NoNewline artifacts\br-windows-x64.zip.sha256
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: br-windows-x64
@@ -169,29 +193,35 @@ jobs:
           RELIABILITY_OVERRIDE_REASON: ${{ inputs.reliability_override_reason || '' }}
         run: |
           set -euo pipefail
-          # Supplying a reason is what records the override: an override without
-          # a written justification is refused, and a bare reason is honoured.
+          # Supplying a reason is what records the override: an override without a
+          # written justification is refused, a bare reason is honoured, and the
+          # record belongs in the job summary so reviewers can see it.
           if [ -n "${RELIABILITY_OVERRIDE}" ] && [ -z "${RELIABILITY_OVERRIDE_REASON}" ]; then
+            echo "reliability_override_reason is required"
             echo "::error::reliability_override_reason is required"
             exit 1
           fi
+          summary="${GITHUB_STEP_SUMMARY:-reliability-override.md}"
           if [ -n "${RELIABILITY_OVERRIDE_REASON}" ]; then
             {
               echo "### Reliability override"
               echo ""
               echo "Reliability gates were explicitly skipped by a documented operator emergency."
               echo ""
-              echo "- override: \`${RELIABILITY_OVERRIDE:-skip}\`"
+              echo "- override: ${RELIABILITY_OVERRIDE:-skip}"
               echo "- reason: ${RELIABILITY_OVERRIDE_REASON}"
-            } > reliability-override.md
+            } > "$summary"
           else
-            echo "No reliability override requested" > reliability-override.md
+            echo "No reliability override requested" > "$summary"
           fi
-          cat reliability-override.md
+          cat "$summary"
 
       - name: Validate required artifacts present
         run: |
           set -euo pipefail
+          # The gates operate on the staged artifacts directory, which is where
+          # the build jobs write and where download-artifact put them.
+          cd artifacts
           REQUIRED_ARTIFACTS_STR="${REQUIRED_ARTIFACTS_STR:-br-macos-arm64.tar.gz br-macos-x64.tar.gz br-linux-x64.tar.gz br-linux-arm64.tar.gz br-windows-x64.zip}"
           # shellcheck disable=SC2206
           REQUIRED_ARTIFACTS=( $REQUIRED_ARTIFACTS_STR )
@@ -243,16 +273,27 @@ jobs:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
         run: |
           set -euo pipefail
+          cd artifacts
           signing_key="$(mktemp "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/minisign-key.XXXXXX")"
           trap 'rm -f "$signing_key"' EXIT
           chmod 600 "$signing_key"
           printf '%s\n' "$MINISIGN_SECRET_KEY" > "$signing_key"
+          signed=0
           for asset in br-macos-arm64.tar.gz br-macos-x64.tar.gz \
                         br-linux-x64.tar.gz br-linux-arm64.tar.gz; do
-            [ -f "$asset" ] || continue
+            if [ ! -f "$asset" ]; then
+              echo "::error::cannot sign missing artifact $asset"
+              exit 1
+            fi
             minisign -Sm "$asset" -s "$signing_key" -x "${asset}.minisig"
             echo "Signed $asset"
+            signed=$((signed + 1))
           done
+          if [ "$signed" -ne 4 ]; then
+            echo "::error::expected to sign 4 archives, signed $signed"
+            exit 1
+          fi
+          echo "Signed $signed archives"
 
       - name: Generate changelog
         run: |
@@ -260,6 +301,11 @@ jobs:
             echo "## br v${GITHUB_REF_NAME#v}"
             echo ""
             previous_tag="$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || true)"
+            if git rev-parse --verify HEAD~20 >/dev/null 2>&1; then
+              echo "Changes in HEAD~20..HEAD:"
+              git --no-pager log --oneline HEAD~20..HEAD --no-merges
+              echo ""
+            fi
             if [ -n "$previous_tag" ]; then
               echo "Previous release: ${previous_tag}"
               echo ""
@@ -277,8 +323,11 @@ jobs:
               echo ""
             fi
             echo "### Downloads"
-            for f in br-*.tar.gz br-*.sha256 br-*.zip; do
-              [ -f "$f" ] && echo "- \`$f\`"
+            for f in artifacts/br-*.tar.gz artifacts/br-*.sha256 \
+                     artifacts/br-*.zip artifacts/br-*.minisig; do
+              if [ -f "$f" ]; then
+                echo "- \`$(basename "$f")\`"
+              fi
             done
           } > release.md
 
@@ -290,9 +339,11 @@ jobs:
           fail_on_unmatched_files: true
           generate_release_notes: true
           files: |
-            br-*.tar.gz
-            br-*.sha256
-            br-*.zip
+            artifacts/br-*.tar.gz
+            artifacts/br-*.sha256
+            artifacts/br-*.zip
+            artifacts/br-*.minisig
+            artifacts/checksums.sha256
 
       - name: Upload build artifacts (manual dispatch fallback)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -303,4 +354,6 @@ jobs:
             artifacts/br-*.tar.gz
             artifacts/br-*.sha256
             artifacts/br-*.zip
+            artifacts/br-*.minisig
+            artifacts/checksums.sha256
           if-no-files-found: error

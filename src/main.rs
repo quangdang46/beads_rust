@@ -35,6 +35,7 @@ fn main() {
     let json_error_mode = should_render_errors_as_json(&cli);
     let color_error_mode = should_color_human_errors_for_cli(&cli);
     let output_ctx = OutputContext::from_args(&cli);
+    beads_rust::output::context::reset_machine_output_emitted();
     let is_mutating = is_mutating_command(&cli.command);
     let command_supports_auto_import = should_auto_import(&cli.command);
 
@@ -522,8 +523,6 @@ fn main() {
         #[cfg(feature = "web")]
         Commands::Web(args) => beads_rust::web::run_server(&args, &overrides),
 
-        #[cfg(feature = "self_update")]
-        Commands::Upgrade(args) => commands::upgrade::execute(&args, &output_ctx),
         Commands::Completions(args) => commands::completions::execute(&args, &output_ctx),
         Commands::Formula { command } => {
             commands::formula::execute(&command, &overrides, &output_ctx)
@@ -1084,9 +1083,6 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         #[cfg(feature = "mcp")]
         Commands::Serve(_) => false,
 
-        #[cfg(feature = "self_update")]
-        Commands::Upgrade(_) => false,
-
         #[cfg(feature = "web")]
         Commands::Web(_) => false,
     }
@@ -1275,11 +1271,21 @@ fn handle_error(err: &BeadsError, json_mode: bool, color_mode: bool) -> ! {
         // clean, parseable stream. tracing/log lines stay on stderr (see
         // `logging::init_logging`, which writes to `std::io::stderr`), so the
         // stdout JSON is never interleaved with diagnostic noise.
+        //
+        // Exception: a command that already wrote its own document must not get
+        // a second one. `br close --json` on a blocked issue prints
+        // `{"closed":[],"skipped":[...]}` and *then* returns NOTHING_TO_DO;
+        // a second document would leave `br ... --json | jq` reading a bare
+        // `null` after the real result. The error goes to stderr in that case,
+        // so stdout stays exactly one parseable document.
         let json = structured.to_json();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json).unwrap_or_else(|_| json.to_string())
-        );
+        let rendered =
+            serde_json::to_string_pretty(&json).unwrap_or_else(|_| json.to_string());
+        if beads_rust::output::context::machine_output_was_emitted() {
+            eprintln!("{rendered}");
+        } else {
+            println!("{rendered}");
+        }
     } else {
         // Human mode: errors stay on stderr so stdout remains usable for the
         // command's normal (non-error) output and pipelines.

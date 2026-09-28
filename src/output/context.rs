@@ -8,7 +8,33 @@ use rich_rust::renderables::Renderable;
 use serde::Serialize;
 use std::borrow::Cow;
 use std::io::{self, IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
+
+/// Set once a command has written a machine-readable document (JSON or TOON)
+/// to stdout.
+///
+/// `br close --json` on a blocked issue writes a result document and *then*
+/// fails with `NOTHING_TO_DO`. If the error envelope also went to stdout, the
+/// stream would hold two documents and `br ... --json | jq` would feed an agent
+/// a bare `null` after the real result. So the error handler consults this flag:
+/// the error travels on stderr whenever a document is already on stdout.
+static MACHINE_OUTPUT_EMITTED: AtomicBool = AtomicBool::new(false);
+
+/// Record that a machine-readable document was written to stdout.
+pub fn mark_machine_output_emitted() {
+    MACHINE_OUTPUT_EMITTED.store(true, Ordering::Relaxed);
+}
+
+/// Whether a machine-readable document has already been written to stdout.
+pub fn machine_output_was_emitted() -> bool {
+    MACHINE_OUTPUT_EMITTED.load(Ordering::Relaxed)
+}
+
+/// Clear the flag. Called before dispatching a command.
+pub fn reset_machine_output_emitted() {
+    MACHINE_OUTPUT_EMITTED.store(false, Ordering::Relaxed);
+}
 use toon_rust::options::KeyFoldingMode;
 use toon_rust::{EncodeOptions, JsonValue, StringOrNumberOrBoolOrNull, encode_lines};
 
@@ -1111,6 +1137,7 @@ impl OutputContext {
 
     pub fn json<T: serde::Serialize>(&self, value: &T) {
         if self.is_json() {
+            mark_machine_output_emitted();
             // Stream to stdout to avoid allocating large JSON strings.
             let stdout = io::stdout();
             let mut out = io::BufWriter::with_capacity(JSON_OUTPUT_BUFFER_CAPACITY, stdout.lock());
@@ -1258,6 +1285,7 @@ impl OutputContext {
     /// Output value as TOON format (token-optimized object notation).
     pub fn toon<T: serde::Serialize>(&self, value: &T) {
         if self.is_toon() {
+            mark_machine_output_emitted();
             let Some(json_value) = self.json_value(value, "TOON") else {
                 return;
             };
