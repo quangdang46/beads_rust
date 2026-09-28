@@ -78,10 +78,11 @@ fn release_workflow_uses_tagless_asset_file_names() -> Result<(), String> {
     let mut published = Vec::new();
     for line in workflow.lines() {
         let trimmed = line.trim();
-        let Some(idx) = trimmed.find("tar czf ../../../artifacts/") else {
+        let marker = "tar czf artifacts/";
+        let Some(idx) = trimmed.find(marker) else {
             continue;
         };
-        let rest = &trimmed[idx + "tar czf ../../../artifacts/".len()..];
+        let rest = &trimmed[idx + marker.len()..];
         if let Some(name) = rest.split_whitespace().next() {
             published.push(name.to_string());
         }
@@ -372,9 +373,15 @@ impl WorkflowFixture {
     }
 
     fn write_release_artifact(&self, platform: &str, bytes: &[u8]) -> Result<(), String> {
+        // Windows ships as a zip; every other platform ships a tar.gz. The
+        // required-artifact gate checks the real published names.
         let mut name = String::from("br-");
         name.push_str(platform);
-        name.push_str(".tar.gz");
+        if platform.starts_with("windows-") {
+            name.push_str(".zip");
+        } else {
+            name.push_str(".tar.gz");
+        }
         self.write_artifact(&name, bytes)
     }
 

@@ -188,32 +188,32 @@ jobs:
       # matching install.sh and packaging/homebrew/br.rb.
 
       - name: Validate reliability override
+        # Only reached when an operator actually asked to bypass the gates;
+        # the step itself then refuses to proceed without a written reason.
+        if: ${{ inputs.reliability_override != '' }}
         env:
-          RELIABILITY_OVERRIDE: ${{ inputs.reliability_override || '' }}
+          RELIABILITY_OVERRIDE: ${{ inputs.reliability_override }}
           RELIABILITY_OVERRIDE_REASON: ${{ inputs.reliability_override_reason || '' }}
         run: |
           set -euo pipefail
-          # Supplying a reason is what records the override: an override without a
-          # written justification is refused, a bare reason is honoured, and the
-          # record belongs in the job summary so reviewers can see it.
-          if [ -n "${RELIABILITY_OVERRIDE}" ] && [ -z "${RELIABILITY_OVERRIDE_REASON}" ]; then
+          if [ -z "${RELIABILITY_OVERRIDE_REASON}" ]; then
             echo "reliability_override_reason is required"
             echo "::error::reliability_override_reason is required"
             exit 1
           fi
+          case "${RELIABILITY_OVERRIDE}" in
+            force|skip) ;;
+            *) echo "::error::unknown reliability_override '${RELIABILITY_OVERRIDE}'"; exit 1 ;;
+          esac
           summary="${GITHUB_STEP_SUMMARY:-reliability-override.md}"
-          if [ -n "${RELIABILITY_OVERRIDE_REASON}" ]; then
-            {
-              echo "### Reliability override"
-              echo ""
-              echo "Reliability gates were explicitly skipped by a documented operator emergency."
-              echo ""
-              echo "- override: ${RELIABILITY_OVERRIDE:-skip}"
-              echo "- reason: ${RELIABILITY_OVERRIDE_REASON}"
-            } > "$summary"
-          else
-            echo "No reliability override requested" > "$summary"
-          fi
+          {
+            echo "### Reliability override"
+            echo ""
+            echo "Reliability gates were explicitly skipped by a documented operator emergency."
+            echo ""
+            echo "- override: \`${RELIABILITY_OVERRIDE}\`"
+            echo "- reason: ${RELIABILITY_OVERRIDE_REASON}"
+          } > "$summary"
           cat "$summary"
 
       - name: Validate required artifacts present
@@ -322,6 +322,16 @@ jobs:
               ' CHANGELOG.md
               echo ""
             fi
+            echo "### Reliability"
+            if [ -f reliability-override.md ]; then
+              cat reliability-override.md
+              echo ""
+            else
+              echo "Reliability gates were not skipped."
+              echo ""
+            fi
+            echo "Release reliability gates completed before artifacts were built."
+            echo ""
             echo "### Downloads"
             for f in artifacts/br-*.tar.gz artifacts/br-*.sha256 \
                      artifacts/br-*.zip artifacts/br-*.minisig; do
