@@ -9,12 +9,18 @@ cd "$target_dir"
 case "$stage" in
   detect)
     out=$("$tool_bin" doctor --json 2>/dev/null) || true
-    # db.sidecars must be warn (NOT error) since frankensqlite expects this.
+    # A WAL with no SHM is the resting state, not a defect. SQLite rebuilds the
+    # shared-memory file on the next open, and br itself checkpoints and
+    # truncates the WAL on drop, so the pair is absent most of the time. This
+    # fixture used to require `warn` because frankensqlite treated the missing
+    # SHM as an anomaly; under rusqlite it is normal, and the unit test
+    # `wal_without_shm_is_not_a_sidecar_mismatch` in src/health.rs pins that.
+    # Flagging it here would make every workspace warn after each write.
     echo "$out" | jq -e '
-      .checks[] | select(.name == "db.sidecars") | select(.status == "warn")
-      | select(.message | test("WAL sidecar"; "i"))
+      .checks[] | select(.name == "db.sidecars")
+      | select(.status != "warn" and .status != "error")
     ' >/dev/null || {
-      echo "ASSERT FAIL[$stage]: db.sidecars not warn for WAL-without-SHM" >&2
+      echo "ASSERT FAIL[$stage]: db.sidecars flagged a WAL-without-SHM pair" >&2
       echo "$out" | jq '.checks[] | select(.name == "db.sidecars")' >&2
       exit 1
     }
