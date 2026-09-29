@@ -438,8 +438,37 @@ fn ensure_beads_dir_is_local(beads_dir: &Path, explicit_db_target: bool) -> Resu
         return Ok(());
     }
 
-    // The workspace sits inside CWD's own tree. Only honoured for an explicit
-    // `--db`; an implicitly resolved one must not be able to reach in either.
+    // A workspace whose `.beads` is a symlink -- the usual layout for a repo
+    // whose data lives on a larger disk -- resolves to a directory that is not
+    // under CWD, because `beads_dir` has already been canonicalized by the
+    // time it reaches this guard. That is still a local workspace: the entry
+    // point sits inside CWD and the user chose it. What this guard exists to
+    // stop is an *outward* target reached implicitly -- a global database via
+    // BEADS_DIR, or an unrelated one via the git-worktree fallback -- and a
+    // symlink the repository itself carries is neither. Compare the entry
+    // point before canonicalization, which is what discovery actually matched.
+    if beads_dir.starts_with(&cwd) || beads_dir.starts_with(&canonical_cwd) {
+        return Ok(());
+    }
+
+    // The same workspace, reached through a `.beads` symlink that points at a
+    // directory outside CWD. `beads_dir` has been canonicalized by the time it
+    // gets here, so a plain prefix test cannot see that the entry point lives
+    // inside the tree the user is standing in. Compare the canonical form of
+    // the local entry points instead -- this still requires the workspace to be
+    // reachable from CWD, so it does not weaken the guard against outward
+    // targets.
+    for entry in [cwd.join(".beads"), cwd.join("_beads")] {
+        if let Ok(canonical_entry) = entry.canonicalize()
+            && let Ok(canonical_target) = beads_dir.canonicalize()
+            && canonical_entry == canonical_target
+        {
+            return Ok(());
+        }
+    }
+
+    // An explicit `--db` may also name a descendant that CWD's own path does
+    // not contain, e.g. when the caller resolved it through a symlinked parent.
     if explicit_db_target {
         let canonical_dir = beads_dir
             .canonicalize()
