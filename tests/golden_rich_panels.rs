@@ -180,10 +180,24 @@ fn run_rich_br(root: &Path, width: usize, args: &[&str]) -> String {
 
     let mut cmd = Command::new("script");
     cmd.current_dir(root);
-    // `script [file [command ...]]` is the form both BSD/macOS and util-linux
-    // accept. The `-c` flag exists only in util-linux, so the GNU form fails on
-    // macOS with "script: illegal option -- c".
-    cmd.args(["-q", "/dev/null", "sh", "-c", &command_line]);
+    // BSD/macOS and util-linux disagree about how `script` takes a command,
+    // and the two forms are not interchangeable in either direction.
+    //
+    //   BSD/macOS: script [options] [file [command ...]]   — positional command
+    //   util-linux: script [options] [file] -c <command>    — `-c` is required
+    //
+    // This used to pass the BSD positional form everywhere, on the belief
+    // that util-linux accepted it too. It does not: on every Linux run the
+    // three golden rich-width tests died with
+    // `script: unexpected number of arguments` and empty stdout, before br
+    // ever ran. The tests had been invisible because ubuntu-latest never got
+    // far enough through the suite to execute them. `cfg!` is the right test
+    // here — the test binary is compiled for the host that runs it.
+    if cfg!(any(target_os = "macos", target_os = "ios")) {
+        cmd.args(["-q", "/dev/null", "sh", "-c", &command_line]);
+    } else {
+        cmd.args(["-q", "-c", &command_line, "/dev/null"]);
+    }
     clear_inherited_br_env(&mut cmd);
     cmd.env("HOME", root);
     cmd.env("COLUMNS", width.to_string());

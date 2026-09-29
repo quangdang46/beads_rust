@@ -1,4 +1,4 @@
-use super::common::cli::{BrWorkspace, run_br};
+use super::common::cli::{BrWorkspace, run_br, run_br_with_env};
 use super::{create_issue, init_workspace, normalize_output};
 use insta::assert_snapshot;
 
@@ -123,7 +123,24 @@ fn snapshot_doctor_output() {
     let init = run_br(&workspace, ["init"], "init");
     assert!(init.status.success());
 
-    let output = run_br(&workspace, ["doctor"], "doctor");
+    // Hermetic env, for the same reason as the doctor scenarios: two checks
+    // in this report describe the machine rather than the workspace.
+    // `br_path_dupes` reports how many `br` binaries are on $PATH, and
+    // `rust_log` reports the harness's own debug-level RUST_LOG. A golden
+    // regenerated on a developer machine that keeps two copies of `br`
+    // captured `WARN br_path_dupes: Found 2 br executables`, while a CI
+    // runner with one — or none — renders `OK br_path_dupes`, and the
+    // snapshot failed there and nowhere else. Pinning both makes the golden
+    // describe br instead of the box it ran on. `doctor_env_path()` keeps
+    // whichever directory provides `sqlite3`, so doctor's orthogonal
+    // integrity check does not warn on top of this.
+    let doctor_path = super::common::harness::doctor_env_path();
+    let output = run_br_with_env(
+        &workspace,
+        ["doctor"],
+        [("PATH", doctor_path.as_str()), ("RUST_LOG", "error")],
+        "doctor",
+    );
     assert_snapshot!("doctor_output", normalize_output(&output.stdout));
 }
 

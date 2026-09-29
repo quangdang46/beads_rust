@@ -12,12 +12,12 @@ OK permissions.recovery_dir
 OK permissions.write_lock
 OK permissions.root_gitignore
 OK permissions.config_yaml_secrets
-WARN br_path_dupes: Found 2 `br` executables on $PATH — operator may be confused which one runs
+OK br_path_dupes
 OK gitignore.beads_inner_present
 OK tmp_files_orphan
 OK br_history.size
 OK routes_jsonl: No routes.jsonl present (ID-REDACTED routing is optional)
-WARN rust_log: RUST_LOG=beads_rust=debug would dump verbose tracing to stderr and break agents parsing --json. Run `export RUST_LOG=error` as documented in README.md.
+OK rust_log: RUST_LOG=error (quiet)
 OK permissions.beads_dir: `.beads/` and critical children are ID-REDACTED
 OK config.yaml: config.yaml parses cleanly (99 bytes)
 OK metadata.json: metadata.json parses cleanly (62 bytes); declared targets exist on disk
