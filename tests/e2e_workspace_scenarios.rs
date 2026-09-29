@@ -505,8 +505,17 @@ fn scenario_workspace_lifecycle() {
         "config list JSON should be an object: {config_json:?}"
     );
 
-    // 6. Run doctor
-    let doctor = ws.run_br(["doctor", "--json"], "doctor");
+    // 6. Run doctor.
+    // Hermetic env, same reason as scenario_doctor_healthy_workspace: the
+    // harness sets a debug-level RUST_LOG for every run, and doctor exits
+    // non-zero on it (and on `br_path_dupes` when more than one `br` is on
+    // $PATH). Neither is about the workspace this step just created.
+    let doctor_path = common::harness::doctor_env_path();
+    let doctor = ws.run_br_env(
+        ["doctor", "--json"],
+        [("PATH", doctor_path.as_str()), ("RUST_LOG", "error")],
+        "doctor",
+    );
     doctor.assert_success();
     let doctor_json = parse_json_stdout(&doctor.stdout, "doctor");
     assert_doctor_json_has_healthy_checks(&doctor_json);
@@ -522,8 +531,15 @@ fn scenario_workspace_lifecycle() {
         reinit.stderr
     );
 
-    // 8. Doctor still passes
-    let doctor2 = ws.run_br(["doctor"], "doctor_after_reinit");
+    // 8. Doctor still passes. Same hermetic env as step 6: post-#292, any
+    // non-OK check flips `ok` to false and exits 1, and the harness's
+    // debug-level RUST_LOG plus any duplicate `br` on $PATH are environment
+    // artifacts rather than statements about this workspace.
+    let doctor2 = ws.run_br_env(
+        ["doctor"],
+        [("PATH", doctor_path.as_str()), ("RUST_LOG", "error")],
+        "doctor_after_reinit",
+    );
     doctor2.assert_success();
     let doctor2_stdout = doctor2.stdout.to_ascii_lowercase();
     assert!(

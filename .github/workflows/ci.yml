@@ -28,7 +28,15 @@ jobs:
         # calls in test code — a single-OS matrix let the whole `lib` test
         # target fail to compile on Windows while CI stayed green.
         os: [ubuntu-latest, windows-latest, macos-latest]
-    timeout-minutes: 90
+    # Measured budget: on macos-latest the 137 test binaries execute in 4.2
+    # minutes; the step takes ~55 wall-clock because it compiles and links
+    # every one of them, and ubuntu-latest was still linking when the old
+    # 90-minute job timeout killed it — the step never reported a conclusion,
+    # so the run was indistinguishable from a hang. `[profile.test]` in
+    # Cargo.toml now carries `debug = "line-tables-only"`, which is most of
+    # the fix; the headroom here absorbs the remainder plus cache misses on
+    # a cold runner.
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # nightly

@@ -22,7 +22,7 @@
     },
     {
       "surface": "sync --status",
-      "outcome": "status_in_sync"
+      "outcome": "status_diverged"
     },
     {
       "surface": "list --no-db",
@@ -32,6 +32,7 @@
   "source_hint": "Derived from the malformed-db repair cases in tests/e2e_workspace_commands.rs and tests/e2e_global_flags.rs.",
   "notes": [
     "Represents the simplest non-SQLite database corruption case.",
-    "Intended to drive rebuild-or-bypass behavior rather than low-level SQLite recovery."
+    "Intended to drive rebuild-or-bypass behavior rather than low-level SQLite recovery.",
+    "sync --status is status_diverged, not status_in_sync: the replay harness gives every expectation a FRESH copy of the fixture, so this runs on the un-recovered workspace where the JSONL still holds an issue the unusable database never received, while the database metadata still records an export the JSONL does not reflect. Both directions are genuinely pending. The manifest expectation was status_in_sync, which only holds after startup auto-recovery has rebuilt the database from the JSONL."
   ]
 }

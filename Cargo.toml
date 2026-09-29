@@ -166,6 +166,17 @@ strip = false
 [profile.dev]
 opt-level = 1
 
+# CI spends ~95% of its test-step wall clock compiling and linking, not
+# running: the 137 test binaries execute in 4.2 minutes on macOS while the
+# step itself takes ~55. Full DWARF is the bulk of that link cost and of the
+# target directory (a from-scratch test build reached 17 GB), and none of it
+# is read by the suite. `line-tables-only` keeps the file/line tables that
+# `RUST_BACKTRACE=1` panic output needs to symbolicate, and drops the rest.
+# This is what lets ubuntu-latest finish inside its job timeout.
+[profile.test]
+inherits = "dev"
+debug = "line-tables-only"
+
 [features]
 default = ["web"]
 mcp = ["dep:fastmcp-rust"]

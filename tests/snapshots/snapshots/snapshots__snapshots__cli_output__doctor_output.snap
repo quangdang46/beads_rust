@@ -3,7 +3,7 @@ source: tests/snapshots/cli_output.rs
 expression: normalize_output(&output.stdout)
 ---
 br doctor
-HEALTH workspace: degraded
+HEALTH workspace: healthy
 OK jsonl.merge_artifacts
 OK base_jsonl
 OK doctor.runs_dir

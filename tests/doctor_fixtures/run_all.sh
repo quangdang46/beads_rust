@@ -210,8 +210,12 @@ run_fixture() {
                 > "$diag/repair_replay.json" 2> "$diag/repair_replay.stderr" || true
             list_run_ids "$runs_dir" > "$after_runs"
             local new_run_ids=()
-            mapfile -t new_run_ids < <(comm -13 "$before_runs" "$after_runs")
+            # `mapfile` is bash 4.0; macOS /bin/bash is 3.2. Read the diff
+            # with a loop so the idempotence-replay stage works everywhere.
             local new_run_id
+            while IFS= read -r new_run_id; do
+                [ -n "$new_run_id" ] && new_run_ids+=("$new_run_id")
+            done < <(comm -13 "$before_runs" "$after_runs")
             for new_run_id in "${new_run_ids[@]}"; do
                 local newest_run="$runs_dir/$new_run_id"
                 if [ -f "$newest_run/actions.jsonl" ]; then

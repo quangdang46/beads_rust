@@ -22,12 +22,13 @@
     },
     {
       "surface": "sync --status",
-      "outcome": "status_in_sync"
+      "outcome": "status_db_newer"
     }
   ],
   "source_hint": "Represents the stale or missing sidecar family called out in beads_rust-rsei.2.1.",
   "notes": [
     "The database file itself is healthy so future tests can isolate how startup reacts to sidecar mismatch.",
-    "The WAL payload is intentionally synthetic and small."
+    "The WAL payload is intentionally synthetic and small.",
+    "sync --status is status_db_newer: metadata records last_export_time (11:37:48.493) after last_import_time (11:37:48.445), so the database holds an export the JSONL has not seen. The WAL-without-SHM pair is NOT the reason - that is a resting state under rusqlite and must not classify as corruption (see the sidecar_mismatch arm in tests/workspace_failure_replay.rs). The drift is incidental to what this fixture tests."
   ]
 }

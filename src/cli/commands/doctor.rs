@@ -1128,7 +1128,15 @@ fn append_doctor_check_anomalies(check: &CheckResult, anomalies: &mut Vec<Anomal
         "counts.db_vs_jsonl" if matches!(check.status, CheckStatus::Warn) => {
             append_count_mismatch_anomaly(check, anomalies);
         }
-        "sync.metadata" => {
+        // Gated on Warn/Error like every sibling arm. An Ok `sync.metadata`
+        // is by construction a state doctor already judged benign: the #330
+        // carve-out reports a fresh workspace's trailing empty `issues.jsonl`
+        // as Ok ("nothing to import") while `details.pending_import` stays
+        // true. Reading that flag without consulting the status re-raised a
+        // `jsonl_newer` anomaly on a brand-new, healthy workspace and sent
+        // `br doctor` out non-zero — the exact failure #330 fixed one layer
+        // up, reintroduced one layer down.
+        "sync.metadata" if matches!(check.status, CheckStatus::Warn | CheckStatus::Error) => {
             append_sync_metadata_anomalies(check, anomalies);
         }
         "db.recovery_artifacts" if matches!(check.status, CheckStatus::Warn) => {
@@ -10619,89 +10627,118 @@ fn inspect_existing_doctor_database(
     mode: DoctorInspectionMode,
     checks: &mut Vec<CheckResult>,
 ) {
-    match config::with_database_family_snapshot(db_path, |snapshot_db_path| {
-        let conn = Connection::open(snapshot_db_path.to_string_lossy().into_owned())?;
-        let _ = conn.execute("PRAGMA busy_timeout=30000", []);
-        if let Err(err) = required_schema_checks(&conn, checks) {
-            push_inspection_error(
-                checks,
-                "schema.inspect",
-                "Failed to inspect database schema",
-                &err,
-            );
-        }
-        if mode == DoctorInspectionMode::Full
-            && let Err(err) = check_recoverable_anomalies(&conn, checks)
-        {
-            push_inspection_error(
-                checks,
-                "db.recoverable_anomalies",
-                "Failed to inspect recoverable anomalies",
-                &err,
-            );
-        }
-        check_null_defaults(&conn, checks);
-        check_integrity(&conn, checks);
-        // Pass-4 cycle 4: detect metadata.jsonl_content_hash drift vs
-        // the JSONL on disk. Uses the SNAPSHOT connection so the live
-        // DB family (incl. SHM/WAL sidecars) is undisturbed.
-        check_export_hash_cache_divergence(&conn, jsonl_path, checks);
-        // Pass-5 cycle 7: missing-post-flush anchor (DB-aware variant of
-        // the file-based base_jsonl check). Uses metadata.last_export_time
-        // to distinguish fresh-clone-missing from post-flush-missing.
-        // The anchor file is checked at the REAL beads_dir (db_path's
-        // parent), not the snapshot dir, because the missing-on-disk
-        // condition must reference the live workspace.
-        let real_beads_dir = db_path.parent().unwrap_or(db_path);
-        check_base_jsonl_missing_post_flush(&conn, real_beads_dir, checks);
-        // Pass-5 cycle 8: detect orphan rows in dirty_issues (FK
-        // CASCADE bypassed). Uses the snapshot connection so live DB
-        // family is undisturbed.
-        check_dirty_bitmap_divergence(&conn, checks);
-        // Pass-5 cycle 34: orphan rows in comments (FK off during delete).
-        check_comments_orphans(&conn, checks);
-        // Pass-5 cycle 35: orphan rows in labels (FK off during delete).
-        check_labels_orphans(&conn, checks);
-        // Pass-5 cycle 36: orphan rows in dependencies (issue_id side only;
-        // depends_on_id intentionally unguarded for cross-repo refs).
-        check_dependencies_orphans(&conn, checks);
-        // beads_rust-m3mi: audit-suspect close_reasons (warn level)
-        check_suspect_close_reasons(&conn, checks);
-        // issue #311: flag issues whose status falls outside a strict
-        // workflow.statuses set (no-op unless configured).
-        check_workflow_statuses(&conn, real_beads_dir, checks);
-        if mode == DoctorInspectionMode::Full {
-            if let Err(err) = check_db_count(&conn, jsonl_count, jsonl_path, checks) {
-                push_inspection_error(
+    // The sqlite3 CLI must be pointed at the SNAPSHOT, never the live
+    // database file. Opening a WAL-mode database whose main file is
+    // truncated or corrupt makes SQLite run WAL recovery and REWRITE that
+    // main file in place — a 22-byte `beads.db` next to a valid
+    // `beads.db-wal` came back as a fully materialised 228 KB database,
+    // and `PRAGMA integrity_check` cheerfully answered "ok". Probing the
+    // live path therefore silently repaired the exact corruption doctor
+    // exists to report, and `br doctor` — a read-only surface — mutated the
+    // workspace out from under the operator.
+    //
+    // The probe runs INSIDE `with_database_family_snapshot` because that
+    // helper deletes its temp directory the moment the closure returns; a
+    // probe issued afterwards finds nothing there. A connection that fails
+    // to open is reported as `db.open` but does not abort the closure, so
+    // the CLI probe still gets its turn on the same snapshot.
+    let snapshot_result = config::with_database_family_snapshot(db_path, |snapshot_db_path| {
+        let conn = match Connection::open(snapshot_db_path.to_string_lossy().into_owned()) {
+            Ok(conn) => {
+                let _ = conn.execute("PRAGMA busy_timeout=30000", []);
+                Some(conn)
+            }
+            Err(err) => {
+                push_check(
                     checks,
-                    "counts.db_vs_jsonl",
-                    "Failed to compare database and JSONL counts",
-                    &err,
+                    "db.open",
+                    CheckStatus::Error,
+                    Some(format!("Failed to open DB snapshot for inspection: {err}")),
+                    Some(serde_json::json!({ "path": db_path.display().to_string() })),
                 );
+                None
             }
-            check_sync_metadata(&conn, snapshot_db_path, jsonl_path, checks);
-            check_issue_write_probe(&conn, checks);
+        };
+        if let Some(conn) = conn {
+            {
+                let conn = &conn;
+                if let Err(err) = required_schema_checks(&conn, checks) {
+                    push_inspection_error(
+                        checks,
+                        "schema.inspect",
+                        "Failed to inspect database schema",
+                        &err,
+                    );
+                }
+                if mode == DoctorInspectionMode::Full
+                    && let Err(err) = check_recoverable_anomalies(&conn, checks)
+                {
+                    push_inspection_error(
+                        checks,
+                        "db.recoverable_anomalies",
+                        "Failed to inspect recoverable anomalies",
+                        &err,
+                    );
+                }
+                check_null_defaults(&conn, checks);
+                check_integrity(&conn, checks);
+                // Pass-4 cycle 4: detect metadata.jsonl_content_hash drift vs
+                // the JSONL on disk. Uses the SNAPSHOT connection so the live
+                // DB family (incl. SHM/WAL sidecars) is undisturbed.
+                check_export_hash_cache_divergence(&conn, jsonl_path, checks);
+                // Pass-5 cycle 7: missing-post-flush anchor (DB-aware variant of
+                // the file-based base_jsonl check). Uses metadata.last_export_time
+                // to distinguish fresh-clone-missing from post-flush-missing.
+                // The anchor file is checked at the REAL beads_dir (db_path's
+                // parent), not the snapshot dir, because the missing-on-disk
+                // condition must reference the live workspace.
+                let real_beads_dir = db_path.parent().unwrap_or(db_path);
+                check_base_jsonl_missing_post_flush(&conn, real_beads_dir, checks);
+                // Pass-5 cycle 8: detect orphan rows in dirty_issues (FK
+                // CASCADE bypassed). Uses the snapshot connection so live DB
+                // family is undisturbed.
+                check_dirty_bitmap_divergence(&conn, checks);
+                // Pass-5 cycle 34: orphan rows in comments (FK off during delete).
+                check_comments_orphans(&conn, checks);
+                // Pass-5 cycle 35: orphan rows in labels (FK off during delete).
+                check_labels_orphans(&conn, checks);
+                // Pass-5 cycle 36: orphan rows in dependencies (issue_id side only;
+                // depends_on_id intentionally unguarded for cross-repo refs).
+                check_dependencies_orphans(&conn, checks);
+                // beads_rust-m3mi: audit-suspect close_reasons (warn level)
+                check_suspect_close_reasons(&conn, checks);
+                // issue #311: flag issues whose status falls outside a strict
+                // workflow.statuses set (no-op unless configured).
+                check_workflow_statuses(&conn, real_beads_dir, checks);
+                if mode == DoctorInspectionMode::Full {
+                    if let Err(err) = check_db_count(&conn, jsonl_count, jsonl_path, checks) {
+                        push_inspection_error(
+                            checks,
+                            "counts.db_vs_jsonl",
+                            "Failed to compare database and JSONL counts",
+                            &err,
+                        );
+                    }
+                    check_sync_metadata(&conn, snapshot_db_path, jsonl_path, checks);
+                    check_issue_write_probe(&conn, checks);
+                }
+            }
+            conn.close().map_err(|(_, e)| e)?;
         }
-        conn.close().map_err(|(_, e)| e)?;
+        if mode == DoctorInspectionMode::Full {
+            check_sqlite_cli_integrity(snapshot_db_path, checks);
+        }
         Ok(())
-    }) {
-        Ok(()) => {
-            if mode == DoctorInspectionMode::Full {
-                check_sqlite_cli_integrity(db_path, checks);
-            }
-        }
-        Err(err) => {
-            push_check(
-                checks,
-                "db.open",
-                CheckStatus::Error,
-                Some(format!("Failed to open DB snapshot for inspection: {err}")),
-                Some(serde_json::json!({ "path": db_path.display().to_string() })),
-            );
-            if mode == DoctorInspectionMode::Full {
-                check_sqlite_cli_integrity(db_path, checks);
-            }
-        }
+    });
+
+    if let Err(err) = snapshot_result {
+        push_check(
+            checks,
+            "db.open",
+            CheckStatus::Error,
+            Some(format!("Failed to open DB snapshot for inspection: {err}")),
+            Some(serde_json::json!({ "path": db_path.display().to_string() })),
+        );
     }
 }
 
@@ -12382,14 +12419,23 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_doctor_checks_records_ok_pending_import_as_degraded_advisory() {
+    fn test_classify_doctor_checks_ignores_ok_sync_metadata_pending_import() {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("beads.db");
         let jsonl_path = temp.path().join("issues.jsonl");
+        // The #330 carve-out: a fresh workspace's trailing empty `issues.jsonl`
+        // makes `jsonl_newer` read true, but there is nothing to import, so
+        // `check_sync_metadata` reports Ok while `details.pending_import` stays
+        // true. Deriving an anomaly from that flag without consulting the
+        // status re-raised `jsonl_newer` on a brand-new healthy workspace and
+        // sent `br doctor` out non-zero — the failure #330 fixed one layer up,
+        // reintroduced one layer down. An Ok check contributes no anomaly.
         let checks = vec![CheckResult {
             name: "sync.metadata".to_string(),
             status: CheckStatus::Ok,
-            message: Some("External changes pending import".to_string()),
+            message: Some(
+                "External changes pending import (empty JSONL, nothing to import)".to_string(),
+            ),
             details: Some(serde_json::json!({
                 "pending_import": true,
                 "pending_export": false,
@@ -12400,13 +12446,13 @@ mod tests {
 
         let classification = classify_doctor_checks(&db_path, &jsonl_path, &checks);
 
-        assert_eq!(classification.health, WorkspaceHealth::Degraded);
+        assert_eq!(classification.health, WorkspaceHealth::Healthy);
         assert!(
-            classification
+            !classification
                 .anomalies
                 .iter()
                 .any(|anomaly| matches!(anomaly, AnomalyClass::JsonlNewer)),
-            "pending import remains an advisory health anomaly: {:?}",
+            "an Ok sync.metadata must not raise a health anomaly: {:?}",
             classification.anomalies
         );
         assert!(

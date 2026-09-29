@@ -22,7 +22,7 @@
     },
     {
       "surface": "sync --status",
-      "outcome": "status_in_sync"
+      "outcome": "status_diverged"
     },
     {
       "surface": "history",
@@ -32,6 +32,7 @@
   "source_hint": "Inspired by the large repo-root recovery dumps collected during real-world investigation.",
   "notes": [
     "The live beads.db is plain text on purpose; the interesting state is the preserved backup and .br_recovery trail.",
-    "Future replay tests can assert that recovery tooling prefers the preserved backups over the broken live file."
+    "Future replay tests can assert that recovery tooling prefers the preserved backups over the broken live file.",
+    "sync --status is status_diverged, not status_in_sync: the replay harness gives every expectation a FRESH copy, so this runs on the un-recovered workspace where the plain-text database classifies as database_not_sqlite and the JSONL holds an issue it never received. In sync only after startup auto-recovery rebuilds the database."
   ]
 }

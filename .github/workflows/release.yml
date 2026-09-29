@@ -32,7 +32,12 @@ jobs:
   gate:
     name: Reliability gate
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # Same measured budget as ci.yml's `check` job, and for the same reason:
+    # the suite executes in ~4 minutes but compiling and linking its 137 test
+    # binaries dominates, and this gate runs on ubuntu — the runner that was
+    # still linking when ci.yml's old 90-minute timeout fired. `[profile.test]`
+    # in Cargo.toml (`debug = "line-tables-only"`) is most of the fix.
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly

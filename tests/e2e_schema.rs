@@ -559,12 +559,11 @@ fn e2e_capabilities_command_detail_machine_output_contracts_json() {
     assert_array_text_contains(detail, "machine_output", "json", "config");
     assert_array_text_excludes(detail, "machine_output", "toon", "config");
 
-    let output = capabilities_command_detail_output(&workspace, "upgrade");
-    let detail = output
-        .get("command_detail")
-        .expect("capabilities output should include command_detail");
-    assert_array_text_contains(detail, "machine_output", "json", "upgrade");
-    assert_array_text_excludes(detail, "machine_output", "toon", "upgrade");
+    // No `upgrade` case: self-update was removed from the crate (no
+    // `self_update` feature, no `upgrade` command), so
+    // `br capabilities --command upgrade` now exits 4 with
+    // VALIDATION_FAILED / "unknown command path". Asserting a detail block
+    // for a command that no longer exists only kept the suite red.
 }
 
 #[test]
@@ -1037,9 +1036,15 @@ fn compare_agent_baseline_error(workspace: &BrWorkspace) {
         Some(3),
         "unexpected status: {missing:?}"
     );
+    // Structured errors go to STDOUT in JSON mode, not stderr: robot callers
+    // get one clean parseable stream and diagnostics stay on stderr. This
+    // read `missing.stderr`, which under the harness's
+    // `RUST_LOG=beads_rust=debug` is a wall of tracing lines — `extract_json_payload`
+    // then handed the parser four stray characters and the baseline blew up
+    // with `Error("trailing characters", line: 1, column: 5)`.
     compare_json_baseline(
         "errors/show_not_found.json",
-        &missing.stderr,
+        &missing.stdout,
         normalize_noop,
     );
 }

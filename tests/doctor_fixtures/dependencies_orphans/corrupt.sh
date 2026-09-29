@@ -47,14 +47,19 @@ with open(".beads/issues.jsonl", "r", encoding="utf-8") as f:
 print("\n".join(ids))
 PY
 )
-mapfile -t id_array <<< "$ids"
-if [ "${#id_array[@]}" -lt 3 ]; then
-  echo "corrupt: expected >=3 issues in JSONL, got ${#id_array[@]}" >&2
+# `mapfile` is a bash 4.0 builtin. macOS still ships bash 3.2 as /bin/bash and
+# the GitHub macOS runner resolves `bash` to it, so the whole fixture suite
+# aborted here with "mapfile: command not found" on every macOS CI run while
+# passing locally (where Homebrew bash 5 shadows it). Keep this script to
+# bash 3.2 constructs.
+id_count=$(printf '%s\n' "$ids" | grep -c '[^[:space:]]' || true)
+if [ "$id_count" -lt 3 ]; then
+  echo "corrupt: expected >=3 issues in JSONL, got $id_count" >&2
   exit 1
 fi
-valid_owner="${id_array[0]}"
-valid_target="${id_array[1]}"
-external_owner="${id_array[2]}"
+valid_owner=$(printf '%s\n' "$ids" | sed -n '1p')
+valid_target=$(printf '%s\n' "$ids" | sed -n '2p')
+external_owner=$(printf '%s\n' "$ids" | sed -n '3p')
 
 sha256sum .beads/issues.jsonl | awk '{print $1}' > .fixture_jsonl_pre_sha256
 {

@@ -861,9 +861,14 @@ mod tests {
 
     #[test]
     fn test_record_failure_in_open_extends_cooldown() {
+        // Default 5s timeout: the assertions below must not race the wall
+        // clock. The previous version used a 50ms timeout and slept 30ms,
+        // so a loaded CI runner overshot the window and the test failed
+        // intermittently — while still being unable to tell an *extended*
+        // cooldown from an unextended one, because both trip and refresh
+        // landed within a few microseconds of each other.
         let mut cb = CircuitBreaker::new(CircuitBreakerConfig {
             failure_threshold: 2,
-            timeout: Duration::from_millis(50),
             ..CircuitBreakerConfig::default()
         });
 
@@ -871,14 +876,28 @@ mod tests {
         cb.record_failure();
         cb.record_failure();
         assert_eq!(cb.state(), CircuitState::Open);
+        let tripped_at = cb
+            .last_tripped_at
+            .expect("an open breaker records a trip timestamp");
 
-        // Immediately record another failure — resets the cooldown timer
+        // 20ms clears even the coarse `Instant` resolution on Windows, and
+        // stays far inside the 5s cooldown.
+        std::thread::sleep(Duration::from_millis(20));
+
+        // A failure recorded while already open must push the trip timestamp
+        // forward — that is the whole mechanism behind extending the cooldown.
         cb.record_failure();
 
-        // Sleep for just under the timeout (which was refreshed)
-        std::thread::sleep(Duration::from_millis(30));
+        let refreshed_at = cb
+            .last_tripped_at
+            .expect("trip timestamp retained while open");
+        assert!(
+            refreshed_at > tripped_at,
+            "record_failure in Open must extend the cooldown window"
+        );
+        assert_eq!(cb.state(), CircuitState::Open);
 
-        // Should still be open because the cooldown was refreshed
+        // Still failing fast inside the refreshed window.
         assert!(!cb.call());
         assert_eq!(cb.state(), CircuitState::Open);
     }

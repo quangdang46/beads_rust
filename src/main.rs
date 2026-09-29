@@ -2060,7 +2060,14 @@ mod tests {
     #[test]
     fn preopened_storage_reuses_startup_paths() {
         let temp = TempDir::new().expect("tempdir");
-        let beads_dir = temp.path().join(".beads");
+        // Discovery canonicalizes `.beads/` (dunce::canonicalize resolves
+        // macOS `/var` -> `/private/var`), so the expected paths must be
+        // built from the canonicalized root as well. Comparing the resolved
+        // `paths.jsonl_path` against one built on the raw temp path asserted
+        // `/private/var/.../first.jsonl` == `/var/.../first.jsonl` — a macOS-only
+        // failure that had nothing to do with the preopen behavior under test.
+        let root = dunce::canonicalize(temp.path()).expect("canonicalize tempdir");
+        let beads_dir = root.join(".beads");
         fs::create_dir_all(&beads_dir).expect("create beads dir");
 
         let first_jsonl = beads_dir.join("first.jsonl");

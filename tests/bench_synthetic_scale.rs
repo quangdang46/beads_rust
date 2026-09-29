@@ -54,6 +54,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::time::Instant;
 use tempfile::TempDir;
 use toon_rust::options::ExpandPathsMode;
@@ -1040,6 +1041,13 @@ fn run_br_status<const N: usize>(
         // debug. The other helpers in this file already pin it; this one did
         // not, so the corpus generator saw a spurious doctor failure.
         .env("RUST_LOG", "error")
+        // Same shape, one check over: `br_path_dupes` warns when $PATH holds
+        // more than one `br` executable, which is a fact about the machine
+        // running the benchmark and not about the synthetic corpus. Left
+        // unpinned, a developer with an installed copy of br alongside the
+        // cargo build failed corpus generation outright, and CI failed it
+        // whenever the runner image happened to ship two.
+        .env("PATH", common::harness::doctor_env_path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()?;
@@ -1061,6 +1069,7 @@ fn sync_status_is_clean(br_path: &Path, workspace: &Path) -> std::io::Result<boo
         .current_dir(workspace)
         .env("NO_COLOR", "1")
         .env("RUST_LOG", "error")
+        .env("PATH", common::harness::doctor_env_path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()?;
@@ -1328,12 +1337,35 @@ struct MeasuredCommandOutput {
     peak_rss_bytes: Option<u64>,
 }
 
+/// Whether `/usr/bin/time` is GNU time, which is the only flavour that
+/// understands `-v`.
+///
+/// The harness used to assume GNU time merely because the path existed.
+/// macOS ships BSD time at that same path; it rejects `-v`, exits non-zero,
+/// and so every measured operation reported failure with
+/// `illegal option -- v` — the benchmark never ran `br` at all. Probe once
+/// per process and fall back to running `br` directly, which costs the
+/// `peak_rss_bytes` figure that `MeasuredCommandOutput` already models as
+/// optional and its docs already describe as Linux-only.
+fn gnu_time_available() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        Path::new("/usr/bin/time").is_file()
+            && Command::new("/usr/bin/time")
+                .arg("--version")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+    })
+}
+
 fn run_measured_br_command(
     br_path: &Path,
     args: &[&str],
     workspace: &Path,
 ) -> std::io::Result<MeasuredCommandOutput> {
-    if Path::new("/usr/bin/time").is_file() {
+    if gnu_time_available() {
         let output = Command::new("/usr/bin/time") // ubs:ignore - benchmark harness intentionally invokes GNU time for child RSS
             .arg("-v")
             .arg(br_path)
@@ -2773,15 +2805,25 @@ fn synthetic_ci_profile_benchmarks_graph_projection_workloads() {
         .expect("generate CI synthetic corpus");
 
     let benchmark = benchmark_synthetic(&dataset, &binaries.br.path);
+    // Carry each failure's stderr into the assertion message. The previous
+    // message listed operation names only, so a run where every operation
+    // failed reported `["list", "list_open", "ready", ...]` and nothing about
+    // why — the same output whether the binary was missing, the seed was
+    // rejected, or the workspace was unreadable.
     let failed_operations = benchmark
         .operations
         .iter()
         .filter(|operation| !operation.success)
-        .map(|operation| operation.operation.as_str())
+        .map(|operation| {
+            (
+                operation.operation.as_str(),
+                operation.error.as_deref().unwrap_or("<no stderr>"),
+            )
+        })
         .collect::<Vec<_>>();
     assert!(
         failed_operations.is_empty(),
-        "synthetic CI profile should have no failed operations: {failed_operations:?}"
+        "synthetic CI profile should have no failed operations: {failed_operations:#?}"
     );
     assert_eq!(benchmark.config.issue_count, 96);
     assert_eq!(
@@ -2822,7 +2864,7 @@ fn synthetic_ci_profile_benchmarks_graph_projection_workloads() {
         );
     }
 
-    if Path::new("/usr/bin/time").is_file() {
+    if gnu_time_available() {
         let missing_rss = benchmark
             .operations
             .iter()

@@ -18,8 +18,13 @@ struct FixtureWorkspace {
 fn fixture_workspace(name: &str) -> FixtureWorkspace {
     let isolated = isolated_workspace_failure_fixture(name).expect("isolated fixture");
     let metadata = isolated.fixture.metadata.clone();
-    let root = isolated.root.clone();
-    let beads_dir = isolated.beads_dir.clone();
+    // br canonicalizes the `.beads/` it discovers (dunce::canonicalize
+    // resolves macOS `/var` -> `/private/var`), so every path this harness
+    // reports back is the canonical one. Expectations built on the raw
+    // TempDir path therefore compared `/private/var/.../custom.db` against
+    // `/var/.../custom.db` and failed on macOS only.
+    let root = dunce::canonicalize(&isolated.root).expect("canonicalize fixture root");
+    let beads_dir = root.join(".beads");
     let log_dir = root.join("logs");
     fs::create_dir_all(&log_dir).expect("log dir");
 
@@ -42,22 +47,6 @@ fn parse_stdout_json(run: &BrRun, context: &str) -> Value {
             assert!(
                 payload.len() == usize::MAX,
                 "{context} should emit valid JSON on stdout: {err}\nstdout={}\nstderr={}",
-                run.stdout,
-                run.stderr
-            );
-            Value::Null
-        }
-    }
-}
-
-fn parse_stderr_json(run: &BrRun, context: &str) -> Value {
-    let payload = extract_json_payload(&run.stderr);
-    match serde_json::from_str(&payload) {
-        Ok(value) => value,
-        Err(err) => {
-            assert!(
-                payload.len() == usize::MAX,
-                "{context} should emit structured JSON on stderr: {err}\nstdout={}\nstderr={}",
                 run.stdout,
                 run.stderr
             );
@@ -158,13 +147,19 @@ fn resolved_database_path(fixture: &FixtureWorkspace, surface: &str) -> PathBuf 
 }
 
 fn assert_config_error(run: &BrRun, needle: &str, context: &str) {
+    // Structured errors go to STDOUT in JSON mode so robot callers get one
+    // clean parseable stream and diagnostics stay on stderr. This used to
+    // read stderr, which under the harness's `RUST_LOG=beads_rust=debug` is a
+    // wall of tracing lines — `extract_json_payload` then handed the parser a
+    // few stray characters and every CONFIG_ERROR assertion blew up with
+    // `Error("trailing characters", line: 1, column: 5)`.
     assert!(
         !run.status.success(),
         "{context} should fail\nstdout={}\nstderr={}",
         run.stdout,
         run.stderr
     );
-    let error_json = parse_stderr_json(run, context);
+    let error_json = parse_stdout_json(run, context);
     assert_eq!(
         error_json["error"]["code"].as_str(),
         Some("CONFIG_ERROR"),
@@ -337,10 +332,26 @@ fn assert_doctor_reliability_audit(fixture: &FixtureWorkspace, context: &str, js
 
     match fixture.metadata.family.as_str() {
         "sidecar_mismatch" => {
-            assert!(
-                has_code("sidecar_mismatch") || has_code("database_corrupt"),
-                "{context} should surface sidecar or WAL-corruption diagnostics: {json}"
-            );
+            if fixture.metadata.name == "sidecar_wal_without_shm" {
+                // WAL-without-SHM is a resting state, not corruption. rusqlite
+                // rebuilds the `-shm` on the next open and br checkpoints +
+                // truncates the `-wal` on drop, so the pair is legitimately
+                // absent most of the time (see `e29dbb27`, and
+                // `wal_without_shm_is_not_a_sidecar_mismatch` in src/health.rs).
+                // This arm used to demand a corruption anomaly, which
+                // re-encoded the removed engine's expectation; assert the
+                // decision instead, so a future engine swap that starts
+                // treating the pair as corruption still gets caught.
+                assert!(
+                    !has_code("sidecar_mismatch") && !has_code("database_corrupt"),
+                    "{context} should not classify a WAL-without-SHM pair as corruption: {json}"
+                );
+            } else {
+                assert!(
+                    has_code("sidecar_mismatch") || has_code("database_corrupt"),
+                    "{context} should surface sidecar or WAL-corruption diagnostics: {json}"
+                );
+            }
         }
         "malformed_jsonl" => {
             assert!(
