@@ -60,7 +60,12 @@ jobs:
         run: cargo clippy --locked --all-features --all-targets
         continue-on-error: true
       - name: Build
-        run: cargo build --locked --all-features --all-targets
+        # Library + binary only. This used to be `--all-targets`, which links
+        # all ~174 test binaries and benches — and then `cargo test` below
+        # builds every one of them again. On a 2-core runner that duplicate
+        # link stage is what killed the job (ubuntu died 23 min in, with this
+        # step never reporting a conclusion).
+        run: cargo build --locked --all-features
       # `cargo test --lib` alone covered 2,722 unit tests and silently skipped
       # all 2,075 integration tests in tests/ (conformance, e2e, atomicity).
       # `--no-fail-fast` runs every test binary so one run reports every
