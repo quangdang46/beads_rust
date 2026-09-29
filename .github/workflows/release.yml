@@ -40,6 +40,40 @@ jobs:
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Verify tag matches the manifest version
+        # Nothing else compares the two. The release note header is the tag,
+        # while the shipped binary reports whatever Cargo.toml says — so a
+        # mismatch does not fail the release, it ships a `br --version` that
+        # contradicts the tag it was downloaded under. This repo has already
+        # done that: v0.2.0 was tagged on a tree with version = "0.2.0", then
+        # eight commits later a v0.1.3 was released from a tree whose manifest
+        # had been rolled back, leaving a higher version permanently shadowed
+        # by a lower one. Fail in seconds, before the web assets build and the
+        # suite, rather than after five binaries.
+        #
+        # `workflow_dispatch` runs carry a branch name in GITHUB_REF_NAME, not
+        # a tag, so there is nothing to compare and the check steps aside.
+        run: |
+          tag="${GITHUB_REF_NAME:-}"
+          case "$tag" in
+            v[0-9]*) ;;
+            *)
+              echo "::notice::GITHUB_REF_NAME='$tag' is not a version tag; skipping tag/manifest check"
+              exit 0
+              ;;
+          esac
+          manifest="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          expected="${tag#v}"
+          if [ -z "$manifest" ]; then
+            echo "::error::could not read a version from Cargo.toml"
+            exit 1
+          fi
+          if [ "$manifest" != "$expected" ]; then
+            echo "::error::tag $tag does not match the Cargo.toml version ($manifest)."
+            echo "::error::Either set Cargo.toml to $expected before tagging, or retag."
+            exit 1
+          fi
+          echo "tag $tag matches the Cargo.toml version $manifest"
       - uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly
         with:
           toolchain: nightly
