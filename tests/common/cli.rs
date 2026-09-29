@@ -81,6 +81,31 @@ impl BrWorkspace {
     }
 }
 
+/// Turn a test label into something safe to use as a log filename.
+///
+/// Labels are free-form and several tests use `->` to describe a dependency
+/// edge ("A->B"). Windows forbids `< > : " / \ | ? *` in filenames, so those
+/// labels made `fs::write` fail with `InvalidFilename` (os error 123) before
+/// the assertion ever ran. The log name is an internal artifact; it should not
+/// constrain what a test is allowed to call itself.
+fn log_file_stem(label: &str) -> String {
+    let sanitized: String = label
+        .chars()
+        .map(|ch| {
+            if matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "run".to_string()
+    } else {
+        sanitized
+    }
+}
+
 pub fn run_br<I, S>(workspace: &BrWorkspace, args: I, label: &str) -> BrRun
 where
     I: IntoIterator<Item = S>,
@@ -219,7 +244,7 @@ where
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-    let log_path = log_dir.join(format!("{label}.log"));
+    let log_path = log_dir.join(format!("{}.log", log_file_stem(label)));
     let timestamp = SystemTime::now();
     let log_body = format!(
         "label: {label}\nstarted: {:?}\nduration: {:?}\nstatus: {}\nargs: {:?}\ncwd: {}\n\nstdout:\n{}\n\nstderr:\n{}\n",

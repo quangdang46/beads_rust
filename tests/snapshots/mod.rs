@@ -73,6 +73,8 @@ static VERSION_NUM_RE: LazyLock<Regex> =
 /// version number, not output shape; mask it like the others.
 static RUNNING_BR_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"Running br \d+\.\d+\.\d+").expect("running-br version regex"));
+static WINDOWS_EXE_SUFFIX_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\bbr\.exe\b").expect("windows exe suffix regex"));
 static LINE_NUM_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\.rs:\d+:").expect("line number regex"));
 /// `tracing` source-location annotation that appears in dev builds after the
@@ -424,6 +426,37 @@ fn normalize_text_with_log(text: &str, config: &TextNormConfig) -> (String, Vec<
         normalized = TMP_PATH_RE.replace_all(&normalized, "/TMP").to_string();
         log.push("temp_paths".to_string());
     }
+    // Windows: the harness TempDir lands at `%TEMP%\.tmpXXXX`, which — after
+    // the home mask above and the backslash-to-slash normalization — reads
+    // `C:/HOME/AppData/Local/Temp/.tmpXXXX/...`. Neither branch of
+    // TMP_PATH_RE matches, so every golden retained a per-run random segment
+    // and a drive letter and the whole error-message snapshot set failed there.
+    // Mask the Windows temp root, then drop the drive letter so the remaining
+    // path has the same shape as on Unix (`/TMP/.beads/...`). Scoped to the
+    // case where a temp path was actually masked, so drive letters elsewhere
+    // in the output are left alone.
+    if config.mask_temp_paths {
+        // The optional leading `/HOME` matters: on windows the temp directory
+        // lives *inside* the user profile, so the home mask above has already
+        // rewritten `/Users/<name>` to `/HOME` and left `C:/HOME/AppData/...`
+        // behind. Unix temp paths are `/tmp/...` with no home segment at all,
+        // so consuming it here is what makes the two platforms agree.
+        static WIN_TMP_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"(?:/HOME)?(?:/AppData/Local)?/Temp/\.tmp[a-zA-Z0-9]+")
+                .expect("windows temp path regex")
+        });
+        // The drive letter only — the separating slash has to survive, or
+        // `C:/TMP/...` collapses to `TMP/...` and stops matching the Unix
+        // shape. `\b` keeps this from biting an ordinary word ending in a
+        // colon: in "Note:" there is no boundary before the `e`.
+        static DRIVE_LETTER_RE: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"\b[A-Za-z]:").expect("drive letter regex"));
+        if WIN_TMP_PATH_RE.is_match(&normalized) {
+            normalized = WIN_TMP_PATH_RE.replace_all(&normalized, "/TMP").to_string();
+            normalized = DRIVE_LETTER_RE.replace_all(&normalized, "").to_string();
+            log.push("windows_temp_paths".to_string());
+        }
+    }
 
     // 6. Redact issue IDs
     if config.redact_ids && ID_RE.is_match(&normalized) {
@@ -514,6 +547,16 @@ fn normalize_text_with_log(text: &str, config: &TextNormConfig) -> (String, Vec<
             .replace_all(&normalized, "Running br X.Y.Z")
             .to_string();
         log.push("running_br_version".to_string());
+    }
+    // clap renders the real executable name in every usage line, so Windows
+    // prints `br.exe` where the golden says `br`. The suffix is a property of
+    // the platform, not of the CLI surface these goldens exist to pin, so
+    // normalize it away rather than committing a second platform's spelling.
+    if WINDOWS_EXE_SUFFIX_RE.is_match(&normalized) {
+        normalized = WINDOWS_EXE_SUFFIX_RE
+            .replace_all(&normalized, "br")
+            .to_string();
+        log.push("windows_exe_suffix".to_string());
     }
 
     // 14. Strip trailing whitespace (per line)
@@ -715,6 +758,36 @@ mod toon_output;
 #[cfg(test)]
 mod golden_snapshot_tests {
     use super::*;
+
+    /// The windows-latest runner produced this exact line in the
+    /// `error_messages` snapshots, against a golden that reads
+    /// `path=/TMP/.beads/issues.jsonl`. Feeding both through the normalizer
+    /// must collapse them to the same string, or every error-message golden
+    /// fails on that platform for a reason that has nothing to do with br.
+    #[test]
+    fn test_windows_temp_path_normalizes_to_the_unix_shape() {
+        let windows = "DEBUG beads_rust::sync::path: Validating sync path \
+                       path=C:/HOME/AppData/Local/Temp/.tmpaRyNTM/.beads/issues.jsonl \
+                       beads_dir=C:/HOME/AppData/Local/Temp/.tmpaRyNTM/.beads";
+        let unix = "DEBUG beads_rust::sync::path: Validating sync path \
+                    path=/TMP/.beads/issues.jsonl beads_dir=/TMP/.beads";
+
+        let from_windows = normalize_output(windows);
+        let from_unix = normalize_output(unix);
+
+        assert_eq!(
+            from_windows, from_unix,
+            "a windows temp path must normalize to the same shape as a unix one"
+        );
+        assert!(
+            !from_windows.contains("tmpaRyNTM"),
+            "the per-run temp segment must be masked: {from_windows}"
+        );
+        assert!(
+            !from_windows.contains('C'),
+            "the drive letter must be dropped: {from_windows}"
+        );
+    }
 
     #[test]
     fn test_strip_ansi_codes() {

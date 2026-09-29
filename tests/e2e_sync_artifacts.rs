@@ -992,6 +992,15 @@ fn e2e_staleness_detects_real_content_change() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn e2e_sync_import_force_preserves_integrity_and_close_works() {
+    // This test's whole assertion is the verdict of the C `sqlite3` CLI, so
+    // it cannot mean anything on a host that does not ship it — and
+    // windows-latest does not. Without this guard the helper's
+    // "sqlite3-missing" fallback turned the absence of a tool into a
+    // regression report about issue #248.
+    if !sqlite3_cli_available() {
+        eprintln!("skipping: the sqlite3 CLI is not available on this host");
+        return;
+    }
     // Create enough issues to cross the bulk-insert threshold where
     // frankensqlite's B-tree layer stops cleaning up after itself reliably.
     // 220 is comfortably above the 200 seen in empirical repros for #248
@@ -1163,6 +1172,12 @@ fn e2e_sync_import_force_preserves_integrity_and_close_works() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn e2e_rebuilt_alt_db_preserves_fresh_lookup_and_mutation_paths() {
+    // Same reason as the sibling test above: the assertion is the C `sqlite3`
+    // CLI's verdict, so it cannot be evaluated on a host without the tool.
+    if !sqlite3_cli_available() {
+        eprintln!("skipping: the sqlite3 CLI is not available on this host");
+        return;
+    }
     const LOOP_COUNT: usize = 25;
 
     let _log = common::test_log("e2e_rebuilt_alt_db_preserves_fresh_lookup_and_mutation_paths");
@@ -1535,6 +1550,19 @@ fn e2e_rebuilt_alt_db_preserves_fresh_lookup_and_mutation_paths() {
          - Artifacts saved to: {:?}",
         artifacts.artifact_dir
     );
+}
+
+/// Whether a usable `sqlite3` CLI is on PATH.
+fn sqlite3_cli_available() -> bool {
+    let binary = if cfg!(windows) {
+        "sqlite3.exe"
+    } else {
+        "sqlite3"
+    };
+    std::process::Command::new(binary)
+        .arg("-version")
+        .output()
+        .is_ok_and(|output| output.status.success())
 }
 
 /// Invoke the C `sqlite3` CLI to run `PRAGMA integrity_check` against the

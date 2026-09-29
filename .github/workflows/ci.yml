@@ -86,8 +86,16 @@ jobs:
   # Sharding is the lever that actually reduces the work: each job links a
   # third of the test binaries instead of all of them, which brings every OS
   # comfortably inside the budget and makes the matrix run in the wall-clock
-  # time of its slowest shard. The library, binary and doc-test targets ride
-  # along with shard 0 so they are still compiled and run exactly once.
+  # time of its slowest shard.
+  #
+  # Shard 3 is the lib/bins/doc-tests job. A bare `cargo test` covers those as
+  # well as `tests/`, but none of them has a `tests/*.rs` file for the loop
+  # below to find, so they have to be requested by name. Carrying them on
+  # shard 0 as well left that shard measurably heavier than its siblings —
+  # shard 0 reached 74 of its 90 minutes on windows-latest while shards 1 and
+  # finished in 44 and 50 — which is not a margin worth trusting on a runner
+  # whose speed varies. Giving them their own job makes all four jobs close to
+  # the same size.
   test:
     name: Test (${{ matrix.os }}, shard ${{ matrix.shard }}/${{ matrix.shards }})
     needs: check
@@ -96,8 +104,8 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        shard: [0, 1, 2]
-        shards: [3]
+        shard: [0, 1, 2, 3]
+        shards: [4]
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -110,14 +118,11 @@ jobs:
           node-version: '20'
       - name: Build web UI assets
         run: bash scripts/build-web.sh
-      # A bare `cargo test` also covers lib, bins and doc tests, none of which
-      # has a `tests/*.rs` file of its own and so none of which the shard loop
-      # can see. They are requested explicitly on shard 0.
-      #
-      # Doc tests get their own invocation because cargo refuses to mix them
-      # with anything else: `--doc` alongside `--lib --test X` fails with
-      # "can't mix --doc with other target selecting options". Verified rather
-      # than assumed — that combination was in the first draft of this step.
+      # Shard 3 runs only the targets that have no `tests/*.rs` file. Doc tests
+      # get their own invocation because cargo refuses to mix them with
+      # anything else: `--doc` alongside `--lib --test X` fails with "can't mix
+      # --doc with other target selecting options". Verified rather than
+      # assumed — that combination was in the first draft of this step.
       #
       # The loop is POSIX sh, not bash: macOS ships bash 3.2 and this runs on
       # all three OSes. `mapfile` here would fail on macOS exactly the way the
@@ -139,21 +144,20 @@ jobs:
           SHARDS: ${{ matrix.shards }}
         run: |
           set -eu
-          if [ "$SHARD" -eq 0 ]; then
-            set -- --lib --bins
-          else
-            set --
+          if [ "$SHARD" -eq 3 ]; then
+            echo "targets: --lib --bins (then --doc)"
+            cargo test --locked --all-features --no-fail-fast --lib --bins
+            cargo test --locked --all-features --doc
+            exit 0
           fi
+          set --
           i=0
           for f in tests/*.rs; do
             name=$(basename "$f" .rs)
-            if [ $((i % SHARDS)) -eq "$SHARD" ]; then
+            if [ $((i % 3)) -eq "$SHARD" ]; then
               set -- "$@" --test "$name"
             fi
             i=$((i + 1))
           done
           echo "targets:$*"
           cargo test --locked --all-features --no-fail-fast "$@"
-          if [ "$SHARD" -eq 0 ]; then
-            cargo test --locked --all-features --doc
-          fi

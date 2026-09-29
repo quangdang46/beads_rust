@@ -240,6 +240,14 @@ jobs:
 }
 
 #[test]
+// These drive scripts/audit-workflow-action-pins.sh through a shell.
+// Unix-only: on windows-latest a bare `bash` resolves to
+// C:\Windows\System32\bash.exe, the WSL launcher, which — with no WSL
+// distribution installed — answers "Windows Subsystem for Linux has no
+// installed distributions." in UTF-16LE and exits non-zero. The policy
+// these tests cover runs in release.yml's reliability gate, which is
+// ubuntu-only, so skipping them there loses no coverage.
+#[cfg(unix)]
 fn audit_report_marks_up_to_date_actions() -> Result<(), String> {
     let fixture = PinFixture::new()?;
     fixture.write_inventory(&[inventory_line_with_tag(
@@ -256,6 +264,14 @@ fn audit_report_marks_up_to_date_actions() -> Result<(), String> {
 }
 
 #[test]
+// These drive scripts/audit-workflow-action-pins.sh through a shell.
+// Unix-only: on windows-latest a bare `bash` resolves to
+// C:\Windows\System32\bash.exe, the WSL launcher, which — with no WSL
+// distribution installed — answers "Windows Subsystem for Linux has no
+// installed distributions." in UTF-16LE and exits non-zero. The policy
+// these tests cover runs in release.yml's reliability gate, which is
+// ubuntu-only, so skipping them there loses no coverage.
+#[cfg(unix)]
 fn audit_report_marks_update_available_actions() -> Result<(), String> {
     let fixture = PinFixture::new()?;
     fixture.write_inventory(&[inventory_line_with_tag(
@@ -276,6 +292,14 @@ fn audit_report_marks_update_available_actions() -> Result<(), String> {
 }
 
 #[test]
+// These drive scripts/audit-workflow-action-pins.sh through a shell.
+// Unix-only: on windows-latest a bare `bash` resolves to
+// C:\Windows\System32\bash.exe, the WSL launcher, which — with no WSL
+// distribution installed — answers "Windows Subsystem for Linux has no
+// installed distributions." in UTF-16LE and exits non-zero. The policy
+// these tests cover runs in release.yml's reliability gate, which is
+// ubuntu-only, so skipping them there loses no coverage.
+#[cfg(unix)]
 fn audit_report_records_upstream_unreachable_without_failing() -> Result<(), String> {
     let fixture = PinFixture::new()?;
     fixture.write_inventory(&[inventory_line_with_tag(
@@ -296,6 +320,14 @@ fn audit_report_records_upstream_unreachable_without_failing() -> Result<(), Str
 }
 
 #[test]
+// These drive scripts/audit-workflow-action-pins.sh through a shell.
+// Unix-only: on windows-latest a bare `bash` resolves to
+// C:\Windows\System32\bash.exe, the WSL launcher, which — with no WSL
+// distribution installed — answers "Windows Subsystem for Linux has no
+// installed distributions." in UTF-16LE and exits non-zero. The policy
+// these tests cover runs in release.yml's reliability gate, which is
+// ubuntu-only, so skipping them there loses no coverage.
+#[cfg(unix)]
 fn audit_report_records_missing_tag_without_failing() -> Result<(), String> {
     let fixture = PinFixture::new()?;
     fixture.write_inventory(&[inventory_line_with_tag(
@@ -316,6 +348,14 @@ fn audit_report_records_missing_tag_without_failing() -> Result<(), String> {
 }
 
 #[test]
+// These drive scripts/audit-workflow-action-pins.sh through a shell.
+// Unix-only: on windows-latest a bare `bash` resolves to
+// C:\Windows\System32\bash.exe, the WSL launcher, which — with no WSL
+// distribution installed — answers "Windows Subsystem for Linux has no
+// installed distributions." in UTF-16LE and exits non-zero. The policy
+// these tests cover runs in release.yml's reliability gate, which is
+// ubuntu-only, so skipping them there loses no coverage.
+#[cfg(unix)]
 fn audit_report_rejects_disallowed_downgrades() -> Result<(), String> {
     let fixture = PinFixture::new()?;
     fixture.write_inventory(&[inventory_line_with_tag(
@@ -331,6 +371,14 @@ fn audit_report_rejects_disallowed_downgrades() -> Result<(), String> {
 }
 
 #[test]
+// These drive scripts/audit-workflow-action-pins.sh through a shell.
+// Unix-only: on windows-latest a bare `bash` resolves to
+// C:\Windows\System32\bash.exe, the WSL launcher, which — with no WSL
+// distribution installed — answers "Windows Subsystem for Linux has no
+// installed distributions." in UTF-16LE and exits non-zero. The policy
+// these tests cover runs in release.yml's reliability gate, which is
+// ubuntu-only, so skipping them there loses no coverage.
+#[cfg(unix)]
 fn audit_text_report_is_concise_human_output() -> Result<(), String> {
     let fixture = PinFixture::new()?;
     fixture.write_inventory(&[inventory_line_with_tag(
@@ -351,6 +399,14 @@ fn audit_text_report_is_concise_human_output() -> Result<(), String> {
 }
 
 #[test]
+// These drive scripts/audit-workflow-action-pins.sh through a shell.
+// Unix-only: on windows-latest a bare `bash` resolves to
+// C:\Windows\System32\bash.exe, the WSL launcher, which — with no WSL
+// distribution installed — answers "Windows Subsystem for Linux has no
+// installed distributions." in UTF-16LE and exits non-zero. The policy
+// these tests cover runs in release.yml's reliability gate, which is
+// ubuntu-only, so skipping them there loses no coverage.
+#[cfg(unix)]
 fn audit_text_report_suppresses_current_rows_by_default() -> Result<(), String> {
     let fixture = PinFixture::new()?;
     fixture.write_inventory(&[inventory_line_with_tag(

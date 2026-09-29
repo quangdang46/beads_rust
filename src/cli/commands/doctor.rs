@@ -6351,7 +6351,15 @@ fn check_sqlite_cli_integrity(db_path: &Path, checks: &mut Vec<CheckResult>) {
             push_check(
                 checks,
                 "sqlite3.integrity_check",
-                CheckStatus::Warn,
+                // Ok, not Warn. The `sqlite3` CLI is an optional, orthogonal
+                // cross-check; its absence says nothing about whether the
+                // workspace is healthy, and under the post-#292 contract
+                // (`br doctor` exits 1 on any non-OK check) a Warn here made
+                // `br doctor` fail on every machine that does not happen to
+                // ship that tool — including every windows-latest runner, where
+                // it turned four healthy-workspace tests red. The check is
+                // still reported, and still says plainly what was skipped.
+                CheckStatus::Ok,
                 Some("sqlite3 not available; skipping orthogonal integrity validation".to_string()),
                 None,
             );
