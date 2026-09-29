@@ -65,6 +65,14 @@ static OWNER_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"Owner: [a-zA-Z0-9_-]+").expect("owner regex"));
 static VERSION_NUM_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"version \d+\.\d+\.\d+").expect("version number regex"));
+/// doctor's `binary_version` check reports the running binary as
+/// `Running br 1.2.3` — the crate's own version, in a shape `VERSION_NUM_RE`
+/// does not match. Left unmasked it pins the golden to whatever version was
+/// current when the snapshot was accepted, so every release bump fails
+/// `snapshot_doctor_output` until someone hand-edits the file. That is a
+/// version number, not output shape; mask it like the others.
+static RUNNING_BR_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"Running br \d+\.\d+\.\d+").expect("running-br version regex"));
 static LINE_NUM_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\.rs:\d+:").expect("line number regex"));
 /// `tracing` source-location annotation that appears in dev builds after the
@@ -500,6 +508,12 @@ fn normalize_text_with_log(text: &str, config: &TextNormConfig) -> (String, Vec<
             .replace_all(&normalized, "version X.Y.Z")
             .to_string();
         log.push("version_numbers".to_string());
+    }
+    if config.mask_version_numbers && RUNNING_BR_RE.is_match(&normalized) {
+        normalized = RUNNING_BR_RE
+            .replace_all(&normalized, "Running br X.Y.Z")
+            .to_string();
+        log.push("running_br_version".to_string());
     }
 
     // 14. Strip trailing whitespace (per line)

@@ -21,7 +21,7 @@ OK rust_log: RUST_LOG=error (quiet)
 OK permissions.beads_dir: `.beads/` and critical children are ID-REDACTED
 OK config.yaml: config.yaml parses cleanly (99 bytes)
 OK metadata.json: metadata.json parses cleanly (62 bytes); declared targets exist on disk
-OK binary_version: Running br 0.1.3; no beads_rust Cargo.toml reachable from .beads/ — not flagging
+OK binary_version: Running br X.Y.Z; no beads_rust Cargo.toml reachable from .beads/ — not flagging
 OK write_lock: .beads/.write.lock is 0s old (within 300s threshold); not stale
 OK routes.targets: No local or town routes.jsonl present (route targets are optional)
 OK startup_cache.health

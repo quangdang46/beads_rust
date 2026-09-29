@@ -15,12 +15,92 @@ This changelog is organized by capability rather than diff order. Each version s
 
 ---
 
-## v0.2.0 -- 2026-07-28 (Release)
+## v0.2.0 -- 2026-09-30 (Release)
 
-Major feature release: web UI server (`br web`), workspace hardening,
-and install script cleanup.
+**The storage engine changes.** `br` moves off frankensqlite to
+[rusqlite](https://github.com/rusqlite/rusqlite) 0.40.2 (bundled SQLite), and
+the engine swap exposed and fixed a number of behaviour differences along the
+way. Everything below under "Since v0.1.3" is new in this release.
 
-### Features
+> **On the version line.** The `v0.2.0` tag existed from 2026-07-28 but was
+> never published, and it pointed at a commit that is an *ancestor* of the
+> published `v0.1.3` (2026-07-29) — a higher version permanently shadowed by a
+> lower one, with `Cargo.toml` rolled back from `0.2.0` to `0.1.3` eight
+> commits later. `v0.2.0` has been reclaimed for the actual release. The web
+> UI entries below were already part of the published `v0.1.3` — `br web` and
+> the `web` feature are present in that tree — and are kept here only as the
+> record of the work that landed there.
+
+### Since v0.1.3
+
+#### Storage
+
+- **Storage engine: frankensqlite → rusqlite 0.40.2.** The `fsqlite` variant,
+  its dependencies and its dead filters are removed outright; `rusqlite` is
+  the only engine. `cargo tree --all-features` reports no frankensqlite crates.
+  ([`75ae8e52`](https://github.com/quangdang46/beads_rust/commit/75ae8e52),
+  [`a9fc9f51`](https://github.com/quangdang46/beads_rust/commit/a9fc9f51))
+- **Go content-hash parity.** Go leaves `MolType`/`WorkType` unset unless
+  explicitly passed, while Rust defaulted them to `Work`/`Mutex`, which changed
+  the digest for every issue and broke deduplication across the two tools.
+  Every expected hash is now produced by running `bd` itself.
+  ([`33402794`](https://github.com/quangdang46/beads_rust/commit/33402794))
+- **Engine differences the C engine exposed** — `check_cycle` restored, plus
+  three SQL literals a regex-based port had eaten, and three further
+  behavioural differences found only by running the suite on the new engine.
+  ([`3467347f`](https://github.com/quangdang46/beads_rust/commit/3467347f),
+  [`5bed0542`](https://github.com/quangdang46/beads_rust/commit/5bed0542),
+  [`097eaa32`](https://github.com/quangdang46/beads_rust/commit/097eaa32))
+
+#### Fixes
+
+- **`br doctor` no longer rewrites a corrupt database.** The `sqlite3.integrity_check`
+  step shelled out against the live database file. Opening a WAL-mode database
+  whose main file is truncated makes SQLite run WAL recovery and rewrite that
+  main file in place — a 22-byte `beads.db` next to a valid `beads.db-wal` came
+  back as a fully materialised 228 KB database, and `PRAGMA integrity_check`
+  answered "ok". A read-only diagnostic surface was silently repairing the
+  exact corruption it exists to report. The probe now runs against a snapshot.
+  ([`81973345`](https://github.com/quangdang46/beads_rust/commit/81973345))
+- **`br doctor` no longer fails on a fresh workspace.** `sync.metadata`
+  raised a `jsonl_newer` health anomaly from `details.pending_import` without
+  consulting the check's status, so a brand-new `br init` workspace was
+  classified degraded and exited non-zero. Now gated on Warn/Error like every
+  sibling arm. ([`81973345`](https://github.com/quangdang46/beads_rust/commit/81973345))
+- **macOS `/var` → `/private/var` canonicalisation** stopped failing 120 tests
+  ([`615c991a`](https://github.com/quangdang46/beads_rust/commit/615c991a))
+- **Workspace reached through a local `.beads` symlink** is now accepted
+  ([`b0bbe1cd`](https://github.com/quangdang46/beads_rust/commit/b0bbe1cd))
+- **`doctor undo` no longer re-validates the rows it restores**, and can roll
+  back a repair that recorded an absolute path
+  ([`da7d938f`](https://github.com/quangdang46/beads_rust/commit/da7d938f),
+  [`1557c756`](https://github.com/quangdang46/beads_rust/commit/1557c756))
+- **`install.sh` resolves the asset names the release actually publishes**
+  ([`bbaa1cdd`](https://github.com/quangdang46/beads_rust/commit/bbaa1cdd))
+
+#### CI and release
+
+- **The test suite runs in CI at all.** It previously never executed: a missing
+  `toolchain:` input failed the toolchain step in ~10s, so every step after it
+  was skipped. Format, Clippy, Build and Test are all live on a
+  Linux/macOS/Windows matrix.
+  ([`09f9de98`](https://github.com/quangdang46/beads_rust/commit/09f9de98))
+- **Test step sharded across three jobs per OS.** The 137 test binaries execute
+  in about four minutes; the step's cost is linking them, and windows-latest
+  could not finish 137 of them inside any reasonable job timeout. Each shard
+  links a third.
+  ([`191905e2`](https://github.com/quangdang46/beads_rust/commit/191905e2))
+- **A tag that disagrees with `Cargo.toml` now fails the release gate**, rather
+  than shipping a binary whose `br --version` contradicts the tag it was
+  downloaded under.
+  ([`2f89da73`](https://github.com/quangdang46/beads_rust/commit/2f89da73))
+- **Linux/macOS portability in the suites** — `mapfile` (bash 4) replaced with
+  a POSIX loop, `script -c` per platform's own `script(1)` argument style, and
+  the doctor golden made hermetic instead of describing the machine it was
+  regenerated on.
+  ([`68ee6c57`](https://github.com/quangdang46/beads_rust/commit/68ee6c57))
+
+### v0.1.3-era work retained below
 
 - **`br web`** — new subcommand that serves a static web UI and REST API
   over HTTP using an embedded axum server. Routes: `GET /api/p/{project_id}/beads`

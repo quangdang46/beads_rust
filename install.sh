@@ -123,7 +123,14 @@ CHECKSUM="${CHECKSUM:-}"
 CHECKSUM_URL="${CHECKSUM_URL:-}"
 ARTIFACT_URL="${ARTIFACT_URL:-}"
 INSECURE_SKIP_CHECKSUM=0
-LOCK_FILE="/tmp/br-install.lock"
+# Installer mutual-exclusion lock. Overridable so the e2e suite can give each
+# test its own path: cargo runs test functions on parallel threads, and with a
+# single hardcoded path one test's lock made a sibling installer abort with
+# "Another installation is running" — a test-isolation failure that only
+# appeared on some runs. The default is unchanged, so installed behaviour and
+# the recovery message that tells users to `rm -rf` this exact path stay
+# identical.
+LOCK_FILE="${BR_INSTALL_LOCK:-/tmp/br-install.lock}"
 NO_GUM=0
 SKIP_SKILLS=0
 # Per-skill opt-ins. Default is to NOT install the bd-to-br-migration skill

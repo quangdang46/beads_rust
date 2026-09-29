@@ -122,10 +122,18 @@ jobs:
       # The loop is POSIX sh, not bash: macOS ships bash 3.2 and this runs on
       # all three OSes. `mapfile` here would fail on macOS exactly the way the
       # doctor fixture suite used to.
-      #
       # `--no-fail-fast` runs every test binary so one shard reports all of its
       # failures rather than only the first.
       - name: Test (shard ${{ matrix.shard }}/${{ matrix.shards }})
+        # Required, and not a nicety: on windows-latest a bare `run:` block is
+        # handed to PowerShell, which cannot parse this script at all. The
+        # first version of this step omitted it and all three Windows shards
+        # died in zero minutes with
+        #   ParserError: Missing '(' after 'if' in if statement.
+        # Git Bash is present on the runner, so `shell: bash` gives all three
+        # OSes one shell. Bash 3.2 on macOS is still why the loop avoids
+        # `mapfile` — the same trap that took out the doctor fixture suite.
+        shell: bash
         env:
           SHARD: ${{ matrix.shard }}
           SHARDS: ${{ matrix.shards }}

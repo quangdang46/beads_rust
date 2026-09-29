@@ -63,6 +63,13 @@ fn run_installer(temp_dir: &TempDir, args: &[&str], env_vars: HashMap<&str, &str
     // Clear potentially interfering variables
     cmd.env_remove("BR_INSTALL_DIR");
     cmd.env_remove("VERSION");
+    // Give each test its own installer lock. cargo runs test functions on
+    // parallel threads, and install.sh's lock path is otherwise one fixed
+    // location shared by every test in this binary — so `..._lock_prevents_
+    // concurrent` could make a sibling installer abort with "Another
+    // installation is running". install.sh honours BR_INSTALL_LOCK and
+    // defaults to the old path when it is unset.
+    cmd.env("BR_INSTALL_LOCK", temp_dir.path().join("br-install.lock"));
 
     // Add custom environment variables
     for (key, value) in env_vars {
@@ -553,8 +560,10 @@ fn e2e_installer_lock_prevents_concurrent() {
 
     let temp = TempDir::new().expect("temp dir");
 
-    // Create a stale lock directory
-    let lock_dir = PathBuf::from("/tmp/br-install.lock.d");
+    // Create a stale lock directory. This must be the same path `run_installer`
+    // hands the script via BR_INSTALL_LOCK, or the test plants a lock nobody
+    // is looking for and then "recovers" from a lock that was never there.
+    let lock_dir = temp.path().join("br-install.lock.d");
 
     // Clean up any existing lock first
     let _ = fs::remove_dir_all(&lock_dir);
