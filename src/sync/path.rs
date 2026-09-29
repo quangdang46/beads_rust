@@ -377,7 +377,8 @@ pub fn validate_sync_path(path: &Path, beads_dir: &Path) -> PathValidation {
     // (or vice versa). Comparing a lexically-normalized path against a
     // canonicalized directory therefore rejected perfectly legitimate paths.
     // Compare the canonical form of both sides as well before refusing.
-    let canonical_path = dunce::canonicalize(&normalized_path).unwrap_or_else(|_| normalized_path.clone());
+    let canonical_path =
+        dunce::canonicalize(&normalized_path).unwrap_or_else(|_| normalized_path.clone());
 
     if had_parent_dir
         && !normalized_path.starts_with(beads_dir)
@@ -400,8 +401,8 @@ pub fn validate_sync_path(path: &Path, beads_dir: &Path) -> PathValidation {
     // entirely is an `OutsideBeadsDir` rejection, and reporting it as a symlink
     // escape misattributes the cause -- on macOS every absolute path crosses
     // the `/var` -> `/private/var` symlink, so the two were indistinguishable.
-    let path_is_inside = normalized_path.starts_with(beads_dir)
-        || normalized_path.starts_with(&canonical_beads);
+    let path_is_inside =
+        normalized_path.starts_with(beads_dir) || normalized_path.starts_with(&canonical_beads);
 
     if path_is_inside
         && let Some(result) =
@@ -608,8 +609,7 @@ fn is_allowed_jsonl_temp_name(file_name: &str) -> bool {
 /// # Errors
 ///
 /// Returns `BeadsError::Config` with a descriptive message if the path is not allowed.
-pub 
-fn require_valid_sync_path(path: &Path, beads_dir: &Path) -> Result<()> {
+pub fn require_valid_sync_path(path: &Path, beads_dir: &Path) -> Result<()> {
     let validation = validate_sync_path(path, beads_dir);
     match validation {
         PathValidation::Allowed => Ok(()),

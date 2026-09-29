@@ -10,10 +10,10 @@ use crate::cli::commands::{
     retry_mutation_with_jsonl_recovery,
 };
 use crate::config;
-use crate::storage::db::{self, SqlValue};
 use crate::error::{BeadsError, Result};
 use crate::format::sanitize_terminal_inline;
 use crate::output::OutputContext;
+use crate::storage::db::{self, SqlValue};
 use crate::storage::{ListFilters, SqliteStorage};
 use crate::util::id::{IdResolver, ResolverConfig};
 use rich_rust::prelude::*;
@@ -1233,11 +1233,11 @@ mod tests {
         // Add dependencies
         storage
             .mutate("test_add_deps", "tester", |tx, _ctx| {
-                db::exec_with(&tx, 
+                db::exec_with(&tx,
                     "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at) VALUES (?, ?, ?, ?)",
                     &[SqlValue::from("bd-b"), SqlValue::from("bd-a"), SqlValue::from("blocks"), SqlValue::from(Utc::now().to_rfc3339())],
                 )?;
-                db::exec_with(&tx, 
+                db::exec_with(&tx,
                     "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at) VALUES (?, ?, ?, ?)",
                     &[SqlValue::from("bd-c"), SqlValue::from("bd-b"), SqlValue::from("blocks"), SqlValue::from(Utc::now().to_rfc3339())],
                 )?;
@@ -1269,11 +1269,11 @@ mod tests {
 
         storage
             .mutate("test_add_direct_deps", "tester", |tx, _ctx| {
-                db::exec_with(&tx, 
+                db::exec_with(&tx,
                     "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at) VALUES (?, ?, ?, ?)",
                     &[SqlValue::from("bd-b"), SqlValue::from("bd-a"), SqlValue::from("blocks"), SqlValue::from(Utc::now().to_rfc3339())],
                 )?;
-                db::exec_with(&tx, 
+                db::exec_with(&tx,
                     "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at) VALUES (?, ?, ?, ?)",
                     &[SqlValue::from("bd-c"), SqlValue::from("bd-b"), SqlValue::from("blocks"), SqlValue::from(Utc::now().to_rfc3339())],
                 )?;
@@ -1302,11 +1302,11 @@ mod tests {
 
         storage
             .mutate("test_add_transitive_deps", "tester", |tx, _ctx| {
-                db::exec_with(&tx, 
+                db::exec_with(&tx,
                     "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at) VALUES (?, ?, ?, ?)",
                     &[SqlValue::from("bd-b"), SqlValue::from("bd-a"), SqlValue::from("blocks"), SqlValue::from(Utc::now().to_rfc3339())],
                 )?;
-                db::exec_with(&tx, 
+                db::exec_with(&tx,
                     "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at) VALUES (?, ?, ?, ?)",
                     &[SqlValue::from("bd-c"), SqlValue::from("bd-b"), SqlValue::from("blocks"), SqlValue::from(Utc::now().to_rfc3339())],
                 )?;
@@ -1338,15 +1338,15 @@ mod tests {
 
         storage
             .mutate("test_add_chain_deps", "tester", |tx, _ctx| {
-                db::exec_with(&tx, 
+                db::exec_with(&tx,
                     "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at) VALUES (?, ?, ?, ?)",
                     &[SqlValue::from("bd-b"), SqlValue::from("bd-a"), SqlValue::from("blocks"), SqlValue::from(Utc::now().to_rfc3339())],
                 )?;
-                db::exec_with(&tx, 
+                db::exec_with(&tx,
                     "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at) VALUES (?, ?, ?, ?)",
                     &[SqlValue::from("bd-c"), SqlValue::from("bd-b"), SqlValue::from("blocks"), SqlValue::from(Utc::now().to_rfc3339())],
                 )?;
-                db::exec_with(&tx, 
+                db::exec_with(&tx,
                     "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at) VALUES (?, ?, ?, ?)",
                     &[SqlValue::from("bd-d"), SqlValue::from("bd-c"), SqlValue::from("blocks"), SqlValue::from(Utc::now().to_rfc3339())],
                 )?;

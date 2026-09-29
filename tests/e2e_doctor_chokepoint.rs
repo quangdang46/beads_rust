@@ -246,7 +246,11 @@ fn mutate_cache_rebuild(ctx: &MutateContext, db_path: &Path) {
 
 fn single_cache_row(db_path: &Path) -> (String, String) {
     let conn = Connection::open(db_path.to_string_lossy().as_ref()).unwrap();
-    let rows = query_all(&conn, "SELECT issue_id, blocked_by FROM blocked_issues_cache").unwrap();
+    let rows = query_all(
+        &conn,
+        "SELECT issue_id, blocked_by FROM blocked_issues_cache",
+    )
+    .unwrap();
     assert_eq!(
         rows.len(),
         1,

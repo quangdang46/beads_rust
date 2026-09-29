@@ -69,10 +69,7 @@ fn release_workflow_uses_tagless_asset_file_names() -> Result<(), String> {
     // `github.ref_name` is the usual way that happens. `bd` and `install.sh`
     // both publish and request *tagless* archives -- `br-macos-arm64.tar.gz` --
     // so the workflow has to do the same.
-    require_not_contains(
-        &workflow,
-        "br-${{ github.ref_name }}-${{ matrix.name }}",
-    )?;
+    require_not_contains(&workflow, "br-${{ github.ref_name }}-${{ matrix.name }}")?;
     require_not_contains(&workflow, "artifacts/br-${{ github.ref_name }}-*")?;
 
     // Every published archive is `br-<platform>.<ext>` with no version segment,

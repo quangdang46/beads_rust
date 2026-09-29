@@ -1,8 +1,8 @@
 mod common;
 
 use beads_rust::storage::SqliteStorage;
-use common::cli::{BrWorkspace, run_br};
 use beads_rust::storage::db::{SqlValue, query_all, query_row_with, query_rows_with};
+use common::cli::{BrWorkspace, run_br};
 use rusqlite::Connection;
 use serde_json::Value;
 use std::path::Path;
@@ -16,7 +16,11 @@ fn scan_issue_ids(conn: &Connection) -> Vec<String> {
     query_all(conn, "SELECT id FROM issues ORDER BY rowid")
         .unwrap()
         .into_iter()
-        .filter_map(|row| row.first().and_then(SqlValue::as_text).map(ToOwned::to_owned))
+        .filter_map(|row| {
+            row.first()
+                .and_then(SqlValue::as_text)
+                .map(ToOwned::to_owned)
+        })
         .collect()
 }
 
@@ -28,7 +32,11 @@ fn keyed_issue_ids(conn: &Connection, id: &str) -> Vec<String> {
     )
     .unwrap()
     .into_iter()
-    .filter_map(|row| row.first().and_then(SqlValue::as_text).map(ToOwned::to_owned))
+    .filter_map(|row| {
+        row.first()
+            .and_then(SqlValue::as_text)
+            .map(ToOwned::to_owned)
+    })
     .collect()
 }
 
@@ -39,13 +47,23 @@ fn keyed_issue_row(conn: &Connection, id: &str) -> Option<String> {
         &[SqlValue::from(id)],
     )
     .unwrap_or_else(|error| panic!("query_row issue lookup failed for {id}: {error}"))
-    .and_then(|row| row.first().and_then(SqlValue::as_text).map(ToOwned::to_owned))
+    .and_then(|row| {
+        row.first()
+            .and_then(SqlValue::as_text)
+            .map(ToOwned::to_owned)
+    })
 }
 
 fn keyed_text_value(conn: &Connection, sql: &str, key: &str) -> Option<String> {
     query_row_with(conn, sql, &[SqlValue::from(key)])
-        .unwrap_or_else(|error| panic!("text lookup failed for key {key} with sql {sql:?}: {error}"))
-        .and_then(|row| row.first().and_then(SqlValue::as_text).map(ToOwned::to_owned))
+        .unwrap_or_else(|error| {
+            panic!("text lookup failed for key {key} with sql {sql:?}: {error}")
+        })
+        .and_then(|row| {
+            row.first()
+                .and_then(SqlValue::as_text)
+                .map(ToOwned::to_owned)
+        })
 }
 
 fn create_seed_issue(workspace: &BrWorkspace, title: &str) {

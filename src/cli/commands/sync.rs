@@ -803,8 +803,7 @@ fn validate_operator_requested_sync_path(beads_dir: &Path, jsonl_path: &Path) ->
         // directory" case), in which case canonicalization fails. Fall back to
         // the lexical path, which is still comparable against `canonical_beads`
         // because `beads_dir` was already canonicalized above.
-        let canonical_target =
-            dunce::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
+        let canonical_target = dunce::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
         if !canonical_target.starts_with(&canonical_beads) {
             return Err(BeadsError::Config(format!(
                 "Refusing to use JSONL path through symlink escaping .beads: {} -> {}",

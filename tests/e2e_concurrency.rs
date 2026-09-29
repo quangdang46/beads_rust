@@ -10,8 +10,8 @@
 mod common;
 
 use assert_cmd::Command;
-use common::dataset_registry::{DatasetRegistry, IsolatedDataset, KnownDataset};
 use beads_rust::storage::db::{SqlValue, query_rows_with};
+use common::dataset_registry::{DatasetRegistry, IsolatedDataset, KnownDataset};
 use rusqlite::Connection;
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
@@ -763,8 +763,11 @@ fn e2e_read_command_witness_refresh_waits_for_write_lock() {
     let conn = Connection::open(db_path.to_string_lossy().as_ref()).expect("open beads db");
     conn.execute("DELETE FROM metadata WHERE key = 'jsonl_size'", [])
         .expect("delete jsonl_size witness");
-    conn.execute("INSERT INTO metadata (key, value) VALUES ('jsonl_size', '0')", [])
-        .expect("write stale jsonl_size witness");
+    conn.execute(
+        "INSERT INTO metadata (key, value) VALUES ('jsonl_size', '0')",
+        [],
+    )
+    .expect("write stale jsonl_size witness");
     // beads_rust-mjmk: also corrupt jsonl_content_hash so the staleness probe
     // actually concludes the JSONL is newer. compute_jsonl_newer_impl falls
     // back to hash comparison when size mismatches; if the hash still matches

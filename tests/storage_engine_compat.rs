@@ -95,21 +95,64 @@ struct Fixture {
 
 const FIXTURES: &[Fixture] = &[
     // --- the 11 project databases: sample_beads_db_files/<name>/beads.db ---
-    Fixture { rel: "sample_beads_db_files/asupersync/beads.db", expect: Expect::Clean, observed_issues: Some(3378) },
+    Fixture {
+        rel: "sample_beads_db_files/asupersync/beads.db",
+        expect: Expect::Clean,
+        observed_issues: Some(3378),
+    },
     Fixture {
         rel: "sample_beads_db_files/beads_rust/beads.db",
-        expect: Expect::MalformedSchema { index: "idx_blocked_cache_blocked_at", table: "blocked_issues_cache" },
+        expect: Expect::MalformedSchema {
+            index: "idx_blocked_cache_blocked_at",
+            table: "blocked_issues_cache",
+        },
         observed_issues: None,
     },
-    Fixture { rel: "sample_beads_db_files/flywheel_connectors/beads.db", expect: Expect::Clean, observed_issues: Some(970) },
-    Fixture { rel: "sample_beads_db_files/franken_whisper/beads.db", expect: Expect::Clean, observed_issues: Some(170) },
-    Fixture { rel: "sample_beads_db_files/frankensqlite/beads.db", expect: Expect::Clean, observed_issues: Some(1484) },
-    Fixture { rel: "sample_beads_db_files/frankenterm/beads.db", expect: Expect::Clean, observed_issues: Some(1727) },
-    Fixture { rel: "sample_beads_db_files/frankentui/beads.db", expect: Expect::Clean, observed_issues: Some(2590) },
-    Fixture { rel: "sample_beads_db_files/mcp_agent_mail_rust/beads.db", expect: Expect::Clean, observed_issues: Some(1600) },
-    Fixture { rel: "sample_beads_db_files/mcp_agent_mail_website/beads.db", expect: Expect::Clean, observed_issues: Some(160) },
-    Fixture { rel: "sample_beads_db_files/ntm/beads.db", expect: Expect::Clean, observed_issues: Some(1947) },
-    Fixture { rel: "sample_beads_db_files/remote_compilation_helper/beads.db", expect: Expect::Clean, observed_issues: Some(733) },
+    Fixture {
+        rel: "sample_beads_db_files/flywheel_connectors/beads.db",
+        expect: Expect::Clean,
+        observed_issues: Some(970),
+    },
+    Fixture {
+        rel: "sample_beads_db_files/franken_whisper/beads.db",
+        expect: Expect::Clean,
+        observed_issues: Some(170),
+    },
+    Fixture {
+        rel: "sample_beads_db_files/frankensqlite/beads.db",
+        expect: Expect::Clean,
+        observed_issues: Some(1484),
+    },
+    Fixture {
+        rel: "sample_beads_db_files/frankenterm/beads.db",
+        expect: Expect::Clean,
+        observed_issues: Some(1727),
+    },
+    Fixture {
+        rel: "sample_beads_db_files/frankentui/beads.db",
+        expect: Expect::Clean,
+        observed_issues: Some(2590),
+    },
+    Fixture {
+        rel: "sample_beads_db_files/mcp_agent_mail_rust/beads.db",
+        expect: Expect::Clean,
+        observed_issues: Some(1600),
+    },
+    Fixture {
+        rel: "sample_beads_db_files/mcp_agent_mail_website/beads.db",
+        expect: Expect::Clean,
+        observed_issues: Some(160),
+    },
+    Fixture {
+        rel: "sample_beads_db_files/ntm/beads.db",
+        expect: Expect::Clean,
+        observed_issues: Some(1947),
+    },
+    Fixture {
+        rel: "sample_beads_db_files/remote_compilation_helper/beads.db",
+        expect: Expect::Clean,
+        observed_issues: Some(733),
+    },
     // --- the 2 repro fixtures. NOTE the extra `.beads/` level: a single
     // `sample_beads_db_files/*/beads.db` glob yields 11 paths, not 13. ---
     Fixture {
@@ -119,7 +162,10 @@ const FIXTURES: &[Fixture] = &[
     },
     Fixture {
         rel: "sample_beads_db_files/repro_frankensqlite_import_write.ljw6cl/.beads/beads.db",
-        expect: Expect::MalformedSchema { index: "idx_issues_status", table: "issues" },
+        expect: Expect::MalformedSchema {
+            index: "idx_issues_status",
+            table: "issues",
+        },
         observed_issues: None,
     },
 ];
@@ -214,10 +260,15 @@ fn frankensqlite_fixtures_behave_as_measured_under_c_sqlite() {
             }
             Ok(conn) => {
                 let issues = conn
-                    .query_row("SELECT COUNT(*) FROM issues", [], |row| row.get::<_, i64>(0))
+                    .query_row("SELECT COUNT(*) FROM issues", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
                     .unwrap_or_else(|e| {
-                    panic!("{}: opened but `SELECT COUNT(*) FROM issues` failed: {e}", fixture.rel)
-                });
+                        panic!(
+                            "{}: opened but `SELECT COUNT(*) FROM issues` failed: {e}",
+                            fixture.rel
+                        )
+                    });
                 assert!(
                     issues > 0,
                     "{}: opened but has zero issues rows; the corpus is supposed to be populated, \
@@ -228,9 +279,9 @@ fn frankensqlite_fixtures_behave_as_measured_under_c_sqlite() {
                 // `PRAGMA integrity_check` returns one row per finding, so it has to be walked as a
                 // statement; `query_row` would only ever see the first.
                 let findings: Vec<String> = {
-                    let mut stmt = conn
-                        .prepare("PRAGMA integrity_check")
-                        .unwrap_or_else(|e| panic!("{}: prepare integrity_check: {e}", fixture.rel));
+                    let mut stmt = conn.prepare("PRAGMA integrity_check").unwrap_or_else(|e| {
+                        panic!("{}: prepare integrity_check: {e}", fixture.rel)
+                    });
                     let rows = stmt
                         .query_map([], |row| row.get::<_, String>(0))
                         .unwrap_or_else(|e| panic!("{}: query integrity_check: {e}", fixture.rel));
@@ -296,10 +347,23 @@ fn frankensqlite_fixtures_behave_as_measured_under_c_sqlite() {
 
     // The corpus is 13 fixtures: 11 at `sample_beads_db_files/<name>/beads.db` and 2 at
     // `sample_beads_db_files/repro_*/.beads/beads.db`.
-    assert_eq!(FIXTURES.len(), 13, "corpus size changed; update the expectations above");
-    assert_eq!(clean, 10, "expected exactly 10 fixtures to open clean, saw {clean}");
-    assert_eq!(degraded, 1, "expected exactly 1 fixture to open with findings, saw {degraded}");
-    assert_eq!(refused, 2, "expected exactly 2 fixtures to be refused, saw {refused}");
+    assert_eq!(
+        FIXTURES.len(),
+        13,
+        "corpus size changed; update the expectations above"
+    );
+    assert_eq!(
+        clean, 10,
+        "expected exactly 10 fixtures to open clean, saw {clean}"
+    );
+    assert_eq!(
+        degraded, 1,
+        "expected exactly 1 fixture to open with findings, saw {degraded}"
+    );
+    assert_eq!(
+        refused, 2,
+        "expected exactly 2 fixtures to be refused, saw {refused}"
+    );
 }
 
 /// The refusal must be a *schema parse* failure, not corruption of the file container.
@@ -316,7 +380,10 @@ fn refused_fixtures_still_have_intact_sqlite_containers() {
     }
 
     let root = crate_root();
-    for fixture in FIXTURES.iter().filter(|f| matches!(f.expect, Expect::MalformedSchema { .. })) {
+    for fixture in FIXTURES
+        .iter()
+        .filter(|f| matches!(f.expect, Expect::MalformedSchema { .. }))
+    {
         let path = root.join(fixture.rel);
         let bytes = std::fs::read(&path).expect("read fixture");
 

@@ -11,10 +11,10 @@
 
 pub mod routing;
 
-use crate::storage::db::{self, SqlValue};
 use crate::error::{BeadsError, Result, ResultExt};
 use crate::model::{IssueType, Priority};
 use crate::storage::SqliteStorage;
+use crate::storage::db::{self, SqlValue};
 use crate::sync::path::validate_sync_path_with_external;
 use crate::sync::{
     ExportConfig, ImportConfig, ImportResult, JsonlTombstoneFilter, PreservedTombstone, auto_flush,
@@ -1191,12 +1191,10 @@ fn should_attempt_jsonl_recovery(open_err: &BeadsError, db_path: &Path, jsonl_pa
 /// neither is fixed by rebuilding from JSONL.
 fn has_non_file_sidecar(db_path: &Path) -> bool {
     let stem = db_path.to_string_lossy().into_owned();
-    ["-wal", "-shm", "-journal"]
-        .iter()
-        .any(|suffix| {
-            let candidate = PathBuf::from(format!("{stem}{suffix}"));
-            candidate.exists() && !candidate.is_file()
-        })
+    ["-wal", "-shm", "-journal"].iter().any(|suffix| {
+        let candidate = PathBuf::from(format!("{stem}{suffix}"));
+        candidate.exists() && !candidate.is_file()
+    })
 }
 
 fn should_attempt_jsonl_recovery_after_open(
@@ -2119,11 +2117,7 @@ fn expected_child_counters(storage: &SqliteStorage) -> Result<HashMap<String, u3
         })?;
     let issue_ids: HashSet<String> = rows
         .iter()
-        .filter_map(|row| {
-            row.first()
-                .and_then(SqlValue::as_text)
-                .map(str::to_string)
-        })
+        .filter_map(|row| row.first().and_then(SqlValue::as_text).map(str::to_string))
         .collect();
     let mut expected = HashMap::new();
 
@@ -4879,10 +4873,13 @@ mod tests {
 
     fn insert_duplicate_issue_prefix_config_row(db_path: &Path, value: &str) {
         let conn = Connection::open(&db_path).expect("open setup db");
-        conn.execute(&format!(
-            "INSERT INTO config (key, value) VALUES ('issue_prefix', '{}')",
-            value.replace('\'', "''")
-        ), [])
+        conn.execute(
+            &format!(
+                "INSERT INTO config (key, value) VALUES ('issue_prefix', '{}')",
+                value.replace('\'', "''")
+            ),
+            [],
+        )
         .expect("insert duplicate issue_prefix config row");
     }
 
@@ -5371,7 +5368,10 @@ labels:
         // `TempDir` hands back a `/var/...` path whose canonical form is
         // `/private/var/...`, so comparing against the raw path fails for a
         // reason that has nothing to do with discovery.
-        assert_eq!(discovered, dunce::canonicalize(&beads_dir).expect("canonical"));
+        assert_eq!(
+            discovered,
+            dunce::canonicalize(&beads_dir).expect("canonical")
+        );
     }
 
     /// Discovery canonicalizes its result, so expectations must too.
@@ -5420,7 +5420,10 @@ labels:
 
         let discovered =
             discover_optional_beads_dir_with_cli(&cli).expect("optional discovery with db");
-        assert_eq!(discovered, Some(dunce::canonicalize(&beads_dir).expect("canonical")));
+        assert_eq!(
+            discovered,
+            Some(dunce::canonicalize(&beads_dir).expect("canonical"))
+        );
     }
 
     #[test]
@@ -5453,7 +5456,10 @@ labels:
 
         let discovered =
             discover_optional_beads_dir_with_cli(&cli).expect("optional discovery with redirect");
-        assert_eq!(discovered, Some(dunce::canonicalize(&target_beads).expect("canonical")));
+        assert_eq!(
+            discovered,
+            Some(dunce::canonicalize(&target_beads).expect("canonical"))
+        );
     }
 
     #[test]
@@ -6581,7 +6587,10 @@ routing:
         // permissions problem or a full disk reports, and rebuilding the
         // database in those cases throws away good data to fix nothing.
         assert!(!should_attempt_jsonl_recovery(
-            &db_error(rusqlite::ffi::ErrorCode::CannotOpen, "unable to open database file"),
+            &db_error(
+                rusqlite::ffi::ErrorCode::CannotOpen,
+                "unable to open database file"
+            ),
             &db_path,
             &jsonl_path
         ));
@@ -6591,7 +6600,10 @@ routing:
         let wal_dir = beads_dir.join("beads.db-wal");
         fs::create_dir_all(&wal_dir).expect("block the wal path with a directory");
         assert!(should_attempt_jsonl_recovery(
-            &db_error(rusqlite::ffi::ErrorCode::CannotOpen, "unable to open database file"),
+            &db_error(
+                rusqlite::ffi::ErrorCode::CannotOpen,
+                "unable to open database file"
+            ),
             &db_path,
             &jsonl_path
         ));
@@ -7868,7 +7880,8 @@ routing:
 
         let prefix = with_database_family_snapshot(&db_path, |snapshot_db_path| {
             let conn = Connection::open(&snapshot_db_path)?;
-            let row = db::query_row_all(&conn, "SELECT value FROM config WHERE key = 'issue_prefix'")?;
+            let row =
+                db::query_row_all(&conn, "SELECT value FROM config WHERE key = 'issue_prefix'")?;
             Ok(row
                 .as_ref()
                 .and_then(|r| r.first())

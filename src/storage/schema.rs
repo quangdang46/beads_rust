@@ -464,12 +464,14 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
     if is_fresh {
         // Fresh database: SCHEMA_SQL already created everything at the
         // current version. Skip migrations and stamp user_version directly.
-        set_pragma(conn, &format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")).map_err(
-            |e| {
-                eprintln!("PRAGMA user_version failed: {:?}", e);
-                db_err(e)
-            },
-        )?;
+        set_pragma(
+            conn,
+            &format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"),
+        )
+        .map_err(|e| {
+            eprintln!("PRAGMA user_version failed: {:?}", e);
+            db_err(e)
+        })?;
     } else {
         // Existing database: run migrations for schema upgrades.
         // If the issues table was rebuilt from scratch, skip migration checks
@@ -481,12 +483,14 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
         })?;
 
         // Mark schema as applied so future opens can skip DDL/migration work.
-        set_pragma(conn, &format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")).map_err(
-            |e| {
-                eprintln!("PRAGMA user_version failed: {:?}", e);
-                db_err(e)
-            },
-        )?;
+        set_pragma(
+            conn,
+            &format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"),
+        )
+        .map_err(|e| {
+            eprintln!("PRAGMA user_version failed: {:?}", e);
+            db_err(e)
+        })?;
     }
 
     apply_runtime_pragmas(conn).map_err(|e| {
@@ -592,7 +596,11 @@ pub(crate) fn apply_runtime_compatible_schema(conn: &Connection) -> Result<()> {
     // heavier pre-schema rebuilds and just restore any missing canonical DDL.
     conn.execute_batch(SCHEMA_SQL).map_err(db_err)?;
     run_migrations(conn, false)?;
-    set_pragma(conn, &format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")).map_err(db_err)?;
+    set_pragma(
+        conn,
+        &format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"),
+    )
+    .map_err(db_err)?;
     apply_runtime_pragmas(conn)?;
     Ok(())
 }
@@ -1420,7 +1428,9 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
                     blocked_by TEXT NOT NULL,
                     blocked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
-                )", [])?;
+                )",
+                [],
+            )?;
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_blocked_cache_blocked_at ON blocked_issues_cache(blocked_at)", [])?;
             Ok(())
@@ -1449,9 +1459,15 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
         {
             tracing::info!("Migrating database to schema version 3 (NOT NULL filter columns)");
             // 1. Backfill NULL values
-            conn.execute("UPDATE issues SET ephemeral = 0 WHERE ephemeral IS NULL", [])?;
+            conn.execute(
+                "UPDATE issues SET ephemeral = 0 WHERE ephemeral IS NULL",
+                [],
+            )?;
             conn.execute("UPDATE issues SET pinned = 0 WHERE pinned IS NULL", [])?;
-            conn.execute("UPDATE issues SET is_template = 0 WHERE is_template IS NULL", [])?;
+            conn.execute(
+                "UPDATE issues SET is_template = 0 WHERE is_template IS NULL",
+                [],
+            )?;
 
             // 2. Rebuild the table to apply NOT NULL constraints
             rebuild_issues_table(conn)?;
@@ -1685,9 +1701,10 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
         ",
         )?;
         // Backfill built-in statuses as custom entries for parity
-        let existing_status_count: i64 = query_first_value(conn, "SELECT COUNT(*) FROM custom_statuses")?
-            .as_integer()
-            .unwrap_or(0);
+        let existing_status_count: i64 =
+            query_first_value(conn, "SELECT COUNT(*) FROM custom_statuses")?
+                .as_integer()
+                .unwrap_or(0);
         if existing_status_count == 0 {
             conn.execute_batch(
                 r#"
@@ -1705,9 +1722,10 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
             tracing::info!("Backfilled built-in statuses into custom_statuses");
         }
 
-        let existing_type_count: i64 = query_first_value(conn, "SELECT COUNT(*) FROM custom_types")?
-            .as_integer()
-            .unwrap_or(0);
+        let existing_type_count: i64 =
+            query_first_value(conn, "SELECT COUNT(*) FROM custom_types")?
+                .as_integer()
+                .unwrap_or(0);
         if existing_type_count == 0 {
             conn.execute_batch(
                 r#"
@@ -1916,7 +1934,10 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
     }
 
     if table_exists(conn, "comments") {
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_comments_issue ON comments(issue_id)", [])?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_comments_issue ON comments(issue_id)",
+            [],
+        )?;
     }
 
     if table_exists(conn, "events") {
@@ -2198,10 +2219,10 @@ mod tests {
         // Verify a few tables exist
         let tables: Vec<String> =
             query_all(&conn, "SELECT name FROM sqlite_master WHERE type='table'")
-            .unwrap()
-            .iter()
-            .filter_map(|row| row.get(0).and_then(|v| v.as_text()).map(String::from))
-            .collect();
+                .unwrap()
+                .iter()
+                .filter_map(|row| row.get(0).and_then(|v| v.as_text()).map(String::from))
+                .collect();
 
         assert!(tables.contains(&"issues".to_string()));
         assert!(tables.contains(&"dependencies".to_string()));
@@ -2251,9 +2272,12 @@ mod tests {
 
         // Sanity: every updated_at/closed_at must be integer-typed pre-repair.
         for (id, _) in rows {
-            let row = query_one_row(&conn, &format!(
+            let row = query_one_row(
+                &conn,
+                &format!(
                     "SELECT typeof(updated_at), typeof(closed_at) FROM issues WHERE id='{id}'"
-                ));
+                ),
+            );
             assert_eq!(
                 row.get(0).and_then(SqlValue::as_text),
                 Some("integer"),
@@ -2269,9 +2293,12 @@ mod tests {
         repair_integer_datetime_columns(&conn).expect("repair should succeed");
 
         for (id, _) in rows {
-            let row = query_one_row(&conn, &format!(
+            let row = query_one_row(
+                &conn,
+                &format!(
                     "SELECT typeof(updated_at), updated_at, typeof(closed_at), closed_at FROM issues WHERE id='{id}'"
-                ));
+                ),
+            );
             assert_eq!(
                 row.get(0).and_then(SqlValue::as_text),
                 Some("text"),
@@ -2294,7 +2321,10 @@ mod tests {
 
         // Idempotency: a second pass is a no-op and leaves the rows TEXT.
         repair_integer_datetime_columns(&conn).expect("second pass should succeed");
-        let row = query_one_row(&conn, "SELECT typeof(updated_at) FROM issues WHERE id='bug-us'");
+        let row = query_one_row(
+            &conn,
+            "SELECT typeof(updated_at) FROM issues WHERE id='bug-us'",
+        );
         assert_eq!(row.get(0).and_then(SqlValue::as_text), Some("text"));
     }
 
@@ -2324,18 +2354,16 @@ mod tests {
         repair_legacy_status_values(&conn).expect("repair should succeed");
 
         for id in ["legacy-done", "legacy-resolved"] {
-            let row = query_one_row(&conn, &format!(
-                    "SELECT status, closed_at FROM issues WHERE id='{id}'"
-                ));
+            let row = query_one_row(
+                &conn,
+                &format!("SELECT status, closed_at FROM issues WHERE id='{id}'"),
+            );
             assert_eq!(
                 row.get(0).and_then(SqlValue::as_text),
                 Some("closed"),
                 "{id} should be closed"
             );
-            let closed_at = row
-                .get(1)
-                .and_then(SqlValue::as_text)
-                .unwrap_or_default();
+            let closed_at = row.get(1).and_then(SqlValue::as_text).unwrap_or_default();
             assert!(!closed_at.is_empty(), "{id} closed_at should be populated");
         }
     }
@@ -2364,14 +2392,20 @@ mod tests {
 
         run_migrations(&conn, false).expect("v7 migration should succeed");
 
-        let row = query_one_row(&conn, "SELECT content_hash FROM issues WHERE id = 'bd-hash'");
+        let row = query_one_row(
+            &conn,
+            "SELECT content_hash FROM issues WHERE id = 'bd-hash'",
+        );
         assert_eq!(
             row.get(0).and_then(SqlValue::as_text),
             Some("c8e7e2783cc1fbb37322ae61efcf0e5c7d79a2cc6203e878fa6556c41742398d"),
             "v7 should rewrite stored issue hashes to Go bd canonical values"
         );
 
-        let dirty_row = query_one_row(&conn, "SELECT COUNT(*) FROM dirty_issues WHERE issue_id = 'bd-hash'");
+        let dirty_row = query_one_row(
+            &conn,
+            "SELECT COUNT(*) FROM dirty_issues WHERE issue_id = 'bd-hash'",
+        );
         assert_eq!(dirty_row.get(0).and_then(SqlValue::as_integer), Some(1));
 
         let export_row = query_one_row(&conn, "SELECT COUNT(*) FROM export_hashes");
@@ -2414,7 +2448,10 @@ mod tests {
         run_migrations(&conn, false)
             .expect("v7 migration must succeed against legacy dirty_issues schema");
 
-        let dirty_row = query_one_row(&conn, "SELECT COUNT(*) FROM dirty_issues WHERE issue_id = 'bd-legacy'");
+        let dirty_row = query_one_row(
+            &conn,
+            "SELECT COUNT(*) FROM dirty_issues WHERE issue_id = 'bd-legacy'",
+        );
         assert_eq!(
             dirty_row.get(0).and_then(SqlValue::as_integer),
             Some(1),
@@ -2459,9 +2496,10 @@ mod tests {
             "is_template",
         ];
         for column in columns_to_null {
-            let _ = conn.execute(&format!(
-                "UPDATE issues SET {column} = NULL WHERE id = 'bd-null'"
-            ), []);
+            let _ = conn.execute(
+                &format!("UPDATE issues SET {column} = NULL WHERE id = 'bd-null'"),
+                [],
+            );
         }
 
         // Run the v8 migration directly so this test stays focused on the
@@ -2472,9 +2510,10 @@ mod tests {
         // storage class after the backfill, regardless of which UPDATE-to-
         // NULL succeeded above.
         for column in columns_to_null {
-            let row = query_one_row(&conn, &format!(
-                    "SELECT typeof({column}) FROM issues WHERE id = 'bd-null'"
-                ));
+            let row = query_one_row(
+                &conn,
+                &format!("SELECT typeof({column}) FROM issues WHERE id = 'bd-null'"),
+            );
             let actual_type = row.get(0).and_then(SqlValue::as_text);
             assert_ne!(
                 actual_type,
@@ -2485,7 +2524,10 @@ mod tests {
 
         // Second pass is a no-op (the UPDATEs touch zero rows).
         backfill_storage_null_in_default_columns(&conn);
-        let row = query_one_row(&conn, "SELECT typeof(notes) FROM issues WHERE id = 'bd-null'");
+        let row = query_one_row(
+            &conn,
+            "SELECT typeof(notes) FROM issues WHERE id = 'bd-null'",
+        );
         assert_ne!(row.get(0).and_then(SqlValue::as_text), Some("null"));
     }
 
@@ -2549,8 +2591,7 @@ mod tests {
 
         // Stamp the legacy version so the open-path would otherwise
         // short-circuit and skip migrations.
-        set_pragma(&conn, "PRAGMA user_version = 9")
-            .expect("stamp legacy user_version");
+        set_pragma(&conn, "PRAGMA user_version = 9").expect("stamp legacy user_version");
 
         assert!(
             !column_exists(&conn, "issues", "source_repo_path"),
@@ -2595,14 +2636,11 @@ mod tests {
         // comment would fail this test while the schema stayed correct. A
         // duplicate column is what actually matters, and PRAGMA table_info
         // reports the real column list.
-        let columns: Vec<String> = query_all(
-            &conn,
-            "SELECT name FROM pragma_table_info('issues')",
-        )
-        .expect("read issues columns")
-        .iter()
-        .filter_map(|row| row.first().and_then(|v| v.as_text()).map(str::to_owned))
-        .collect();
+        let columns: Vec<String> = query_all(&conn, "SELECT name FROM pragma_table_info('issues')")
+            .expect("read issues columns")
+            .iter()
+            .filter_map(|row| row.first().and_then(|v| v.as_text()).map(str::to_owned))
+            .collect();
 
         for name in ["source_repo", "source_repo_path", "is_template"] {
             let count = columns.iter().filter(|c| c.as_str() == name).count();
@@ -2627,26 +2665,26 @@ mod tests {
         // Verify column defaults
         let issues_cols: Vec<(String, String, i32, Option<String>)> =
             query_all(&conn, "PRAGMA table_info(issues)")
-            .unwrap()
-            .iter()
-            .map(|row| {
-                (
-                    row.get(1)
-                        .and_then(|v| v.as_text())
-                        .unwrap_or("")
-                        .to_string(),
-                    row.get(2)
-                        .and_then(|v| v.as_text())
-                        .unwrap_or("")
-                        .to_string(),
-                    #[allow(clippy::cast_possible_truncation)]
-                    {
-                        row.get(3).and_then(SqlValue::as_integer).unwrap_or(0) as i32
-                    },
-                    row.get(4).and_then(|v| v.as_text()).map(String::from),
-                )
-            })
-            .collect();
+                .unwrap()
+                .iter()
+                .map(|row| {
+                    (
+                        row.get(1)
+                            .and_then(|v| v.as_text())
+                            .unwrap_or("")
+                            .to_string(),
+                        row.get(2)
+                            .and_then(|v| v.as_text())
+                            .unwrap_or("")
+                            .to_string(),
+                        #[allow(clippy::cast_possible_truncation)]
+                        {
+                            row.get(3).and_then(SqlValue::as_integer).unwrap_or(0) as i32
+                        },
+                        row.get(4).and_then(|v| v.as_text()).map(String::from),
+                    )
+                })
+                .collect();
 
         // Check required defaults for bd parity
         let col_map: std::collections::HashMap<_, _> = issues_cols
@@ -2690,12 +2728,14 @@ mod tests {
         );
 
         // === VERIFY KEY INDEXES EXIST ===
-        let indexes: HashSet<String> =
-            query_all(&conn, "SELECT name FROM sqlite_master WHERE type='index' AND sql IS NOT NULL")
-            .unwrap()
-            .iter()
-            .filter_map(|row| row.get(0).and_then(|v| v.as_text()).map(String::from))
-            .collect();
+        let indexes: HashSet<String> = query_all(
+            &conn,
+            "SELECT name FROM sqlite_master WHERE type='index' AND sql IS NOT NULL",
+        )
+        .unwrap()
+        .iter()
+        .filter_map(|row| row.get(0).and_then(|v| v.as_text()).map(String::from))
+        .collect();
 
         // Core indexes
         assert!(
@@ -2772,18 +2812,18 @@ mod tests {
         // === DEPENDENCIES TABLE ===
         let deps_cols: Vec<(String, Option<String>)> =
             query_all(&conn, "PRAGMA table_info(dependencies)")
-            .unwrap()
-            .iter()
-            .map(|row| {
-                (
-                    row.get(1)
-                        .and_then(|v| v.as_text())
-                        .unwrap_or("")
-                        .to_string(),
-                    row.get(4).and_then(|v| v.as_text()).map(String::from),
-                )
-            })
-            .collect();
+                .unwrap()
+                .iter()
+                .map(|row| {
+                    (
+                        row.get(1)
+                            .and_then(|v| v.as_text())
+                            .unwrap_or("")
+                            .to_string(),
+                        row.get(4).and_then(|v| v.as_text()).map(String::from),
+                    )
+                })
+                .collect();
 
         let deps_map: std::collections::HashMap<_, _> = deps_cols
             .iter()
@@ -2874,8 +2914,11 @@ mod tests {
 
         // === TEST CLOSED-AT CONSTRAINT ===
         // Insert an issue with defaults (will get status='open', closed_at=NULL)
-        conn.execute("INSERT INTO issues (id, title) VALUES ('test-1', 'Test Issue')", [])
-            .expect("Should allow open issue without closed_at");
+        conn.execute(
+            "INSERT INTO issues (id, title) VALUES ('test-1', 'Test Issue')",
+            [],
+        )
+        .expect("Should allow open issue without closed_at");
 
         // Try to insert closed issue without closed_at — CHECK constraint
         // should reject it. fsqlite does not yet enforce CHECK constraints,
@@ -3261,12 +3304,17 @@ mod tests {
 
         let metadata_values = [SqlValue::from("project")];
         let metadata_latest = crate::storage::db::query_row_values_with_params(
-            &mut conn.prepare("SELECT value FROM metadata WHERE key = ?1").unwrap(),
+            &mut conn
+                .prepare("SELECT value FROM metadata WHERE key = ?1")
+                .unwrap(),
             crate::storage::db::params_from(&metadata_values).as_slice(),
         )
         .unwrap();
         assert_eq!(
-            metadata_latest.as_ref().and_then(|r| r.first()).and_then(SqlValue::as_text),
+            metadata_latest
+                .as_ref()
+                .and_then(|r| r.first())
+                .and_then(SqlValue::as_text),
             Some("new")
         );
     }
@@ -3282,14 +3330,21 @@ mod tests {
             conn.execute("DROP INDEX IF EXISTS idx_config_key", [])
                 .expect("drop config index");
             conn.execute("DROP TABLE config", []).expect("drop config");
-            conn.execute("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL)", [])
-                .expect("recreate legacy config");
+            conn.execute(
+                "CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+                [],
+            )
+            .expect("recreate legacy config");
 
             conn.execute("DROP INDEX IF EXISTS idx_metadata_key", [])
                 .expect("drop metadata index");
-            conn.execute("DROP TABLE metadata", []).expect("drop metadata");
-            conn.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)", [])
-                .expect("recreate legacy metadata");
+            conn.execute("DROP TABLE metadata", [])
+                .expect("drop metadata");
+            conn.execute(
+                "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+                [],
+            )
+            .expect("recreate legacy metadata");
         }
 
         let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
@@ -3316,8 +3371,8 @@ mod tests {
                    AND (is_template = 0 OR is_template IS NULL)
                  ORDER BY priority ASC, created_at DESC
                  LIMIT 1",
-            )
-            .expect("query plan");
+        )
+        .expect("query plan");
 
         let details: Vec<String> = plan_rows
             .iter()
@@ -3378,7 +3433,11 @@ mod tests {
     #[test]
     fn test_check_schema_skew_current_version_ok() {
         let conn = Connection::open_in_memory().unwrap();
-        set_pragma(&conn, &format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")).unwrap();
+        set_pragma(
+            &conn,
+            &format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"),
+        )
+        .unwrap();
         assert!(check_schema_skew(&conn, false, false).is_ok());
         assert!(check_schema_skew(&conn, true, false).is_ok());
     }

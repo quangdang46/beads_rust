@@ -1279,8 +1279,7 @@ fn handle_error(err: &BeadsError, json_mode: bool, color_mode: bool) -> ! {
         // `null` after the real result. The error goes to stderr in that case,
         // so stdout stays exactly one parseable document.
         let json = structured.to_json();
-        let rendered =
-            serde_json::to_string_pretty(&json).unwrap_or_else(|_| json.to_string());
+        let rendered = serde_json::to_string_pretty(&json).unwrap_or_else(|_| json.to_string());
         if beads_rust::output::context::machine_output_was_emitted() {
             eprintln!("{rendered}");
         } else {
@@ -2108,8 +2107,7 @@ mod tests {
         let metadata_json = |db: &std::path::Path| {
             format!(
                 r#"{{"database":{},"jsonl_export":"issues.jsonl"}}"#,
-                serde_json::to_string(&db.to_string_lossy().to_string())
-                    .expect("encode db path")
+                serde_json::to_string(&db.to_string_lossy().to_string()).expect("encode db path")
             )
         };
         fs::write(&metadata_path, metadata_json(&first_db)).expect("write initial metadata");

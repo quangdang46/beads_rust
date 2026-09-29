@@ -2834,7 +2834,10 @@ fn collect_table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> 
 
 #[allow(clippy::too_many_lines)]
 fn required_schema_checks(conn: &Connection, checks: &mut Vec<CheckResult>) -> Result<()> {
-    let rows = query_all(conn, "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")?;
+    let rows = query_all(
+        conn,
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+    )?;
     let mut tables = Vec::with_capacity(rows.len());
     for row in &rows {
         if let Some(name) = row.first().and_then(SqlValue::as_text) {
@@ -5158,7 +5161,8 @@ fn check_root_gitignore_writable(repo_root: &Path, checks: &mut Vec<CheckResult>
 /// to attempt rewriting non-existent records. Auto-fixable via a
 /// targeted chokepointed prune that snapshots matching rows first.
 fn check_dirty_bitmap_divergence(conn: &Connection, checks: &mut Vec<CheckResult>) {
-    let Ok(rows) = query_all(&conn, 
+    let Ok(rows) = query_all(
+        &conn,
         "SELECT COUNT(*) FROM dirty_issues d LEFT JOIN issues i ON d.issue_id = i.id WHERE i.id IS NULL",
     ) else {
         // dirty_issues missing → upstream schema check covers it.
@@ -5171,7 +5175,8 @@ fn check_dirty_bitmap_divergence(conn: &Connection, checks: &mut Vec<CheckResult
         return;
     }
     // Sample up to 5 orphan ids for the operator.
-    let sample: Vec<String> = match query_all(conn, 
+    let sample: Vec<String> = match query_all(
+        conn,
         "SELECT d.issue_id FROM dirty_issues d LEFT JOIN issues i ON d.issue_id = i.id WHERE i.id IS NULL LIMIT 5",
     ) {
         Ok(rows) => column_texts(&rows, 0),
@@ -5265,7 +5270,8 @@ fn fix_dirty_bitmap_orphans_if_warned(
 /// cycle 29's dirty-bitmap surgical-DELETE pattern through the
 /// chokepoint.
 fn check_comments_orphans(conn: &Connection, checks: &mut Vec<CheckResult>) {
-    let Ok(rows) = query_all(&conn, 
+    let Ok(rows) = query_all(
+        &conn,
         "SELECT COUNT(*) FROM comments c LEFT JOIN issues i ON c.issue_id = i.id WHERE i.id IS NULL",
     ) else {
         push_check(checks, "comments.orphans", CheckStatus::Ok, None, None);
@@ -5276,7 +5282,8 @@ fn check_comments_orphans(conn: &Connection, checks: &mut Vec<CheckResult>) {
         push_check(checks, "comments.orphans", CheckStatus::Ok, None, None);
         return;
     }
-    let sample: Vec<String> = match query_all(conn, 
+    let sample: Vec<String> = match query_all(
+        conn,
         "SELECT c.issue_id FROM comments c LEFT JOIN issues i ON c.issue_id = i.id WHERE i.id IS NULL LIMIT 5",
     ) {
         Ok(rows) => column_texts(&rows, 0),
@@ -5366,7 +5373,8 @@ fn fix_comments_orphans_if_warned(
 /// cycle 29's dirty-bitmap surgical-DELETE pattern through the
 /// chokepoint.
 fn check_labels_orphans(conn: &Connection, checks: &mut Vec<CheckResult>) {
-    let Ok(rows) = query_all(&conn, 
+    let Ok(rows) = query_all(
+        &conn,
         "SELECT COUNT(*) FROM labels l LEFT JOIN issues i ON l.issue_id = i.id WHERE i.id IS NULL",
     ) else {
         push_check(checks, "labels.orphans", CheckStatus::Ok, None, None);
@@ -5377,7 +5385,8 @@ fn check_labels_orphans(conn: &Connection, checks: &mut Vec<CheckResult>) {
         push_check(checks, "labels.orphans", CheckStatus::Ok, None, None);
         return;
     }
-    let sample: Vec<String> = match query_all(conn, 
+    let sample: Vec<String> = match query_all(
+        conn,
         "SELECT l.issue_id FROM labels l LEFT JOIN issues i ON l.issue_id = i.id WHERE i.id IS NULL LIMIT 5",
     ) {
         Ok(rows) => column_texts(&rows, 0),
@@ -5471,9 +5480,10 @@ const DEPENDENCIES_ORPHAN_PREDICATE: &str = "issue_id NOT IN (SELECT id FROM iss
          AND depends_on_id NOT IN (SELECT id FROM issues))";
 
 fn check_dependencies_orphans(conn: &Connection, checks: &mut Vec<CheckResult>) {
-    let Ok(rows) = query_all(&conn, &format!(
-        "SELECT COUNT(*) FROM dependencies WHERE {DEPENDENCIES_ORPHAN_PREDICATE}"
-    )) else {
+    let Ok(rows) = query_all(
+        &conn,
+        &format!("SELECT COUNT(*) FROM dependencies WHERE {DEPENDENCIES_ORPHAN_PREDICATE}"),
+    ) else {
         push_check(checks, "dependencies.orphans", CheckStatus::Ok, None, None);
         return;
     };
@@ -5482,12 +5492,15 @@ fn check_dependencies_orphans(conn: &Connection, checks: &mut Vec<CheckResult>) 
         push_check(checks, "dependencies.orphans", CheckStatus::Ok, None, None);
         return;
     }
-    let sample: Vec<String> = match query_all(conn, &format!(
-        "SELECT issue_id, depends_on_id FROM dependencies \
+    let sample: Vec<String> = match query_all(
+        conn,
+        &format!(
+            "SELECT issue_id, depends_on_id FROM dependencies \
          WHERE {DEPENDENCIES_ORPHAN_PREDICATE} \
          ORDER BY issue_id, depends_on_id \
          LIMIT 5"
-    )) {
+        ),
+    ) {
         Ok(rows) => rows
             .iter()
             .filter_map(|row| {
@@ -5656,7 +5669,8 @@ fn check_suspect_close_reasons(conn: &Connection, checks: &mut Vec<CheckResult>)
     // GROUP_CONCAT separator can't contain commas in case a label ever
     // does — the validator forbids commas today, but we don't want to
     // create a latent bug if the schema ever changes.
-    let rows = match query_all(conn, 
+    let rows = match query_all(
+        conn,
         "SELECT i.id, i.close_reason,
                 COALESCE(GROUP_CONCAT(l.label, char(31)), '') AS labels
          FROM issues i
@@ -5785,22 +5799,24 @@ fn check_workflow_statuses(conn: &Connection, beads_dir: &Path, checks: &mut Vec
         return;
     }
 
-    let rows =
-        match query_all(conn, "SELECT id, status FROM issues WHERE status IS NOT NULL ORDER BY id") {
-            Ok(rows) => rows,
-            Err(err) => {
-                push_check(
-                    checks,
-                    "policy.workflow_statuses",
-                    CheckStatus::Warn,
-                    Some(format!(
-                        "Failed to query issue statuses for workflow audit: {err}"
-                    )),
-                    None,
-                );
-                return;
-            }
-        };
+    let rows = match query_all(
+        conn,
+        "SELECT id, status FROM issues WHERE status IS NOT NULL ORDER BY id",
+    ) {
+        Ok(rows) => rows,
+        Err(err) => {
+            push_check(
+                checks,
+                "policy.workflow_statuses",
+                CheckStatus::Warn,
+                Some(format!(
+                    "Failed to query issue statuses for workflow audit: {err}"
+                )),
+                None,
+            );
+            return;
+        }
+    };
 
     let mut offenders: Vec<serde_json::Value> = Vec::new();
     for row in rows {
@@ -5854,7 +5870,8 @@ fn check_workflow_statuses(conn: &Connection, beads_dir: &Path, checks: &mut Vec
 }
 
 fn check_recoverable_anomalies(conn: &Connection, checks: &mut Vec<CheckResult>) -> Result<()> {
-    let duplicate_schema_rows = query_all(&conn, 
+    let duplicate_schema_rows = query_all(
+        &conn,
         "SELECT type, name, COUNT(*) AS row_count
          FROM sqlite_master
          WHERE name IN ('blocked_issues_cache', 'idx_blocked_cache_blocked_at')
@@ -5864,7 +5881,8 @@ fn check_recoverable_anomalies(conn: &Connection, checks: &mut Vec<CheckResult>)
          LIMIT 1",
     )?;
 
-    let duplicate_config = query_all(&conn, 
+    let duplicate_config = query_all(
+        &conn,
         "SELECT key, COUNT(*) AS row_count
          FROM config
          GROUP BY key
@@ -5873,7 +5891,8 @@ fn check_recoverable_anomalies(conn: &Connection, checks: &mut Vec<CheckResult>)
          LIMIT 1",
     )?;
 
-    let duplicate_metadata = query_all(&conn, 
+    let duplicate_metadata = query_all(
+        &conn,
         "SELECT key, COUNT(*) AS row_count
          FROM metadata
          GROUP BY key
@@ -5885,14 +5904,8 @@ fn check_recoverable_anomalies(conn: &Connection, checks: &mut Vec<CheckResult>)
     let mut findings = Vec::new();
 
     if let Some(row) = duplicate_schema_rows.first() {
-        let object_type = row
-            .get(0)
-            .and_then(SqlValue::as_text)
-            .unwrap_or("object");
-        let name = row
-            .get(1)
-            .and_then(SqlValue::as_text)
-            .unwrap_or("unknown");
+        let object_type = row.get(0).and_then(SqlValue::as_text).unwrap_or("object");
+        let name = row.get(1).and_then(SqlValue::as_text).unwrap_or("unknown");
         let row_count = row.get(2).and_then(SqlValue::as_integer).unwrap_or(2);
         findings.push(format!(
             "sqlite_master contains duplicate {object_type} entries for '{name}' ({row_count} rows)"
@@ -5900,10 +5913,7 @@ fn check_recoverable_anomalies(conn: &Connection, checks: &mut Vec<CheckResult>)
     }
 
     if let Some(row) = duplicate_config.first() {
-        let key = row
-            .get(0)
-            .and_then(SqlValue::as_text)
-            .unwrap_or("unknown");
+        let key = row.get(0).and_then(SqlValue::as_text).unwrap_or("unknown");
         let row_count = row.get(1).and_then(SqlValue::as_integer).unwrap_or(2);
         findings.push(format!(
             "config contains duplicate rows for key '{key}' ({row_count} rows)"
@@ -5911,10 +5921,7 @@ fn check_recoverable_anomalies(conn: &Connection, checks: &mut Vec<CheckResult>)
     }
 
     if let Some(row) = duplicate_metadata.first() {
-        let key = row
-            .get(0)
-            .and_then(SqlValue::as_text)
-            .unwrap_or("unknown");
+        let key = row.get(0).and_then(SqlValue::as_text).unwrap_or("unknown");
         let row_count = row.get(1).and_then(SqlValue::as_integer).unwrap_or(2);
         findings.push(format!(
             "metadata contains duplicate rows for key '{key}' ({row_count} rows)"
@@ -9095,7 +9102,8 @@ fn compute_db_jsonl_id_delta(conn: &Connection, jsonl_path: &Path) -> Result<IdD
 
     // DB side: include the same filter the cardinality check uses so
     // counts and ids agree on the same population.
-    let rows = query_all(&conn, 
+    let rows = query_all(
+        &conn,
         "SELECT id FROM issues \
          WHERE (ephemeral = 0 OR ephemeral IS NULL) AND id NOT LIKE '%-wisp-%'",
     )?;
@@ -9800,7 +9808,8 @@ fn execute_repair_indexes(
     // reindex sqlite_autoindex_* or any internal index — those are
     // managed by SQLite and not the partial-index class we're after.
     let conn = Connection::open(&paths.db_path)?;
-    let rows = match query_all(&conn, 
+    let rows = match query_all(
+        &conn,
         "SELECT name FROM sqlite_master \
          WHERE type = 'index' \
            AND name NOT LIKE 'sqlite_autoindex_%' \
@@ -12082,8 +12091,7 @@ mod tests {
     }
 
     fn dependency_row_count(conn: &Connection, issue_id: &str, depends_on_id: &str) -> i64 {
-        let rows = query_all(conn, "SELECT issue_id, depends_on_id FROM dependencies")
-            .unwrap();
+        let rows = query_all(conn, "SELECT issue_id, depends_on_id FROM dependencies").unwrap();
         rows.iter()
             .filter(|row| {
                 let values = row.clone();
@@ -13443,7 +13451,17 @@ mod tests {
         let conn = Connection::open(&db_path).unwrap();
         // Disable FK enforcement so the orphan insert succeeds.
         let _ = conn.execute("PRAGMA foreign_keys = OFF", []);
-        { let __v = [SqlValue::from("bd-orphan-1"), SqlValue::from("2026-05-14T00:00:00Z"),]; let __p = crate::storage::db::params_from(&__v); conn.execute("INSERT INTO dirty_issues(issue_id, marked_at) VALUES (?1, ?2)", __p.as_slice()) }
+        {
+            let __v = [
+                SqlValue::from("bd-orphan-1"),
+                SqlValue::from("2026-05-14T00:00:00Z"),
+            ];
+            let __p = crate::storage::db::params_from(&__v);
+            conn.execute(
+                "INSERT INTO dirty_issues(issue_id, marked_at) VALUES (?1, ?2)",
+                __p.as_slice(),
+            )
+        }
         .unwrap();
 
         let mut checks = Vec::new();
@@ -13476,7 +13494,18 @@ mod tests {
         let _storage = SqliteStorage::open(&db_path).unwrap();
         let conn = Connection::open(&db_path).unwrap();
         let _ = conn.execute("PRAGMA foreign_keys = OFF", []);
-        { let __v = [SqlValue::from("bd-orphan-d"), SqlValue::from("bd-other"), SqlValue::from("blocks"),]; let __p = crate::storage::db::params_from(&__v); conn.execute("INSERT INTO dependencies(issue_id, depends_on_id, type) VALUES (?1, ?2, ?3)", __p.as_slice()) }
+        {
+            let __v = [
+                SqlValue::from("bd-orphan-d"),
+                SqlValue::from("bd-other"),
+                SqlValue::from("blocks"),
+            ];
+            let __p = crate::storage::db::params_from(&__v);
+            conn.execute(
+                "INSERT INTO dependencies(issue_id, depends_on_id, type) VALUES (?1, ?2, ?3)",
+                __p.as_slice(),
+            )
+        }
         .unwrap();
 
         let mut checks = Vec::new();
@@ -13504,7 +13533,18 @@ mod tests {
             .unwrap();
         drop(storage);
         let conn = Connection::open(&db_path).unwrap();
-        { let __v = [SqlValue::from("bd-owner-d"), SqlValue::from("bd-missing-local-target"), SqlValue::from("blocks"),]; let __p = crate::storage::db::params_from(&__v); conn.execute("INSERT INTO dependencies(issue_id, depends_on_id, type) VALUES (?1, ?2, ?3)", __p.as_slice()) }
+        {
+            let __v = [
+                SqlValue::from("bd-owner-d"),
+                SqlValue::from("bd-missing-local-target"),
+                SqlValue::from("blocks"),
+            ];
+            let __p = crate::storage::db::params_from(&__v);
+            conn.execute(
+                "INSERT INTO dependencies(issue_id, depends_on_id, type) VALUES (?1, ?2, ?3)",
+                __p.as_slice(),
+            )
+        }
         .unwrap();
 
         let mut checks = Vec::new();
@@ -13544,7 +13584,18 @@ mod tests {
             .unwrap();
         drop(storage);
         let conn = Connection::open(&db_path).unwrap();
-        { let __v = [SqlValue::from("bd-local-d"), SqlValue::from("external:upstream-1"), SqlValue::from("blocks"),]; let __p = crate::storage::db::params_from(&__v); conn.execute("INSERT INTO dependencies(issue_id, depends_on_id, type) VALUES (?1, ?2, ?3)", __p.as_slice()) }
+        {
+            let __v = [
+                SqlValue::from("bd-local-d"),
+                SqlValue::from("external:upstream-1"),
+                SqlValue::from("blocks"),
+            ];
+            let __p = crate::storage::db::params_from(&__v);
+            conn.execute(
+                "INSERT INTO dependencies(issue_id, depends_on_id, type) VALUES (?1, ?2, ?3)",
+                __p.as_slice(),
+            )
+        }
         .unwrap();
         let mut checks = Vec::new();
         check_dependencies_orphans(&conn, &mut checks);
@@ -13701,7 +13752,14 @@ mod tests {
         let _storage = SqliteStorage::open(&db_path).unwrap();
         let conn = Connection::open(&db_path).unwrap();
         let _ = conn.execute("PRAGMA foreign_keys = OFF", []);
-        { let __v = [SqlValue::from("bd-orphan-l"), SqlValue::from("doc"),]; let __p = crate::storage::db::params_from(&__v); conn.execute("INSERT INTO labels(issue_id, label) VALUES (?1, ?2)", __p.as_slice()) }
+        {
+            let __v = [SqlValue::from("bd-orphan-l"), SqlValue::from("doc")];
+            let __p = crate::storage::db::params_from(&__v);
+            conn.execute(
+                "INSERT INTO labels(issue_id, label) VALUES (?1, ?2)",
+                __p.as_slice(),
+            )
+        }
         .unwrap();
 
         let mut checks = Vec::new();
@@ -13738,7 +13796,14 @@ mod tests {
         {
             let conn = Connection::open(&db_path).unwrap();
             let _ = conn.execute("PRAGMA foreign_keys = OFF", []);
-            { let __v = [SqlValue::from("bd-orphan-fix-l"), SqlValue::from("doc"),]; let __p = crate::storage::db::params_from(&__v); conn.execute("INSERT INTO labels(issue_id, label) VALUES (?1, ?2)", __p.as_slice()) }
+            {
+                let __v = [SqlValue::from("bd-orphan-fix-l"), SqlValue::from("doc")];
+                let __p = crate::storage::db::params_from(&__v);
+                conn.execute(
+                    "INSERT INTO labels(issue_id, label) VALUES (?1, ?2)",
+                    __p.as_slice(),
+                )
+            }
             .unwrap();
         }
 
@@ -13783,7 +13848,19 @@ mod tests {
         let _storage = SqliteStorage::open(&db_path).unwrap();
         let conn = Connection::open(&db_path).unwrap();
         let _ = conn.execute("PRAGMA foreign_keys = OFF", []);
-        { let __v = [SqlValue::from("bd-orphan-c"), SqlValue::from("orphan body"), SqlValue::from("2026-05-15T00:00:00Z"), SqlValue::from("ghost"),]; let __p = crate::storage::db::params_from(&__v); conn.execute("INSERT INTO comments(issue_id, text, created_at, author) VALUES (?1, ?2, ?3, ?4)", __p.as_slice()) }
+        {
+            let __v = [
+                SqlValue::from("bd-orphan-c"),
+                SqlValue::from("orphan body"),
+                SqlValue::from("2026-05-15T00:00:00Z"),
+                SqlValue::from("ghost"),
+            ];
+            let __p = crate::storage::db::params_from(&__v);
+            conn.execute(
+                "INSERT INTO comments(issue_id, text, created_at, author) VALUES (?1, ?2, ?3, ?4)",
+                __p.as_slice(),
+            )
+        }
         .unwrap();
 
         let mut checks = Vec::new();
@@ -13885,8 +13962,8 @@ mod tests {
                     created_at TEXT NOT NULL DEFAULT '',
                     metadata TEXT
                 )",
-            [],
-        )
+                [],
+            )
             .unwrap();
             { let __v = [SqlValue::from("bd-null-fix"), SqlValue::from("created"), SqlValue::null(), SqlValue::from("2026-05-15T00:00:00Z"),]; let __p = crate::storage::db::params_from(&__v); conn.execute("INSERT INTO events(issue_id, event_type, actor, created_at) VALUES (?1, ?2, ?3, ?4)", __p.as_slice()) }
             .unwrap();
@@ -13926,8 +14003,11 @@ mod tests {
         check_null_defaults(&conn, &mut after);
         let check = find_check(&after, "db.null_defaults").expect("check present");
         assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
-        let rows = query_all(&conn, "SELECT actor FROM events WHERE issue_id = 'bd-null-fix'")
-            .unwrap();
+        let rows = query_all(
+            &conn,
+            "SELECT actor FROM events WHERE issue_id = 'bd-null-fix'",
+        )
+        .unwrap();
         let actor = rows.first().and_then(|row| row.first());
         assert!(
             actor.and_then(SqlValue::as_text) == Some(""),
@@ -13948,7 +14028,17 @@ mod tests {
         {
             let conn = Connection::open(&db_path).unwrap();
             let _ = conn.execute("PRAGMA foreign_keys = OFF", []);
-            { let __v = [SqlValue::from("bd-orphan-fix"), SqlValue::from("2026-05-15T00:00:00Z"),]; let __p = crate::storage::db::params_from(&__v); conn.execute("INSERT INTO dirty_issues(issue_id, marked_at) VALUES (?1, ?2)", __p.as_slice()) }
+            {
+                let __v = [
+                    SqlValue::from("bd-orphan-fix"),
+                    SqlValue::from("2026-05-15T00:00:00Z"),
+                ];
+                let __p = crate::storage::db::params_from(&__v);
+                conn.execute(
+                    "INSERT INTO dirty_issues(issue_id, marked_at) VALUES (?1, ?2)",
+                    __p.as_slice(),
+                )
+            }
             .unwrap();
         }
 
@@ -14000,7 +14090,14 @@ mod tests {
         {
             let conn = Connection::open(&db_path).unwrap();
             let _ = conn.execute("PRAGMA foreign_keys = OFF", []);
-            { let __v = [SqlValue::null(), SqlValue::from("2026-05-15T00:00:00Z"),]; let __p = crate::storage::db::params_from(&__v); conn.execute("INSERT INTO dirty_issues(issue_id, marked_at) VALUES (?1, ?2)", __p.as_slice()) }
+            {
+                let __v = [SqlValue::null(), SqlValue::from("2026-05-15T00:00:00Z")];
+                let __p = crate::storage::db::params_from(&__v);
+                conn.execute(
+                    "INSERT INTO dirty_issues(issue_id, marked_at) VALUES (?1, ?2)",
+                    __p.as_slice(),
+                )
+            }
             .unwrap();
         }
 
@@ -15586,13 +15683,23 @@ mod tests {
         conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))
             .unwrap();
         conn.pragma_update(None, "wal_autocheckpoint", "0").unwrap();
-        conn.execute("CREATE TABLE wal_growth (id INTEGER PRIMARY KEY, payload TEXT)", [])
-            .unwrap();
+        conn.execute(
+            "CREATE TABLE wal_growth (id INTEGER PRIMARY KEY, payload TEXT)",
+            [],
+        )
+        .unwrap();
 
         let payload = "x".repeat(1024 * 1024);
         let wal_path = sqlite_wal_sidecar_path(db_path);
         for _ in 0..(WAL_OVERSIZED_BYTES / (1024 * 1024) + 4) {
-            { let __v = [SqlValue::from(payload.as_str())]; let __p = crate::storage::db::params_from(&__v); conn.execute("INSERT INTO wal_growth(payload) VALUES (?1)", __p.as_slice()) }
+            {
+                let __v = [SqlValue::from(payload.as_str())];
+                let __p = crate::storage::db::params_from(&__v);
+                conn.execute(
+                    "INSERT INTO wal_growth(payload) VALUES (?1)",
+                    __p.as_slice(),
+                )
+            }
             .unwrap();
             if fs::metadata(&wal_path).map_or(0, |meta| meta.len()) > WAL_OVERSIZED_BYTES {
                 break;
@@ -17559,14 +17666,26 @@ mod tests {
         let _storage = SqliteStorage::open(&db_path).unwrap();
 
         let conn = Connection::open(&db_path).unwrap();
-        conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-a')", [])
-            .unwrap();
-        conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-b')", [])
-            .unwrap();
-        conn.execute("INSERT INTO metadata (key, value) VALUES ('project', 'dup-a')", [])
-            .unwrap();
-        conn.execute("INSERT INTO metadata (key, value) VALUES ('project', 'dup-b')", [])
-            .unwrap();
+        conn.execute(
+            "INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-a')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-b')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO metadata (key, value) VALUES ('project', 'dup-a')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO metadata (key, value) VALUES ('project', 'dup-b')",
+            [],
+        )
+        .unwrap();
 
         let mut checks = Vec::new();
         check_recoverable_anomalies(&conn, &mut checks)?;
@@ -20111,8 +20230,7 @@ version = "2026-05-11-abc123"
         let jsonl_path = tmp.path().join("issues.jsonl");
         write_jsonl_with_ids(&jsonl_path, &["bd-1", "bd-2", "bd-only-jsonl"]);
 
-        let conn =
-            Connection::open(&db_path).expect("open db for read");
+        let conn = Connection::open(&db_path).expect("open db for read");
         let delta = compute_db_jsonl_id_delta(&conn, &jsonl_path).expect("id delta should succeed");
 
         // The intersection contains bd-1 and bd-2.

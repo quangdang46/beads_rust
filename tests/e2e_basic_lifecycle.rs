@@ -1789,7 +1789,11 @@ fn e2e_doctor_json() {
     // database brings the store in sync so the only remaining findings are
     // the host-dependent warnings handled below.
     let align = run_br(&workspace, ["sync", "--import-only"], "sync_import_only");
-    assert!(align.status.success(), "sync import failed: {}", align.stderr);
+    assert!(
+        align.status.success(),
+        "sync import failed: {}",
+        align.stderr
+    );
 
     // Doctor checks that warn make it exit non-zero, and each of these would
     // otherwise depend on the host rather than on the code under test:

@@ -5,10 +5,10 @@
 
 use crate::cli::{OutputFormatBasic, SqlArgs};
 use crate::config;
-use crate::storage::db::SqlValue;
 use crate::error::Result;
 use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
+use crate::storage::db::SqlValue;
 use serde_json::Value as JsonValue;
 use std::borrow::Cow;
 

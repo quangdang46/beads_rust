@@ -2,11 +2,11 @@
 
 use crate::cli::{EpicCloseEligibleArgs, EpicCommands, EpicStatusArgs};
 use crate::config;
-use crate::storage::db::{self, SqlValue};
 use crate::error::Result;
 use crate::format::sanitize_terminal_inline;
 use crate::model::{EpicStatus, EventType, IssueType};
 use crate::output::{OutputContext, OutputMode};
+use crate::storage::db::{self, SqlValue};
 use crate::storage::{ListFilters, SqliteStorage};
 use chrono::Utc;
 use crossterm::style::Stylize;

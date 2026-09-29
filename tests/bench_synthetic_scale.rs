@@ -38,14 +38,14 @@ mod common;
 use beads_rust::coordination::{AgentMailAgentSnapshot, AgentMailReservationSnapshot};
 use beads_rust::model::{Comment, Dependency, DependencyType, Issue, IssueType, Priority, Status};
 use beads_rust::storage::SqliteStorage;
+use beads_rust::storage::db::{SqlValue, exec_with, query_row_all};
 use beads_rust::util::hex_encode;
 use chrono::Utc;
 use common::binary_discovery::discover_binaries;
 use common::dataset_registry::KnownDataset;
-use beads_rust::storage::db::{SqlValue, exec_with, query_row_all};
-use rusqlite::Connection;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -908,8 +908,8 @@ fn populate_sqlite_direct(db_path: &Path, jsonl_path: &Path) -> std::io::Result<
     }
 
     sqlite_io(conn.execute("COMMIT", []))?;
-    let row = sqlite_io(query_row_all(&conn, "SELECT count(*) FROM issues"))?
-        .expect("count row present");
+    let row =
+        sqlite_io(query_row_all(&conn, "SELECT count(*) FROM issues"))?.expect("count row present");
     let persisted_count = row.first().and_then(SqlValue::as_integer).unwrap_or(0);
     let persisted_count = usize::try_from(persisted_count).unwrap_or(0);
     if persisted_count != issue_count {
@@ -935,7 +935,7 @@ fn insert_issue_direct(conn: &Connection, issue: &Issue) -> std::io::Result<()> 
         .content_hash
         .clone()
         .unwrap_or_else(|| issue.compute_content_hash());
-    sqlite_io(exec_with(&conn, 
+    sqlite_io(exec_with(&conn,
         "INSERT INTO issues (
             id, content_hash, title, description, design, acceptance_criteria, notes,
             status, priority, issue_type, assignee, owner, estimated_minutes,
@@ -981,7 +981,8 @@ fn insert_issue_direct(conn: &Connection, issue: &Issue) -> std::io::Result<()> 
     ))?;
 
     for label in &issue.labels {
-        sqlite_io(exec_with(&conn, 
+        sqlite_io(exec_with(
+            &conn,
             "INSERT OR IGNORE INTO labels (issue_id, label) VALUES (?, ?)",
             &[
                 SqlValue::from(issue.id.as_str()),
@@ -991,7 +992,8 @@ fn insert_issue_direct(conn: &Connection, issue: &Issue) -> std::io::Result<()> 
     }
 
     for dependency in &issue.dependencies {
-        sqlite_io(exec_with(&conn, 
+        sqlite_io(exec_with(
+            &conn,
             "INSERT OR IGNORE INTO dependencies (
                 issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id
              ) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -1008,7 +1010,8 @@ fn insert_issue_direct(conn: &Connection, issue: &Issue) -> std::io::Result<()> 
     }
 
     for comment in &issue.comments {
-        sqlite_io(exec_with(&conn, 
+        sqlite_io(exec_with(
+            &conn,
             "INSERT INTO comments (issue_id, author, text, created_at) VALUES (?, ?, ?, ?)",
             &[
                 SqlValue::from(issue.id.as_str()),

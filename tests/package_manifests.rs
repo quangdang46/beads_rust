@@ -382,9 +382,7 @@ fn test_release_publishes_checksum_sidecars_for_every_asset() -> Result<(), Stri
         // release.yml also mentions bare platform prefixes such as
         // `br-linux-x64` (matrix keys, template fragments). Only a name that
         // carries a real archive extension is something someone can download.
-        if name.contains(".sha256")
-            || !(name.ends_with(".tar.gz") || name.ends_with(".zip"))
-        {
+        if name.contains(".sha256") || !(name.ends_with(".tar.gz") || name.ends_with(".zip")) {
             continue;
         }
         if !assets.contains(&name) {

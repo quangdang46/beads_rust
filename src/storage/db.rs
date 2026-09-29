@@ -53,8 +53,8 @@
 //!   comparison in Phase 6 is what detects it. Do not add a conversion that "helpfully"
 //! coerces, because a coercion here is exactly the class of bug the golden exists to catch.
 
-use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, Value, ValueRef};
 use rusqlite::fallible_streaming_iterator::FallibleStreamingIterator as _;
+use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, Value, ValueRef};
 use rusqlite::{Connection, Error, Row, Statement};
 
 /// A bindable value, shaped so that the `SqliteValue::from(x)` call sites keep working
@@ -287,11 +287,7 @@ pub fn db_exec(conn: &Connection, sql: &str) -> rusqlite::Result<usize> {
 ///
 /// The `[..]` argument is an ordinary temporary, so it lives to the end of the call and the
 /// borrow inside is fine. No `unsafe`, no `'static` requirement, no clone of the values.
-pub fn exec_with(
-    conn: &Connection,
-    sql: &str,
-    values: &[SqlValue],
-) -> rusqlite::Result<usize> {
+pub fn exec_with(conn: &Connection, sql: &str, values: &[SqlValue]) -> rusqlite::Result<usize> {
     conn.execute(sql, params_from(values).as_slice())
 }
 
@@ -445,16 +441,16 @@ mod tests {
             "INSERT INTO t (a, b) VALUES (?1, ?2)",
             &[SqlValue::from(1), SqlValue::from("two")],
         );
-        assert!(rows.is_ok(), "inline array literal must borrow-check: {rows:?}");
+        assert!(
+            rows.is_ok(),
+            "inline array literal must borrow-check: {rows:?}"
+        );
 
         let mut stmt = c.prepare("SELECT a, b FROM t").expect("prepare");
         let out = query_rows(&mut stmt).expect("read back");
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].first().and_then(SqlValue::as_integer), Some(1));
-        assert_eq!(
-            out[0].get(1).and_then(SqlValue::as_text),
-            Some("two")
-        );
+        assert_eq!(out[0].get(1).and_then(SqlValue::as_text), Some("two"));
     }
 
     /// The `From` set is the whole point of this type. A missing impl turns 674 call sites
@@ -526,7 +522,11 @@ mod tests {
         let mut stmt = c.prepare("SELECT a, b FROM t").expect("prepare");
         let rows = query_rows(&mut stmt).expect("collect");
         let values = &rows[0];
-        assert_eq!(values[0].as_integer(), None, "text must not read as integer");
+        assert_eq!(
+            values[0].as_integer(),
+            None,
+            "text must not read as integer"
+        );
         assert_eq!(values[0].as_text(), Some("seven"));
         assert_eq!(values[1].as_integer(), None);
         assert_eq!(values[1].as_float(), None);
@@ -538,7 +538,8 @@ mod tests {
     #[test]
     fn integer_column_affinity_converts_numeric_text_on_insert() {
         let c = conn();
-        c.execute("INSERT INTO t (a) VALUES ('7')", []).expect("insert");
+        c.execute("INSERT INTO t (a) VALUES ('7')", [])
+            .expect("insert");
         let mut stmt = c.prepare("SELECT a FROM t").expect("prepare");
         let rows = query_rows(&mut stmt).expect("collect");
         assert_eq!(
@@ -566,7 +567,8 @@ mod tests {
     #[test]
     fn collected_rows_outlive_the_statement_that_produced_them() {
         let c = conn();
-        c.execute("INSERT INTO t (a) VALUES (1)", []).expect("insert");
+        c.execute("INSERT INTO t (a) VALUES (1)", [])
+            .expect("insert");
         let rows = {
             let mut stmt = c.prepare("SELECT a FROM t").expect("prepare");
             query_rows(&mut stmt).expect("collect")
@@ -587,8 +589,11 @@ mod tests {
     #[test]
     fn get_str_accepts_text_rejects_non_text_and_reports_null() {
         let c = conn();
-        c.execute("INSERT INTO t (a, b, c, e) VALUES ('hello', 5, 2.5, NULL)", [])
-            .expect("insert");
+        c.execute(
+            "INSERT INTO t (a, b, c, e) VALUES ('hello', 5, 2.5, NULL)",
+            [],
+        )
+        .expect("insert");
         let mut stmt = c.prepare("SELECT a, b, c, e FROM t").expect("prepare");
         let mut rows = stmt.query([]).expect("query");
         let row = rows.next().expect("one row").expect("no error");
@@ -597,7 +602,10 @@ mod tests {
         assert_eq!(get_str(row, 0).expect("text"), Some("hello".to_string()));
         // 5 in a TEXT column is affinity-converted to '5' on insert: this is the engine, not
         // the accessor, and reading it as text is therefore the faithful answer.
-        assert_eq!(get_str(row, 1).expect("affinity text"), Some("5".to_string()));
+        assert_eq!(
+            get_str(row, 1).expect("affinity text"),
+            Some("5".to_string())
+        );
         // A REAL column is genuinely not text and must not stringify.
         assert!(get_str(row, 2).is_err(), "a real column must not stringify");
         assert_eq!(get_str(row, 3).expect("null column"), None);
@@ -606,6 +614,9 @@ mod tests {
     #[test]
     fn db_exec_reports_affected_rows() {
         let c = conn();
-        assert_eq!(db_exec(&c, "INSERT INTO t (a) VALUES (1)").expect("exec"), 1);
+        assert_eq!(
+            db_exec(&c, "INSERT INTO t (a) VALUES (1)").expect("exec"),
+            1
+        );
     }
 }

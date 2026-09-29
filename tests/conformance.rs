@@ -412,9 +412,8 @@ fn conformance_content_hash_matches_go_bd_fixture() {
         Some("pane6"),
         Some("github:org/repo#123"),
         Some("github"),
-        true,   // pinned
-        false,  // is_template
-
+        true,  // pinned
+        false, // is_template
     );
 
     assert_eq!(

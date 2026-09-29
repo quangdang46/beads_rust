@@ -1458,7 +1458,7 @@ fn e2e_sync_rename_prefix_validation_failure_restores_original_corrupt_db_family
         // raw-interpolated backslash is not a valid JSON escape, so br rejected
         // the fixture outright ("invalid escape") before reaching the
         // behaviour under test.
-                serde_json::to_string(&external_jsonl.to_string_lossy().to_string())
+        serde_json::to_string(&external_jsonl.to_string_lossy().to_string())
             .expect("encode jsonl path")
     );
     fs::write(&metadata_path, metadata_json).expect("write metadata");
@@ -1528,7 +1528,7 @@ fn e2e_sync_rename_prefix_validation_failure_does_not_create_missing_db() {
         // raw-interpolated backslash is not a valid JSON escape, so br rejected
         // the fixture outright ("invalid escape") before reaching the
         // behaviour under test.
-                serde_json::to_string(&external_jsonl.to_string_lossy().to_string())
+        serde_json::to_string(&external_jsonl.to_string_lossy().to_string())
             .expect("encode jsonl path")
     );
     fs::write(&metadata_path, metadata_json).expect("write metadata");

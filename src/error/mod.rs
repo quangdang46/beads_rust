@@ -286,9 +286,7 @@ impl BeadsError {
         }
         matches!(
             err.sqlite_error_code(),
-            Some(
-                rusqlite::ffi::ErrorCode::DatabaseBusy | rusqlite::ffi::ErrorCode::DatabaseLocked
-            )
+            Some(rusqlite::ffi::ErrorCode::DatabaseBusy | rusqlite::ffi::ErrorCode::DatabaseLocked)
         )
     }
 }
@@ -581,7 +579,8 @@ mod tests {
     }
 
     #[test]
-    fn test_suggestion() {        let err = BeadsError::NotInitialized;
+    fn test_suggestion() {
+        let err = BeadsError::NotInitialized;
         assert_eq!(err.suggestion(), Some("Run: br init"));
 
         let err = BeadsError::AmbiguousId {

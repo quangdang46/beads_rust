@@ -255,12 +255,9 @@ fn scenario_doctor_healthy_workspace() {
     // Platform-aware, and keeps any `sqlite3` on $PATH so doctor's
     // `sqlite3.integrity_check` warn does not fail the run.
     let doctor_path = common::harness::doctor_env_path();
-let doctor = ws.run_br_env(
+    let doctor = ws.run_br_env(
         ["doctor"],
-        [
-            ("PATH", doctor_path.as_str()),
-            ("RUST_LOG", "error"),
-        ],
+        [("PATH", doctor_path.as_str()), ("RUST_LOG", "error")],
         "doctor",
     );
     doctor.assert_success();
@@ -285,12 +282,9 @@ fn scenario_doctor_json_output() {
     // Platform-aware, and keeps any `sqlite3` on $PATH so doctor's
     // `sqlite3.integrity_check` warn does not fail the run.
     let doctor_path = common::harness::doctor_env_path();
-let doctor = ws.run_br_env(
+    let doctor = ws.run_br_env(
         ["doctor", "--json"],
-        [
-            ("PATH", doctor_path.as_str()),
-            ("RUST_LOG", "error"),
-        ],
+        [("PATH", doctor_path.as_str()), ("RUST_LOG", "error")],
         "doctor_json",
     );
     doctor.assert_success();
@@ -310,12 +304,9 @@ fn scenario_doctor_no_workspace() {
     // Platform-aware, and keeps any `sqlite3` on $PATH so doctor's
     // `sqlite3.integrity_check` warn does not fail the run.
     let doctor_path = common::harness::doctor_env_path();
-let doctor = ws.run_br_env(
+    let doctor = ws.run_br_env(
         ["doctor"],
-        [
-            ("PATH", doctor_path.as_str()),
-            ("RUST_LOG", "error"),
-        ],
+        [("PATH", doctor_path.as_str()), ("RUST_LOG", "error")],
         "doctor_no_init",
     );
     // Should fail or warn about missing workspace

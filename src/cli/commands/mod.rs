@@ -360,7 +360,7 @@ fn should_attempt_mutation_jsonl_recovery(
     // invisible to the compiler.
     operation_err.is_database_error()
         && (storage_ctx.should_attempt_jsonl_recovery(operation_err)
-        || probe_err.is_some_and(|err| storage_ctx.should_attempt_jsonl_recovery(err)))
+            || probe_err.is_some_and(|err| storage_ctx.should_attempt_jsonl_recovery(err)))
 }
 
 pub(super) fn auto_import_storage_ctx_if_stale(

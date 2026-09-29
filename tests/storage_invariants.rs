@@ -1,10 +1,10 @@
 mod common;
 
 use beads_rust::model::{DependencyType, Issue, IssueType, Priority, Status};
+use beads_rust::storage::db::query_all;
 use beads_rust::storage::{ListFilters, ReadyFilters, ReadySortPolicy};
 use chrono::{Duration, Utc};
 use common::{fixtures, test_db, test_db_with_dir};
-use beads_rust::storage::db::query_all;
 use rusqlite::Connection;
 use std::collections::HashSet;
 
@@ -17,8 +17,7 @@ fn table_names(conn: &Connection) -> HashSet<String> {
 }
 
 fn column_names(conn: &Connection, table: &str) -> HashSet<String> {
-    let rows = query_all(conn, &format!("PRAGMA table_info({table})"))
-        .expect("query table info");
+    let rows = query_all(conn, &format!("PRAGMA table_info({table})")).expect("query table info");
     rows.iter()
         .filter_map(|row| row.get(1).and_then(|v| v.as_text()).map(String::from))
         .collect()

@@ -305,7 +305,7 @@ fn e2e_routing_routes_jsonl_external_route() {
         // raw-interpolated backslash is not a valid JSON escape, so br rejected
         // the fixture outright ("invalid escape") before reaching the
         // behaviour under test.
-                serde_json::to_string(&external_workspace.root.to_string_lossy().to_string())
+        serde_json::to_string(&external_workspace.root.to_string_lossy().to_string())
             .expect("encode route path")
     );
     fs::write(&routes_path, route_entry).expect("write routes.jsonl");
@@ -2276,8 +2276,12 @@ fn e2e_routing_label_add_failure_does_not_mutate_earlier_batches() {
     // The point is "no partial success output", not "no output": under --json
     // the structured error is written to stdout by design, so assert that what
     // is there is an error payload and carries no success result.
-    let payload: Value = serde_json::from_str(label_add.stdout.trim())
-        .unwrap_or_else(|e| panic!("stdout should be one JSON document ({e}): {}", label_add.stdout));
+    let payload: Value = serde_json::from_str(label_add.stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "stdout should be one JSON document ({e}): {}",
+            label_add.stdout
+        )
+    });
     assert!(
         payload.get("error").is_some() && payload.get("added").is_none(),
         "failing routed label add should emit only an error, got: {}",
@@ -3532,7 +3536,7 @@ fn e2e_routing_show_external_issue_not_found() {
         // raw-interpolated backslash is not a valid JSON escape, so br rejected
         // the fixture outright ("invalid escape") before reaching the
         // behaviour under test.
-                serde_json::to_string(&external_workspace.root.to_string_lossy().to_string())
+        serde_json::to_string(&external_workspace.root.to_string_lossy().to_string())
             .expect("encode route path")
     );
     fs::write(&routes_path, route_entry).expect("write routes.jsonl");
@@ -3588,7 +3592,7 @@ fn e2e_routing_show_external_issue_not_found_quiet_still_fails() {
         // raw-interpolated backslash is not a valid JSON escape, so br rejected
         // the fixture outright ("invalid escape") before reaching the
         // behaviour under test.
-                serde_json::to_string(&external_workspace.root.to_string_lossy().to_string())
+        serde_json::to_string(&external_workspace.root.to_string_lossy().to_string())
             .expect("encode route path")
     );
     fs::write(&routes_path, route_entry).expect("write routes.jsonl");

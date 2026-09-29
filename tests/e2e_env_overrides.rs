@@ -566,7 +566,7 @@ fn e2e_beads_jsonl_metadata_external_without_allow_fails() {
         // raw-interpolated backslash is not a valid JSON escape, so br rejected
         // the fixture outright ("invalid escape") before reaching the
         // behaviour under test.
-                serde_json::to_string(&external_jsonl.to_string_lossy().to_string())
+        serde_json::to_string(&external_jsonl.to_string_lossy().to_string())
             .expect("encode jsonl path")
     );
     fs::write(&metadata_path, metadata_json).expect("write metadata");

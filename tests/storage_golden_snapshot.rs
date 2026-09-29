@@ -4,17 +4,20 @@
 //! row shape, event sequence, content hash, and JSONL field layout.
 
 use beads_rust::model::{Issue, IssueType, Priority, Status};
+use beads_rust::storage::db::{query_all, query_row_all};
 use beads_rust::storage::{IssueUpdate, SqliteStorage};
 use chrono::{TimeZone, Utc};
-use beads_rust::storage::db::{query_all, query_row_all};
-use rusqlite::Connection;
 use insta::assert_snapshot;
+use rusqlite::Connection;
 use serde_json::Value;
 use std::fmt::Write;
 use tempfile::TempDir;
 
 fn value_text(row: &[beads_rust::storage::db::SqlValue], idx: usize) -> String {
-    row.get(idx).and_then(|v| v.as_text()).unwrap_or("").to_string()
+    row.get(idx)
+        .and_then(|v| v.as_text())
+        .unwrap_or("")
+        .to_string()
 }
 
 fn value_i64(row: &[beads_rust::storage::db::SqlValue], idx: usize) -> i64 {

@@ -378,8 +378,7 @@ pub fn get_events(conn: &Connection, issue_id: &str, limit: usize) -> Result<Vec
         )
         .map_err(db::db_err)?;
     let bind = db::params_from(&params);
-    let events =
-        db::query_rows_with_params(&mut stmt, bind.as_slice()).map_err(db::db_err)?;
+    let events = db::query_rows_with_params(&mut stmt, bind.as_slice()).map_err(db::db_err)?;
 
     let mut result: Vec<Event> = events
         .iter()
@@ -520,8 +519,7 @@ pub fn count_events(conn: &Connection, issue_id: &str) -> Result<i64> {
     // directly. Reading it as an integer still does not coerce a non-integer column to 0
     // silently at the SQL layer.
     let bind = db::params_from(&params);
-    let row =
-        db::query_row_values_with_params(&mut stmt, bind.as_slice()).map_err(db::db_err)?;
+    let row = db::query_row_values_with_params(&mut stmt, bind.as_slice()).map_err(db::db_err)?;
     let count = row
         .as_ref()
         .and_then(|values| values.first())
@@ -563,7 +561,8 @@ pub fn init_events_table(conn: &Connection) -> Result<()> {
     // `conn.execute(..)` here would be rejected at runtime by the engine. `execute_batch` steps
     // each statement once and discards whatever it produced, which is what the DDL wants -- every
     // statement is idempotent `IF NOT EXISTS`, and none of them returns a row.
-    conn.execute_batch(EVENTS_TABLE_SCHEMA).map_err(db::db_err)?;
+    conn.execute_batch(EVENTS_TABLE_SCHEMA)
+        .map_err(db::db_err)?;
     Ok(())
 }
 
@@ -595,7 +594,7 @@ mod tests {
             "INSERT INTO issues (id, title) VALUES ('test-001', 'Test Issue')",
             [],
         )
-            .expect("Failed to insert test issue");
+        .expect("Failed to insert test issue");
 
         conn
     }
@@ -671,7 +670,7 @@ mod tests {
             "INSERT INTO issues (id, title) VALUES ('test-002', 'Blocking Issue')",
             [],
         )
-            .expect("Failed to insert second issue");
+        .expect("Failed to insert second issue");
 
         conn.execute("BEGIN", []).expect("Failed to start tx");
         insert_dependency_added_event(&conn, "test-001", "eve", "blocks", "test-002")
@@ -844,7 +843,7 @@ mod tests {
             "INSERT INTO issues (id, title) VALUES ('test-002', 'Second Issue')",
             [],
         )
-            .expect("Failed to insert second issue");
+        .expect("Failed to insert second issue");
 
         // Insert events for both issues
         conn.execute("BEGIN", []).expect("Failed to start tx");

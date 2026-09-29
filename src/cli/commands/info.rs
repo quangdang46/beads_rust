@@ -2,14 +2,14 @@
 
 use crate::cli::InfoArgs;
 use crate::config;
-use crate::storage::db::{self, SqlValue};
 use crate::error::Result;
 use crate::format::sanitize_terminal_inline;
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::SqliteStorage;
+use crate::storage::db::{self, SqlValue};
 use crate::util::parse_id;
-use rusqlite::{Connection, OpenFlags};
 use rich_rust::prelude::*;
+use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -266,7 +266,11 @@ fn collect_info_snapshot(args: &InfoArgs, conn: &Connection) -> InfoSnapshot {
 fn query_issue_count(conn: &Connection) -> Option<usize> {
     db::query_row_all(&conn, "SELECT COUNT(*) FROM issues")
         .ok()
-        .and_then(|row| row.as_ref().and_then(|r| r.first()).and_then(SqlValue::as_integer))
+        .and_then(|row| {
+            row.as_ref()
+                .and_then(|r| r.first())
+                .and_then(SqlValue::as_integer)
+        })
         .and_then(|count| usize::try_from(count).ok())
 }
 
@@ -352,7 +356,8 @@ fn combined_projection_parity_status(blocked_status: &str, ready_status: &str) -
 }
 
 fn metadata_value(conn: &Connection, key: &str) -> Option<String> {
-    db::query_row_with(&conn, 
+    db::query_row_with(
+        &conn,
         "SELECT value FROM metadata WHERE key = ?1 ORDER BY rowid DESC LIMIT 1",
         &[SqlValue::from(key)],
     )
@@ -375,7 +380,11 @@ fn projection_row_count(conn: &Connection, table: &str) -> Option<usize> {
 
     db::query_row_all(&conn, sql)
         .ok()
-        .and_then(|row| row.as_ref().and_then(|r| r.first()).and_then(SqlValue::as_integer))
+        .and_then(|row| {
+            row.as_ref()
+                .and_then(|r| r.first())
+                .and_then(SqlValue::as_integer)
+        })
         .and_then(|count| usize::try_from(count).ok())
 }
 
@@ -385,18 +394,15 @@ fn build_schema_info(
     detected_prefix: Option<String>,
 ) -> SchemaInfo {
     let tables = actual_table_names(conn);
-    let sample_issue_ids: Vec<String> = db::query_all(&conn, "SELECT id FROM issues ORDER BY id LIMIT 3")
-        .ok()
-        .map(|rows| {
-            rows.into_iter()
-                .filter_map(|row| {
-                    row.get(0)
-                        .and_then(SqlValue::as_text)
-                        .map(str::to_string)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let sample_issue_ids: Vec<String> =
+        db::query_all(&conn, "SELECT id FROM issues ORDER BY id LIMIT 3")
+            .ok()
+            .map(|rows| {
+                rows.into_iter()
+                    .filter_map(|row| row.get(0).and_then(SqlValue::as_text).map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
 
     SchemaInfo {
         tables,
@@ -417,17 +423,14 @@ fn detect_prefix(
             db::query_all(&conn, "SELECT id FROM issues ORDER BY id LIMIT 1")
                 .ok()
                 .and_then(|rows| rows.first().cloned())
-                .and_then(|row| {
-                    row.get(0)
-                        .and_then(SqlValue::as_text)
-                        .map(str::to_string)
-                })
+                .and_then(|row| row.get(0).and_then(SqlValue::as_text).map(str::to_string))
                 .and_then(|id| parse_id(&id).ok().map(|parsed| parsed.prefix))
         })
 }
 
 fn actual_table_names(conn: &Connection) -> Vec<String> {
-    db::query_all(&conn, 
+    db::query_all(
+        &conn,
         "SELECT name FROM sqlite_master \
          WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
          ORDER BY name",
@@ -435,11 +438,7 @@ fn actual_table_names(conn: &Connection) -> Vec<String> {
     .ok()
     .map(|rows| {
         rows.into_iter()
-            .filter_map(|row| {
-                row.get(0)
-                    .and_then(SqlValue::as_text)
-                    .map(str::to_string)
-            })
+            .filter_map(|row| row.get(0).and_then(SqlValue::as_text).map(str::to_string))
             .collect()
     })
     .unwrap_or_default()
@@ -448,7 +447,11 @@ fn actual_table_names(conn: &Connection) -> Vec<String> {
 fn actual_schema_version(conn: &Connection) -> String {
     db::query_row_all(&conn, "PRAGMA user_version")
         .ok()
-        .and_then(|row| row.as_ref().and_then(|r| r.first()).and_then(SqlValue::as_integer))
+        .and_then(|row| {
+            row.as_ref()
+                .and_then(|r| r.first())
+                .and_then(SqlValue::as_integer)
+        })
         .map_or_else(|| "unknown".to_string(), |version| version.to_string())
 }
 
