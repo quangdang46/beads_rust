@@ -1101,12 +1101,20 @@ fn e2e_parallel_read_only_commands_serialize_without_busy_on_drop() {
 
             let mut failures = Vec::new();
             for iteration in 0..6 {
+                // 6 workers x 6 iterations = 36 acquisitions contending for the
+                // same `.write.lock`. The budget has to cover queueing behind
+                // five peers, not just one lock hold: at 1s a loaded CI runner
+                // produced "Timed out after 1000ms waiting for write lock" and
+                // failed a test whose actual subject is `database is busy` and
+                // workspace corruption, neither of which a longer wait hides.
+                // A genuinely stuck lock still fails fast — 15s is far more
+                // than any of these commands needs to acquire and release.
                 let result = if worker % 2 == 0 {
                     run_br_in_dir(
                         &root_clone,
                         [
                             "--lock-timeout",
-                            "1000",
+                            "15000",
                             "--no-auto-import",
                             "--no-auto-flush",
                             "ready",
@@ -1118,7 +1126,7 @@ fn e2e_parallel_read_only_commands_serialize_without_busy_on_drop() {
                         &root_clone,
                         [
                             "--lock-timeout",
-                            "1000",
+                            "15000",
                             "--no-auto-import",
                             "--no-auto-flush",
                             "show",
