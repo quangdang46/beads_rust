@@ -1425,7 +1425,10 @@ mod tests {
         // This test may fail if HOME is not set, which is fine
         if let Some(path) = get_user_config_path() {
             assert!(path.ends_with("config.yaml"));
-            let path_str = path.to_string_lossy();
+            // Normalize separators: the same location reads
+            // `…\.config\beads\config.yaml` on Windows, so the forward-slash
+            // substring check below could never match there.
+            let path_str = path.to_string_lossy().replace('\\', "/");
             assert!(
                 path_str.contains(".config/beads") || path_str.contains(".config/bd"),
                 "unexpected user config path: {path_str}"

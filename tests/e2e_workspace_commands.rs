@@ -370,7 +370,7 @@ fn e2e_doctor_healthy_workspace() {
         &workspace,
         ["doctor"],
         [
-            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+            ("PATH".to_string(), common::harness::doctor_env_path()),
             ("RUST_LOG".to_string(), "error".to_string()),
         ],
         "doctor",
@@ -417,7 +417,7 @@ fn e2e_doctor_json_output() {
         &workspace,
         ["doctor", "--json"],
         [
-            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+            ("PATH".to_string(), common::harness::doctor_env_path()),
             ("RUST_LOG".to_string(), "error".to_string()),
         ],
         "doctor_json",
@@ -469,7 +469,7 @@ fn e2e_doctor_detects_issues() {
         &workspace,
         ["doctor"],
         [
-            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+            ("PATH".to_string(), common::harness::doctor_env_path()),
             ("RUST_LOG".to_string(), "error".to_string()),
         ],
         "doctor_check",
@@ -1348,7 +1348,7 @@ fn e2e_full_workspace_lifecycle() {
         &workspace,
         ["doctor"],
         [
-            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+            ("PATH".to_string(), common::harness::doctor_env_path()),
             ("RUST_LOG".to_string(), "error".to_string()),
         ],
         "doctor",

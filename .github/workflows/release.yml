@@ -4,21 +4,69 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    # The `release` job already read `inputs.reliability_override*`, but no
+    # `workflow_dispatch` inputs were declared, so both were permanently
+    # empty and the documented emergency override was unreachable. Declaring
+    # them makes that path real.
+    inputs:
+      reliability_override:
+        description: "Bypass the reliability gate (emergency only: skip | force)"
+        required: false
+        default: ""
+        type: string
+      reliability_override_reason:
+        description: "Written justification, recorded in the release notes"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: write
 
 jobs:
+  # The release used to build five binaries and publish them without ever
+  # compiling a test, and ci.yml did not trigger on tag pushes — so
+  # `git tag vX && git push --tags` shipped whatever was on the tree, tested
+  # or not. This gate runs the full suite against the tagged commit before a
+  # single artifact is produced.
+  gate:
+    name: Reliability gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+      - name: Build web UI assets
+        run: bash scripts/build-web.sh
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --locked --all-features --all-targets
+      - name: Test
+        run: cargo test --locked --all-features --no-fail-fast
+        # The documented emergency path: an operator may push through a broken
+        # gate, but only by supplying a reason, which the release job below
+        # refuses to accept without and then records in the release notes.
+        continue-on-error: ${{ inputs.reliability_override != '' }}
+
   # Native musl builds — avoid `cargo install cross` which currently fails to
   # compile on latest nightly (eyre::bail trailing-semicolon hard errors).
   linux-x64:
     name: linux-x64
+    needs: [gate]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly
         with:
+          toolchain: nightly
           targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Install musl toolchain
@@ -28,7 +76,7 @@ jobs:
           node-version: '20'
       - name: Build embedded web UI
         run: bash scripts/build-web.sh
-      - run: cargo build --release --target x86_64-unknown-linux-musl
+      - run: cargo build --locked --release --target x86_64-unknown-linux-musl
         env:
           RUSTC_BOOTSTRAP: 1
       - run: |
@@ -45,6 +93,7 @@ jobs:
 
   linux-arm64:
     name: linux-arm64
+    needs: [gate]
     # Native ARM runner — no cross-compilation / no cross crate.
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
@@ -52,6 +101,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly
         with:
+          toolchain: nightly
           targets: aarch64-unknown-linux-musl
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Install musl toolchain
@@ -61,7 +111,7 @@ jobs:
           node-version: '20'
       - name: Build embedded web UI
         run: bash scripts/build-web.sh
-      - run: cargo build --release --target aarch64-unknown-linux-musl
+      - run: cargo build --locked --release --target aarch64-unknown-linux-musl
         env:
           RUSTC_BOOTSTRAP: 1
       - run: |
@@ -78,12 +128,14 @@ jobs:
 
   macos-arm64:
     name: macos-arm64
+    needs: [gate]
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly
         with:
+          toolchain: nightly
           targets: aarch64-apple-darwin
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -91,7 +143,7 @@ jobs:
           node-version: '20'
       - name: Build embedded web UI
         run: bash scripts/build-web.sh
-      - run: cargo build --release --target aarch64-apple-darwin
+      - run: cargo build --locked --release --target aarch64-apple-darwin
         env:
           RUSTC_BOOTSTRAP: 1
       - run: |
@@ -108,12 +160,14 @@ jobs:
 
   macos-x64:
     name: macos-x64
+    needs: [gate]
     runs-on: macos-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly
         with:
+          toolchain: nightly
           targets: x86_64-apple-darwin
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -121,7 +175,7 @@ jobs:
           node-version: '20'
       - name: Build embedded web UI
         run: bash scripts/build-web.sh
-      - run: cargo build --release --target x86_64-apple-darwin
+      - run: cargo build --locked --release --target x86_64-apple-darwin
         env:
           RUSTC_BOOTSTRAP: 1
       - run: |
@@ -138,12 +192,14 @@ jobs:
 
   windows-x64:
     name: windows-x64
+    needs: [gate]
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly
         with:
+          toolchain: nightly
           targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -151,7 +207,7 @@ jobs:
           node-version: '20'
       - name: Build embedded web UI
         run: bash scripts/build-web.sh
-      - run: cargo build --release --target x86_64-pc-windows-msvc
+      - run: cargo build --locked --release --target x86_64-pc-windows-msvc
         env:
           RUSTC_BOOTSTRAP: 1
       - run: |

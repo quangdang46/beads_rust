@@ -357,6 +357,24 @@ fn json_stdout_write_failure_exits_with_io_error() {
     );
 }
 
+/// Drop the Windows `\\?\` verbatim prefix that `canonicalize` adds.
+///
+/// The canonicalize itself is still required — macOS resolves `/var` to
+/// `/private/var`, so a TempDir path and the path `br` reports are different
+/// strings for one directory. But on Windows the verbatim prefix is likewise
+/// a different string for the same directory, and `br` does not report it, so
+/// the expectation has to be normalized back before comparing.
+fn strip_verbatim_prefix(path: &std::path::Path) -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        let as_str = path.to_string_lossy();
+        if let Some(rest) = as_str.strip_prefix(r"\\?\") {
+            return std::path::PathBuf::from(rest);
+        }
+    }
+    path.to_path_buf()
+}
+
 #[test]
 fn e2e_non_hermetic_smoke_existing_workspace_preserves_env_sensitive_paths() {
     let _log =
@@ -372,10 +390,12 @@ fn e2e_non_hermetic_smoke_existing_workspace_preserves_env_sensitive_paths() {
     // the root -- which exists -- and join onto that, because `.beads` has not
     // been created yet and canonicalizing it would fail. Same approach as the
     // other path tests (`tests/common/harness.rs`); see commit 615c991a.
-    let canonical_root = fixture
-        .root
-        .canonicalize()
-        .unwrap_or_else(|_| fixture.root.clone());
+    let canonical_root = strip_verbatim_prefix(
+        &fixture
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| fixture.root.clone()),
+    );
     let external_beads_dir = canonical_root.join(".beads");
     let external_beads_dir_str = external_beads_dir.display().to_string();
     let custom_db_str = external_beads_dir.join("custom.db").display().to_string();
@@ -1434,9 +1454,11 @@ fn e2e_sync_witness_json_is_deterministic_and_read_only() {
         serde_json::from_str(&extract_json_payload(&witness.stdout)).expect("sync witness json");
 
     assert!(
+        // Normalize separators: the emitted path is `…\.beads\issues.jsonl` on
+        // Windows, so a forward-slash `ends_with` can never match there.
         witness_json["jsonl_path"]
             .as_str()
-            .is_some_and(|path| path.ends_with(".beads/issues.jsonl")),
+            .is_some_and(|path| path.replace('\\', "/").ends_with(".beads/issues.jsonl")),
         "unexpected witness path: {witness_json}"
     );
     let witness_body = &witness_json["witness"];
@@ -1717,9 +1739,10 @@ fn e2e_sync_witness_reports_base_snapshot_drift() {
         serde_json::from_str(&extract_json_payload(&witness.stdout)).expect("sync witness json");
 
     assert!(
+        // Separator-normalized for the same reason as the witness path above.
         witness_json["base_jsonl_path"]
             .as_str()
-            .is_some_and(|path| path.ends_with(".beads/beads.base.jsonl")),
+            .is_some_and(|path| path.replace('\\', "/").ends_with(".beads/beads.base.jsonl")),
         "unexpected base witness path: {witness_json}"
     );
     let comparison = &witness_json["base_comparison"];
@@ -1760,19 +1783,31 @@ fn e2e_doctor_json() {
     let init = run_br(&workspace, ["init"], "init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
 
-    // Two doctor checks are warnings that make it exit non-zero, and both would
+    // `init` leaves the JSONL newer than the database, which trips the
+    // `jsonl_newer` anomaly and makes doctor report `degraded`/`ok:false`
+    // before any code under test has run. Importing the JSONL back into the
+    // database brings the store in sync so the only remaining findings are
+    // the host-dependent warnings handled below.
+    let align = run_br(&workspace, ["sync", "--import-only"], "sync_import_only");
+    assert!(align.status.success(), "sync import failed: {}", align.stderr);
+
+    // Doctor checks that warn make it exit non-zero, and each of these would
     // otherwise depend on the host rather than on the code under test:
     //   * `br_path_dupes` -- warns when more than one `br` is on $PATH. The
     //     binary under test is invoked by absolute path, so $PATH is not needed
-    //     to find it; pin it to the system dirs.
+    //     to find it; pin it to the system dir. `/usr/bin:/bin` is a Unix path
+    //     and empties $PATH on Windows, so pick per platform.
     //   * `rust_log` -- warns on any debug-level RUST_LOG, and the e2e harness
     //     sets `beads_rust=debug` for every run. `error` is the quiet level the
     //     check treats as healthy.
+    //   * `br_path_dupes` / `sqlite3.integrity_check` -- see
+    //     `common::harness::doctor_env_path`, which builds the $PATH that
+    //     keeps both quiet.
     let doctor = run_br_with_env(
         &workspace,
         ["doctor", "--json"],
         [
-            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+            ("PATH".to_string(), common::harness::doctor_env_path()),
             ("RUST_LOG".to_string(), "error".to_string()),
         ],
         "doctor_json",

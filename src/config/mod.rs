@@ -5656,16 +5656,21 @@ labels:
         let beads_dir = temp.path().join(".beads");
         fs::create_dir_all(&beads_dir).expect("create beads dir");
 
-        let absolute_path = "/absolute/path/to/beads.db";
+        // Build a path that is genuinely absolute on this platform. A literal
+        // "/absolute/path/..." is *not* absolute on Windows, where resolution
+        // attaches the current drive and the test compared against a path the
+        // function had correctly rewritten.
+        let absolute_path = std::env::temp_dir().join("absolute/path/to/beads.db");
+        let absolute_path = absolute_path.to_string_lossy().to_string();
         let metadata = Metadata {
-            database: absolute_path.to_string(),
+            database: absolute_path.clone(),
             jsonl_export: DEFAULT_JSONL_FILENAME.to_string(),
             backend: None,
             deletions_retention_days: None,
         };
 
         let resolved = resolve_db_path(&beads_dir, &metadata, None);
-        assert_eq!(resolved, PathBuf::from(absolute_path));
+        assert_eq!(resolved, PathBuf::from(&absolute_path));
     }
 
     #[test]
@@ -5704,16 +5709,20 @@ labels:
         let beads_dir = temp.path().join(".beads");
         fs::create_dir_all(&beads_dir).expect("create beads dir");
 
-        let absolute_path = "/absolute/path/to/issues.jsonl";
+        // See `resolve_db_path_absolute_in_metadata`: a "/absolute/..." literal
+        // is not absolute on Windows, so the expectation has to be built from
+        // a path that really is absolute here.
+        let absolute_path = std::env::temp_dir().join("absolute/path/to/issues.jsonl");
+        let absolute_path = absolute_path.to_string_lossy().to_string();
         let metadata = Metadata {
             database: DEFAULT_DB_FILENAME.to_string(),
-            jsonl_export: absolute_path.to_string(),
+            jsonl_export: absolute_path.clone(),
             backend: None,
             deletions_retention_days: None,
         };
 
         let resolved = resolve_jsonl_path(&beads_dir, &metadata, None);
-        assert_eq!(resolved, PathBuf::from(absolute_path));
+        assert_eq!(resolved, PathBuf::from(&absolute_path));
     }
 
     #[test]

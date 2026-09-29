@@ -300,6 +300,9 @@ fn assert_rich_frame(output: &str, command: &str, width: usize) {
 }
 
 #[test]
+// Needs the `script(1)` pty wrapper to give `br` a TTY, which does not exist
+// on Windows, so these width-sensitive goldens are Unix-only.
+#[cfg(unix)]
 fn golden_list_rich_widths() {
     let fixture = init_fixture();
 
@@ -313,6 +316,9 @@ fn golden_list_rich_widths() {
 }
 
 #[test]
+// Needs the `script(1)` pty wrapper to give `br` a TTY, which does not exist
+// on Windows, so these width-sensitive goldens are Unix-only.
+#[cfg(unix)]
 fn golden_show_rich_widths() {
     let fixture = init_fixture();
 
@@ -326,6 +332,9 @@ fn golden_show_rich_widths() {
 }
 
 #[test]
+// Needs the `script(1)` pty wrapper to give `br` a TTY, which does not exist
+// on Windows, so these width-sensitive goldens are Unix-only.
+#[cfg(unix)]
 fn golden_stats_rich_widths() {
     let fixture = init_fixture();
 

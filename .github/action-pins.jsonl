@@ -1,7 +1,7 @@
 {"action": "actions/checkout", "sha": "9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0", "source": "https://github.com/actions/checkout.git", "tag": "v7.0.0", "workflow": ".github/workflows/audit.yml"}
 {"action": "dtolnay/rust-toolchain", "sha": "67ef31d5b988238dd797d409d6f9574278e20537", "source": "https://github.com/dtolnay/rust-toolchain.git", "tag": "unknown", "workflow": ".github/workflows/audit.yml"}
 {"action": "taiki-e/install-action", "sha": "9e1e5806d4a4822de933115878265be9aaa786d9", "source": "https://github.com/taiki-e/install-action.git", "tag": "v2.82.2", "workflow": ".github/workflows/audit.yml"}
-{"action": "actions/checkout", "sha": "9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0", "source": "https://github.com/actions/checkout.git", "tag": "v4", "workflow": ".github/workflows/ci.yml"}
+{"action": "actions/checkout", "sha": "9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0", "source": "https://github.com/actions/checkout.git", "tag": "v7.0.0", "workflow": ".github/workflows/ci.yml"}
 {"action": "dtolnay/rust-toolchain", "sha": "67ef31d5b988238dd797d409d6f9574278e20537", "source": "https://github.com/dtolnay/rust-toolchain.git", "tag": "nightly", "workflow": ".github/workflows/ci.yml"}
 {"action": "Swatinem/rust-cache", "sha": "49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c", "source": "https://github.com/Swatinem/rust-cache.git", "tag": "v2", "workflow": ".github/workflows/ci.yml"}
 {"action": "actions/setup-node", "sha": "49933ea5288caeca8642d1e84afbd3f7d6820020", "source": "https://github.com/actions/setup-node.git", "tag": "v4", "workflow": ".github/workflows/ci.yml"}

@@ -161,6 +161,9 @@ fn test_scoop_manifest_schema() {
 
 /// Test that the AUR PKGBUILD has valid shell syntax.
 #[test]
+// Syntax-checks a macOS `pkgbuild` property list with `bash -n`; neither
+// bash nor pkgbuild exists on Windows.
+#[cfg(unix)]
 fn test_pkgbuild_syntax() {
     let pkgbuild_path = Path::new("packaging/aur/PKGBUILD");
 

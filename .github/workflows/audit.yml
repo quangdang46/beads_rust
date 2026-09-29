@@ -5,6 +5,12 @@ on:
     paths:
       - '**/Cargo.toml'
       - '**/Cargo.lock'
+  pull_request:
+    # A dependency bump that lands via PR is exactly the case an audit is for;
+    # without this trigger a vulnerable dep is only caught by the nightly cron.
+    paths:
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
   schedule:
     - cron: '0 0 * * *'
   workflow_dispatch:
@@ -38,8 +44,13 @@ jobs:
         with:
           tool: cargo-audit
 
-      - name: Security audit (advisories)
-        run: cargo audit --deny warnings
+      - name: Security audit (advisories, non-blocking)
+        # Policy: known advisories are reported, not enforced. This step used to
+        # pass `--deny warnings` and then immediately set `continue-on-error`,
+        # so the strict flag was dead code and the step could never fail —
+        # reading as if advisories were gated when nothing was gated.
+        # A yanked dependency, by contrast, is a hard failure below.
+        run: cargo audit
         continue-on-error: true
 
       - name: Check for yanked dependencies

@@ -943,7 +943,7 @@ fn insert_issue_direct(conn: &Connection, issue: &Issue) -> std::io::Result<()> 
             closed_by_session, due_at, defer_until, external_ref, source_system,
             source_repo, deleted_at, deleted_by, delete_reason, original_type,
             sender, ephemeral, pinned, is_template
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         &[
             SqlValue::from(issue.id.as_str()),
             SqlValue::from(content_hash.as_str()),
@@ -1032,6 +1032,11 @@ fn run_br_status<const N: usize>(
         .args(args)
         .current_dir(workspace)
         .env("NO_COLOR", "1")
+        // Doctor's `rust_log` check reports a warning — and a warning makes
+        // `ok:false` and a non-zero exit — whenever RUST_LOG is unset or
+        // debug. The other helpers in this file already pin it; this one did
+        // not, so the corpus generator saw a spurious doctor failure.
+        .env("RUST_LOG", "error")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()?;
@@ -1052,6 +1057,7 @@ fn sync_status_is_clean(br_path: &Path, workspace: &Path) -> std::io::Result<boo
         .args(["sync", "--status", "--json"])
         .current_dir(workspace)
         .env("NO_COLOR", "1")
+        .env("RUST_LOG", "error")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()?;

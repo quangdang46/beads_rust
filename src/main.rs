@@ -2101,27 +2101,24 @@ mod tests {
         let first_db = beads_dir.join("first.db");
         let second_db = beads_dir.join("second.db");
         let metadata_path = beads_dir.join("metadata.json");
-        fs::write(
-            &metadata_path,
+        // Hand-built JSON has to escape the path. On Windows `display()` yields
+        // `C:\Users\…`, and `\U` is not a valid JSON escape, so the fixture
+        // failed to parse ("invalid escape") before br ever read it. The real
+        // metadata.json is written by a serializer and was never affected.
+        let metadata_json = |db: &std::path::Path| {
             format!(
-                r#"{{"database":"{}","jsonl_export":"issues.jsonl"}}"#,
-                first_db.display()
-            ),
-        )
-        .expect("write initial metadata");
+                r#"{{"database":{},"jsonl_export":"issues.jsonl"}}"#,
+                serde_json::to_string(&db.to_string_lossy().to_string())
+                    .expect("encode db path")
+            )
+        };
+        fs::write(&metadata_path, metadata_json(&first_db)).expect("write initial metadata");
 
         let overrides = config::CliOverrides::default();
         let startup =
             config::load_startup_config_with_paths(&beads_dir, None).expect("startup context");
 
-        fs::write(
-            &metadata_path,
-            format!(
-                r#"{{"database":"{}","jsonl_export":"issues.jsonl"}}"#,
-                second_db.display()
-            ),
-        )
-        .expect("rewrite metadata");
+        fs::write(&metadata_path, metadata_json(&second_db)).expect("rewrite metadata");
 
         let cli = Cli::parse_from(["br", "--json", "create", "Use preopened storage"]);
         let output_ctx = OutputContext::from_args(&cli);

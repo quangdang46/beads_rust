@@ -3,6 +3,11 @@ name: CI
 on:
   push:
     branches: [main, dev]
+    # Tag pushes ran nothing before, so `git tag vX && git push --tags`
+    # shipped a commit no test had ever built. Releasing is gated in
+    # release.yml too; this trigger means a bad tag is caught before the
+    # release job starts rather than after it has built five binaries.
+    tags: ["v*"]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -16,22 +21,43 @@ jobs:
     name: Check (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest]
-    timeout-minutes: 40
+        # Windows is not optional. frankensqlite's WAL-index quarantine is
+        # unimplemented there, and src/sync/path.rs kept `std::os::unix`
+        # calls in test code — a single-OS matrix let the whole `lib` test
+        # target fail to compile on Windows while CI stayed green.
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    timeout-minutes: 90
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # nightly
         with:
-          components: rustfmt
+          # This pin made `toolchain` a required input and dropped the
+          # rust-toolchain.toml fallback. Without it the step died in ~10s with
+          # "'toolchain' is a required input", so every step after it was
+          # skipped and CI had never once reached the tests. audit.yml already
+          # passed this; ci.yml did not.
+          toolchain: nightly
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '20'
-      - run: cargo fmt --all -- --check
-        if: matrix.os == 'ubuntu-latest'
       - name: Build web UI assets
         run: bash scripts/build-web.sh
-      - run: cargo test --lib --all-features
-        env:
-          RUSTC_BOOTSTRAP: 1
+      # `--locked` everywhere: without it CI is free to resolve a different
+      # dependency set than the committed Cargo.lock, so a green run says
+      # nothing about the tree that actually gets released.
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --locked --all-features --all-targets
+      - name: Build
+        run: cargo build --locked --all-features --all-targets
+      # `cargo test --lib` alone covered 2,722 unit tests and silently skipped
+      # all 2,075 integration tests in tests/ (conformance, e2e, atomicity).
+      # `--no-fail-fast` runs every test binary so one run reports every
+      # failure rather than only the first.
+      - name: Test
+        run: cargo test --locked --all-features --no-fail-fast

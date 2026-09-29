@@ -583,10 +583,14 @@ mod tests {
     fn read_redirect_absolute() {
         let dir = TempDir::new().unwrap();
         let redirect_path = dir.path().join("redirect");
-        fs::write(&redirect_path, "/absolute/path/.beads\n").unwrap();
+        // A literal "/absolute/path/.beads" is not absolute on Windows, where
+        // it comes back with a drive prefix attached. Use a path that is
+        // genuinely absolute on the platform under test.
+        let absolute = std::env::temp_dir().join("absolute/path/.beads");
+        fs::write(&redirect_path, format!("{}\n", absolute.to_string_lossy())).unwrap();
 
         let result = read_redirect(dir.path()).unwrap();
-        assert_eq!(result, Some(PathBuf::from("/absolute/path/.beads")));
+        assert_eq!(result, Some(absolute));
     }
 
     #[test]

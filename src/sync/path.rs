@@ -926,6 +926,66 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// Create a symlink on whichever platform the suite is running on.
+    ///
+    /// `std::os::unix` does not exist on Windows, so calling it directly here
+    /// stopped the whole `lib` test target from compiling there — which meant
+    /// no test in the crate could run on Windows at all, not just these two.
+    /// Mirrors `doctor_subsystems::mutate::create_symlink`.
+    #[cfg(unix)]
+    fn create_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn create_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        let resolved_target = link
+            .parent()
+            .map_or_else(|| target.to_path_buf(), |parent| parent.join(target));
+        if resolved_target.is_dir() {
+            std::os::windows::fs::symlink_dir(target, link)
+        } else {
+            std::os::windows::fs::symlink_file(target, link)
+        }
+    }
+
+    #[cfg(all(not(unix), not(windows)))]
+    fn create_symlink(_target: &Path, _link: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "sync path tests: symlink creation is not supported on this platform",
+        ))
+    }
+
+    /// Open `path` for reading even when it is a directory.
+    ///
+    /// `File::open` opens a directory on Unix, but Windows rejects it with
+    /// `PermissionDenied` (code 5) unless `FILE_FLAG_BACKUP_SEMANTICS` is set.
+    /// Without this the "reject a directory fd" fixture could not build the
+    /// handle at all on Windows, and the assertion it guards went untested.
+    #[cfg(unix)]
+    fn open_for_metadata(path: &Path) -> std::io::Result<File> {
+        File::open(path)
+    }
+
+    #[cfg(windows)]
+    fn open_for_metadata(path: &Path) -> std::io::Result<File> {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+    }
+
+    #[cfg(all(not(unix), not(windows)))]
+    fn open_for_metadata(_path: &Path) -> std::io::Result<File> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "sync path tests: opening directories is not supported on this platform",
+        ))
+    }
+
     /// A workspace reached through a symlinked ancestor is the same workspace.
     ///
     /// On macOS `/tmp` and `/var` are symlinks to `/private/tmp` and
@@ -948,7 +1008,7 @@ mod tests {
 
         // Skip where symlinks are unavailable (Windows without privileges).
         let link = outer.path().join("link");
-        if std::os::unix::fs::symlink(&real_beads, &link).is_err() {
+        if create_symlink(&real_beads, &link).is_err() {
             return;
         }
 
@@ -981,7 +1041,7 @@ mod tests {
         // An escape expressed as a symlinked ancestor: `escape` -> elsewhere,
         // with the workspace reached through it.
         let escape = outer.path().join("escape");
-        if std::os::unix::fs::symlink(&elsewhere, &escape).is_err() {
+        if create_symlink(&elsewhere, &escape).is_err() {
             return;
         }
         let outside_file = escape.join("stolen.jsonl");
@@ -1677,7 +1737,7 @@ mod tests {
         let dir_path = beads_dir.join("subdir");
         std::fs::create_dir(&dir_path).expect("create dir");
 
-        let file = File::open(&dir_path).expect("open directory");
+        let file = open_for_metadata(&dir_path).expect("open directory");
         let result = validate_jsonl_fd_metadata(&file, &dir_path);
         assert!(
             result.is_err(),

@@ -986,6 +986,12 @@ mod tests {
     }
 
     #[test]
+    // The fixture needs a filename containing ESC and a newline, which
+    // Windows rejects outright (`InvalidFilename`, code 123) before br ever
+    // sees it. The control-character handling this asserts is still covered
+    // cross-platform by `validated_backup_filename_errors_escape_terminal_controls`
+    // directly above, which needs no such file.
+    #[cfg(unix)]
     fn unified_diff_for_files_escapes_terminal_controls() {
         let temp = TempDir::new().unwrap();
         let current = temp.path().join("current\x1b[2J\nfake.jsonl");

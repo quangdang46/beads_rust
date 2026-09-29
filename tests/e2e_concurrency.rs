@@ -456,9 +456,13 @@ fn create_routes_file(root: &Path, entries: &[(&str, &Path)]) {
     let content = entries
         .iter()
         .map(|(prefix, path)| {
+            // Escape the path: on Windows it renders as `C:\Users\…`, and a
+            // raw-interpolated `\U` is not a valid JSON escape, so br rejected
+            // the fixture with "invalid escape at line 1 column 29".
             format!(
-                r#"{{"prefix":"{prefix}","path":"{}"}}"#,
-                path.to_string_lossy()
+                r#"{{"prefix":{},"path":{}}}"#,
+                serde_json::to_string(prefix).expect("encode prefix"),
+                serde_json::to_string(&path.to_string_lossy().to_string()).expect("encode path")
             )
         })
         .collect::<Vec<_>>()

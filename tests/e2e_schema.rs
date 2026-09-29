@@ -1137,6 +1137,9 @@ fn normalize_text_snapshot(text: &str) -> String {
     let mut normalized = text
         .lines()
         .map(str::trim_end)
+        // clap prints argv[0] in the usage line, which is `br.exe` on Windows.
+        // The baselines are generated on Unix, so normalize the suffix away.
+        .map(|line| line.replace("br.exe", "br"))
         .collect::<Vec<_>>()
         .join("\n");
     normalized.push('\n');

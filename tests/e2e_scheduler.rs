@@ -257,7 +257,10 @@ fn scheduler_candidate_limit_keeps_satisfied_external_prefix() {
 
     let config_path = workspace.root.join(".beads/config.yaml");
     let external_path = external.root.display();
-    let config = format!("issue_prefix: bd\nexternal_projects:\n  extproj: \"{external_path}\"\n");
+    // Single-quoted YAML scalar: a double-quoted one turns the backslash in a
+    // Windows path into an invalid escape, so br failed to parse config.yaml
+    // at all ("did not find expected hexadecimal number").
+    let config = format!("issue_prefix: bd\nexternal_projects:\n  extproj: '{external_path}'\n");
     fs::write(&config_path, config).expect("write config");
 
     let provider = create_labeled_issue(&external, "Provide auth", "1", "provides:auth");

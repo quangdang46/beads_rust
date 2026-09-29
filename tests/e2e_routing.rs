@@ -22,7 +22,14 @@ fn create_routes_file(workspace: &BrWorkspace, entries: &[(&str, &str)]) {
     let routes_path = workspace.root.join(".beads").join("routes.jsonl");
     let content: String = entries
         .iter()
-        .map(|(prefix, path)| format!(r#"{{"prefix":"{}","path":"{}"}}"#, prefix, path))
+        .map(|(prefix, path)| {
+            // Escaped for the same reason as the single-entry fixture below.
+            format!(
+                r#"{{"prefix":{},"path":{}}}"#,
+                serde_json::to_string(prefix).expect("encode prefix"),
+                serde_json::to_string(path).expect("encode path")
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n");
     fs::write(&routes_path, content).expect("write routes.jsonl");
@@ -293,8 +300,13 @@ fn e2e_routing_routes_jsonl_external_route() {
     // Create routes file in main workspace pointing to external workspace
     let routes_path = main_workspace.root.join(".beads").join("routes.jsonl");
     let route_entry = format!(
-        r#"{{"prefix":"ext-","path":"{}"}}"#,
-        external_workspace.root.display()
+        r#"{{"prefix":"ext-","path":{}}}"#,
+        // Escape the path: on Windows it renders as `C:\Users\...`, and a
+        // raw-interpolated backslash is not a valid JSON escape, so br rejected
+        // the fixture outright ("invalid escape") before reaching the
+        // behaviour under test.
+                serde_json::to_string(&external_workspace.root.to_string_lossy().to_string())
+            .expect("encode route path")
     );
     fs::write(&routes_path, route_entry).expect("write routes.jsonl");
 
@@ -3515,8 +3527,13 @@ fn e2e_routing_show_external_issue_not_found() {
     // Create routes file in main workspace pointing to external workspace
     let routes_path = main_workspace.root.join(".beads").join("routes.jsonl");
     let route_entry = format!(
-        r#"{{"prefix":"ext-","path":"{}"}}"#,
-        external_workspace.root.display()
+        r#"{{"prefix":"ext-","path":{}}}"#,
+        // Escape the path: on Windows it renders as `C:\Users\...`, and a
+        // raw-interpolated backslash is not a valid JSON escape, so br rejected
+        // the fixture outright ("invalid escape") before reaching the
+        // behaviour under test.
+                serde_json::to_string(&external_workspace.root.to_string_lossy().to_string())
+            .expect("encode route path")
     );
     fs::write(&routes_path, route_entry).expect("write routes.jsonl");
 
@@ -3566,8 +3583,13 @@ fn e2e_routing_show_external_issue_not_found_quiet_still_fails() {
 
     let routes_path = main_workspace.root.join(".beads").join("routes.jsonl");
     let route_entry = format!(
-        r#"{{"prefix":"ext-","path":"{}"}}"#,
-        external_workspace.root.display()
+        r#"{{"prefix":"ext-","path":{}}}"#,
+        // Escape the path: on Windows it renders as `C:\Users\...`, and a
+        // raw-interpolated backslash is not a valid JSON escape, so br rejected
+        // the fixture outright ("invalid escape") before reaching the
+        // behaviour under test.
+                serde_json::to_string(&external_workspace.root.to_string_lossy().to_string())
+            .expect("encode route path")
     );
     fs::write(&routes_path, route_entry).expect("write routes.jsonl");
 

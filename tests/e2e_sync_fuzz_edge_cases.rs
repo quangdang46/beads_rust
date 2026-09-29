@@ -21,7 +21,31 @@ use beads_rust::storage::SqliteStorage;
 use common::cli::{BrWorkspace, run_br};
 use serde_json::Value;
 use std::fs;
-use std::os::unix::fs::symlink;
+use std::path::Path;
+
+/// Create a file symlink on whichever platform the suite is running on.
+///
+/// The call sites below already treat a symlink failure as "skip this
+/// assertion", so the intent was cross-platform — but importing
+/// `std::os::unix::fs::symlink` unconditionally meant the whole test binary
+/// failed to compile on Windows before any of that could run.
+#[cfg(unix)]
+fn symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(target, link)
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn symlink(_target: &Path, _link: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "symlink creation is not supported on this platform",
+    ))
+}
 
 // ============================================================================
 // Helper: Create a basic beads workspace with some issues

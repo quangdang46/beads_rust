@@ -166,8 +166,52 @@ fn durable_rename_with_parent_sync<F>(from: &Path, to: &Path, sync_dir: F) -> io
 where
     F: FnMut(&Path) -> io::Result<()>,
 {
-    fs::rename(from, to)?;
+    rename_with_sharing_violation_retry(from, to)?;
     sync_rename_parent_directories_with(from, to, sync_dir)
+}
+
+/// `ERROR_SHARING_VIOLATION` (32) and `ERROR_LOCK_VIOLATION` (33).
+#[cfg(windows)]
+const RENAME_TRANSIENT_OS_ERRORS: [i32; 2] = [32, 33];
+
+/// Rename, retrying while the failure is a transient Windows sharing/lock
+/// violation.
+///
+/// Windows refuses to rename a file that any process still holds open, and
+/// that window outlives the call that closed the handle — a just-exited `br`,
+/// or a virus scanner or search indexer that grabbed the database for a
+/// moment. `doctor --repair` moves the whole database family aside before
+/// rebuilding it, so a single transient violation there aborted the repair
+/// with `os error 32` even though no long-lived handle was actually open.
+///
+/// POSIX `rename` has no equivalent window, so this stays Windows-only rather
+/// than adding retry latency to every rename everywhere. Genuine contention
+/// still fails: the bound is short and grows linearly, so the worst case adds
+/// ~450 ms before the original error is returned.
+#[cfg(windows)]
+fn rename_with_sharing_violation_retry(from: &Path, to: &Path) -> io::Result<()> {
+    const MAX_ATTEMPTS: u32 = 10;
+    let mut attempt: u32 = 0;
+    loop {
+        match fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                let transient = err
+                    .raw_os_error()
+                    .is_some_and(|code| RENAME_TRANSIENT_OS_ERRORS.contains(&code));
+                attempt += 1;
+                if !transient || attempt >= MAX_ATTEMPTS {
+                    return Err(err);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10 * u64::from(attempt)));
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn rename_with_sharing_violation_retry(from: &Path, to: &Path) -> io::Result<()> {
+    fs::rename(from, to)
 }
 
 fn sync_rename_parent_directories_with<F>(from: &Path, to: &Path, mut sync_dir: F) -> io::Result<()>
@@ -279,7 +323,10 @@ mod tests {
         let path = last_touched_path(&beads_dir);
         fs::write(&path, "bd-abc123\n").expect("write last touched");
         let file = OpenOptions::new()
-            .append(true)
+            // `write`, not `append`: on Windows append mode opens with
+            // FILE_APPEND_DATA only, which is not enough for `set_len` and
+            // fails with PermissionDenied (code 5).
+            .write(true)
             .open(&path)
             .expect("open last touched");
         file.set_len(MAX_LAST_TOUCHED_BYTES_U64 + 1)

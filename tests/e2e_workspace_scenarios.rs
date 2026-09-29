@@ -252,10 +252,13 @@ fn scenario_doctor_healthy_workspace() {
     // `doctor` exits non-zero on br_path_dupes (more than one `br` on $PATH)
     // and on a debug-level RUST_LOG, which this harness sets for every run.
     // Neither is about the workspace, so pin both.
-    let doctor = ws.run_br_env(
+    // Platform-aware, and keeps any `sqlite3` on $PATH so doctor's
+    // `sqlite3.integrity_check` warn does not fail the run.
+    let doctor_path = common::harness::doctor_env_path();
+let doctor = ws.run_br_env(
         ["doctor"],
         [
-            ("PATH", "/usr/bin:/bin"),
+            ("PATH", doctor_path.as_str()),
             ("RUST_LOG", "error"),
         ],
         "doctor",
@@ -279,10 +282,13 @@ fn scenario_doctor_json_output() {
     init.assert_success();
 
     // Same hermetic env as scenario_doctor_healthy_workspace.
-    let doctor = ws.run_br_env(
+    // Platform-aware, and keeps any `sqlite3` on $PATH so doctor's
+    // `sqlite3.integrity_check` warn does not fail the run.
+    let doctor_path = common::harness::doctor_env_path();
+let doctor = ws.run_br_env(
         ["doctor", "--json"],
         [
-            ("PATH", "/usr/bin:/bin"),
+            ("PATH", doctor_path.as_str()),
             ("RUST_LOG", "error"),
         ],
         "doctor_json",
@@ -301,10 +307,13 @@ fn scenario_doctor_no_workspace() {
     // Do NOT init
 
     // Hermetic env, same reason as scenario_doctor_healthy_workspace.
-    let doctor = ws.run_br_env(
+    // Platform-aware, and keeps any `sqlite3` on $PATH so doctor's
+    // `sqlite3.integrity_check` warn does not fail the run.
+    let doctor_path = common::harness::doctor_env_path();
+let doctor = ws.run_br_env(
         ["doctor"],
         [
-            ("PATH", "/usr/bin:/bin"),
+            ("PATH", doctor_path.as_str()),
             ("RUST_LOG", "error"),
         ],
         "doctor_no_init",

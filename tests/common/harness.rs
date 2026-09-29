@@ -1663,7 +1663,15 @@ mod tests {
         fs::write(root.join("a_dir/file_a.txt"), "a").expect("write file_a");
 
         let entries = collect_file_tree(root);
-        let paths: Vec<String> = entries.iter().map(|entry| entry.path.clone()).collect();
+        // `collect_file_tree` reports platform-native separators, so on Windows
+        // these entries read `a_dir\file_a.txt`. Normalize to `/` so the
+        // expectations below mean the same thing on every platform — this
+        // helper is `mod common`, so an ungated separator assumption here
+        // fails in every integration test binary at once.
+        let paths: Vec<String> = entries
+            .iter()
+            .map(|entry| entry.path.replace('\\', "/"))
+            .collect();
 
         assert!(paths.contains(&"a_dir".to_string()));
         assert!(paths.contains(&"a_dir/file_a.txt".to_string()));
@@ -1800,9 +1808,52 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&payload).expect("parse where json");
         let path = value.get("path").and_then(|p| p.as_str()).unwrap_or("");
 
-        let expected = beads_dir.canonicalize().unwrap_or(beads_dir);
-        assert_eq!(path, expected.to_string_lossy());
+        // On Windows `canonicalize` yields the `\\?\` UNC-prefixed form, which
+        // `br where` does not echo back. Canonicalize both sides so the
+        // comparison is stable regardless of prefix and separator.
+        let expected = beads_dir
+            .canonicalize()
+            .unwrap_or_else(|_| beads_dir.clone());
+        let actual = std::path::Path::new(path)
+            .canonicalize()
+            .unwrap_or_else(|_| std::path::PathBuf::from(path));
+        assert_eq!(actual, expected);
 
         ws.finish(true);
     }
+}
+
+/// `$PATH` to hand a doctor-spawning test so its host-dependent warnings
+/// stay quiet without depending on the host.
+///
+/// Two checks make `br doctor` exit non-zero on a `warn`:
+///
+///   * `br_path_dupes` warns when a second `br` is reachable on `$PATH`. The
+///     binary under test is invoked by absolute path, so `$PATH` is not needed
+///     to find it — pin `$PATH` to the system dir.
+///   * `sqlite3.integrity_check` warns when the `sqlite3` CLI is unreachable.
+///     Pinning to the system dir alone hides any `sqlite3` installed
+///     elsewhere, so carry over whichever inherited `$PATH` entry provides it.
+///     No system dir contains a `br`, so `br_path_dupes` stays suppressed.
+pub fn doctor_env_path() -> String {
+    let mut path = String::from(if cfg!(windows) {
+        r"C:\Windows\System32"
+    } else {
+        "/usr/bin:/bin"
+    });
+    let sqlite_dir = std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths).find(|dir| {
+            dir.join(if cfg!(windows) {
+                "sqlite3.exe"
+            } else {
+                "sqlite3"
+            })
+            .exists()
+        })
+    });
+    if let Some(dir) = sqlite_dir {
+        path.push(if cfg!(windows) { ';' } else { ':' });
+        path.push_str(&dir.to_string_lossy());
+    }
+    path
 }
