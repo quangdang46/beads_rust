@@ -184,7 +184,28 @@ fn corpus_present() -> bool {
 /// and `-shm` creation entirely, so the on-disk family is never touched.
 fn open_readonly_immutable(path: &Path) -> rusqlite::Result<Connection> {
     let abs = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let uri = format!("file:{}?immutable=1", abs.display());
+    // SQLite file URIs need forward slashes, a `file:` scheme and — on
+    // Windows — a drive-letter or authority form. `Path::canonicalize`
+    // returns the extended-length `\\?\D:\...` spelling there, so the old
+    // `format!("file:{}?immutable=1", ...)` produced
+    // `file:\\?\D:\...?immutable=1`, which SQLite cannot open at all. Every
+    // fixture then failed at open time, and the failure arm's message reads
+    // "opened but was expected to fail", so the test reported a fixture that
+    // had changed when nothing about the fixture had.
+    let text = abs.to_string_lossy().replace('\\', "/");
+    let uri = if cfg!(windows) {
+        if let Some(rest) = text.strip_prefix("//?/UNC/") {
+            format!("file:/{rest}?immutable=1")
+        } else if let Some(rest) = text.strip_prefix("//?/") {
+            format!("file:///{rest}?immutable=1")
+        } else if let Some(rest) = text.strip_prefix("//") {
+            format!("file:/{rest}?immutable=1")
+        } else {
+            format!("file:/{text}?immutable=1")
+        }
+    } else {
+        format!("file:{text}?immutable=1")
+    };
     Connection::open_with_flags(
         uri,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
@@ -235,8 +256,8 @@ fn frankensqlite_fixtures_behave_as_measured_under_c_sqlite() {
                 // claim is incomplete, so it must match precisely.
                 let Expect::MalformedSchema { index, table } = fixture.expect else {
                     panic!(
-                        "FIXTURE CHANGED: {} opened but was expected to fail.\n\
-                         If this fixture was regenerated and now opens cleanly, that is progress --\n\
+                        "FIXTURE CHANGED: {} failed to open but was expected to open cleanly.\n\
+                         If this fixture was regenerated and now refuses, that is a regression --\n\
                          update its `Expect` deliberately rather than loosening the assertion.\n\
                          C SQLite said: {err}",
                         fixture.rel
