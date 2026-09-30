@@ -193,6 +193,24 @@ way. Everything below under "Since v0.1.3" is new in this release.
   widening it would trip `pk_mismatch`. Storing both types at once is a
   schema-parity decision, not a bug fix.
 
+- **`br export` threw away every selection flag when writing to a file.**
+  With `-o <path>`, the command handed off to the sync export, which has no
+  filter concept and writes the whole database. The selection was parsed,
+  validated, and used to build a query — and the result was then discarded in
+  favour of a separate unfiltered path. Piping to stdout took the filtered
+  rows, so the two disagreed:
+
+  | | no filter | `--type=bug` | `--status=closed` |
+  |---|---|---|---|
+  | `-o file` | 14 | **14** | **14** |
+  | stdout | 13 | 0 | 1 |
+
+  Exiting 0, no warning: `br export --type=bug -o out.jsonl` returned every
+  row in a database containing no bugs. An unfiltered `-o` export is a real
+  sync and still goes through the sync engine, with its temp-file rename,
+  integrity check, and history snapshot; a filtered one now writes exactly the
+  selected rows, still atomically.
+
 #### Tooling
 
 - **`ubs` and `rch` are no longer referenced.** Neither tool exists on any

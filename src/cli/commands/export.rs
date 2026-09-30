@@ -113,23 +113,35 @@ fn execute_inner(
     match export_format {
         ExportFormat::Jsonl => {
             if let Some(ref output_path) = args.output {
-                // Use the sync atomic export path (temp file + rename)
-                let export_config = ExportConfig {
-                    force: false,
-                    is_default_path: false,
-                    error_policy: ExportErrorPolicy::Strict,
-                    retention_days: None,
-                    beads_dir: Some(storage_ctx.paths.beads_dir.clone()),
-                    allow_external_jsonl: true,
-                    show_progress: false,
-                    history: HistoryConfig::default(),
-                    max_parallel_workers: 0,
-                };
-                let (_result, _report) = sync::export_to_jsonl_with_policy(
-                    &storage_ctx.storage,
-                    output_path,
-                    &export_config,
-                )?;
+                if args.filters.selects_everything() {
+                    // No selection, so this is a full export: a sync, and it
+                    // goes through the sync path so it gets the temp-file
+                    // rename, the integrity check, and the history snapshot
+                    // that every other full export gets.
+                    let export_config = ExportConfig {
+                        force: false,
+                        is_default_path: false,
+                        error_policy: ExportErrorPolicy::Strict,
+                        retention_days: None,
+                        beads_dir: Some(storage_ctx.paths.beads_dir.clone()),
+                        allow_external_jsonl: true,
+                        show_progress: false,
+                        history: HistoryConfig::default(),
+                        max_parallel_workers: 0,
+                    };
+                    let (_result, _report) = sync::export_to_jsonl_with_policy(
+                        &storage_ctx.storage,
+                        output_path,
+                        &export_config,
+                    )?;
+                } else {
+                    // A selection is a subset, and a subset is not a sync:
+                    // it must not rewrite the history snapshot or be verified
+                    // against the whole database. Write exactly the rows the
+                    // query returned, still via a temp file and a rename so a
+                    // failed write cannot leave a half-written export behind.
+                    write_subset_atomically(output_path, &issues)?;
+                }
             } else {
                 // Write to stdout
                 let stdout = io::stdout();
@@ -174,6 +186,42 @@ fn execute_inner(
         }
     }
 
+    Ok(())
+}
+
+/// Write a filtered selection to `output_path` as JSONL, atomically.
+///
+/// A full export goes through the sync engine; this is the other half of that
+/// branch — the case where the caller asked for a subset. The temp-file dance
+/// is kept because a truncated JSONL is indistinguishable from a valid one
+/// with fewer rows, and someone will eventually read it back.
+fn write_subset_atomically(output_path: &std::path::Path, issues: &[Issue]) -> Result<()> {
+    use std::io::Write as _;
+
+    if let Some(parent) = output_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let temp_path = output_path.with_extension("jsonl.partial");
+    {
+        let file = File::create(&temp_path)?;
+        let mut writer = BufWriter::new(file);
+        for issue in issues {
+            let line = serde_json::to_string(issue)
+                .map_err(|e| BeadsError::Config(format!("Serialization error: {e}")))?;
+            writeln!(writer, "{line}")?;
+        }
+        writer.flush()?;
+    }
+
+    // Windows will not rename onto an existing path, and POSIX rename is
+    // atomic while a Windows replace is not, so the old file goes first.
+    if output_path.exists() {
+        std::fs::remove_file(output_path)?;
+    }
+    std::fs::rename(&temp_path, output_path)?;
     Ok(())
 }
 

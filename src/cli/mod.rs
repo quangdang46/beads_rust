@@ -2398,6 +2398,44 @@ impl ExportFilterArgs {
             filter: self.filter.clone(),
         }
     }
+
+    /// Whether every selection flag is left at its default, i.e. this export
+    /// asks for the whole database.
+    ///
+    /// Presentation-only flags are not selection: sorting, reversing, which
+    /// columns to print, and an explicit `--limit 0` all still mean "all of
+    /// it". `--all` does not either — it means "include closed issues", which
+    /// is a real selection once closed issues exist.
+    pub fn selects_everything(&self) -> bool {
+        self.status.is_empty()
+            && self.type_.is_empty()
+            && self.assignee.is_none()
+            && !self.unassigned
+            && self.owner.is_none()
+            && !self.pinned
+            && self.mol_type.is_none()
+            && self.id.is_empty()
+            && self.label.is_empty()
+            && self.label_any.is_empty()
+            && self.priority.is_empty()
+            && self.priority_min.is_none()
+            && self.priority_max.is_none()
+            && self.title_contains.is_none()
+            && self.desc_contains.is_none()
+            && self.notes_contains.is_none()
+            && !self.all
+            && self.limit.is_none()
+            && self.offset.is_none()
+            && !self.deferred
+            && !self.overdue
+            && self.external_ref.is_none()
+            && self.metadata.is_empty()
+            && self.created_before.is_none()
+            && self.created_after.is_none()
+            && self.updated_before.is_none()
+            && self.updated_after.is_none()
+            && self.filter.is_none()
+    }
 }
 
 /// Arguments for the search command.
@@ -4239,5 +4277,107 @@ mod tests {
             .into_iter()
             .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
             .collect()
+    }
+
+    use super::ExportFilterArgs;
+
+    /// `br export -o file` took the sync path whenever an output path was
+    /// given, and the sync path exports the whole database. Every selection
+    /// flag was therefore accepted, validated, and then thrown away -- so
+    /// `br export --status=open -o out.jsonl` wrote all of it, silently, and
+    /// exited 0. This is the predicate that keeps a subset off that path.
+    #[test]
+    fn export_selection_is_detected() {
+        let none = ExportFilterArgs::default();
+        assert!(
+            none.selects_everything(),
+            "no flags means the whole database"
+        );
+
+        // Presentation-only flags are not a selection.
+        let mut presentation = ExportFilterArgs::default();
+        presentation.sort = Some("priority".into());
+        presentation.reverse = true;
+        presentation.fields = Some("id,title".into());
+        assert!(presentation.selects_everything());
+
+        // Every flag that narrows the set must be noticed.
+        for (name, apply) in [
+            (
+                "status",
+                (|f: &mut ExportFilterArgs| f.status.push("open".into()))
+                    as fn(&mut ExportFilterArgs),
+            ),
+            ("type", |f: &mut ExportFilterArgs| {
+                f.type_.push("bug".into())
+            }),
+            ("assignee", |f: &mut ExportFilterArgs| {
+                f.assignee = Some("me".into())
+            }),
+            ("unassigned", |f: &mut ExportFilterArgs| f.unassigned = true),
+            ("owner", |f: &mut ExportFilterArgs| {
+                f.owner = Some("me".into())
+            }),
+            ("pinned", |f: &mut ExportFilterArgs| f.pinned = true),
+            ("mol-type", |f: &mut ExportFilterArgs| {
+                f.mol_type = Some("swarm".into())
+            }),
+            ("id", |f: &mut ExportFilterArgs| f.id.push("x-1".into())),
+            ("label", |f: &mut ExportFilterArgs| f.label.push("l".into())),
+            ("label-any", |f: &mut ExportFilterArgs| {
+                f.label_any.push("l".into())
+            }),
+            ("priority", |f: &mut ExportFilterArgs| {
+                f.priority.push("0".into())
+            }),
+            ("priority-min", |f: &mut ExportFilterArgs| {
+                f.priority_min = Some(1)
+            }),
+            ("priority-max", |f: &mut ExportFilterArgs| {
+                f.priority_max = Some(2)
+            }),
+            ("title-contains", |f: &mut ExportFilterArgs| {
+                f.title_contains = Some("t".into())
+            }),
+            ("desc-contains", |f: &mut ExportFilterArgs| {
+                f.desc_contains = Some("d".into())
+            }),
+            ("notes-contains", |f: &mut ExportFilterArgs| {
+                f.notes_contains = Some("n".into())
+            }),
+            ("all", |f: &mut ExportFilterArgs| f.all = true),
+            ("limit", |f: &mut ExportFilterArgs| f.limit = Some(5)),
+            ("offset", |f: &mut ExportFilterArgs| f.offset = Some(5)),
+            ("deferred", |f: &mut ExportFilterArgs| f.deferred = true),
+            ("overdue", |f: &mut ExportFilterArgs| f.overdue = true),
+            ("external-ref", |f: &mut ExportFilterArgs| {
+                f.external_ref = Some("e".into())
+            }),
+            ("metadata", |f: &mut ExportFilterArgs| {
+                f.metadata.push("m".into())
+            }),
+            ("created-before", |f: &mut ExportFilterArgs| {
+                f.created_before = Some("2026-01-01".into())
+            }),
+            ("created-after", |f: &mut ExportFilterArgs| {
+                f.created_after = Some("2026-01-01".into())
+            }),
+            ("updated-before", |f: &mut ExportFilterArgs| {
+                f.updated_before = Some("2026-01-01".into())
+            }),
+            ("updated-after", |f: &mut ExportFilterArgs| {
+                f.updated_after = Some("2026-01-01".into())
+            }),
+            ("filter", |f: &mut ExportFilterArgs| {
+                f.filter = Some("priority=0".into())
+            }),
+        ] {
+            let mut args = ExportFilterArgs::default();
+            apply(&mut args);
+            assert!(
+                !args.selects_everything(),
+                "--{name} narrows the set but was not detected"
+            );
+        }
     }
 }
