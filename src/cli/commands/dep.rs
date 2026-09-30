@@ -1620,7 +1620,23 @@ fn dep_cycles(
         } else {
             ctx.json_pretty(&result);
         }
-        return Ok(());
+        // The machine-readable modes used to return Ok(()) unconditionally,
+        // so `br dep cycles --json` exited 0 on a graph that has cycles while
+        // the rich and plain branches both exited non-zero for the identical
+        // condition. A CI gate or an agent checking exit status read a
+        // broken graph as clean. The payload still carries the counts; the
+        // exit status now agrees with them.
+        return if count == 0 {
+            Ok(())
+        } else {
+            Err(BeadsError::validation(
+                "dep_cycles",
+                format!(
+                    "{count} {} cycle(s) detected",
+                    cycle_scope_label(args.blocking_only)
+                ),
+            ))
+        };
     }
 
     if matches!(ctx.mode(), OutputMode::Quiet) {

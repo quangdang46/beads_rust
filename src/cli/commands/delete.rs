@@ -115,6 +115,39 @@ pub fn execute(
                 ..Default::default()
             })
             .map_err(|e| BeadsError::internal(&format!("failed to query tombstones: {e}")))?;
+
+        // --dry-run has to be honoured here too. Purging a tombstone is
+        // irreversible and it is the record that propagates a delete to every
+        // other clone, so answering a preview request with a real purge takes
+        // out both the row and the propagation.
+        if args.dry_run {
+            if ctx.is_json() || ctx.is_toon() {
+                let preview = DeletePreviewResult {
+                    preview: true,
+                    would_delete: tombstones.iter().map(|ts| ts.id.clone()).collect(),
+                    cascade_delete: Vec::new(),
+                    blocked_dependents: Vec::new(),
+                    orphaned_issues: Vec::new(),
+                };
+                if ctx.is_toon() {
+                    ctx.toon(&preview);
+                } else {
+                    ctx.json_pretty(&preview);
+                }
+            } else if tombstones.is_empty() {
+                ctx.success("No tombstones to prune.");
+            } else {
+                ctx.success(&format!(
+                    "Would prune {} tombstone(s) (dry run, nothing was deleted):",
+                    tombstones.len()
+                ));
+                for ts in &tombstones {
+                    ctx.print_line(&format!("  {}", ts.id));
+                }
+            }
+            return Ok(());
+        }
+
         for ts in &tombstones {
             storage_ctx
                 .storage

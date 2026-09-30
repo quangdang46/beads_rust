@@ -211,6 +211,21 @@ way. Everything below under "Since v0.1.3" is new in this release.
   integrity check, and history snapshot; a filtered one now writes exactly the
   selected rows, still atomically.
 
+- **`br delete --hard --dry-run` deleted instead of previewing.** The
+  no-IDs branch of `--hard` purges every tombstone, and unlike the with-IDs
+  path it never consulted `--dry-run`. `br delete --hard --dry-run` printed
+  `Pruned 7 tombstone(s)` and exited 0 — a preview request answered with an
+  irreversible delete. A tombstone is also the record that propagates a delete
+  to every other clone over JSONL, so the preview destroyed both the row and
+  the propagation. It now reports what it would prune, in text and in JSON,
+  and deletes nothing.
+
+- **`br dep cycles --json` exited 0 on a graph that has cycles.** The JSON and
+  TOON branches returned `Ok(())` unconditionally while the rich and plain
+  branches returned a validation error for the identical condition — so a CI
+  job or an agent gating on exit status read a broken dependency graph as
+  clean. The machine-readable branches now match.
+
 #### Tooling
 
 - **`ubs` and `rch` are no longer referenced.** Neither tool exists on any
