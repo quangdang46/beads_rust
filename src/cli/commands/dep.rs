@@ -1857,6 +1857,40 @@ mod tests {
     }
 
     #[test]
+    fn test_add_dependency_second_type_is_refused_not_dropped() {
+        init_test_logging();
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        let issue1 = make_test_issue("bd-001", "Issue 1");
+        let issue2 = make_test_issue("bd-002", "Issue 2");
+        storage.create_issue(&issue1, "tester").unwrap();
+        storage.create_issue(&issue2, "tester").unwrap();
+
+        assert!(
+            storage
+                .add_dependency("bd-001", "bd-002", "blocks", "tester")
+                .unwrap()
+        );
+
+        // The pair's primary key is (issue_id, depends_on_id), so a second type
+        // cannot be stored. That used to return Ok(false) -- indistinguishable
+        // from "you already added this" -- and the requested type vanished.
+        let err = storage
+            .add_dependency("bd-001", "bd-002", "related", "tester")
+            .expect_err("a different type for an existing pair must be an error");
+        let message = err.to_string();
+        assert!(
+            message.contains("blocks") && message.contains("related"),
+            "the error should name both the existing and the requested type, got: {message}"
+        );
+
+        // The original edge is untouched -- the refused call changed nothing.
+        let deps = storage.get_dependencies_full("bd-001").unwrap();
+        assert_eq!(deps.len(), 1, "the refused add must not add a second row");
+        assert_eq!(deps[0].dep_type.as_str(), "blocks");
+    }
+
+    #[test]
     fn test_remove_dependency() {
         init_test_logging();
         info!("test_remove_dependency: starting");

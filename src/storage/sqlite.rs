@@ -7794,13 +7794,35 @@ impl SqliteStorage {
             }
 
             let existing = db::query_rows_with(&conn,
-                "SELECT 1 FROM dependencies WHERE issue_id = ?1 AND depends_on_id = ?2 LIMIT 1",
+                "SELECT type FROM dependencies WHERE issue_id = ?1 AND depends_on_id = ?2 LIMIT 1",
                 &[
                     SqlValue::from(issue_id),
                     SqlValue::from(depends_on_id),
                 ],
             )?;
-            if !existing.is_empty() {
+            if let Some(existing_type) = existing
+                .first()
+                .and_then(|row| row.first())
+                .and_then(SqlValue::as_text)
+            {
+                if existing_type != dep_type {
+                    // The pair's primary key is (issue_id, depends_on_id), so a
+                    // second type for the same pair cannot be stored. Returning
+                    // Ok(false) here would report "already present" for a
+                    // request the caller did not make, and the type they asked
+                    // for would vanish without a word. Say what happened and
+                    // how to change it.
+                    return Err(BeadsError::Validation {
+                        field: "type".to_string(),
+                        reason: format!(
+                            "{issue_id} -> {depends_on_id} already exists as \
+                             `{existing_type}`, and a pair carries exactly one \
+                             dependency type; `{dep_type}` was not added. Remove \
+                             the existing edge first: `br dep remove {issue_id} \
+                             {depends_on_id} -t {existing_type}`"
+                        ),
+                    });
+                }
                 return Ok(false);
             }
 
