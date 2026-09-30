@@ -73,6 +73,12 @@ static VERSION_NUM_RE: LazyLock<Regex> =
 /// version number, not output shape; mask it like the others.
 static RUNNING_BR_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"Running br \d+\.\d+\.\d+").expect("running-br version regex"));
+/// The whole log line reporting that directory fsync was skipped, which only
+/// happens on platforms that have no portable directory fsync.
+static DIRECTORY_FSYNC_SKIPPED_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^.*Skipping parent directory fsync: no portable directory fsync on this target[^\n]*\n?")
+        .expect("directory fsync skipped line regex")
+});
 /// Elapsed-seconds value inside the history throttle message. The floor that
 /// follows it is a constant and is not captured.
 static HISTORY_THROTTLE_ELAPSED_RE: LazyLock<Regex> =
@@ -577,6 +583,18 @@ fn normalize_text_with_log(text: &str, config: &TextNormConfig) -> (String, Vec<
             .to_string();
         log.push("platform_prose_checks".to_string());
     }
+    // This line is only emitted where the platform has no directory fsync, so
+    // it appears in the windows run and never in the golden. No rewriting can
+    // reconcile the two — a line that exists on one side and not the other has
+    // to be dropped. What the golden pins is the sequence of sync operations,
+    // not which platforms quietly skipped a durability step.
+    if DIRECTORY_FSYNC_SKIPPED_RE.is_match(&normalized) {
+        normalized = DIRECTORY_FSYNC_SKIPPED_RE
+            .replace_all(&normalized, "")
+            .to_string();
+        log.push("directory_fsync_skipped".to_string());
+    }
+
     if HISTORY_THROTTLE_ELAPSED_RE.is_match(&normalized) {
         normalized = HISTORY_THROTTLE_ELAPSED_RE
             .replace_all(&normalized, "(Ns since latest")
