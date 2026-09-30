@@ -1561,6 +1561,40 @@ fn is_offending_root_gitignore_pattern(line: &str) -> bool {
         && ROOT_GITIGNORE_OFFENDING_PATTERNS.contains(&trimmed)
 }
 
+/// Explain a repair no-op when the workspace shows recovery artifacts.
+///
+/// "No errors detected; nothing to repair" reads as *the database was never
+/// broken*. For a workspace whose database file was malformed and has since
+/// been rebuilt from JSONL, that is not what happened: the workspace opened,
+/// found the file unreadable, preserved the original under `.br_recovery/`,
+/// and rebuilt. The artifacts sitting there are the evidence, and the operator
+/// reading the output deserves to be told so rather than left to conclude the
+/// storage layer never noticed anything.
+fn recovery_artifact_note(report: &DoctorReport) -> Option<String> {
+    let check = report
+        .checks
+        .iter()
+        .find(|check| check.name == "db.recovery_artifacts")?;
+    if !matches!(check.status, CheckStatus::Warn) {
+        return None;
+    }
+    let artifacts = check
+        .details
+        .as_ref()
+        .and_then(|d| d.get("artifacts"))
+        .and_then(|a| a.as_array())
+        .map_or(0, Vec::len);
+    if artifacts == 0 {
+        return None;
+    }
+    Some(format!(
+        "The database file was not readable and has been rebuilt from JSONL; \
+         the original {artifacts} file(s) are preserved under the workspace's \
+         recovery directory until they age out (30-day TTL). Nothing further \
+         was needed here, and that is the whole story -- not a clean workspace."
+    ))
+}
+
 fn repair_outcome_message_from_parts(
     mut messages: Vec<String>,
     local_repair: Option<&LocalRepairResult>,
@@ -11569,19 +11603,23 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             let verified = repair_report_verified(&initial.report);
             let recovery_audit = early_repair.audit_record();
             emit_recovery_audit_record(&recovery_audit);
+            let mut outcome_messages = early_repair.messages();
+            if let Some(note) = recovery_artifact_note(&initial.report) {
+                outcome_messages.push(note);
+            }
             if ctx.is_json() {
                 ctx.json(&serde_json::json!({
                     "report": initial.report,
                     "repaired": early_repair.applied(),
                     "recovery_audit": recovery_audit,
-                    "message": repair_outcome_message_from_parts(early_repair.messages(), None, None),
+                    "message": repair_outcome_message_from_parts(outcome_messages, None, None),
                     "post_repair": initial.report,
                     "verified": verified,
                 }));
             } else {
                 print_report(&initial.report, ctx)?;
                 ctx.info(&repair_outcome_message_from_parts(
-                    early_repair.messages(),
+                    outcome_messages,
                     None,
                     None,
                 ));
