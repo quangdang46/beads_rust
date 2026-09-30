@@ -99,6 +99,24 @@ way. Everything below under "Since v0.1.3" is new in this release.
   the doctor golden made hermetic instead of describing the machine it was
   regenerated on.
   ([`68ee6c57`](https://github.com/quangdang46/beads_rust/commit/68ee6c57))
+- **`doctor --repair` works on Windows.** The three directory-`fsync` helpers
+  only tolerated `InvalidInput` (the tmpfs case). On Windows
+  `fs::File::open(dir)` returns `PermissionDenied` (os error 5) because a
+  directory handle needs `FILE_FLAG_BACKUP_SEMANTICS`, so the error propagated
+  through `create_run_dir`, the repair session was dropped, and every
+  chokepointed fixer bailed — `doctor --repair` reported `nothing_to_repair` on
+  the `corrupt_db_text` replay fixture. That failed CI on windows-latest shard
+  1/4 while Linux and macOS stayed green. The tolerance is now a shared
+  predicate (`InvalidInput` + `PermissionDenied`) used by all three helpers.
+  ([`361555b`](https://github.com/quangdang46/beads_rust/commit/361555b))
+- **Unsigned releases publish.** The Create Release job set
+  `fail_on_unmatched_files: true` while its `files:` list includes the optional
+  `artifacts/br-*.minisig` glob. With no `MINISIGN_SECRET_KEY` configured the
+  signing step is skipped, so the upload died on the unmatched glob even though
+  every required archive was present and checksum-verified. The flag is now
+  false; the required archives are still hard-validated by the dedicated
+  artifact step.
+  ([`43846e2`](https://github.com/quangdang46/beads_rust/commit/43846e2))
 
 #### Removals
 
