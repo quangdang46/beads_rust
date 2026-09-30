@@ -3836,6 +3836,12 @@ pub struct WebArgs {
     #[arg(long, default_value = "127.0.0.1")]
     pub host: String,
 
+    /// Allow binding a non-loopback host. The API has no authentication, so
+    /// this hands a read-write issue tracker to the network -- only do it
+    /// behind your own auth and a firewall.
+    #[arg(long)]
+    pub allow_remote: bool,
+
     /// Don't open a browser
     #[arg(long)]
     pub no_open: bool,
@@ -3855,6 +3861,7 @@ impl Default for WebArgs {
             port: None,
             strict_port: false,
             host: "127.0.0.1".into(),
+            allow_remote: false,
             no_open: false,
             db: None,
         }

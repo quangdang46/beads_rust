@@ -153,6 +153,46 @@ way. Everything below under "Since v0.1.3" is new in this release.
   phantom section sat in the reference for months.
   ([`19598ddd`](https://github.com/quangdang46/beads_rust/commit/19598ddd))
 
+#### Security
+
+- **`br web` let any website write to your issue database.** The mutating API
+  carried no authentication and sat behind `CorsLayer::permissive()`, and the
+  server opens a browser on start. A page the user visited could therefore
+  `POST` to `http://127.0.0.1:3000` and have a bead created — CORS decides
+  whether a browser hands the *response* back to the calling script, so it
+  never stopped the request being delivered in the first place. Reproduced
+  against the release binary before the fix; the injected bead persisted and
+  was visible in `br list`.
+
+  Three changes, in order of how much they matter:
+
+  - A middleware rejects any mutating request whose `Origin` does not match
+    the `Host` it was addressed to, which also covers DNS rebinding. CORS is
+    now `CorsLayer::new()` — the UI is served by the same router, so it never
+    needed cross-origin access.
+  - Binding a non-loopback host now fails with an explanation instead of
+    quietly exposing an unauthenticated read-write API to the network.
+    `--allow-remote` is the explicit opt-in for people who have their own auth
+    and firewall in front of it.
+  - Requests with no `Origin` are still served, so curl, the MCP client, and
+    other local tools are unaffected.
+
+#### Fixes
+
+- **`br dep add` reported success while discarding the type you asked for.**
+  The dependency table's primary key is `(issue_id, depends_on_id)`, so a pair
+  can hold exactly one type — but the duplicate check ignored the type and
+  returned the same "already present" result a no-op re-add would, so
+  `br dep add A B -t blocks` followed by `-t related` exited 0 and the
+  `related` edge simply never existed. It is now an error naming both types
+  and the command to fix it. Re-adding the same type is still an idempotent
+  no-op.
+
+  The primary key itself is unchanged: `tests/conformance_schema.rs` compares
+  br's schema against Go `bd` column by column, primary key included, so
+  widening it would trip `pk_mismatch`. Storing both types at once is a
+  schema-parity decision, not a bug fix.
+
 #### Tooling
 
 - **`ubs` and `rch` are no longer referenced.** Neither tool exists on any
