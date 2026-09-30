@@ -171,10 +171,31 @@ pub fn create_run_dir(repo_root: &Path) -> Result<RunDir, BeadsError> {
 
     let undo_script = root.join("undo.sh");
 
-    // .doctor/latest symlink (points relative inside the runs root so
-    // it survives moves of the repo root).
+    // `.doctor/latest` symlink, a convenience index into `runs/` (it points
+    // relative inside the runs root so it survives moves of the repo root).
+    //
+    // Best-effort, deliberately. Creating a symlink on Windows needs Developer
+    // Mode or an elevated token, and neither is present on a stock GitHub
+    // Actions runner: `symlink_dir` returns ERROR_ACCESS_DENIED (os error 5).
+    // When that error was propagated, `br doctor --repair` failed the whole
+    // session and fell back to legacy in-place writes — throwing away
+    // `actions.jsonl`, the pre-mutation backups and `undo.sh` for a repair it
+    // was in the middle of, and reporting "no session could be created" for a
+    // run directory that had just been built in full.
+    //
+    // Nothing here needs the link. `br doctor undo --run-id latest` resolves
+    // through `find_latest_run`, which tries the symlink and then scans
+    // `runs/` for the greatest run-id — a comparison that works because
+    // run-ids are human-sortable (`YYYYMMDDTHHMMSSZ__hex`).
     let latest_link = runs_root.parent().unwrap_or(&runs_root).join("latest");
-    update_latest_symlink(&latest_link, &root)?;
+    if let Err(err) = update_latest_symlink(&latest_link, &root) {
+        tracing::debug!(
+            error = %err,
+            link = %latest_link.display(),
+            "could not update the .doctor/latest symlink; \
+             br doctor undo will fall back to scanning .doctor/runs/"
+        );
+    }
 
     Ok(RunDir {
         run_id,
@@ -447,6 +468,74 @@ mod tests {
             .prefix(prefix.as_str())
             .tempdir()
             .expect("tempdir")
+    }
+
+    /// The `latest` symlink is a convenience index, not part of the run's
+    /// contract, so a run directory must stay complete and resolvable
+    /// without it. That is what lets `create_run_dir` treat symlink failure
+    /// as best-effort — the failure Windows hands back for every runner
+    /// without Developer Mode, which otherwise cost the whole repair its
+    /// actions log, its backups and its undo script.
+    #[test]
+    fn run_dir_is_complete_and_findable_without_the_latest_symlink() {
+        let tmp = unique_temp_root("no-latest");
+        let run = create_run_dir(tmp.path()).expect("create_run_dir");
+
+        // `undo.sh` is written when the run finishes, so it is not here yet.
+        // These are the two that `br doctor undo` reads: the reverse action
+        // log and the verbatim pre-mutation copies it restores from.
+        for artifact in ["actions.jsonl", "report.json"] {
+            assert!(
+                run.root.join(artifact).exists(),
+                "{artifact} must exist for undo to work"
+            );
+        }
+        assert!(run.backups.is_dir(), "backups/ must exist");
+        assert_eq!(
+            run.actions_file.parent().map(Path::to_path_buf),
+            Some(run.root.clone()),
+            "the open handle must belong to this run directory"
+        );
+
+        let latest = run.root.parent().unwrap_or(&run.root).join("latest");
+        let _ = fs::remove_file(&latest);
+
+        // Stand-in for `find_latest_run`'s scan fallback, which is what
+        // `br doctor undo --run-id latest` falls back to when the link is
+        // absent or unreadable.
+        let runs_root = run.root.parent().unwrap_or(&run.root);
+        let mut found: Option<String> = None;
+        for entry in fs::read_dir(runs_root).expect("read runs root") {
+            let name = entry
+                .expect("dir entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned();
+            // Same shape `validate_run_id_arg` enforces on the public
+            // surface: a timestamp, `__`, then hex. Checked locally rather
+            // than reaching into the sibling module, which keeps this a
+            // statement about discoverability rather than about that
+            // function.
+            let looks_like_run_id = name.split_once("__").is_some_and(|(ts, short)| {
+                ts.len() == 16
+                    && ts
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || b == b'T' || b == b'Z')
+                    && short.len() == 6
+                    && short.bytes().all(|b| b.is_ascii_hexdigit())
+            });
+            if !looks_like_run_id {
+                continue;
+            }
+            if found.as_ref().is_none_or(|current| name > *current) {
+                found = Some(name);
+            }
+        }
+        assert_eq!(
+            found.as_deref(),
+            Some(run.run_id.as_str()),
+            "a run must remain discoverable after the latest symlink is removed"
+        );
     }
 
     #[test]
