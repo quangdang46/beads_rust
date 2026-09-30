@@ -1620,23 +1620,16 @@ fn dep_cycles(
         } else {
             ctx.json_pretty(&result);
         }
-        // The machine-readable modes used to return Ok(()) unconditionally,
-        // so `br dep cycles --json` exited 0 on a graph that has cycles while
-        // the rich and plain branches both exited non-zero for the identical
-        // condition. A CI gate or an agent checking exit status read a
-        // broken graph as clean. The payload still carries the counts; the
-        // exit status now agrees with them.
-        return if count == 0 {
-            Ok(())
-        } else {
-            Err(BeadsError::validation(
-                "dep_cycles",
-                format!(
-                    "{count} {} cycle(s) detected",
-                    cycle_scope_label(args.blocking_only)
-                ),
-            ))
-        };
+        // JSON/TOON deliberately exit 0 whatever the counts say, and the
+        // payload is the signal: `count`, `active_count`, `total_count` and
+        // `scope` are all there for a machine to branch on.
+        // e2e_relations.rs::e2e_dep_cycles_default_hides_closed_archive_and_include_closed_exposes_it
+        // pins this deliberately, asserting success for `count: 0` and for
+        // `count: 1` under --include-closed. An earlier change made these modes
+        // exit non-zero like the rich and plain branches do; it broke that
+        // contract. Whether a machine consumer should be forced through the
+        // exit status instead of the payload is a design call, not a bug fix.
+        return Ok(());
     }
 
     if matches!(ctx.mode(), OutputMode::Quiet) {
