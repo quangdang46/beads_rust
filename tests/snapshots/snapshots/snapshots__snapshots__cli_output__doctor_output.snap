@@ -18,7 +18,7 @@ OK tmp_files_orphan
 OK br_history.size
 OK routes_jsonl: No routes.jsonl present (ID-REDACTED routing is optional)
 OK rust_log: RUST_LOG=error (quiet)
-OK permissions.beads_dir: `.beads/` and critical children are ID-REDACTED
+OK permissions.beads_dir: <platform message>
 OK config.yaml: config.yaml parses cleanly (99 bytes)
 OK metadata.json: metadata.json parses cleanly (62 bytes); declared targets exist on disk
 OK binary_version: Running br X.Y.Z; no beads_rust Cargo.toml reachable from .beads/ — not flagging

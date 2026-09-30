@@ -73,6 +73,14 @@ static VERSION_NUM_RE: LazyLock<Regex> =
 /// version number, not output shape; mask it like the others.
 static RUNNING_BR_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"Running br \d+\.\d+\.\d+").expect("running-br version regex"));
+/// Elapsed-seconds value inside the history throttle message. The floor that
+/// follows it is a constant and is not captured.
+static HISTORY_THROTTLE_ELAPSED_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\((\d+)s since latest").expect("history throttle elapsed regex"));
+static PERMISSIONS_BEADS_DIR_MESSAGE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^OK permissions\.beads_dir: .*$")
+        .expect("permissions.beads_dir message regex")
+});
 static WINDOWS_EXE_SUFFIX_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\bbr\.exe\b").expect("windows exe suffix regex"));
 static LINE_NUM_RE: LazyLock<Regex> =
@@ -547,6 +555,28 @@ fn normalize_text_with_log(text: &str, config: &TextNormConfig) -> (String, Vec<
             .replace_all(&normalized, "Running br X.Y.Z")
             .to_string();
         log.push("running_br_version".to_string());
+    }
+    // The history throttle logs how long ago the last backup was, which is
+    // wall-clock and therefore differs between two runs of the same code —
+    // the golden recorded `0s`, a slower run produced `1s`. The 5s floor in
+    // the same line is a constant and is deliberately left alone.
+    // `permissions.beads_dir` reports different prose per platform and both are
+    // correct: the POSIX user-write-bit check genuinely does not apply on
+    // Windows, so the check says so instead of naming the verified paths. The
+    // status is `Ok` either way, and that is what this golden is pinning — not
+    // which sentence a platform uses to explain itself. The check's `details`
+    // carry the platform, so the information is not lost.
+    if PERMISSIONS_BEADS_DIR_MESSAGE_RE.is_match(&normalized) {
+        normalized = PERMISSIONS_BEADS_DIR_MESSAGE_RE
+            .replace_all(&normalized, "OK permissions.beads_dir: <platform message>")
+            .to_string();
+        log.push("permissions_beads_dir_message".to_string());
+    }
+    if HISTORY_THROTTLE_ELAPSED_RE.is_match(&normalized) {
+        normalized = HISTORY_THROTTLE_ELAPSED_RE
+            .replace_all(&normalized, "(${1}s since latest")
+            .to_string();
+        log.push("history_throttle_elapsed".to_string());
     }
     // clap renders the real executable name in every usage line, so Windows
     // prints `br.exe` where the golden says `br`. The suffix is a property of

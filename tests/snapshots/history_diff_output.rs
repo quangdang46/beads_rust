@@ -47,17 +47,28 @@ fn init_history_diff_workspace() -> BrWorkspace {
 }
 
 fn normalize_history_output(raw: &str, workspace: &BrWorkspace) -> String {
-    let workspace_root = workspace.root.to_string_lossy().replace('\\', "/");
+    let workspace_root =
+        collapse_path_separators(&workspace.root.to_string_lossy().replace('\\', "/"));
     // `br` reports canonicalized paths, and on macOS `/var` is a symlink to
     // `/private/var`, so logged output carries a `/private` prefix the raw
     // workspace root does not have. Replace the canonical form too, otherwise
     // the token is never substituted and the golden records a platform path.
+    // On Windows canonicalization is also what resolves the 8.3 short name of
+    // a profile directory (`C:\Users\RUNNER~1\...`) to its long form, which
+    // is the spelling `br` reports.
     let canonical_root = workspace
         .root
         .canonicalize()
-        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .map(|p| collapse_path_separators(&p.to_string_lossy().replace('\\', "/")))
         .unwrap_or_else(|_| workspace_root.clone());
     let normalized = raw.trim_end().replace('\\', "/");
+    // In JSON output a Windows path arrives escaped — `C:\\Users\\...` — so
+    // the backslash-to-slash pass above turns it into `C://Users//...` while
+    // the workspace root is spelled with single slashes. The substitution
+    // then never matches and the golden records a whole machine-specific
+    // path. Collapse the doubled separators so both sides agree; on unix
+    // there is nothing to collapse, so the committed goldens are unaffected.
+    let normalized = collapse_path_separators(&normalized);
     // Longest form first: the canonical root is a superstring of the raw one.
     if canonical_root.len() > workspace_root.len() {
         normalized
@@ -68,6 +79,20 @@ fn normalize_history_output(raw: &str, workspace: &BrWorkspace) -> String {
             .replace(&workspace_root, "$WORKSPACE")
             .replace(&canonical_root, "$WORKSPACE")
     }
+}
+
+/// Collapse runs of two or more `/` into one, for path spellings only.
+fn collapse_path_separators(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut previous_was_separator = false;
+    for ch in text.chars() {
+        let is_separator = ch == '/';
+        if !(is_separator && previous_was_separator) {
+            out.push(ch);
+        }
+        previous_was_separator = is_separator;
+    }
+    out
 }
 
 fn assert_valid_json(raw: &str, context: &str) {
