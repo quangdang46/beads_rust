@@ -57,13 +57,11 @@ Important boundaries:
 
 - `br` never performs workflow git operations, releases, pull requests, network
   dispatches, or upstream lookups automatically.
-- Agents run workflow proof Cargo targets directly through RCH; local shell
-  verifier scripts are operator shortcuts and may call Cargo internally.
 - Whole-crate `cargo check --all-targets` and
   `cargo clippy --all-targets -- -D warnings` are required when Rust code
-  changes, and must be offloaded through RCH in agent sessions.
-- Run `git diff --check`, `actionlint` when available, the relevant workflow
-  harnesses, and `ubs` on changed workflow-related files before committing.
+  changes.
+- Run `git diff --check`, `actionlint` when available, and the relevant workflow
+  harnesses before committing.
 
 ---
 
@@ -464,8 +462,8 @@ use MCP tools/resources/prompts instead of shelling out. It is optional and only
 exists in binaries built with the `mcp` feature:
 
 ```bash
-MCP_TARGET="${TMPDIR:-/tmp}/rch_target_beads_rust_${AGENT_NAME:-agent}"
-rch exec -- env CARGO_TARGET_DIR="$MCP_TARGET" cargo build --release --features mcp
+MCP_TARGET="${TMPDIR:-/tmp}/br_target_mcp_${AGENT_NAME:-agent}"
+CARGO_TARGET_DIR="$MCP_TARGET" cargo build --release --features mcp
 RUST_LOG=error "$MCP_TARGET/release/br" serve --actor "${AGENT_NAME:-mcp}"
 ```
 
@@ -717,75 +715,6 @@ bv --robot-plan | jq '.plan.summary.highest_impact'        # Best unblock target
 bv --robot-insights | jq '.status'                         # Check metric readiness
 bv --robot-insights | jq '.Cycles'                         # Circular deps (must fix!)
 ```
-
----
-
-## UBS — Ultimate Bug Scanner
-
-**Golden Rule:** `ubs <changed-files>` before every commit. Exit 0 = safe. Exit >0 = fix & re-run.
-
-### Commands
-
-```bash
-ubs file.rs file2.rs                    # Specific files (< 1s) — USE THIS
-ubs $(git diff --name-only --cached)    # Staged files — before commit
-ubs --only=rust,toml src/               # Language filter (3-5x faster)
-ubs --ci --fail-on-warning .            # CI mode — before PR
-ubs .                                   # Whole project (ignores target/, Cargo.lock)
-```
-
-### Output Format
-
-```
-⚠️  Category (N errors)
-    file.rs:42:5 – Issue description
-    💡 Suggested fix
-Exit code: 1
-```
-
-Parse: `file:line:col` → location | 💡 → how to fix | Exit 0/1 → pass/fail
-
-### Fix Workflow
-
-1. Read finding → category + fix suggestion
-2. Navigate `file:line:col` → view context
-3. Verify real issue (not false positive)
-4. Fix root cause (not symptom)
-5. Re-run `ubs <file>` → exit 0
-6. Commit
-
-### Bug Severity
-
-- **Critical (always fix):** Memory safety, use-after-free, data races, SQL injection
-- **Important (production):** Unwrap panics, resource leaks, overflow checks
-- **Contextual (judgment):** TODO/FIXME, println! debugging
-
----
-
-## RCH — Remote Compilation Helper
-
-RCH offloads `cargo build`, `cargo test`, `cargo clippy`, and other compilation commands to a fleet of 8 remote Contabo VPS workers instead of building locally. This prevents compilation storms from overwhelming csd when many agents run simultaneously.
-
-**RCH is installed at `~/.local/bin/rch` and is hooked into Claude Code's PreToolUse automatically.** Most of the time you don't need to do anything if you are Claude Code — builds are intercepted and offloaded transparently.
-
-To manually offload a build:
-```bash
-rch exec -- cargo build --release
-rch exec -- cargo test
-rch exec -- cargo clippy
-```
-
-Quick commands:
-```bash
-rch doctor                    # Health check
-rch workers probe --all       # Test connectivity to all 8 workers
-rch status                    # Overview of current state
-rch queue                     # See active/waiting builds
-```
-
-If rch or its workers are unavailable, it fails open — builds run locally as normal.
-
-**Note for Codex/GPT-5.2:** Codex does not have the automatic PreToolUse hook, but you can (and should) still manually offload compute-intensive compilation commands using `rch exec -- <command>`. This avoids local resource contention when multiple agents are building simultaneously.
 
 ---
 

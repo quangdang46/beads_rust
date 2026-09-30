@@ -396,7 +396,7 @@ impl SyntheticDataset {
         fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n")?;
 
         // Initialize beads
-        let init_output = Command::new(br_path) // ubs:ignore - benchmark harness executes only discovered br binaries
+        let init_output = Command::new(br_path)
             .args(["init"])
             .current_dir(&root)
             .output()?;
@@ -493,7 +493,7 @@ impl SyntheticDataset {
         fs::create_dir_all(root.join(".git"))?;
         fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n")?;
 
-        let init_output = Command::new(br_path) // ubs:ignore - benchmark harness executes only discovered br binaries
+        let init_output = Command::new(br_path)
             .args(["init"])
             .current_dir(&root)
             .output()?;
@@ -1032,7 +1032,7 @@ fn run_br_status<const N: usize>(
     workspace: &Path,
     label: &str,
 ) -> std::io::Result<bool> {
-    let output = Command::new(br_path) // ubs:ignore - benchmark harness executes only discovered br binaries
+    let output = Command::new(br_path)
         .args(args)
         .current_dir(workspace)
         .env("NO_COLOR", "1")
@@ -1064,7 +1064,7 @@ fn run_br_status<const N: usize>(
 }
 
 fn sync_status_is_clean(br_path: &Path, workspace: &Path) -> std::io::Result<bool> {
-    let output = Command::new(br_path) // ubs:ignore - benchmark harness executes only discovered br binaries
+    let output = Command::new(br_path)
         .args(["sync", "--status", "--json"])
         .current_dir(workspace)
         .env("NO_COLOR", "1")
@@ -1366,7 +1366,7 @@ fn run_measured_br_command(
     workspace: &Path,
 ) -> std::io::Result<MeasuredCommandOutput> {
     if gnu_time_available() {
-        let output = Command::new("/usr/bin/time") // ubs:ignore - benchmark harness intentionally invokes GNU time for child RSS
+        let output = Command::new("/usr/bin/time")
             .arg("-v")
             .arg(br_path)
             .args(args)
@@ -1385,7 +1385,7 @@ fn run_measured_br_command(
         });
     }
 
-    let output = Command::new(br_path) // ubs:ignore - benchmark harness executes only discovered br binaries
+    let output = Command::new(br_path)
         .args(args)
         .current_dir(workspace)
         .env("NO_COLOR", "1")

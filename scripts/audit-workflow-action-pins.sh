@@ -172,7 +172,7 @@ def manual_steps(entry: dict[str, str]) -> list[str]:
         f"Review {action} upstream ref {latest_tag}.",
         f"Update each workflow uses entry for {action} to {latest_sha}.",
         f"Update .github/action-pins.jsonl rows for {action} with tag {latest_tag}, sha {latest_sha}, and provenance.",
-        "Run ./scripts/verify-workflow-action-pins.sh and ubs on changed workflow/inventory files.",
+        "Run ./scripts/verify-workflow-action-pins.sh on changed workflow/inventory files.",
     ]
 
 

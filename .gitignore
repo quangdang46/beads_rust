@@ -1,7 +1,6 @@
 # Build artifacts (all target directories)
 target/
 target*/
-.rch-target/
 
 # Cargo.lock IS tracked — beads_rust is a binary CLI, so a committed
 # lockfile gives reproducible builds for `nix build`, `cargo install --git`,
@@ -168,10 +167,7 @@ sample_beads_db_files/**/*.db-wal
 # Beads snapshot backups (timestamped)
 .beads.snapshot_*/
 
-# UBS scan output
-ubs.json
-ubs.txt
-ubs_output.*
+# Local scan output
 rust-bug-scan.txt
 report.json
 

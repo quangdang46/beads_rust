@@ -7,7 +7,7 @@ use std::fs;
 // Representative fixture for exact list/show JSON goldens.
 //
 // Golden update workflow:
-// INSTA_UPDATE=always rch exec -- cargo test --test snapshots representative_json_golden
+// INSTA_UPDATE=always cargo test --test snapshots representative_json_golden
 //
 // Review the resulting tests/snapshots/snapshots/*.snap diffs before committing.
 // The fixture uses fixed IDs, actors, and timestamps, so these snapshots should

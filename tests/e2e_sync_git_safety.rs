@@ -1738,7 +1738,6 @@ fn integration_sync_in_subdirectory_only_touches_nearest_beads_dir() {
         .args(["sync", "--flush-only"])
         .current_dir(&subdir)
         .env("RUST_LOG", "info")
-        .env("RCH_DISABLED", "1")
         .output()
         .expect("spawn br sync from subdir");
     eprintln!(

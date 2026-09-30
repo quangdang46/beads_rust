@@ -11,7 +11,7 @@ use std::sync::LazyLock;
 // Representative fixture for exact robot-output goldens.
 //
 // Golden update workflow:
-// INSTA_UPDATE=always rch exec -- cargo test --test snapshots robot_golden
+// INSTA_UPDATE=always cargo test --test snapshots robot_golden
 //
 // Review the resulting tests/snapshots/snapshots/*.snap diffs before
 // committing. The br ready fixture is fully deterministic and unmasked. The bv

@@ -8,7 +8,7 @@ use std::sync::LazyLock;
 // Full schema-document goldens for agent integration surfaces.
 //
 // Golden update workflow:
-// INSTA_UPDATE=always rch exec -- cargo test --test snapshots schema_document_golden
+// INSTA_UPDATE=always cargo test --test snapshots schema_document_golden
 //
 // Review the JSON and TOON snapshots together. These tests normalize only the
 // top-level generated_at value; schema names, key order, field definitions,
@@ -65,7 +65,6 @@ fn parse_json(raw: &str, context: &str) -> Value {
 }
 
 fn parse_toon(raw: &str, context: &str) -> Value {
-    // ubs:ignore - this decodes TOON snapshot text, not JWTs or credentials.
     let result = toon_rust::try_decode(raw, None);
     let error = result.as_ref().err().map(ToString::to_string);
     assert_eq!(None, error, "{context} did not emit valid TOON\n\n{raw}");

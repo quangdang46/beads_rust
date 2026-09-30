@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 
 const WORKFLOW_PATH: &str = ".github/workflows/notify-acfs.yml";
 const INSTALLER_PATH: &str = "install.sh";
-const HAS_TOKEN_OUTPUT: &str = "steps.check_token.outputs.has_token"; // ubs:ignore - GitHub Actions output name in a test assertion, not a secret value
+const HAS_TOKEN_OUTPUT: &str = "steps.check_token.outputs.has_token";
 const TRUE_COMPARISON: &str = " == ";
 const TRUE_LITERAL: &str = "'true'";
 

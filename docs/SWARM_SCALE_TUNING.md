@@ -53,13 +53,6 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-Manual, fleet-specific `rch` profile:
-
-```bash
-RCH_TARGET="/data/tmp/br-rch-target-${AGENT_NAME:-agent}"
-rch exec -- env CARGO_TARGET_DIR="$RCH_TARGET" cargo check --all-targets
-```
-
 Do not delete target directories from an agent pane unless the operator has
 explicitly approved the exact cleanup command. Prefer creating a fresh target
 directory when disk pressure is not urgent.
@@ -321,7 +314,6 @@ br sync --status --json
 Also run:
 
 - Focused tests for the changed command or module.
-- UBS on the exact changed files.
 - A perf/evidence command when the change makes a performance claim.
 - Agent Mail completion plus file reservation release.
 

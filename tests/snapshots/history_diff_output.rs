@@ -8,7 +8,7 @@ use std::fs;
 // review diffs show exactly which JSONL lines changed.
 //
 // Golden update workflow:
-// INSTA_UPDATE=always rch exec -- cargo test --test snapshots history_diff_golden
+// INSTA_UPDATE=always cargo test --test snapshots history_diff_golden
 //
 // Review the text diff and JSON summary snapshots together. The text diff is
 // the detailed human artifact; the JSON summary is the concise machine surface.
