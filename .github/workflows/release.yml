@@ -453,7 +453,18 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         with:
           body_path: release.md
-          fail_on_unmatched_files: true
+          # `fail_on_unmatched_files` is deliberately NOT set. The required
+          # platform archives are already hard-validated by the
+          # "Validate required artifacts present" step above, so this flag
+          # only adds a second, stricter gate — and it breaks unsigned
+          # releases: `artifacts/br-*.minisig` is an OPTIONAL glob (the
+          # signing step is skipped when MINISIGN_SECRET_KEY is unset, which
+          # is the case on this repo), so with the flag on, the upload fails
+          # with "Pattern 'artifacts/br-*.minisig' does not match any files"
+          # even though every required artifact is present. The optional
+          # minisig files upload fine when they exist and are simply omitted
+          # when they don't.
+          fail_on_unmatched_files: false
           generate_release_notes: true
           files: |
             artifacts/br-*.tar.gz
