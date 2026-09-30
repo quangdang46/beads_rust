@@ -58,7 +58,6 @@ Comprehensive reference for all `br` (beads_rust) commands.
   - [changelog](#changelog)
   - [lint](#lint)
 - [Utilities](#utilities)
-  - [upgrade](#upgrade)
   - [completions](#completions)
 - [Exit Codes](#exit-codes)
 - [Environment Variables](#environment-variables)
@@ -1862,22 +1861,6 @@ br lint [OPTIONS]
 
 ## Utilities
 
-### upgrade
-
-Upgrade br to the latest version.
-
-```bash
-br upgrade [OPTIONS]
-```
-
-**Options:**
-| Option | Description |
-|--------|-------------|
-| `--check` | Check for updates without installing |
-| `--force` | Force reinstall current version |
-
----
-
 ### completions
 
 Generate shell completions.
@@ -1968,19 +1951,9 @@ br rename-prefix <NEW_PREFIX>
 
 ---
 
-### memory
-
-Persistent agent memory (remember, memories, recall, forget).
-
-```bash
-br memory <COMMAND>
-```
-
----
-
 ### prime
 
-AI session context with persistent memory injection.
+AI session context.
 
 ```bash
 br prime [OPTIONS]

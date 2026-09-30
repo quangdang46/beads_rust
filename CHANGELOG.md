@@ -100,6 +100,83 @@ way. Everything below under "Since v0.1.3" is new in this release.
   regenerated on.
   ([`68ee6c57`](https://github.com/quangdang46/beads_rust/commit/68ee6c57))
 
+#### Removals
+
+*Work from 2026-09-30, landed in the four commits below the v0.2.0 cut.*
+
+- **`br memory` is gone.** The `remember` / `memories` / `recall` / `forget`
+  subcommand tree and its `kv.memory.*` keyspace are removed, along with
+  `br prime`'s memory injection and its `--memories-only` flag. Memories lived
+  only in the SQLite config table and never crossed the JSONL sync boundary, so
+  no data migration is implied — the `kv.memory.*` rows are simply no longer
+  addressed by any command. `br codex-hook`'s PreCompact path passed
+  `--memories-only` as a literal argument string, so it compiled cleanly and
+  failed only at runtime; it now runs plain `br prime`.
+  ([`51867a19`](https://github.com/quangdang46/beads_rust/commit/51867a19))
+
+#### Fixes
+
+- **The web container installed the wrong binary.** `web/Dockerfile`
+  downloaded and installed the Go `bd` release from `gastownhall/beads`, while
+  `web/lib/br.ts` resolves `process.env.BR_BIN || "br"` — and no file anywhere
+  sets `BR_BIN`. The published image therefore had no `br` on `PATH` and every
+  API route failed with `ENOENT`. The stated rationale was inverted as well: the
+  comment claimed `bd` was glibc-linked so the runner must be Debian, whereas
+  the `br` release binaries are musl-static. The image now fetches
+  `br-linux-{x64,arm64}.tar.gz` from this repo's own releases.
+- **The web UI taught users a command that does not exist.** Roughly 25
+  user-visible strings named `bd` where the app shells out to `br`. Two were
+  worse than cosmetic: `error-toast.tsx` put a copy-to-clipboard button on
+  `BD_ALLOW_REMOTE_MIGRATE=1 bd migrate` directly beneath text assuring the
+  user their data was safe, and the delete confirmation read
+  `This calls bd delete.` when the route actually runs `br delete --force` — a
+  flag that bypasses dependent checks and orphans them. `bd migrate` has no
+  `br` equivalent at all, so that button is gone rather than renamed.
+- **`br agents install` wrote a stale binary name into other projects.**
+  `AGENT_BLURB` shipped `br ready  # or: bd ready`, and the blurb is appended
+  to downstream `AGENTS.md`/`CLAUDE.md` files — so `br` was propagating `bd`
+  outward. It also advertised itself as `(`br`/`bd`)`.
+- **The `br` skill taught the wrong issue-ID scheme.** `.claude/skills/br/`
+  documented IDs as `bd-###`, including a runnable `br close bd-123`, which
+  contradicts this repo's own `AGENTS.md`; the default prefix is `br`.
+- **A user-facing validation message cited a foreign ID prefix** —
+  `must be prefix-suffix format (e.g., bd-dolt, gt-auth)` on the rename path.
+- **Documentation for commands that do not exist.** `docs/CLI_REFERENCE.md`
+  documented `br upgrade`; `docs/BD_VS_BR.md` claimed `br diff` and
+  `br snapshot`. `br diff` was a rename of `br history diff <backup>`, which the
+  matrix now shows; there is no manual snapshot command, so that row is marked
+  absent and points at the automatic `.br_history/` backups. Both files also
+  misdescribed `br dep graph`, `br worktree add`, and `br agents session`.
+- **The drift guard that let those through is one-directional.**
+  `test_cli_reference_documents_current_clap_surface` walks live subcommands and
+  fails if one lacks a heading, but never checks the reverse — which is how a
+  phantom section sat in the reference for months.
+  ([`19598ddd`](https://github.com/quangdang46/beads_rust/commit/19598ddd))
+
+#### Tooling
+
+- **`ubs` and `rch` are no longer referenced.** Neither tool exists on any
+  machine this project is worked from, so "run `ubs <changed-files>` before
+  every commit" and the remote-compilation instructions were unenforceable —
+  including the claim that builds are "hooked into Claude Code's PreToolUse
+  automatically", which was never backed by any config. The `rch exec`
+  wrappers in `docs/CI_SUPPLY_CHAIN.md` were rewritten as the `cargo` commands
+  they wrapped rather than deleted; the proof commands are the policy. The
+  mandatory `cargo check` / `clippy` / `fmt` gates are unchanged. Also removed:
+  a dead `RCH_DISABLED` env set and eight `ubs:ignore` directives.
+  ([`8fecfa1f`](https://github.com/quangdang46/beads_rust/commit/8fecfa1f))
+
+#### Documentation
+
+- **`docs/audit_bd_to_br_2026_05_09.md` is corrected.** A re-audit on
+  2026-09-30 found the migration-completeness audit's counts wrong by one to
+  three orders of magnitude, and its headline "user-facing `bd <command>` = 0"
+  row measured with a hyphen pattern that cannot match a space-form command, so
+  it was never actually tested. The "frozen baselines, ~72,000 hits" category —
+  the stated basis for recommending against a `bd-` lint — does not exist in
+  the repository at any commit. A dated correction is recorded at the head of
+  the file; the original text is left intact as the record of what was believed.
+
 ### v0.1.3-era work retained below
 
 - **`br web`** — new subcommand that serves a static web UI and REST API

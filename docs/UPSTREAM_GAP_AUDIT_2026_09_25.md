@@ -26,6 +26,33 @@
 
 ---
 
+## ⚠️ CORRECTION (2026-09-30) — the `br memory` / `br remember` surface no longer exists
+
+Added 2026-09-30. Everything below this line is preserved **verbatim** as the record of what the audit measured on 2026-09-25 against LOCAL at `69f972d9`. Do not act on any memory finding below without reading this first.
+
+**What changed.** The persistent-agent-memory surface — `br remember` / `br memories` / `br recall` / `br forget`, implemented in `src/cli/commands/memory.rs` (276 lines, introduced by `af264c66 feat(#58)`) — was deleted on 2026-09-30. The file is gone, `pub mod memory;` is out of `src/cli/commands/mod.rs`, and the `Memory` variant is out of `pub enum Commands` in `src/cli/mod.rs`. No file under `src/` references it any more. The deletion is in the working tree and not yet committed as of writing, so there is no commit to point at yet.
+
+**Which claims this falsifies.** The audit treats the memory surface as a LOCAL capability in 15 places. They do not all stand or fall together, so they are classified rather than blanket-corrected. Line numbers are **as the audit was published on 2026-09-25**; this note adds 27 lines above them, so add 27 to reach the current file.
+
+| Line | Where | What it asserted | Status now |
+|---|---|---|---|
+| **538** | §5, item 6 | `br remember` as one leg of the degraded Agent-Mail coordination workflow — "a first-class process capability" | **Narrowed, not void.** Reservations and self-tracking `.beads` are untouched; only the `br remember` leg is gone. The degraded protocol `AGENTS.md` documents today routes through `br comments add`, which this audit predates. |
+| 843, 863 | App. A, `kv` refutation | LOCAL has GO's kv store "addressed through `br config`/`br memory`"; `MemoryCommands Remember/Memories/Recall/Forget` "is real" | **Partly false.** The `br config` half still holds, so the `kv` refutation stands on its own; the `br memory` half and both file:line citations are dead. |
+| 1398, 1406 | App. A, search refutation | `memory.rs:148` / `memory.rs:135-175` as Unicode-aware search paths in LOCAL | **Dead citation only.** The refutation's conclusion rests on `search.rs` itself; the same paragraph's `list.rs` and `query/evaluator.rs` citations are unaffected. |
+| 1925, 1929 | App. B `cli-surface`, gaps #1 and #5 | LOCAL `br memory` substitutes for GO's remember/recall/memories/forget; `memory` present "in all three, namespaced differently" | **False.** The audit's own stated bar was "only that a command exists under a different name". No such command exists now. |
+| 1962 | App. B, observability | "DWS has no … `memory.rs` …; LOCAL has all of them" | **False** for `memory.rs` only; the rest of that list is unaffected. |
+| 4094, 4167 | App. C `sync-jsonl` finding, severity **medium** | Persistent memories never travel through LOCAL's JSONL sync | **Moot.** LOCAL has no memories to sync. This is a deletion, not a fix — the gap reopens in full if the surface returns. |
+| 4173, 4177, 4181 | same finding | LOCAL "ported `br remember/memories/recall/forget`" into `kv.memory.<key>`; every `br remember` stays invisible on other clones | **False**, and the Impact section now describes a capability that does not exist. |
+| 4217, 4225 | App. C export-scoping finding, severity **medium** | GO's `--all` / `--include-infra` / `--scrub` / `--include-memories` / `--exclude-owner` are absent in LOCAL | **Still a gap, one flag narrower.** `--include-memories` is moot; `--all` record types, `--include-infra`, `--scrub` and `--exclude-owner` remain, and the finding's own text calls `--exclude-owner` "the materially different capability". Severity medium stands on that alone. |
+
+**What this does not touch.** The GO-side citations — 1900 (`memoryops/`), 1922 (`rememberCmd`), 2132, 4027, 4039 (`cmd/bd/memory.go`), 4185, 4229, 4239, 4251 — remain accurate. GO still ships `bd remember`; nothing about this removal disturbs the upstream half of any of those findings, and they should not be "corrected" later.
+
+**Why only three sites are annotated inline.** §5 item 6 (538), the Appendix C summary row (4094) and the finding headline (4167) state a *conclusion to act on*, so each carries a short dated pointer. Every other site is a verbatim per-domain transcript or an evidence citation; those are left exactly as the agent wrote them, and the table above is their index.
+
+**Effect on the audit's conclusions.** §4's ranking and Appendix C's severity ladder are unchanged — deleting a LOCAL capability is not an upstream gap, so this note creates no new finding. It does weaken §5 item 6, which was the only one of that list's six items resting on a surface the audit itself called "the one artifact that cannot travel".
+
+---
+
 ## 1. Executive summary
 
 LOCAL `br` is **not dramatically smaller** than its Rust upstream once measured on the same basis — **314 `.rs` files / ~319K LOC** versus DWS's **327 / ~437K** (73% of the LOC) and GO's **2943 `.go` / ~860K** (37%). The gap is **depth of hardening, not code volume**.
@@ -536,6 +563,7 @@ This is the most important section for deciding what *not* to port. LOCAL is a *
 4. **Multi-agent "swarm" vocabulary** — mol / wisp / prime / heartbeat is far more present in LOCAL `src` than DWS (e.g. mol 18 vs 1, prime 10 vs 1, heartbeat 2 vs 0). Ahead of DWS; shared with GO.
 5. **A `bv` graph-aware triage companion** (PageRank / betweenness / HITS / k-core) ships alongside `br`, exposing graph metrics neither fork offers in-tree.
 6. **The degraded Agent-Mail-coordination workflow** — reservation, `br remember`, self-tracking `.beads` — is a first-class process capability that neither upstream fork encodes.
+   > **Correction (2026-09-30).** The `br remember` leg of this item no longer exists — the memory surface was deleted on 2026-09-30. Reservations and self-tracking `.beads` are unaffected, and the degraded workflow `AGENTS.md` documents today routes through `br comments add`, which this audit predates. Item 6 is narrowed, not void. See the 2026-09-30 correction at the top of this document.
 
 ---
 
@@ -4092,6 +4120,7 @@ The 21 ranked gaps in §4 are a **merge** of these 99 verified findings. The tab
 | — | low | dws-only | `missing_flag` | DWS lossless/reviewed reconcile modes (--reconcile, --reconcile-additive, --apply + --expect-plan-sha256) have no LOCAL equivalent |
 | — | low | dws-only | `architecture_gap` | DWS three-layer write authority (workspace lock + canonical-path sidecar + SQLite-safe inode OFD lock) absent; LOCAL holds one unbound .write.lock |
 | — | low | go-only | `missing_feature` | Persistent memories (`br remember`) never travel through LOCAL's JSONL sync; GO round-trips them as `_type: "memory"` records |
+| ↳ | — | — | — | **Moot as of 2026-09-30** — the LOCAL memory surface was deleted, so there are no memories left to sync. Not a fix; reopens if the surface returns. See the 2026-09-30 correction at the top of this document. |
 | — | info | go-only | `architecture_gap` | DWS federation sync is a real pull-then-push against Dolt remotes; LOCAL's federation remote is a local file path only |
 | — | low | go-only | `missing_flag` | GO export record-type scoping (--all, --include-infra, --scrub, --include-memories, --exclude-owner) absent; LOCAL export filters issue rows only |
 | — | low | go-only | `missing_flag` | GO's `bd import --dry-run` classification preview and `--dedup` title-dedup have no LOCAL equivalent |
@@ -4163,6 +4192,8 @@ The 21 ranked gaps in §4 are a **merge** of these 99 verified findings. The tab
 > DWS src/sync/mod.rs:440-457 `pub struct DatabaseFamilyWriteLock` with doc 'Composite advisory authority for every mutation of one database family. The workspace lock preserves existing single-workspace serialization, the canonical-path sidecar serializes independent workspaces before a database exists or across atomic replacement, and the database-inode lock unifies hard-link aliases once the file exists.' src/sync/mod.rs:460-479 `pub struct JsonlFamilyWriteLock` with doc 'Unlike a SQLite database, JSONL export intentionally renames a fresh inode over the destination. Locking the destination inode would therefore become stale at every successful flush.' Re-verification at src/sync/mod.rs:521-540 verify_jsonl_authority ('Canonical JSONL path changed while its write authority was held'), src/sync/mod.rs:1227 verify_database_authority, src/sync/mod.rs:1358 canonical_database_authority_path, src/sync/mod.rs:1453-1475 DatabaseOpenerLease / DatabaseOpenerExclusiveHold, src/sync/mod.rs:1651 blocking_jsonl_family_write_lock_with_timeout, src/sync/mod.rs:1723 blocking_database_family_write_lock_with_timeout. Inode lock rationale and the macOS/Windows breakage of the old approach: src/sync/db_inode_lock.rs:1-70, offset constant at DATABASE_INODE_LOCK_OFFSET chosen away from SQLite's 0x4000_0000..0x4000_0200 range.
 
 </details>
+
+> **Correction (2026-09-30).** Moot: the LOCAL memory surface this finding measures was deleted on 2026-09-30, so there is nothing left to fail to sync. This is a deletion rather than a fix — the gap reopens in full if `br remember` is ever reintroduced. The GO-side upstream evidence below is unaffected. See the 2026-09-30 correction at the top of this document.
 
 <details><summary><b>Persistent memories (`br remember`) never travel through LOCAL's JSONL sync; GO round-trips them as `_type: "memory"` records</b></summary>
 

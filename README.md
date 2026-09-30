@@ -481,7 +481,7 @@ git commit -m "Fix: login timeout (br-a1b2c3)"
 | `graph` | Visualize dependency graph | `br graph br-abc123` |
 | `lint` | Check issues for missing template sections | `br lint --status all` |
 | `orphans` | List open issues referenced in commits | `br orphans` |
-| `prime` | AI session-start context + memories | `br prime` |
+| `prime` | AI session-start context | `br prime` |
 | `reflect` | Agent instructions to sync beads ↔ git/code | `br reflect --json` |
 | `changelog` | Generate changelog from closed issues | `br changelog --since-tag v0.1.44` |
 | `history` | Manage local history backups | `br history list` |

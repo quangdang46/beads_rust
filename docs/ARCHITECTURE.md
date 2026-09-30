@@ -163,7 +163,7 @@ User Input                  CLI                     Storage                 Sync
     │                        │  (auto-flush if enabled)                      │
     │                        │ ───────────────────────────────────────────> │
     │                        │                        │                      │
-    │  ID: bd-abc123         │                        │                      │
+    │  ID: br-abc123         │                        │                      │
     │ <───────────────────── │                        │                      │
 ```
 
@@ -289,8 +289,8 @@ Rebuilt when:
 Each line is a complete JSON object:
 
 ```json
-{"id":"bd-abc123","title":"Fix bug","status":"open",...}
-{"id":"bd-def456","title":"Add feature","status":"in_progress",...}
+{"id":"br-abc123","title":"Fix bug","status":"open",...}
+{"id":"br-def456","title":"Add feature","status":"in_progress",...}
 ```
 
 **Benefits:**
@@ -446,7 +446,7 @@ pub enum BeadsError {
 {
   "error_code": 3,
   "kind": "not_found",
-  "message": "Issue not found: bd-xyz999",
+  "message": "Issue not found: br-xyz999",
   "recovery_hints": [
     "Check the issue ID spelling",
     "Use 'br list' to find valid IDs"
@@ -530,7 +530,7 @@ pub struct IdConfig {
     pub max_collision_prob: f64, // 0.25
 }
 
-// Generated: bd-abc123
+// Generated: br-abc123
 ```
 
 **Algorithm:**
