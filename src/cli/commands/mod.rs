@@ -90,7 +90,6 @@ pub mod init;
 pub mod label;
 pub mod lint;
 pub mod list;
-pub mod memory;
 pub mod merge_slot;
 pub mod mol;
 pub mod orphans;

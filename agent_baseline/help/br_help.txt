@@ -53,11 +53,10 @@ Commands:
   status         Alias for stats
   sync           Sync database with JSONL file (export or import)
   undefer        Undefer issues (make ready again)
-  memory         Persistent agent memory (remember / memories / recall / forget)
   wisp           Manage wisps (ephemeral, JSONL-excluded issues)
   custom-status  Manage custom statuses (Issue #5)
   custom-type    Manage custom types (Issue #5)
-  prime          AI session context with persistent memory injection
+  prime          AI session context
   reflect        Agent instructions to sync beads with the current codebase (prime-style)
   template       Issue tracking template commands
   update         Update an issue

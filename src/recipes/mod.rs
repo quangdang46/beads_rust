@@ -308,7 +308,7 @@ const CODEX_HOOKS_JSON: &str = r#"{
 /// The YAML frontmatter makes it discoverable via `goose skills list`.
 const GOOSE_SKILL_MD: &str = r#"---
 title: beads
-description: Use Beads (br) for durable issue tracking, dependencies, memory, and session handoff.
+description: Use Beads (br) for durable issue tracking, dependencies, and session handoff.
 ---
 
 # Beads Issue Tracking
@@ -330,9 +330,10 @@ br sync --flush-only  # Export DB to JSONL before session end
 
 When creating issues, use `--deps "blocks:<dep-id>"` to block on other issues. Use `br ready` to find unblocked work.
 
-## Memories
+## Session Handoff
 
-Use `br remember -k <key> <text>` to store session context. Use `br recall <key>` to retrieve it.
+Issue comments travel with the issue through JSONL sync, so they are the durable place for
+session context. Use `br comments add <id> -m "<text>"` to record it and `br comments list <id>` to read it back.
 "#;
 
 /// Crush skill markdown content written to `.agents/skills/beads/SKILL.md`.
@@ -341,7 +342,7 @@ Use `br remember -k <key> <text>` to store session context. Use `br recall <key>
 /// `.agents/skills/<name>/SKILL.md`.
 const CRUSH_SKILL_MD: &str = r#"---
 title: beads
-description: Use Beads (br) for durable issue tracking, dependencies, memory, and session handoff.
+description: Use Beads (br) for durable issue tracking, dependencies, and session handoff.
 ---
 
 # Beads Issue Tracking
@@ -361,9 +362,10 @@ br sync --flush-only  - Export DB to JSONL before session end
 
 When creating issues, use --deps "blocks:<dep-id>" to block on other issues. Use br ready to find unblocked work.
 
-## Memories
+## Session Handoff
 
-Use br remember -k <key> <text> to store session context. Use br recall <key> to retrieve it.
+Issue comments travel with the issue through JSONL sync, so they are the durable place for
+session context. Use br comments add <id> -m "<text>" to record it and br comments list <id> to read it back.
 "#;
 
 /// Shared MCP server JSON configuration for IDE integrations.

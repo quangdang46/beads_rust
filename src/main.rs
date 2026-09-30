@@ -557,9 +557,6 @@ fn main() {
             commands::defer::execute_undefer(&args, cli.json || args.robot, &overrides, &output_ctx)
         }
         Commands::Wisp { command } => commands::wisp::execute(&command, &overrides, &output_ctx),
-        Commands::Memory { command } => {
-            commands::memory::execute(&command, cli.json, &overrides, &output_ctx)
-        }
         Commands::Prime(args) => commands::prime::execute(&args, cli.json, &overrides, &output_ctx),
         Commands::Reflect(args) => {
             commands::reflect::execute(&args, cli.json, &overrides, &output_ctx)
@@ -991,7 +988,6 @@ const fn needs_write_lock(cmd: &Commands) -> bool {
         | Commands::Doctor(_)
         | Commands::Template { .. }
         | Commands::Admin { .. }
-        | Commands::Memory { .. }
         | Commands::Prime(_)
         | Commands::Reflect(_)
         | Commands::Sql(_) => true,
@@ -1075,7 +1071,6 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Worktree(_)
         | Commands::MergeSlot(_)
         | Commands::Federation(_)
-        | Commands::Memory { .. }
         | Commands::Prime(_)
         | Commands::Reflect(_)
         | Commands::Sql(_) => false,

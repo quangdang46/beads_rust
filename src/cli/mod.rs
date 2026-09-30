@@ -1023,12 +1023,6 @@ EXAMPLES:
     /// Undefer issues (make ready again)
     Undefer(UndeferArgs),
 
-    /// Persistent agent memory (remember / memories / recall / forget)
-    Memory {
-        #[command(subcommand)]
-        command: commands::memory::MemoryCommands,
-    },
-
     /// Manage wisps (ephemeral, JSONL-excluded issues)
     Wisp {
         #[command(subcommand)]
@@ -1047,7 +1041,7 @@ EXAMPLES:
         command: commands::custom_status::TypeCommands,
     },
 
-    /// AI session context with persistent memory injection
+    /// AI session context
     Prime(commands::prime::PrimeArgs),
 
     /// Agent instructions to sync beads with the current codebase (prime-style)

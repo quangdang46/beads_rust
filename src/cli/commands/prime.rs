@@ -1,36 +1,25 @@
-//! `br prime` — AI session context with persistent memory injection.
+//! `br prime` — AI session context.
 //!
 //! Outputs a canonical context blob (~1-2k tokens CLI, ~50 tokens MCP/hook) for
-//! AI agents at session start. Injects persistent memories from kv.memory.*.
+//! AI agents at session start. A `.beads/PRIME.md` file, when present,
+//! replaces the default template.
 
 use clap::Args;
 
-use crate::config::{CliOverrides, discover_beads_dir_with_cli, open_storage_with_cli};
+use crate::config::CliOverrides;
 use crate::error::BeadsError;
 use crate::output::OutputContext;
-
-/// Key prefix for persistent agent memories — mirrors `memory.rs`.
-const MEMORY_KEY_PREFIX: &str = "kv.memory.";
-
-/// Extract the slug from a full memory key (strip prefix).
-fn slug_from_key(key: &str) -> Option<&str> {
-    key.strip_prefix(MEMORY_KEY_PREFIX)
-}
 
 /// Arguments for `br prime`.
 #[derive(Args, Debug, Clone)]
 pub struct PrimeArgs {
-    /// Emit the full workflow reference + memories (default when not piped)
-    #[arg(long, conflicts_with = "memories_only")]
+    /// Emit the full workflow reference (default when not piped)
+    #[arg(long)]
     pub full: bool,
 
     /// Compact mode (MCP-friendly, ~50 tokens of reminders)
-    #[arg(long, conflicts_with_all = &["full", "memories_only"])]
+    #[arg(long, conflicts_with = "full")]
     pub mcp: bool,
-
-    /// Output only the memories section (for pre-compact / post-mode hooks)
-    #[arg(long, conflicts_with_all = &["full", "mcp"])]
-    pub memories_only: bool,
 
     /// Wrap output in a SessionStart hook JSON envelope
     #[arg(long)]
@@ -57,7 +46,6 @@ const DEFAULT_PRIME_TEMPLATE: &str = r#"# br — Dependency-Aware Issue Tracker
 - `br update <id> --status=in_progress`
 - `br close <id> --reason "Completed"`
 - `br sync --flush-only` — Export to JSONL (NO git operations)
-- `br remember <text>` — Store a persistent memory
 
 ## Workflow
 
@@ -77,11 +65,6 @@ git add .beads/
 git commit -m "..."
 git push
 ```
-
-## Persistent memories
-
-Below are your stored memories from previous sessions.
-Use `br remember "..."` to add more, `br forget <key>` to remove one.
 "#;
 
 /// Default MCP-mode prime content (compact).
@@ -93,7 +76,7 @@ const DEFAULT_MCP_PRIME: &str = "br: dependency-aware issue tracker.\n\
 pub fn execute(
     args: &PrimeArgs,
     json_mode: bool,
-    overrides: &CliOverrides,
+    _overrides: &CliOverrides,
     ctx: &OutputContext,
 ) -> Result<(), BeadsError> {
     // --export: dump default template and exit
@@ -107,12 +90,9 @@ pub fn execute(
         return Ok(());
     }
 
-    // Try to load memories, but don't fail if no beads dir / DB
-    let memories = load_memories(overrides);
-
-    // Check for .beads/PRIME.md override (full mode only, not memories-only)
-    let beads_dir = discover_optional_beads_dir(overrides);
-    let prime_md_override = if !args.memories_only && !args.mcp {
+    // Check for a .beads/PRIME.md override (full mode only)
+    let beads_dir = discover_optional_beads_dir();
+    let prime_md_override = if !args.mcp {
         beads_dir
             .as_ref()
             .map(|d| d.join("PRIME.md"))
@@ -122,20 +102,12 @@ pub fn execute(
         None
     };
 
-    let output = if args.memories_only {
-        format_memories_block(&memories)
-    } else if args.mcp {
-        format_mcp_prime(&memories)
+    let output = if args.mcp {
+        format_mcp_prime()
     } else if let Some(md_content) = prime_md_override {
-        // If the PRIME.md exists, append memories after it
-        let mem_block = format_memories_block(&memories);
-        if mem_block.is_empty() {
-            md_content
-        } else {
-            format!("{md_content}\n\n{mem_block}")
-        }
+        md_content
     } else {
-        format_default_prime(&memories, args.stealth)
+        format_default_prime(args.stealth)
     };
 
     if args.hook_json {
@@ -148,10 +120,7 @@ pub fn execute(
     } else if json_mode || ctx.is_json() {
         let json_output = serde_json::json!({
             "prime": output,
-            "memories_count": memories.len(),
-            "mode": if args.memories_only { "memories_only" }
-                else if args.mcp { "mcp" }
-                else { "full" },
+            "mode": if args.mcp { "mcp" } else { "full" },
         });
         println!("{}", serde_json::to_string_pretty(&json_output)?);
     } else {
@@ -161,76 +130,18 @@ pub fn execute(
     Ok(())
 }
 
-/// Load memories from the config table.
-fn load_memories(overrides: &CliOverrides) -> Vec<(String, String)> {
-    let beads_dir = match discover_optional_beads_dir(overrides) {
-        Some(d) => d,
-        None => return vec![],
-    };
-    let storage_result = match open_storage_with_cli(&beads_dir, overrides) {
-        Ok(r) => r,
-        Err(_) => return vec![],
-    };
-    let all_config = storage_result.storage.get_all_config().unwrap_or_default();
-
-    let mut memories: Vec<(String, String)> = all_config
-        .into_iter()
-        .filter_map(|(k, v)| slug_from_key(&k).map(|slug| (slug.to_string(), v)))
-        .collect();
-
-    memories.sort_by(|a, b| a.0.cmp(&b.0));
-    memories
-}
-
-/// Format the memories section (empty string if no memories).
-fn format_memories_block(memories: &[(String, String)]) -> String {
-    if memories.is_empty() {
-        return String::new();
-    }
-    let mut block = String::from("## Persistent Memories\n\n");
-    for (slug, val) in memories {
-        // Use first line of value as summary
-        let summary = val.lines().next().unwrap_or("");
-        let truncated = if summary.len() > 80 {
-            format!("{}…", &summary[..77])
-        } else {
-            summary.to_string()
-        };
-        block.push_str(&format!("- **{slug}**: {truncated}\n"));
-    }
-    block
-}
-
 /// Build the default full prime output.
-fn format_default_prime(memories: &[(String, String)], _stealth: bool) -> String {
-    let mem_block = format_memories_block(memories);
-    if mem_block.is_empty() {
-        // Strip the "## Persistent memories" placeholder from the default template
-        let trimmed = DEFAULT_PRIME_TEMPLATE
-            .split("\n## Persistent memories")
-            .next()
-            .unwrap_or(DEFAULT_PRIME_TEMPLATE)
-            .trim_end();
-        format!("{trimmed}\n")
-    } else {
-        format!("{}\n\n{mem_block}", DEFAULT_PRIME_TEMPLATE)
-    }
+fn format_default_prime(_stealth: bool) -> String {
+    DEFAULT_PRIME_TEMPLATE.to_string()
 }
 
 /// Build the MCP-mode prime output.
-fn format_mcp_prime(memories: &[(String, String)]) -> String {
-    let mut out = String::from(DEFAULT_MCP_PRIME);
-    if !memories.is_empty() {
-        out.push_str("memories: ");
-        let slugs: Vec<&str> = memories.iter().map(|(s, _)| s.as_str()).collect();
-        out.push_str(&slugs.join(", "));
-        out.push('\n');
-    }
-    out
+fn format_mcp_prime() -> String {
+    DEFAULT_MCP_PRIME.to_string()
 }
 
 /// Discover beads dir without erroring if none exists.
-fn discover_optional_beads_dir(overrides: &CliOverrides) -> Option<std::path::PathBuf> {
+fn discover_optional_beads_dir() -> Option<std::path::PathBuf> {
     let cwd = std::env::current_dir().ok()?;
     let mut dir = cwd.as_path();
     loop {
@@ -247,46 +158,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_slug_from_key() {
-        assert_eq!(slug_from_key("kv.memory.foo"), Some("foo"));
-        assert_eq!(slug_from_key("kv.memory.my-key"), Some("my-key"));
-        assert_eq!(slug_from_key("config.value"), None);
-    }
-
-    #[test]
-    fn test_format_memories_block_empty() {
-        assert_eq!(format_memories_block(&[]), "");
-    }
-
-    #[test]
-    fn test_format_memories_block_with_entries() {
-        let memories = vec![
-            ("quickstart".to_string(), "Run br ready first".to_string()),
-            (
-                "db-schema".to_string(),
-                "Schema is at src/storage/schema.rs".to_string(),
-            ),
-        ];
-        let block = format_memories_block(&memories);
-        assert!(block.contains("quickstart"));
-        assert!(block.contains("db-schema"));
-        assert!(block.contains("Run br ready first"));
-    }
-
-    #[test]
-    fn test_format_mcp_prime_with_memories() {
-        let memories = vec![
-            ("key1".to_string(), "val1".to_string()),
-            ("key2".to_string(), "val2".to_string()),
-        ];
-        let output = format_mcp_prime(&memories);
-        assert!(output.contains("memories: key1, key2"));
-    }
-
-    #[test]
     fn test_format_mcp_prime_empty() {
-        let output = format_mcp_prime(&[]);
+        let output = format_mcp_prime();
         assert!(!output.contains("memories:"));
         assert!(output.contains("br ready"));
+    }
+
+    #[test]
+    fn test_default_prime_template_has_no_memory_commands() {
+        assert!(!DEFAULT_PRIME_TEMPLATE.contains("br remember"));
+        assert!(!DEFAULT_PRIME_TEMPLATE.contains("br forget"));
+        assert!(!DEFAULT_PRIME_TEMPLATE.contains("br memory"));
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! Implements Codex CLI lifecycle hooks comparable to the Go `bd codex-hook`:
 //! - SessionStart: inject `br prime` output as additional context
-//! - PreCompact: run `br prime --memories-only` to validate state before compaction
+//! - PreCompact: run `br prime` to validate state before compaction
 //! - PostCompact: create a refresh marker file
 //! - UserPromptSubmit: if refresh marker exists, run `br prime` and clear the marker
 //!
@@ -96,12 +96,9 @@ struct CodexHookSpecificOutput {
 }
 
 /// Run `br prime` and capture its stdout.
-fn run_br_prime(memories_only: bool) -> Result<String> {
+fn run_br_prime() -> Result<String> {
     let mut cmd = Command::new(std::env::current_exe()?);
     cmd.arg("prime");
-    if memories_only {
-        cmd.arg("--memories-only");
-    }
     let output = cmd
         .output()
         .map_err(|e| BeadsError::Config(format!("Failed to execute br prime: {e}")))?;
@@ -115,7 +112,7 @@ fn run_br_prime(memories_only: bool) -> Result<String> {
 
 /// Handle the SessionStart hook: inject `br prime` output as additional context.
 fn handle_session_start(input: &CodexHookInput, stdout: io::StdoutLock<'_>) -> Result<()> {
-    let out = run_br_prime(false)?;
+    let out = run_br_prime()?;
     let trimmed = out.trim();
     if trimmed.is_empty() {
         // No additional context; just signal continue
@@ -146,7 +143,7 @@ fn handle_session_start(input: &CodexHookInput, stdout: io::StdoutLock<'_>) -> R
 
 /// Handle the PreCompact hook: validate state before compaction.
 fn handle_pre_compact(stdout: io::StdoutLock<'_>) -> Result<()> {
-    match run_br_prime(true) {
+    match run_br_prime() {
         Ok(_) => {
             let response = CodexHookResponse {
                 continue_: true,
@@ -201,7 +198,7 @@ fn handle_user_prompt_submit(input: &CodexHookInput, stdout: io::StdoutLock<'_>)
     // Remove the marker first (best-effort)
     let _ = std::fs::remove_file(&path);
 
-    match run_br_prime(false) {
+    match run_br_prime() {
         Ok(out) => {
             let trimmed = out.trim();
             if trimmed.is_empty() {
