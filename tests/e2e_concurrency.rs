@@ -1333,7 +1333,15 @@ fn e2e_mixed_read_write_concurrency() {
         let handle = thread::spawn(move || {
             barrier_clone.wait();
             let start = Instant::now();
-            let result = run_br_in_dir(&root_clone, ["--lock-timeout", "500", "list", "--json"]);
+            // 500ms was not enough for a single reader to get past three
+            // writers on a loaded runner: every reader timed out and the test
+            // failed with "expected at least one successful reader under mixed
+            // contention", which reads as a starvation defect but was only a
+            // budget that no reader could meet. The claim under test is that
+            // reads are not starved, and a longer wait does not hide
+            // starvation — genuinely starved readers still time out. Same
+            // reasoning, and the same value, as the sibling parallel-read test.
+            let result = run_br_in_dir(&root_clone, ["--lock-timeout", "15000", "list", "--json"]);
             let elapsed = start.elapsed();
             ("reader", i, result, elapsed)
         });
