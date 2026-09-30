@@ -2045,7 +2045,11 @@ fn e2e_routing_delete_preview_does_not_mutate_earlier_local_batch() {
     );
     assert!(
         delete.status.success(),
-        "delete preview failed: {}",
+        // stdout too: a structured error goes there in JSON mode, so a
+        // failure reported with stderr alone shows only the tracing lines and
+        // says nothing about why the command refused.
+        "delete preview failed:\nstdout: {}\nstderr: {}",
+        delete.stdout,
         delete.stderr
     );
     let json: Value =
