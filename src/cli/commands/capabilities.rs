@@ -980,7 +980,7 @@ fn command_contract(name: &str) -> CommandContract {
             operation: "read",
             workspace: "optional",
             machine_output: &["json", "text"],
-            examples: &["br prime", "br prime --mcp", "br prime --export"],
+            examples: &["br prime", "br prime --export"],
         },
         "reflect" => CommandContract {
             operation: "read",
@@ -989,7 +989,6 @@ fn command_contract(name: &str) -> CommandContract {
             examples: &[
                 "br reflect",
                 "br reflect --json",
-                "br reflect --mcp",
                 "br reflect --since HEAD~20",
                 "br reflect --export",
             ],

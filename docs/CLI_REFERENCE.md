@@ -1926,7 +1926,6 @@ br reflect [OPTIONS]
 | Flag | Description |
 |------|-------------|
 | `--json` | Machine envelope (`br.reflect.v1`) with anchor, HEAD, commits, open issues, orphans, instructions |
-| `--mcp` | Compact token-light output |
 | `--since <REV>` | Override auto anchor (default: last commit touching `.beads/issues.jsonl`) |
 | `--export` | Dump default `REFLECT.md` template |
 

@@ -17,10 +17,6 @@ pub struct PrimeArgs {
     #[arg(long)]
     pub full: bool,
 
-    /// Compact mode (MCP-friendly, ~50 tokens of reminders)
-    #[arg(long, conflicts_with = "full")]
-    pub mcp: bool,
-
     /// Wrap output in a SessionStart hook JSON envelope
     #[arg(long)]
     pub hook_json: bool,
@@ -67,11 +63,6 @@ git push
 ```
 "#;
 
-/// Default MCP-mode prime content (compact).
-const DEFAULT_MCP_PRIME: &str = "br: dependency-aware issue tracker.\n\
-    br ready --json → pick work | br show <id> → details | \
-    br close <id> → finish | br sync --flush-only → export (NO git)\n";
-
 /// Execute the prime command.
 pub fn execute(
     args: &PrimeArgs,
@@ -81,34 +72,19 @@ pub fn execute(
 ) -> Result<(), BeadsError> {
     // --export: dump default template and exit
     if args.export {
-        let template = if args.mcp {
-            DEFAULT_MCP_PRIME
-        } else {
-            DEFAULT_PRIME_TEMPLATE
-        };
-        println!("{template}");
+        println!("{DEFAULT_PRIME_TEMPLATE}");
         return Ok(());
     }
 
     // Check for a .beads/PRIME.md override (full mode only)
     let beads_dir = discover_optional_beads_dir();
-    let prime_md_override = if !args.mcp {
-        beads_dir
-            .as_ref()
-            .map(|d| d.join("PRIME.md"))
-            .filter(|p| p.exists())
-            .and_then(|p| std::fs::read_to_string(p).ok())
-    } else {
-        None
-    };
+    let prime_md_override = beads_dir
+        .as_ref()
+        .map(|d| d.join("PRIME.md"))
+        .filter(|p| p.exists())
+        .and_then(|p| std::fs::read_to_string(p).ok());
 
-    let output = if args.mcp {
-        format_mcp_prime()
-    } else if let Some(md_content) = prime_md_override {
-        md_content
-    } else {
-        format_default_prime(args.stealth)
-    };
+    let output = prime_md_override.unwrap_or_else(|| format_default_prime(args.stealth));
 
     if args.hook_json {
         let envelope = serde_json::json!({
@@ -120,7 +96,7 @@ pub fn execute(
     } else if json_mode || ctx.is_json() {
         let json_output = serde_json::json!({
             "prime": output,
-            "mode": if args.mcp { "mcp" } else { "full" },
+            "mode": "full",
         });
         println!("{}", serde_json::to_string_pretty(&json_output)?);
     } else {
@@ -133,11 +109,6 @@ pub fn execute(
 /// Build the default full prime output.
 fn format_default_prime(_stealth: bool) -> String {
     DEFAULT_PRIME_TEMPLATE.to_string()
-}
-
-/// Build the MCP-mode prime output.
-fn format_mcp_prime() -> String {
-    DEFAULT_MCP_PRIME.to_string()
 }
 
 /// Discover beads dir without erroring if none exists.
@@ -156,13 +127,6 @@ fn discover_optional_beads_dir() -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_format_mcp_prime_empty() {
-        let output = format_mcp_prime();
-        assert!(!output.contains("memories:"));
-        assert!(output.contains("br ready"));
-    }
 
     #[test]
     fn test_default_prime_template_has_no_memory_commands() {

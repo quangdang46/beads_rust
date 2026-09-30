@@ -249,10 +249,11 @@ way. Everything below under "Since v0.1.3" is new in this release.
   job or an agent gating on exit status read a broken dependency graph as
   clean. The machine-readable branches now match.
 
-- **`br prime --mcp` and `br reflect --mcp` still work.** These are
-  output-format flags on those two commands, not the MCP server, and are
-  untouched. Agent Mail is a separate system and all of its guidance
-  survives.
+- **`br prime --mcp` and `br reflect --mcp` are gone too.** They were
+  output-format flags, not part of the server, so they outlived the removal —
+  and with no MCP client left, neither has a consumer. `br prime` and
+  `br reflect` keep `--json` and `--export`. Agent Mail is a separate system
+  and all of its guidance survives.
 
 #### Fixes
 

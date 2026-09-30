@@ -27,10 +27,6 @@ const OPEN_ISSUES_CAP: usize = 100;
 /// Arguments for `br reflect`.
 #[derive(Args, Debug, Clone)]
 pub struct ReflectArgs {
-    /// Compact mode (MCP-friendly, token-light reminders)
-    #[arg(long)]
-    pub mcp: bool,
-
     /// Dump the default reflect template to stdout (ignore `.beads/REFLECT.md`)
     #[arg(long)]
     pub export: bool,
@@ -125,11 +121,6 @@ Make open/closed beads match what the code actually does since the beads JSONL l
 6. `br sync --flush-only`
 "#;
 
-/// Compact MCP-mode reflect content.
-const DEFAULT_MCP_REFLECT: &str = "br reflect: sync beads ↔ git/code (instructions only).\n\
-    1) Read Facts (anchor..HEAD) 2) close shipped opens with proof \
-    3) create beads for untracked ship 4) br sync --flush-only (NO git)\n";
-
 /// Execute the reflect command.
 ///
 /// # Errors
@@ -143,12 +134,7 @@ pub fn execute(
     ctx: &OutputContext,
 ) -> Result<()> {
     if args.export {
-        let template = if args.mcp {
-            DEFAULT_MCP_REFLECT
-        } else {
-            DEFAULT_REFLECT_TEMPLATE
-        };
-        println!("{template}");
+        println!("{DEFAULT_REFLECT_TEMPLATE}");
         return Ok(());
     }
 
@@ -174,22 +160,14 @@ pub fn execute(
     )?;
 
     // Optional project override of the agent protocol body.
-    let protocol = if args.mcp {
-        None
+    let reflect_md = beads_dir.join("REFLECT.md");
+    let protocol = if reflect_md.is_file() {
+        std::fs::read_to_string(&reflect_md).ok()
     } else {
-        let reflect_md = beads_dir.join("REFLECT.md");
-        if reflect_md.is_file() {
-            std::fs::read_to_string(&reflect_md).ok()
-        } else {
-            None
-        }
+        None
     };
 
-    let instructions = if args.mcp {
-        format_mcp_output(&facts)
-    } else {
-        format_full_output(&facts, protocol.as_deref())
-    };
+    let instructions = format_full_output(&facts, protocol.as_deref());
 
     if json_mode || ctx.is_json() {
         let envelope = ReflectEnvelope {
@@ -206,11 +184,7 @@ pub fn execute(
             hints: facts.hints.clone(),
             stats_summary: facts.stats_summary.clone(),
             instructions_markdown: instructions,
-            mode: if args.mcp {
-                "mcp".to_string()
-            } else {
-                "full".to_string()
-            },
+            mode: "full".to_string(),
         };
         println!("{}", serde_json::to_string_pretty(&envelope)?);
     } else {
@@ -505,35 +479,6 @@ fn format_full_output(facts: &ReflectFacts, protocol_override: Option<&str>) -> 
     out
 }
 
-fn format_mcp_output(facts: &ReflectFacts) -> String {
-    let mut out = String::from(DEFAULT_MCP_REFLECT);
-    out.push_str(&format!(
-        "range: {} ({} commits, {} files)\n",
-        facts.range.spec, facts.range.commit_count, facts.range.files_changed
-    ));
-    out.push_str(&format!(
-        "open: {} | in_progress: {} | orphans_in_range: {}\n",
-        facts.stats_summary.open,
-        facts.stats_summary.in_progress,
-        facts.orphans.len()
-    ));
-    if !facts.open_issues.is_empty() {
-        out.push_str("issues: ");
-        let ids: Vec<&str> = facts
-            .open_issues
-            .iter()
-            .take(12)
-            .map(|i| i.id.as_str())
-            .collect();
-        out.push_str(&ids.join(", "));
-        if facts.open_issues.len() > 12 {
-            out.push_str(", …");
-        }
-        out.push('\n');
-    }
-    out
-}
-
 // ---------------------------------------------------------------------------
 // Git helpers (local; br does not automate git commit/push)
 // ---------------------------------------------------------------------------
@@ -768,46 +713,6 @@ mod tests {
     }
 
     #[test]
-    fn format_mcp_output_includes_counts() {
-        let facts = ReflectFacts {
-            anchor: ReflectCommitRef {
-                sha: "aaaaaaa".into(),
-                date: "2026-07-01".into(),
-                path: Some(".beads/issues.jsonl".into()),
-            },
-            head: ReflectCommitRef {
-                sha: "bbbbbbb".into(),
-                date: "2026-07-16".into(),
-                path: None,
-            },
-            range: ReflectRange {
-                spec: "aaaaaaa..bbbbbbb".into(),
-                commit_count: 3,
-                files_changed: 5,
-            },
-            commits: vec!["bbbbbbb feat: x".into()],
-            diff_stat: "a.rs | 1 +\n".into(),
-            open_issues: vec![ReflectOpenIssue {
-                id: "br-1".into(),
-                title: "t".into(),
-                status: "open".into(),
-                priority: 1,
-            }],
-            orphans: vec![],
-            hints: vec![],
-            stats_summary: ReflectStatsSummary {
-                open: 1,
-                in_progress: 0,
-                total_listed: 1,
-            },
-        };
-        let out = format_mcp_output(&facts);
-        assert!(out.contains("3 commits"));
-        assert!(out.contains("br-1"));
-        assert!(out.contains("open: 1"));
-    }
-
-    #[test]
     fn format_full_output_is_deterministic() {
         let facts = ReflectFacts {
             anchor: ReflectCommitRef {
@@ -930,6 +835,5 @@ mod tests {
     #[test]
     fn export_template_constants_are_nonempty() {
         assert!(DEFAULT_REFLECT_TEMPLATE.contains("br sync --flush-only"));
-        assert!(DEFAULT_MCP_REFLECT.contains("br reflect"));
     }
 }
