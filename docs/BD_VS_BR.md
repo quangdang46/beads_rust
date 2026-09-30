@@ -28,7 +28,7 @@ The following `bd` features are **not** planned for `br`:
 | **Dependencies** | | | |
 | Add dep | `bd dep add` | `br dep add` | Parity |
 | Remove dep | `bd dep remove` | `br dep remove` | Parity |
-| List deps | `bd dep list/graph` | `br dep graph` | Parity |
+| List deps | `bd dep list/graph` | `br dep list` | Parity; `br` splits it into `br dep list`, `br dep tree`, and top-level `br graph` |
 | Ready work | `bd ready` | `br ready` | Parity |
 | **Sync** | | | |
 | Export JSONL | `bd export jsonl` | `br export --format jsonl` | Parity |
@@ -40,8 +40,8 @@ The following `bd` features are **not** planned for `br`:
 | Query DSL | `bd query` | `br list --filter` | Parity; `br` adds `--filter` on `list` |
 | **History** | | | |
 | Audit log | `bd log` | `br audit` | Parity |
-| Diff | `bd diff` | `br diff` | Parity |
-| Snapshot | `bd snapshot` | `br snapshot` | Parity |
+| Diff | `bd diff` | `br history diff <backup>` | Renamed; diffs a `.br_history` backup against the active JSONL |
+| Snapshot | `bd snapshot` | — | No `br` equivalent; every export writes a timestamped backup into `.br_history/` automatically (browse with `br history list`) |
 | Restore | `bd restore` | `br history restore` | Parity |
 | Prune | `bd prune` | `br history prune` | Parity |
 | **Config** | | | |
@@ -50,7 +50,7 @@ The following `bd` features are **not** planned for `br`:
 | Doctor | — | `br doctor` | `br`-exclusive; health checks + diagnostics |
 | **Worktree** | | | |
 | Worktree info | `bd worktree` | `br worktree` | Parity |
-| Worktree create | `bd worktree add` | `br worktree add` | Parity |
+| Worktree create | `bd worktree add` | `br worktree create` | Parity |
 | **Hooks** | | | |
 | Hook install | `bd hooks install` | `br hooks install` | Parity |
 | Hook list | `bd hooks list` | `br hooks list` | Parity |
@@ -61,7 +61,7 @@ The following `bd` features are **not** planned for `br`:
 | Agent info | — | `br agents` | `br`-exclusive |
 | Robot docs | — | `br robot-docs` | `br`-exclusive |
 | MCP serve | — | `br serve` | `br`-exclusive |
-| Session context | — | `br agents session` | `br`-exclusive |
+| Session context | — | `br prime` | Mirrors `bd prime` |
 | **Formula** | | | |
 | Formula apply | `bd formula apply` | `br formula apply` | Parity |
 | **Wisp** | | | |

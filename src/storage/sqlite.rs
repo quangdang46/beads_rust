@@ -3413,14 +3413,14 @@ impl SqliteStorage {
                 });
             }
 
-            // Validate new ID format: prefix-suffix (e.g. bd-dolt, gt-auth)
+            // Validate new ID format: prefix-suffix (e.g. acme-dolt, gt-auth)
             if !regex::Regex::new(r"^[a-z]+-[a-zA-Z0-9._-]+$")
                 .unwrap()
                 .is_match(new_id)
             {
                 return Err(BeadsError::validation(
                     "new_id",
-                    "must be prefix-suffix format (e.g., bd-dolt, gt-auth)",
+                    "must be prefix-suffix format (e.g., acme-dolt, gt-auth)",
                 ));
             }
 

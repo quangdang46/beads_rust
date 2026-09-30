@@ -8,18 +8,18 @@ import { BLOCKING_DEP_TYPES } from "./schema";
 
 /**
  * A bead needs a human decision when it carries the `human` label (set by
- * `bd human`) and is still actionable (not closed or deferred). Drives the
- * "Needs You" inbox and its sidebar count badge.
+ * `br label add <id> -l human`) and is still actionable (not closed or
+ * deferred). Drives the "Needs You" inbox and its sidebar count badge.
  */
 export function needsHuman(b: Bead): boolean {
   return (b.labels ?? []).includes("human") && b.status !== "closed" && b.status !== "deferred";
 }
 
 /**
- * A human-approval gate: an `issue_type === "gate"` bead created by
- * `bd gate create --type human`. Unlike `bd human` (a label on a normal bead),
- * a gate is its own bead whose sub-type lives in `await_type`, so it never
- * carries the `human` label and `needsHuman()` misses it.
+ * A human-approval gate: an `issue_type === "gate"` bead whose sub-type lives
+ * in `await_type` (br has no `gate create` subcommand — the gate is an ordinary
+ * bead of type `gate` that other beads depend on). Unlike the `human` label
+ * path, a gate never carries the `human` label and `needsHuman()` misses it.
  */
 export function isHumanGate(b: Bead): boolean {
   return b.issue_type === "gate" && b.await_type === "human";
@@ -71,7 +71,7 @@ export function toggleTask(text: string, index: number): string {
 }
 
 /**
- * `bd close` with no `--reason` still records a reason: the literal "Closed".
+ * `br close` with no `--reason` still records a reason: the literal "Closed".
  * That placeholder carries no information, so treat it as absent rather than
  * rendering a "Close reason" section that just says "Closed".
  */
@@ -184,7 +184,7 @@ export function blockingDeps(b: Bead, index: Map<string, Bead>): string[] {
 
 /**
  * The bead's parent, whatever its type. Resolved from the parent-child
- * dependency EDGE — never `bead.parent`, which `bd export --json` omits, so an
+ * dependency EDGE — never `bead.parent`, which `br export --json` omits, so an
  * edge lookup is the only one correct on board/list data as well as in the
  * drawer.
  *

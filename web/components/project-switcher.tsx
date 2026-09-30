@@ -56,7 +56,7 @@ export function ProjectSwitcher({
           <div className="min-w-0 flex-1 leading-[1.15]">
             <div className="truncate text-[13px] font-[600] text-[var(--text)]">{currentName}</div>
             <div className="text-[10.5px] text-[var(--text-3)]">
-              {isDemo ? "sample data" : isLive ? "bd · live" : "bd · project"}
+              {isDemo ? "sample data" : isLive ? "br · live" : "br · project"}
             </div>
           </div>
           <ChevronsUpDown size={14} className="flex-shrink-0 text-[var(--text-3)]" />

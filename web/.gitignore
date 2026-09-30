@@ -52,8 +52,10 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 
-# Beads / Dolt files (added by bd init)
-# .beads holds local tracker state (embedded Dolt DB, config, logs) — not app source.
+# Beads files (added by br init)
+# .beads holds local tracker state (SQLite DB, config, logs) — not app source.
+# .dolt/ is a leftover from the pre-migration Dolt-based bd; kept ignored so a
+# stale one on disk stays out of the tree.
 .beads/
 .dolt/
 *.db

@@ -128,7 +128,7 @@ export function Board() {
         <div className="mr-1 flex flex-col gap-px">
           <h1 className="m-0 text-base font-[650] tracking-[-.01em]">Board</h1>
           <span className="text-[11.5px] text-[var(--text-3)]">
-            {visible.length} beads · live from <span className="font-mono">bd list</span>
+            {visible.length} beads · live from <span className="font-mono">br export</span>
           </span>
         </div>
 

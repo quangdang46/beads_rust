@@ -11,8 +11,7 @@ import { ApiError } from "@/lib/api-client";
  * closes and gates at once rather than being bolted onto one route.
  */
 
-const MIGRATE_BACKUP = "bd export --all -o beads-backup.jsonl";
-const MIGRATE_CMD = "BD_ALLOW_REMOTE_MIGRATE=1 bd migrate";
+const SKEW_BACKUP = "BR_IGNORE_SCHEMA_SKEW=1 br export --all -o beads-backup.jsonl";
 
 function CommandLine({ cmd, note }: { cmd: string; note: string }) {
   const [copied, setCopied] = React.useState(false);
@@ -44,10 +43,11 @@ function CommandLine({ cmd, note }: { cmd: string; note: string }) {
 }
 
 /**
- * bd refuses ALL writes when the binary's schema is ahead of the local database
- * (gastownhall/beads#4259). Reads still work, so the board renders fine and only
- * mutations fail — which makes the raw stderr especially alarming and easy to
- * misread as data loss. Lead with "your data is safe".
+ * br refuses to open the database when its schema is ahead of the binary
+ * (BeadsError::SchemaSkewForward). Nothing is written and nothing is lost — the
+ * raw stderr just reads like data loss, so lead with "your data is safe". There
+ * is no `br migrate` command: the fix is a binary that knows this schema, so
+ * the copy button carries the safety export and nothing else.
  */
 function SchemaMigrationMessage({ detail }: { detail?: string }) {
   const [open, setOpen] = React.useState(false);
@@ -55,16 +55,17 @@ function SchemaMigrationMessage({ detail }: { detail?: string }) {
     <div className="flex w-full flex-col gap-[7px]">
       <div className="text-[13px] font-[650]">Your beads database needs a one-time upgrade</div>
       <p className="m-0 text-[12px] leading-[1.5] text-[var(--text-2)]">
-        Your <span className="font-mono">bd</span> tool is newer than this project&rsquo;s database,
-        so writes are paused until they&rsquo;re reconciled.{" "}
+        This database was written by a newer <span className="font-mono">br</span> than the one
+        you&rsquo;re running, so it refuses to open it at all.{" "}
         <strong>Your data is safe and nothing has been lost.</strong> In a terminal, from this
-        project folder:
+        project folder, take a safety copy:
       </p>
-      <CommandLine cmd={MIGRATE_BACKUP} note="safety copy" />
-      <CommandLine cmd={MIGRATE_CMD} note="one-time" />
+      <CommandLine cmd={SKEW_BACKUP} note="safety copy" />
       <p className="m-0 text-[11.5px] leading-[1.45] text-[var(--text-3)]">
-        Then reload. If this database is shared, run the migrate on{" "}
-        <strong>one machine only</strong> — coordinate with anyone else using it first.
+        <span className="font-mono">BR_IGNORE_SCHEMA_SKEW=1</span> is what lets the read-only
+        export run past that check; it changes nothing on disk. Then upgrade br to the version that
+        wrote this database — there is no migrate command — and reload. Anyone else working in
+        this workspace needs the same br version.
       </p>
       {detail && (
         <>

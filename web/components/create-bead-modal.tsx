@@ -146,8 +146,8 @@ function CreateForm({
     onChange: (v) => set("description", v),
   });
 
-  // Any open bead can parent another (bd allows it and createInputSchema/
-  // `bd create --parent` already accept any id) — epics first, since
+  // Any open bead can parent another (br allows it and createInputSchema/
+  // `br create --parent` already accept any id) — epics first, since
   // epic-as-parent stays the common case and must not get harder to reach.
   const parentOptions = React.useMemo(
     () =>
@@ -227,7 +227,7 @@ function CreateForm({
             {dialogTitle}
           </DialogTitle>
           <DialogDescription className="font-mono text-[11.5px] text-[var(--text-3)]">
-            bd create … --json
+            br create … --json
           </DialogDescription>
         </div>
         <button

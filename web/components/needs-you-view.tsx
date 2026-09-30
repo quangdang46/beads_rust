@@ -18,11 +18,13 @@ import type { Bead } from "@/lib/schema";
 /**
  * Mission Control — "Needs You" decision inbox. Surfaces two kinds of items
  * waiting on a person:
- *   1. Beads an agent flagged for a decision (the `human` label, via `bd human`)
- *      — answered inline (comment + clear the flag) or dismissed.
- *   2. Human-approval gates (`bd gate create --type human`) whose blockers are
- *      resolved — approved (closed, which unblocks dependents) from here so they
- *      don't sit invisibly waiting on the board (bead 8qc / gh-6).
+ *   1. Beads an agent flagged for a decision (the `human` label, via
+ *      `br label add <id> -l human`) — answered inline (comment + clear the
+ *      flag) or dismissed.
+ *   2. Human-approval gates (`gate`-typed beads with await_type `human`) whose
+ *      blockers are resolved — approved (closed, which unblocks dependents)
+ *      from here so they don't sit invisibly waiting on the board
+ *      (bead 8qc / gh-6).
  */
 export function NeedsYouView() {
   const { beads, index } = useApp();
@@ -46,9 +48,9 @@ export function NeedsYouView() {
         {total === 0 ? (
           <div className="p-10 text-center text-[13px] text-[var(--text-3)]">
             🎉 Nothing needs you right now. Agents flag beads here with{" "}
-            <span className="font-mono">bd human</span>, and human-approval gates
-            (<span className="font-mono">bd gate create --type human</span>) show
-            up once their blockers clear.
+            <span className="font-mono">br label add &lt;id&gt; -l human</span>,
+            and human-approval gates (<span className="font-mono">gate</span>
+            {" "}issue type) show up once their blockers clear.
           </div>
         ) : (
           <div className="mx-auto flex max-w-3xl flex-col gap-3">
@@ -66,7 +68,7 @@ export function NeedsYouView() {
 }
 
 /**
- * A ready human-approval gate. "Approve" closes the gate (via `bd close`), which
+ * A ready human-approval gate. "Approve" closes the gate (via `br close`), which
  * resolves it and unblocks every bead depending on it.
  */
 function GateCard({ gate }: { gate: Bead }) {

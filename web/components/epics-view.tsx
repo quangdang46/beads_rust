@@ -49,7 +49,7 @@ export function EpicsView({ focusEpic }: { focusEpic?: { id: string; nonce: numb
   const [hideClosed, setHideClosed] = React.useState(true);
   // Explicitly ordered: open before closed, then priority ascending, then id
   // for stability. Previously a bare .filter(), so the apparent priority order
-  // was incidental to whatever `bd export` returned.
+  // was incidental to whatever `br export` returned.
   const allEpics = beads
     .filter((b) => b.issue_type === "epic")
     .sort(

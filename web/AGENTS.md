@@ -5,76 +5,66 @@ This version has breaking changes — APIs, conventions, and file structure may 
 <!-- END:nextjs-agent-rules -->
 
 <!-- This section is project-owned and deliberately sits OUTSIDE the generated
-     Beads blocks below, which `bd setup` may rewrite. If a generated block ever
+     Beads blocks below, which `br` may rewrite. If a generated block ever
      contradicts this section, THIS SECTION WINS. -->
-# Beads data is local-only — never sync it
+# Beads data is local-only — never sync it to a remote
 
-**Issue data in this repo never leaves the machine it was created on.** This is a
+**Issue data in this repo stays on the machine it was created on.** This is a
 deliberate choice, not an unfinished setup. Do not "fix" it.
 
-Concretely, never do any of these unless the user explicitly asks in the current
-session:
+`br` has no remote and no push/pull of any kind — there is nothing to wire up, so
+the "don't set up a remote" rule is satisfied by not inventing tooling. Concretely,
+never do any of these unless the user explicitly asks in the current session:
 
-- `bd dolt remote add …` — do not wire up a Dolt remote
-- `bd dolt push` / `bd dolt pull` — there is nothing to push to and nothing to pull
+- Add a network sync backend, a remote, or a host/URL of any kind
 - `git push` of anything under `.beads/`
-- un-ignoring `.beads/` in `.gitignore`, or force-adding files inside it
+- un-ignoring `.beads/` in `web/.gitignore`, or force-adding files inside it
 
-`bd` prints a "no Dolt remote configured" advisory with a `repair:` command that
-adds a remote and pushes. **That advisory is wrong for this repo — ignore it.**
-It is suppressed locally via `dolt.local-only: true` in `.beads/config.yaml`, but
-that file is itself gitignored, so a fresh clone will start nagging again. Re-set
-it rather than following the repair hint:
+**Why:** this is a single-maintainer project worked on from one machine. A remote
+only buys cross-machine sync, which nobody here needs, and pushing issue data to
+a public repo would publish internal planning notes alongside the source.
+External bug reports live in GitHub Issues; beads is the private, local work
+tracker.
 
-```bash
-bd config set dolt.local-only true
-```
-
-**Why:** this is a single-maintainer project worked on from one machine. A Dolt
-remote only buys cross-machine sync, which nobody here needs, and pushing issue
-data to a public repo would publish internal planning notes and `bd remember`
-memories alongside the source. External bug reports live in GitHub Issues; beads
-is the private, local work tracker.
-
-**The trade-off, stated plainly:** because `.beads/` is gitignored *and* there is
-no remote, the issue database has **no offsite copy**. If the disk fails, every
-issue, comment and memory is gone. Guard against that with periodic local
-exports, which involve no remote at all:
+**The trade-off, stated plainly:** `.beads/beads.db` is a local SQLite database
+and `.beads/issues.jsonl` is its passive export. A remote is the only offsite
+copy this project has, so **there is none**. If the disk fails, every issue and
+comment is gone. Guard against that with periodic local exports, which involve no
+remote at all:
 
 ```bash
-bd export --all -o ~/bd-backups/<project>-$(date +%F).jsonl
+br export --all -o ~/br-backups/<project>-$(date +%F).jsonl
 ```
 
-Git commits still work normally — this section is only about bead/Dolt data.
+Git commits still work normally — this section is only about bead data.
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:6cd5cc61 -->
 ## Beads Issue Tracker
 
-This project uses **bd (beads)** for issue tracking. Run `bd prime` to see full workflow context and commands.
+This project uses **br (beads_rust)** for issue tracking. Run `br prime` to see full workflow context and commands.
 
 ### Quick Reference
 
 ```bash
-bd ready              # Find available work
-bd show <id>          # View issue details
-bd update <id> --claim  # Claim work
-bd close <id>         # Complete work
+br ready              # Find available work
+br show <id>          # View issue details
+br update <id> --claim  # Claim work
+br close <id>         # Complete work
 ```
 
 ### Rules
 
-- Use `bd` for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
-- Run `bd prime` for detailed command reference and session close protocol
-- Use `bd remember` for persistent knowledge — do NOT use MEMORY.md files
+- Use `br` for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
+- Run `br prime` for detailed command reference and session close protocol
 
-**Architecture in one line:** issues live in a local Dolt DB and **stay there** — this repo runs local-only, with no Dolt remote and no `refs/dolt/data` sync (see "Beads data is local-only" above, which overrides this block); `.beads/issues.jsonl` is a passive local export and is gitignored.
+**Architecture in one line:** issues live in a local SQLite database (`.beads/beads.db`) and **stay there** — this repo runs local-only, with no remote and no background sync (see "Beads data is local-only" above, which overrides this block); `.beads/issues.jsonl` is a passive local export of that database.
 
 ## Agent Context Profiles
 
 The managed Beads block is task-tracking guidance, not permission to override repository, user, or orchestrator instructions.
 
-- **Conservative (default)**: Use `bd` for task tracking. Do not run git commits, git pushes, or Dolt remote sync unless explicitly asked. At handoff, report changed files, validation, and suggested next commands.
-- **Minimal**: Keep tool instruction files as pointers to `bd prime`; use the same conservative git policy unless active instructions say otherwise.
+- **Conservative (default)**: Use `br` for task tracking. Do not run git commits, git pushes, or any bead data sync unless explicitly asked. At handoff, report changed files, validation, and suggested next commands.
+- **Minimal**: Keep tool instruction files as pointers to `br prime`; use the same conservative git policy unless active instructions say otherwise.
 - **Team-maintainer**: Only when the repository explicitly opts in, agents may close beads, run quality gates, commit, and push as part of session close. A current "do not commit" or "do not push" instruction still wins.
 
 ## Session Completion
@@ -102,26 +92,25 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 - If a required sync or push is blocked, stop and report the exact command and error.
 <!-- END BEADS INTEGRATION -->
 
-<!-- BEGIN BEADS CODEX SETUP: generated by bd setup codex -->
+<!-- BEGIN BEADS CODEX SETUP: generated by br -->
 ## Beads Issue Tracker
 
-Use Beads (`bd`) for durable task tracking in repositories that include it. Use the `beads` skill at `.agents/skills/beads/SKILL.md` (project install) or `~/.agents/skills/beads/SKILL.md` (global install) for Beads workflow guidance, then use the `bd` CLI for issue operations.
+Use Beads (`br`) for durable task tracking in repositories that include it. Use the `beads` skill at `.agents/skills/beads/SKILL.md` (project install) or `~/.agents/skills/beads/SKILL.md` (global install) for Beads workflow guidance, then use the `br` CLI for issue operations.
 
 ### Quick Reference
 
 ```bash
-bd ready                # Find available work
-bd show <id>            # View issue details
-bd update <id> --claim  # Claim work
-bd close <id>           # Complete work
-bd prime                # Refresh Beads context
+br ready                # Find available work
+br show <id>            # View issue details
+br update <id> --claim  # Claim work
+br close <id>           # Complete work
+br prime                # Refresh Beads context
 ```
 
 ### Rules
 
-- Use `bd` for all task tracking; do not create markdown TODO lists.
-- Run `bd prime` when Beads context is missing or stale. Codex 0.129.0+ can load Beads context automatically through native hooks; use `/hooks` to inspect or toggle them.
-- Keep persistent project memory in Beads via `bd remember`; do not create ad hoc memory files.
+- Use `br` for all task tracking; do not create markdown TODO lists.
+- Run `br prime` when Beads context is missing or stale. Codex 0.129.0+ can load Beads context automatically through native hooks; use `/hooks` to inspect or toggle them.
 
-**Architecture in one line:** issues live in a local Dolt DB and **stay there** — this repo runs local-only, with no Dolt remote and no `refs/dolt/data` sync (see "Beads data is local-only" above, which overrides this block); `.beads/issues.jsonl` is a passive local export and is gitignored.
+**Architecture in one line:** issues live in a local SQLite database (`.beads/beads.db`) and **stay there** — this repo runs local-only, with no remote and no background sync (see "Beads data is local-only" above, which overrides this block); `.beads/issues.jsonl` is a passive local export of that database.
 <!-- END BEADS CODEX SETUP -->

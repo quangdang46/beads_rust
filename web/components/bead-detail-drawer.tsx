@@ -155,7 +155,7 @@ function DrawerBody({
   const [gateReason, setGateReason] = React.useState("");
   const gateBead = isHumanGate(bead);
 
-  // Closing is the only moment a reason can be recorded — bd offers no way to
+  // Closing is the only moment a reason can be recorded — br offers no way to
   // attach one afterwards — so picking "Closed" opens a skippable composer
   // instead of firing the mutation straight away.
   const [closing, setClosing] = React.useState(false);
@@ -217,7 +217,7 @@ function DrawerBody({
   const o = beadOrigin(bead, humanAllowlist);
   const ep = parentOf(bead, index);
   // Children come from the parent-child dependency EDGE, never `bead.parent` —
-  // `bd export --json` (the source for the list cache) omits the parent field,
+  // `br export --json` (the source for the list cache) omits the parent field,
   // so an edge-based lookup is the only one correct in every context.
   const kids = childrenOf(bead.id, beads);
   // epicProgress is parent-agnostic despite the name (worth renaming later).
@@ -277,7 +277,7 @@ function DrawerBody({
           title="Delete"
           danger
           onClick={() => {
-            if (confirm(`Delete ${bead.id}? This calls bd delete.`)) {
+            if (confirm(`Delete ${bead.id}? This calls br delete --force.`)) {
               del.mutate(bead.id);
               onClose();
             }
@@ -461,7 +461,7 @@ function DrawerBody({
                 Cancel
               </button>
               <span className="text-[11.5px] text-[var(--text-3)]">
-                bd can&rsquo;t attach a reason later — this is the only chance to record one.
+                br can&rsquo;t attach a reason later — this is the only chance to record one.
               </span>
             </div>
           </div>
@@ -694,9 +694,10 @@ function DrawerBody({
               </button>
             )}
 
-            {/* Require a human approval gate before this bead can proceed
-                (bd gate create --type human --blocks <this>). Resolved from the
-                gate's own drawer or the Needs You inbox. */}
+            {/* Require a human approval gate before this bead can proceed: a
+                `gate`-typed bead (await_type `human`) linked to this one by a
+                `blocks` dependency — br has no `gate create` subcommand.
+                Resolved from the gate's own drawer or the Needs You inbox. */}
             {!gateBead && bead.status !== "closed" &&
               (addingGate ? (
                 <div className="flex items-center gap-[7px] rounded-[9px] border border-border bg-[var(--surface)] p-[9px_11px]">

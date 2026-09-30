@@ -65,7 +65,7 @@ export function Sidebar({
   const { meta, beads, index } = useApp();
   const actor = meta?.humanActor ?? "you";
   const epicCount = beads.filter((b) => b.issue_type === "epic").length;
-  // "Needs You" = agent-flagged beads (bd human) + ready human-approval gates.
+  // "Needs You" = agent-flagged beads (the `human` label) + ready human-approval gates.
   const needsYouCount =
     beads.filter(needsHuman).length + beads.filter((b) => readyHumanGate(b, index)).length;
   const game = useGamification(projectId, !!meta?.gamification);

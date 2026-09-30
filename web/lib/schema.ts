@@ -62,7 +62,7 @@ export type Priority = (typeof PRIORITIES)[number];
 const statusSchema = z.string();
 const typeSchema = z.string();
 
-/** Flat dependency link records, as emitted by `bd export --json`. */
+/** Flat dependency link records, as emitted by `br export --json`. */
 const flatDepSchema = z
   .object({
     issue_id: z.string().optional(),
@@ -73,7 +73,7 @@ const flatDepSchema = z
   });
 
 /**
- * `bd show --json` instead expands each dependency into the full target bead
+ * `br show --json` instead expands each dependency into the full target bead
  * ({ id, title, status, …, dependency_type }). Normalize that shape to the
  * flat link record so consumers see a single canonical Dependency type
  * (gh-12). The two shapes are disjoint: flat has depends_on_id/type, expanded
@@ -127,10 +127,10 @@ export const beadSchema = z
     comment_count: z.number().optional(),
     parent: z.string().nullable().optional(),
     /**
-     * Gate sub-type from `bd gate create --type <t>` (human | timer | gh:run |
-     * gh:pr | bead). Present only on issue_type "gate". Preserved here — zod
-     * strips unknown keys — so the UI can surface human-approval gates that are
-     * waiting on a person (bead 8qc / gh-6).
+     * Gate sub-type (human | timer | gh:run | gh:pr | bead). Present only on
+     * issue_type "gate". Preserved here — zod strips unknown keys — so the UI
+     * can surface human-approval gates that are waiting on a person
+     * (bead 8qc / gh-6).
      */
     await_type: z.string().optional(),
   });
@@ -138,7 +138,11 @@ export type Bead = z.infer<typeof beadSchema>;
 
 export const beadArraySchema = z.array(beadSchema);
 
-/** bd --json envelope: { schema_version, data } (BD_JSON_ENVELOPE=1). */
+/**
+ * Unwrap a `{ schema_version, data }` payload, tolerating a bare payload.
+ * `br --json` emits the bare shape; the envelope is tolerated because older
+ * `bd` builds (and anything proxying them) emit it.
+ */
 export function unwrapEnvelope(raw: unknown): unknown {
   if (raw && typeof raw === "object" && "data" in (raw as Record<string, unknown>)) {
     return (raw as Record<string, unknown>).data;
@@ -176,7 +180,7 @@ export const updateInputSchema = z.object({
    */
   labels: z.array(z.string()).optional(),
   /**
-   * New parent issue id. Mirrors `bd update --parent` semantics exactly, and
+   * New parent issue id. Mirrors `br update --parent` semantics exactly, and
    * the absent-vs-empty distinction IS the contract: field absent means "leave
    * the parent alone", `""` means "detach from the current parent". Hence
    * `.optional()` with no default — a default would make detaching the only

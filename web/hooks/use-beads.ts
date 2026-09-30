@@ -106,7 +106,7 @@ export function useCreateBead() {
   return useMutation(
     mutationToast<CreateInput, Bead>(
       (input) => api.create(projectId, input),
-      (_a, res) => `Created ${res.id} · bd create`,
+      (_a, res) => `Created ${res.id} · br create`,
       qc,
       beadsKey(projectId),
     ),
@@ -119,7 +119,7 @@ export function useUpdateBead() {
   return useMutation(
     mutationToast<{ id: string; patch: UpdateInput }, Bead>(
       ({ id, patch }) => api.update(projectId, id, patch),
-      () => "Updated · bd update",
+      () => "Updated · br update",
       qc,
       beadsKey(projectId),
     ),
@@ -132,7 +132,7 @@ export function useDeleteBead() {
   return useMutation(
     mutationToast<string, { deleted: string }>(
       (id) => api.remove(projectId, id),
-      (id) => `Deleted ${id} · bd delete`,
+      (id) => `Deleted ${id} · br delete`,
       qc,
       beadsKey(projectId),
     ),
@@ -158,7 +158,7 @@ export function useAddDep() {
   return useMutation(
     mutationToast<{ id: string; dependsOnId: string; type: DepType }, Bead>(
       ({ id, dependsOnId, type }) => api.addDep(projectId, id, dependsOnId, type),
-      () => "Dependency added · bd dep add",
+      () => "Dependency added · br dep add",
       qc,
       beadsKey(projectId),
     ),
@@ -171,21 +171,26 @@ export function useRemoveDep() {
   return useMutation(
     mutationToast<{ id: string; dependsOnId: string }, Bead>(
       ({ id, dependsOnId }) => api.removeDep(projectId, id, dependsOnId),
-      () => "Dependency removed · bd dep remove",
+      () => "Dependency removed · br dep remove",
       qc,
       beadsKey(projectId),
     ),
   );
 }
 
-/** Create a human approval gate blocking `id` (bd gate create --type human). */
+/**
+ * Create a human approval gate blocking `id`. A gate is a `gate`-typed bead
+ * (issue_type `gate`, await_type `human`) linked to its target by a `blocks`
+ * dependency — br has no `gate create` subcommand, so there is no CLI form to
+ * point the toast at.
+ */
 export function useCreateGate() {
   const { projectId } = useApp();
   const qc = useQueryClient();
   return useMutation(
     mutationToast<{ id: string; reason?: string }, Bead>(
       ({ id, reason }) => api.createGate(projectId, id, reason),
-      (_a, res) => `Created approval gate ${res.id} · bd gate create`,
+      (_a, res) => `Created approval gate ${res.id}`,
       qc,
       beadsKey(projectId),
     ),
@@ -225,7 +230,7 @@ export function useArchiveBead() {
   return useMutation(
     mutationToast<string, Bead>(
       (id) => api.archive(projectId, id),
-      (id) => `Archived ${id} · bd close + label`,
+      (id) => `Archived ${id} · br close + label`,
       qc,
       beadsKey(projectId),
     ),

@@ -9,7 +9,7 @@ const geistMono = Geist_Mono({ variable: "--font-geist-mono", subsets: ["latin"]
 
 export const metadata: Metadata = {
   title: APP_TITLE,
-  description: "A local web UI for the beads (bd) issue tracker",
+  description: "A local web UI for the beads (br) issue tracker",
 };
 
 export default function RootLayout({

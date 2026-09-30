@@ -202,7 +202,7 @@ export const api = {
   assist: (projectId: string, id: string) =>
     request<AssistResult>(`${base(projectId)}/beads/${enc(id)}/assist`, { method: "POST" }),
 
-  // Act on a "Needs You" (human-labelled) bead, mirroring `bd human`.
+  // Act on a "Needs You" (human-labelled) bead, mirroring the `human` label.
   human: {
     respond: (projectId: string, id: string, text: string) =>
       request<Bead>(`${base(projectId)}/beads/${enc(id)}/human`, {

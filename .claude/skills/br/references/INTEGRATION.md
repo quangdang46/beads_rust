@@ -43,24 +43,24 @@ Use bead IDs as coordination threads for multi-agent work:
 
 | Concept | Value |
 |---------|-------|
-| Mail `thread_id` | `bd-###` (the issue ID) |
-| Mail subject | `[bd-###] ...` |
-| File reservation `reason` | `bd-###` |
-| Commit messages | Include `bd-###` for traceability |
+| Mail `thread_id` | `br-###` (the issue ID) |
+| Mail subject | `[br-###] ...` |
+| File reservation `reason` | `br-###` |
+| Commit messages | Include `br-###` for traceability |
 
 ### Agent Mail Workflow
 
 ```python
 # 1. Reserve files for bead
-file_reservation_paths(..., reason="bd-123")
+file_reservation_paths(..., reason="br-123")
 
 # 2. Announce work in thread
-send_message(..., thread_id="bd-123", subject="[bd-123] Starting...")
+send_message(..., thread_id="br-123", subject="[br-123] Starting...")
 
 # 3. Do work...
 
 # 4. Close bead when done
-br close bd-123 --reason "Completed"
+br close br-123 --reason "Completed"
 
 # 5. Release reservations
 release_file_reservations(...)

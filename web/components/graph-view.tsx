@@ -134,8 +134,8 @@ export function GraphView() {
         <div className="flex-1">
           <h1 className="m-0 text-base font-[650] tracking-[-.01em]">Dependency graph</h1>
           <span className="text-[11.5px] text-[var(--text-3)]">
-            <span className="font-mono">bd dep tree</span> · drag a node handle onto another to link
-            (cycle-checked by bd)
+            <span className="font-mono">br dep tree</span> · drag a node handle onto another to link
+            (cycle-checked by br)
           </span>
         </div>
         <button
