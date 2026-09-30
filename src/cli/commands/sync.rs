@@ -817,10 +817,18 @@ fn validate_operator_requested_sync_path(beads_dir: &Path, jsonl_path: &Path) ->
 }
 
 fn resolve_requested_sync_path(jsonl_path: &Path) -> Result<PathBuf> {
-    if jsonl_path.is_absolute() {
-        return Ok(jsonl_path.to_path_buf());
-    }
-
+    // Absolute paths used to return verbatim here. That is what broke the
+    // Windows case: `validate_sync_paths` canonicalizes the beads directory
+    // but passed the JSONL path through untouched, so when the JSONL's parent
+    // did not exist yet the two sides were spelled differently — the temp root
+    // arrives as the 8.3 short name `C:\Users\RUNNER~1\...` and canonicalizing
+    // yields `C:\Users\runneradmin\...`. `sync::path` only knows the canonical
+    // spelling, so containment failed and the documented "missing internal
+    // parent is allowed" case became a hard error with os error 3.
+    //
+    // Resolving the parent for absolute paths too keeps both sides spelled the
+    // same way, and still preserves the final component, which is the whole
+    // point of this function.
     let file_name = jsonl_path
         .file_name()
         .ok_or_else(|| BeadsError::Config("JSONL path must include a filename".to_string()))?;
@@ -843,7 +851,43 @@ fn resolve_sync_parent_path(jsonl_parent: &Path) -> Result<PathBuf> {
     }
 
     if jsonl_parent.is_absolute() {
-        return Ok(jsonl_parent.to_path_buf());
+        // The parent does not exist yet, which is legitimate — sync creates it
+        // — but returning the path verbatim here means it keeps whatever
+        // spelling the caller used, while `canonical_beads` above always comes
+        // back canonicalized. On Windows those two spellings differ: the temp
+        // root reached the test as the 8.3 short name `C:\Users\RUNNER~1\...`
+        // and canonicalization yields `C:\Users\runneradmin\...`, so the two
+        // sides stopped matching and the later containment check failed with
+        // "The system cannot find the path specified" (os error 3) — the
+        // documented "missing internal parent is allowed" case turned into a
+        // hard error, on every machine whose TEMP is reached in short form.
+        //
+        // Canonicalize the nearest ancestor that does exist and re-append the
+        // missing tail, so both sides are spelled the same way. The missing
+        // components are preserved verbatim, which is what keeps the path
+        // operator-facing and keeps the symlink checks meaningful.
+        let mut existing = jsonl_parent;
+        let mut missing: Vec<&std::ffi::OsStr> = Vec::new();
+        while !existing.exists() {
+            let Some(name) = existing.file_name() else {
+                break;
+            };
+            missing.push(name);
+            let Some(parent) = existing.parent() else {
+                break;
+            };
+            if parent.as_os_str().is_empty() {
+                break;
+            }
+            existing = parent;
+        }
+        let Ok(mut resolved) = dunce::canonicalize(existing) else {
+            return Ok(jsonl_parent.to_path_buf());
+        };
+        for name in missing.iter().rev() {
+            resolved.push(name);
+        }
+        return Ok(resolved);
     }
 
     let cwd = std::env::current_dir().map_err(|e| {
@@ -3803,9 +3847,85 @@ mod tests {
         let jsonl_path = beads_dir.join("nested").join("issues.jsonl");
         let policy = validate_sync_paths(&beads_dir, &jsonl_path, false).expect("path policy");
 
-        assert_eq!(policy.jsonl_path, jsonl_path);
+        // Compare against the canonical `.beads` prefix rather than requiring
+        // the caller's exact spelling back. That byte-for-byte assertion is
+        // what pinned the macOS `/var` vs `/private/var` split into the result
+        // and, on Windows, the 8.3 short name of the user profile — and
+        // canonicalizing both sides cannot repair it here, because the path's
+        // parent does not exist, which is the very thing under test. The
+        // resolved path now names the file the caller asked for through one
+        // canonical spelling; the final component is still preserved.
+        let canonical_beads = dunce::canonicalize(&beads_dir).expect("canonicalize beads dir");
+        let resolved = policy.jsonl_path.display().to_string();
+        assert!(
+            resolved.starts_with(&canonical_beads.display().to_string()),
+            "resolved path should sit under the canonical beads dir: {resolved}"
+        );
+        assert!(
+            resolved.ends_with("nested/issues.jsonl") || resolved.ends_with("nested\\issues.jsonl"),
+            "the missing component must be preserved: {resolved}"
+        );
         assert!(!policy.is_external);
         assert!(!policy.allow_external_jsonl);
+    }
+
+    /// A missing internal parent must not leave the JSONL path spelled
+    /// differently from the canonical `.beads` directory. On Windows these are
+    /// genuinely different strings — the 8.3 short name of the user profile
+    /// versus its long name — and the mismatch made validation fail for a
+    /// path that is entirely inside the workspace.
+    #[test]
+    fn test_missing_internal_parent_keeps_the_canonical_beads_prefix() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let jsonl_path = beads_dir.join("nested").join("deep").join("issues.jsonl");
+        let policy = validate_sync_paths(&beads_dir, &jsonl_path, false).expect("path policy");
+
+        let canonical_beads = dunce::canonicalize(&beads_dir).expect("canonicalize beads dir");
+        let resolved = policy.jsonl_path.display().to_string();
+        let prefix = canonical_beads.display().to_string();
+        assert!(
+            resolved.starts_with(&prefix),
+            "the resolved path must be spelled the same way as the canonical beads dir: \
+             {resolved} does not start with {prefix}"
+        );
+        assert!(
+            resolved.ends_with("nested/deep/issues.jsonl")
+                || resolved.ends_with("nested\\deep\\issues.jsonl"),
+            "the missing components must be preserved: {resolved}"
+        );
+    }
+
+    /// Assert a resolved sync path names the file the caller asked for: it
+    /// must sit under the canonical form of an existing root, and end with the
+    /// components the caller supplied.
+    ///
+    /// Several tests used to assert `policy.jsonl_path == jsonl_path`
+    /// byte-for-byte. That pinned whatever spelling the caller happened to
+    /// use into the result — the macOS `/var` vs `/private/var` split, and on
+    /// Windows the 8.3 short name of the user profile. The resolved path now
+    /// names the same file through one canonical spelling, so the invariant
+    /// worth pinning is the location, not the spelling.
+    fn assert_resolved_under(
+        resolved: &std::path::Path,
+        existing_root: &std::path::Path,
+        tail: &str,
+    ) {
+        let canonical_root =
+            dunce::canonicalize(existing_root).expect("canonicalize existing root");
+        let resolved_str = resolved.display().to_string();
+        assert!(
+            resolved_str.starts_with(&canonical_root.display().to_string()),
+            "{resolved_str} should sit under the canonical {}",
+            canonical_root.display()
+        );
+        let tail_windows = tail.replace('/', "\\");
+        assert!(
+            resolved_str.ends_with(tail) || resolved_str.ends_with(&tail_windows),
+            "{resolved_str} should end with {tail}"
+        );
     }
 
     #[test]
@@ -3821,7 +3941,11 @@ mod tests {
             .join("issues.jsonl");
         let policy = validate_sync_paths(&beads_dir, &jsonl_path, true).expect("path policy");
 
-        assert_eq!(policy.jsonl_path, jsonl_path);
+        assert_resolved_under(
+            &policy.jsonl_path,
+            temp.path(),
+            "external/nested/issues.jsonl",
+        );
         assert!(policy.is_external);
         assert!(policy.allow_external_jsonl);
     }
@@ -3843,7 +3967,7 @@ mod tests {
         let policy = validate_sync_paths(&beads_dir, &jsonl_path, allow_external_jsonl)
             .expect("path policy");
 
-        assert_eq!(policy.jsonl_path, jsonl_path);
+        assert_resolved_under(&policy.jsonl_path, &external_dir, "issues.jsonl");
         assert!(policy.is_external);
         assert!(policy.allow_external_jsonl);
     }
