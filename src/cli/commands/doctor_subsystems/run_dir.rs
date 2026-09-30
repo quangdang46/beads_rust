@@ -375,10 +375,33 @@ fn ensure_doctor_in_gitignore(repo_root: &Path) -> Result<(), BeadsError> {
 }
 
 fn fsync_dir(dir: &Path) -> Result<(), BeadsError> {
-    let file = fs::File::open(dir).map_err(BeadsError::Io)?;
+    // Platforms that cannot fsync a directory (Windows `PermissionDenied`
+    // on `File::open(dir)`, POSIX `InvalidInput` on `sync_all`) are
+    // best-effort, not hard failures — see the shared predicate. When this
+    // propagated, `create_run_dir` failed, the whole doctor repair session
+    // was dropped, and every chokepointed fixer bailed, so `doctor
+    // --repair` reported `nothing_to_repair` on a workspace it should have
+    // repaired (the `corrupt_db_text` workspace-failure replay fixture).
+    let file = match fs::File::open(dir) {
+        Ok(file) => file,
+        Err(e)
+            if crate::cli::commands::doctor_subsystems::mutate::is_best_effort_dir_sync_error(
+                &e,
+            ) =>
+        {
+            return Ok(());
+        }
+        Err(e) => return Err(BeadsError::Io(e)),
+    };
     match file.sync_all() {
         Ok(()) => Ok(()),
-        Err(e) if e.kind() == ErrorKind::InvalidInput => Ok(()),
+        Err(e)
+            if crate::cli::commands::doctor_subsystems::mutate::is_best_effort_dir_sync_error(
+                &e,
+            ) =>
+        {
+            Ok(())
+        }
         Err(e) => Err(BeadsError::Io(e)),
     }
 }
@@ -608,6 +631,35 @@ mod tests {
     fn fsync_dir_accepts_existing_directory() {
         let tmp = unique_temp_root("fsync-dir");
         fsync_dir(tmp.path()).expect("fsync temp dir");
+    }
+
+    #[test]
+    fn fsync_dir_tolerates_platform_cannot_fsync_directory() {
+        // The tolerance lives in the shared predicate (it cannot be
+        // triggered naturally on Linux/macOS, where `File::open(dir)`
+        // succeeds), so exercise the predicate directly with the two
+        // error kinds a directory fsync can legitimately produce:
+        // `InvalidInput` (tmpfs rejecting fsync on a directory) and
+        // `PermissionDenied` (Windows `File::open` on a directory, os
+        // error 5, because a directory handle needs
+        // FILE_FLAG_BACKUP_SEMANTICS).
+        use crate::cli::commands::doctor_subsystems::mutate::is_best_effort_dir_sync_error;
+        for kind in [ErrorKind::InvalidInput, ErrorKind::PermissionDenied] {
+            let err = std::io::Error::from(kind);
+            assert!(
+                is_best_effort_dir_sync_error(&err),
+                "{kind:?} must be tolerated as a best-effort dir-fsync limitation"
+            );
+        }
+        // A genuine I/O fault must still propagate — the guard is not a
+        // blanket swallow.
+        for kind in [ErrorKind::NotFound, ErrorKind::BrokenPipe] {
+            let err = std::io::Error::from(kind);
+            assert!(
+                !is_best_effort_dir_sync_error(&err),
+                "{kind:?} is a real I/O fault and must NOT be swallowed"
+            );
+        }
     }
 
     #[test]

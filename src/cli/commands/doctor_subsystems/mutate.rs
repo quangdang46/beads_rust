@@ -521,19 +521,49 @@ fn now_ns() -> u128 {
         .map_or(0, |d| d.as_nanos())
 }
 
+/// Decide whether a directory-fsync error is "this platform cannot fsync
+/// a directory" rather than a genuine I/O fault.
+///
+/// Two shapes are tolerated, because neither means the rename(2) atomicity
+/// the fsync was backing is actually at risk:
+///
+/// * `InvalidInput` — a minority of filesystems (e.g. some kernel-side
+///   tmpfs configurations) reject `fsync` on a directory handle.
+/// * `PermissionDenied` — on Windows `fs::File::open(dir)` returns os
+///   error 5 because a directory handle needs
+///   `FILE_FLAG_BACKUP_SEMANTICS`, which `File::open` does not pass.
+///
+/// Propagating either turned a perfectly successful run-dir creation into
+/// a hard failure, which dropped the whole doctor repair session on
+/// Windows and made every chokepointed fixer bail — so `doctor --repair`
+/// reported `nothing_to_repair` on a workspace it should have repaired
+/// (the `corrupt_db_text` workspace-failure replay fixture).
+///
+/// Extracted as a pure predicate so the tolerance is unit-testable on
+/// every platform, not just on a Windows runner.
+pub(crate) fn is_best_effort_dir_sync_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::PermissionDenied
+    )
+}
+
 /// Fsync the given directory so a freshly-created entry is durable
 /// across power loss. POSIX guarantees `rename(2)` atomicity but not
 /// durability — the directory's data block must be flushed for the
-/// new entry to survive a crash. A minority of filesystems (e.g. some
-/// kernel-side tmpfs configurations) reject fsync on a directory; we
-/// treat `InvalidInput` as best-effort and only propagate genuine
-/// I/O faults so a perfectly successful mutate is not turned into a
-/// false negative.
+/// new entry to survive a crash. Platforms that cannot fsync a directory
+/// (see [`is_best_effort_dir_sync_error`]) are treated as best-effort and
+/// only genuine I/O faults are propagated, so a perfectly successful
+/// mutate is not turned into a false negative.
 fn fsync_dir(dir: &Path) -> std::io::Result<()> {
-    let d = fs::File::open(dir)?;
+    let d = match fs::File::open(dir) {
+        Ok(d) => d,
+        Err(e) if is_best_effort_dir_sync_error(&e) => return Ok(()),
+        Err(e) => return Err(e),
+    };
     match d.sync_all() {
         Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
+        Err(e) if is_best_effort_dir_sync_error(&e) => Ok(()),
         Err(e) => Err(e),
     }
 }
@@ -1507,6 +1537,44 @@ where
     }
 
     outcome
+}
+
+#[cfg(test)]
+mod dir_sync_tests {
+    use super::is_best_effort_dir_sync_error;
+    use std::io::ErrorKind;
+
+    #[test]
+    fn windows_directory_open_permission_denied_is_tolerated() {
+        // On Windows `fs::File::open(dir)` returns PermissionDenied (os
+        // error 5) because a directory handle needs
+        // FILE_FLAG_BACKUP_SEMANTICS. Propagating that made
+        // `create_run_dir` fail, which dropped the entire doctor repair
+        // session so every chokepointed fixer bailed and
+        // `doctor --repair` reported `nothing_to_repair` on the
+        // `corrupt_db_text` workspace-failure replay fixture. This test
+        // runs on every platform (unlike the `unix`-gated suite below)
+        // so the Windows regression is guarded from Linux/macOS CI too.
+        let err = std::io::Error::from(ErrorKind::PermissionDenied);
+        assert!(is_best_effort_dir_sync_error(&err));
+    }
+
+    #[test]
+    fn tmpfs_invalid_input_is_tolerated() {
+        let err = std::io::Error::from(ErrorKind::InvalidInput);
+        assert!(is_best_effort_dir_sync_error(&err));
+    }
+
+    #[test]
+    fn genuine_io_faults_are_not_swallowed() {
+        for kind in [ErrorKind::NotFound, ErrorKind::BrokenPipe, ErrorKind::Other] {
+            let err = std::io::Error::from(kind);
+            assert!(
+                !is_best_effort_dir_sync_error(&err),
+                "{kind:?} is a real I/O fault and must propagate"
+            );
+        }
+    }
 }
 
 #[cfg(all(test, unix))]

@@ -1891,14 +1891,19 @@ fn mark_report_undone(run_dir_path: &Path, run_id: &str) -> Result<()> {
 }
 
 /// Fsync a directory entry so a freshly-renamed file is durable across
-/// power loss. Best-effort: filesystems that reject directory fsync
-/// (some tmpfs variants) are tolerated by treating InvalidInput as
-/// success.
+/// power loss. Best-effort: platforms that cannot fsync a directory (see
+/// `mutate::is_best_effort_dir_sync_error`) are tolerated as success
+/// rather than failing `doctor undo` on a fully-successful report write.
 fn fsync_report_dir(dir: &Path) -> Result<()> {
-    let file = fs::File::open(dir).map_err(BeadsError::Io)?;
+    use crate::cli::commands::doctor_subsystems::mutate::is_best_effort_dir_sync_error;
+    let file = match fs::File::open(dir) {
+        Ok(file) => file,
+        Err(e) if is_best_effort_dir_sync_error(&e) => return Ok(()),
+        Err(e) => return Err(BeadsError::Io(e)),
+    };
     match file.sync_all() {
         Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
+        Err(e) if is_best_effort_dir_sync_error(&e) => Ok(()),
         Err(e) => Err(BeadsError::Io(e)),
     }
 }
