@@ -1,4 +1,12 @@
 //! Regression coverage for high-risk release workflow shell fragments.
+//!
+//! Eight of the nine tests here drive `run_bash_step`, which shells out to
+//! `bash -euo pipefail`. On windows-latest a bare `bash` resolves to
+//! `C:\Windows\System32\bash.exe`, the WSL launcher, which with no WSL
+//! distribution installed answers "Windows Subsystem for Linux has no installed
+//! distributions." in UTF-16LE and exits non-zero. The fragments themselves only
+//! ever run in release.yml's bash steps on ubuntu, so those tests are Unix-gated
+//! rather than made to pass on a platform that will never execute them.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -103,6 +111,7 @@ fn release_workflow_uses_tagless_asset_file_names() -> Result<(), String> {
 }
 
 #[test]
+#[cfg(unix)]
 fn reliability_override_fragment_requires_reason_and_records_summary() -> Result<(), String> {
     let script = release_step_script("Validate reliability override")?;
     let fixture = WorkflowFixture::new()?;
@@ -141,6 +150,7 @@ fn reliability_override_fragment_requires_reason_and_records_summary() -> Result
 }
 
 #[test]
+#[cfg(unix)]
 fn required_artifact_fragment_reports_missing_platforms() -> Result<(), String> {
     let script = release_step_script("Validate required artifacts present")?;
     let fixture = WorkflowFixture::new()?;
@@ -169,6 +179,7 @@ fn required_artifact_fragment_reports_missing_platforms() -> Result<(), String> 
 }
 
 #[test]
+#[cfg(unix)]
 fn combined_checksums_fragment_is_null_safe_and_replaces_existing_file() -> Result<(), String> {
     let script = release_step_script("Generate combined checksums")?;
     let fixture = WorkflowFixture::new()?;
@@ -188,6 +199,7 @@ fn combined_checksums_fragment_is_null_safe_and_replaces_existing_file() -> Resu
 }
 
 #[test]
+#[cfg(unix)]
 fn verify_checksums_fragment_accepts_spaces_and_leading_dashes() -> Result<(), String> {
     let script = release_step_script("Verify all checksums")?;
     let fixture = WorkflowFixture::new()?;
@@ -203,6 +215,7 @@ fn verify_checksums_fragment_accepts_spaces_and_leading_dashes() -> Result<(), S
 }
 
 #[test]
+#[cfg(unix)]
 fn verify_checksums_fragment_fails_on_corrupt_checksum() -> Result<(), String> {
     let script = release_step_script("Verify all checksums")?;
     let fixture = WorkflowFixture::new()?;
@@ -232,6 +245,7 @@ fn signing_fragment_uses_private_ephemeral_key_file() -> Result<(), String> {
 }
 
 #[test]
+#[cfg(unix)]
 fn changelog_fragment_keeps_previous_tag_and_reliability_paths() -> Result<(), String> {
     let script = release_step_script("Generate changelog")?;
 
@@ -266,6 +280,7 @@ fn release_step_script(step_name: &str) -> Result<String, String> {
     Ok(run.to_owned())
 }
 
+#[cfg(unix)]
 fn run_bash_step(
     script: &str,
     working_dir: &Path,
