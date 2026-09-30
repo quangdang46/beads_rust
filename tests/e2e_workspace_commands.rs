@@ -496,17 +496,27 @@ fn e2e_doctor_repair_json_rebuilds_and_returns_single_payload() {
         "issues.jsonl should exist before repair test"
     );
 
-    let conn = Connection::open(db_path.to_string_lossy().as_ref()).expect("open beads db");
-    conn.execute(
-        "INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-a')",
-        [],
-    )
-    .expect("insert duplicate config row a");
-    conn.execute(
-        "INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-b')",
-        [],
-    )
-    .expect("insert duplicate config row b");
+    // The connection must be closed before the repair below. `doctor --repair`
+    // renames the whole database family aside before rebuilding it, and Windows
+    // refuses to rename a file any handle is still open on —
+    // ERROR_SHARING_VIOLATION, os error 32. `conn` outliving the inserts kept
+    // that handle alive for the rest of the test, so the repair failed on
+    // Windows for a reason that has nothing to do with br. POSIX rename has no
+    // such rule, which is why this only ever showed up there.
+    {
+        let conn = Connection::open(db_path.to_string_lossy().as_ref()).expect("open beads db");
+        conn.execute(
+            "INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-a')",
+            [],
+        )
+        .expect("insert duplicate config row a");
+        conn.execute(
+            "INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-b')",
+            [],
+        )
+        .expect("insert duplicate config row b");
+        conn.close().expect("close beads db");
+    }
 
     let pre_repair = run_br(&workspace, ["doctor", "--json"], "doctor_pre_repair_json");
     assert!(
