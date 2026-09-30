@@ -78,8 +78,7 @@ static RUNNING_BR_RE: LazyLock<Regex> =
 static HISTORY_THROTTLE_ELAPSED_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\((\d+)s since latest").expect("history throttle elapsed regex"));
 static PERMISSIONS_BEADS_DIR_MESSAGE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)^OK permissions\.beads_dir: .*$")
-        .expect("permissions.beads_dir message regex")
+    Regex::new(r"(?m)^OK permissions\.beads_dir: .*$").expect("permissions.beads_dir message regex")
 });
 static WINDOWS_EXE_SUFFIX_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\bbr\.exe\b").expect("windows exe suffix regex"));
