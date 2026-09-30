@@ -77,8 +77,13 @@ static RUNNING_BR_RE: LazyLock<Regex> =
 /// follows it is a constant and is not captured.
 static HISTORY_THROTTLE_ELAPSED_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\((\d+)s since latest").expect("history throttle elapsed regex"));
-static PERMISSIONS_BEADS_DIR_MESSAGE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)^OK permissions\.beads_dir: .*$").expect("permissions.beads_dir message regex")
+static PLATFORM_PROSE_CHECK_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // The trailing message is optional: where the platform-dependent branch
+    // runs, the check prints an explanation after a colon; where the check
+    // actually executes, it prints a bare name. Both must normalize to the
+    // same line or the two platforms still disagree.
+    Regex::new(r"(?m)^OK (permissions\.beads_dir|sqlite3\.integrity_check)(?:: .*)?$")
+        .expect("platform-dependent check message regex")
 });
 static WINDOWS_EXE_SUFFIX_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\bbr\.exe\b").expect("windows exe suffix regex"));
@@ -559,21 +564,22 @@ fn normalize_text_with_log(text: &str, config: &TextNormConfig) -> (String, Vec<
     // wall-clock and therefore differs between two runs of the same code —
     // the golden recorded `0s`, a slower run produced `1s`. The 5s floor in
     // the same line is a constant and is deliberately left alone.
-    // `permissions.beads_dir` reports different prose per platform and both are
-    // correct: the POSIX user-write-bit check genuinely does not apply on
-    // Windows, so the check says so instead of naming the verified paths. The
-    // status is `Ok` either way, and that is what this golden is pinning — not
-    // which sentence a platform uses to explain itself. The check's `details`
-    // carry the platform, so the information is not lost.
-    if PERMISSIONS_BEADS_DIR_MESSAGE_RE.is_match(&normalized) {
-        normalized = PERMISSIONS_BEADS_DIR_MESSAGE_RE
-            .replace_all(&normalized, "OK permissions.beads_dir: <platform message>")
+    // These two checks report different prose per platform and both are right.
+    // `permissions.beads_dir` explains that the POSIX user-write-bit check does
+    // not apply on Windows instead of naming the paths it verified;
+    // `sqlite3.integrity_check` says the CLI is absent instead of staying
+    // silent. Status is `Ok` either way, and that is what the golden pins —
+    // not which sentence a platform uses to explain itself. The checks' JSON
+    // details carry the platform, so nothing is lost.
+    if PLATFORM_PROSE_CHECK_RE.is_match(&normalized) {
+        normalized = PLATFORM_PROSE_CHECK_RE
+            .replace_all(&normalized, "OK $1: <platform message>")
             .to_string();
-        log.push("permissions_beads_dir_message".to_string());
+        log.push("platform_prose_checks".to_string());
     }
     if HISTORY_THROTTLE_ELAPSED_RE.is_match(&normalized) {
         normalized = HISTORY_THROTTLE_ELAPSED_RE
-            .replace_all(&normalized, "(${1}s since latest")
+            .replace_all(&normalized, "(Ns since latest")
             .to_string();
         log.push("history_throttle_elapsed".to_string());
     }
@@ -815,6 +821,26 @@ mod golden_snapshot_tests {
         assert!(
             !from_windows.contains('C'),
             "the drive letter must be dropped: {from_windows}"
+        );
+    }
+
+    /// A mask that re-inserts the value it matched normalizes nothing. The
+    /// first version of the throttle rule replaced the elapsed seconds with
+    /// `${1}`, so a run reporting `1s` still differed from a run reporting
+    /// `0s` and the golden failed on whichever host was slower. Two readings
+    /// of the same message must land on the same line.
+    #[test]
+    fn test_history_throttle_elapsed_normalizes_across_runs() {
+        let fast = "DEBUG beads_rust::sync::history: Skipping backup: throttled (0s since latest < 5s floor)";
+        let slow = "DEBUG beads_rust::sync::history: Skipping backup: throttled (37s since latest < 5s floor)";
+        assert_eq!(
+            normalize_output(fast),
+            normalize_output(slow),
+            "the throttle's elapsed seconds must not survive into the golden"
+        );
+        assert!(
+            !normalize_output(slow).contains("37"),
+            "the run-to-run value must be replaced, not re-inserted"
         );
     }
 

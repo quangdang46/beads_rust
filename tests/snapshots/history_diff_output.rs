@@ -47,8 +47,9 @@ fn init_history_diff_workspace() -> BrWorkspace {
 }
 
 fn normalize_history_output(raw: &str, workspace: &BrWorkspace) -> String {
-    let workspace_root =
-        collapse_path_separators(&workspace.root.to_string_lossy().replace('\\', "/"));
+    let workspace_root = strip_windows_extended_prefix(&collapse_path_separators(
+        &workspace.root.to_string_lossy().replace('\\', "/"),
+    ));
     // `br` reports canonicalized paths, and on macOS `/var` is a symlink to
     // `/private/var`, so logged output carries a `/private` prefix the raw
     // workspace root does not have. Replace the canonical form too, otherwise
@@ -59,7 +60,11 @@ fn normalize_history_output(raw: &str, workspace: &BrWorkspace) -> String {
     let canonical_root = workspace
         .root
         .canonicalize()
-        .map(|p| collapse_path_separators(&p.to_string_lossy().replace('\\', "/")))
+        .map(|p| {
+            strip_windows_extended_prefix(&collapse_path_separators(
+                &p.to_string_lossy().replace('\\', "/"),
+            ))
+        })
         .unwrap_or_else(|_| workspace_root.clone());
     let normalized = raw.trim_end().replace('\\', "/");
     // In JSON output a Windows path arrives escaped — `C:\\Users\\...` — so
@@ -93,6 +98,20 @@ fn collapse_path_separators(text: &str) -> String {
         previous_was_separator = is_separator;
     }
     out
+}
+
+/// Strip the Windows extended-length prefix so a canonicalized path and the
+/// spelling `br` printed agree.
+///
+/// `Path::canonicalize` returns `\\?\C:\...` on Windows, which becomes
+/// `//?/C:/...` once backslashes are normalized, and that never matches the
+/// `C:/Users/...` the CLI prints — so `$WORKSPACE` was never substituted and
+/// the golden recorded a whole machine-specific path.
+fn strip_windows_extended_prefix(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("//?/UNC/") {
+        return format!("//{rest}");
+    }
+    path.strip_prefix("//?/").unwrap_or(path).to_string()
 }
 
 fn assert_valid_json(raw: &str, context: &str) {

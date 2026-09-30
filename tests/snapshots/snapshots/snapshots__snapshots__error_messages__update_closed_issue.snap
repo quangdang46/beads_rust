@@ -21,7 +21,7 @@ YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Path validated for sync I/O pa
 YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync: ID-REDACTED: exporting dirty issues dirty_count=1 needs_flush=false
 YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Validating sync path path=/TMP/.beads/issues.jsonl beads_dir=/TMP/.beads
 YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Path validated for sync I/O path=/TMP/.beads/issues.jsonl
-YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::history: Skipping backup: throttled (0s since latest < 5s floor)
+YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::history: Skipping backup: throttled (Ns since latest < 5s floor)
 YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Validating sync path path=/TMP/.beads/issues.jsonl.PID.tmp beads_dir=/TMP/.beads
 YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Path validated for sync I/O path=/TMP/.beads/issues.jsonl.PID.tmp
 YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync: Temp file path validated temp_path=/TMP/.beads/issues.jsonl.PID.tmp target_path=/TMP/.beads/issues.jsonl
