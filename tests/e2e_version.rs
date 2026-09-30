@@ -57,12 +57,9 @@ fn e2e_version_json_flag() {
     if option_env!("VERGEN_GIT_SHA").is_some() {
         assert!(json.get("commit").is_some(), "missing commit field");
     }
-    #[cfg(feature = "mcp")]
-    assert!(json.get("features").is_some(), "missing features field");
-    #[cfg(not(feature = "mcp"))]
     assert!(
         json.get("features").is_none(),
-        "features field should be absent without mcp feature"
+        "features field should be absent when no optional feature is compiled in"
     );
 }
 

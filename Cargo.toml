@@ -112,9 +112,6 @@ unicode-width = "0.2.2"
 # Versioning
 semver = "1.0.27"
 
-# MCP server (optional; gated behind the `mcp` feature)
-fastmcp-rust = { version = "0.3.1", optional = true }
-
 # Embedded web UI server (optional; gated behind the `web` feature)
 axum = { version = "0.8", optional = true, features = ["macros"] }
 tokio = { version = "1", optional = true, features = ["rt-multi-thread", "macros", "signal"] }
@@ -179,21 +176,19 @@ debug = "line-tables-only"
 
 [features]
 default = ["web"]
-mcp = ["dep:fastmcp-rust"]
 web = ["dep:axum", "dep:tokio", "dep:tower-http", "dep:rust-embed"]
 
 # NOTE: no `[patch.crates-io]` here.
 #
-# All dependencies — rusqlite 0.40.2+ and fastmcp-rust 0.3.1+ — are
-# published on crates.io, so this crate resolves everything from the
-# registry out of the box.  That makes
+# All dependencies — rusqlite 0.40.2+ — are published on crates.io, so
+# this crate resolves everything from the registry out of the box.  That
+# makes
 # `cargo install --git https://github.com/quangdang46/beads_rust.git`
-# work without requiring a sibling `fastmcp_rust` checkout
-# (issue #250 bug 1).
+# work without requiring any sibling checkout (issue #250 bug 1).
 #
 # Local co-development: contributors who want to hack on frankensqlite
-# or fastmcp_rust alongside beads_rust can add a workspace-level
-# `.cargo/config.toml` with their own `[patch.crates-io]` table.  See
+# alongside beads_rust can add a workspace-level `.cargo/config.toml`
+# with their own `[patch.crates-io]` table.  See
 # `scripts/dev-local-frankensqlite.toml` for a ready-to-copy template.
 
 [lints.rust]

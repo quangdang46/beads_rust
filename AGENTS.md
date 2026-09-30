@@ -350,7 +350,6 @@ beads_rust/
 ```toml
 [features]
 default = ["web"]
-mcp = ["dep:fastmcp-rust"]   # MCP server (`br serve`) for agent tool use
 web = ["dep:axum", "dep:tokio", "dep:tower-http", "dep:rust-embed"]   # embedded web UI (`br web`)
 ```
 
@@ -454,36 +453,6 @@ JSON mode guarantees:
 Schema discovery:
 - `br schema all --format json` emits JSON Schema documents for the main robot outputs
 - `br schema issue-details --format toon` for token-efficient schema viewing
-
-### MCP Serve for Agents
-
-`br serve` exposes the same issue tracker as an MCP server for agents that can
-use MCP tools/resources/prompts instead of shelling out. It is optional and only
-exists in binaries built with the `mcp` feature:
-
-```bash
-MCP_TARGET="${TMPDIR:-/tmp}/br_target_mcp_${AGENT_NAME:-agent}"
-CARGO_TARGET_DIR="$MCP_TARGET" cargo build --release --features mcp
-RUST_LOG=error "$MCP_TARGET/release/br" serve --actor "${AGENT_NAME:-mcp}"
-```
-
-Transport is stdio. Configure the MCP client to launch `br serve`; do not expect
-a TCP port or background daemon. Available tools are `list_issues`, `show_issue`,
-`create_issue`, `update_issue`, `close_issue`, `manage_dependencies`, and
-`project_overview`. Resources include `beads://project/info`,
-`beads://issues/{id}`, `beads://schema`, `beads://labels`,
-`beads://issues/ready`, `beads://issues/blocked`,
-`beads://issues/in_progress`, `beads://issues/deferred`,
-`beads://issues/bottlenecks`, `beads://graph/health`, and
-`beads://events/recent`. Guided prompts are `triage`, `status_report`,
-`plan_next_work`, and `polish_backlog`.
-
-Safety model: MCP serve uses the same local SQLite/JSONL workspace as the CLI,
-never runs git, and does not listen on the network. Mutating tools acquire the
-workspace `.write.lock`, record audit events with `--actor`, and attempt the
-normal JSONL auto-flush after successful writes. Agent Mail is still the
-reservation and swarm-coordination layer; MCP serve is a br API surface, not a
-replacement for file reservations.
 
 ---
 

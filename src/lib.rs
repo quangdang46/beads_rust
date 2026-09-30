@@ -49,9 +49,6 @@ pub mod validation;
 pub mod worktree;
 pub mod write_combining;
 
-#[cfg(feature = "mcp")]
-pub mod mcp;
-
 #[cfg(feature = "web")]
 pub mod web;
 

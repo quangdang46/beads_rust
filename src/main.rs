@@ -517,9 +517,6 @@ fn main() {
         }
         Commands::Version(args) => commands::version::execute(&args, &output_ctx),
 
-        #[cfg(feature = "mcp")]
-        Commands::Serve(args) => beads_rust::mcp::run_serve(&args, &overrides),
-
         #[cfg(feature = "web")]
         Commands::Web(args) => beads_rust::web::run_server(&args, &overrides),
 
@@ -1074,9 +1071,6 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Prime(_)
         | Commands::Reflect(_)
         | Commands::Sql(_) => false,
-
-        #[cfg(feature = "mcp")]
-        Commands::Serve(_) => false,
 
         #[cfg(feature = "web")]
         Commands::Web(_) => false,

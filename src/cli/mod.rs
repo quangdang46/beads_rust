@@ -1056,13 +1056,6 @@ EXAMPLES:
     /// Update an issue
     Update(UpdateArgs),
 
-    /// Start an MCP (Model Context Protocol) server on stdio
-    ///
-    /// Exposes the issue tracker to AI agents via the standard MCP protocol.
-    /// This is an alternative to shelling out to the br CLI.
-    #[cfg(feature = "mcp")]
-    Serve(crate::mcp::ServeArgs),
-
     /// Start the embedded web UI server
     #[cfg(feature = "web")]
     #[command(alias = "ui")]
@@ -4230,7 +4223,6 @@ mod tests {
         "`--reservations <PATH>` | Offline Agent Mail reservation snapshot",
         "`--agents <PATH>` | Offline Agent Mail agent snapshot",
         "br coordination status --reservations reservations.json --agents agents.jsonl --json",
-        "beads://coordination/status",
         "`issue-with-counts`, `issue-details`",
     ];
 

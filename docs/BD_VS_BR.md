@@ -11,7 +11,7 @@ The following `bd` features are **not** planned for `br`:
 | External tracker sync | `bd track`, `bd sync-linear`, `bd sync-jira`, `bd sync-ado`, `bd sync-github`, `bd sync-notion` | Agents use MCP / APIs directly; `bd` shell-outs are brittle |
 | Persistent memory | `bd remember`, `bd prime` | Use `br robot-docs` + `br agents` for session context; LLM memory handled externally |
 | Mol/Swarm user domain | `bd mol`, `bd swarm`, full formula cook | Swarm orchestration has its own external tooling |
-| RPC daemon | `bd daemon rpc`, `bd daemon start` | `br serve` uses MCP over stdio (no network daemon) |
+| RPC daemon | `bd daemon rpc`, `bd daemon start` | No daemon in `br`; invoke the CLI directly |
 
 ## Command Parity Map
 
@@ -60,7 +60,6 @@ The following `bd` features are **not** planned for `br`:
 | **Agent Integration** | | | |
 | Agent info | — | `br agents` | `br`-exclusive |
 | Robot docs | — | `br robot-docs` | `br`-exclusive |
-| MCP serve | — | `br serve` | `br`-exclusive |
 | Session context | — | `br prime` | Mirrors `bd prime` |
 | **Formula** | | | |
 | Formula apply | `bd formula apply` | `br formula apply` | Parity |
@@ -77,7 +76,6 @@ The following `bd` features are **not** planned for `br`:
 ## `br`-Exclusive Features
 
 - **Atomic sync operations** — `--flush-only`, `--import-only`, `--witness`
-- **MCP stdio server** — `br serve` exposes issue tracker tools/resources via Model Context Protocol
 - **Doctor diagnostics** — `br doctor` performs health checks, schema validation, and invariant testing
 - **Agent integration** — `br agents`, `br robot-docs`, `br agents session` for AI coding agent workflows
 - **Formulas** — `br formula apply` for creating issues from resolved formulas
@@ -94,6 +92,6 @@ See the intentionally out-of-scope table above.
 
 - **`bd sync`** → `br sync --flush-only` for export, `br sync --import-only` for import
 - **`bd query "..."`** → `br list --filter "..."` (with caveats — `br` filters are applied as SQL + in-memory predicate)
-- **`bd daemon start`** → use `br serve` (MCP) or direct CLI invocation
+- **`bd daemon start`** → invoke `br` directly; there is no daemon to start
 - **`bd prime`** → `br robot-docs` + `br agents session` for session context
 - **`bd remember`** → external LLM memory system

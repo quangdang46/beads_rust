@@ -131,10 +131,6 @@ const FEATURES: &[FeatureCapability] = &[
         name: "coordination_diagnostics",
         description: "br coordination status diagnoses hidden or stale in-progress claims.",
     },
-    FeatureCapability {
-        name: "mcp_stdio_optional",
-        description: "Binaries built with the mcp feature can serve a stdio MCP API.",
-    },
 ];
 
 const GLOBAL_FLAGS: &[FlagCapability] = &[

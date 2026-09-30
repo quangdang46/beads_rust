@@ -1,7 +1,7 @@
 # Coordination Evidence Contract
 
-Status: implemented helper contract shared by coordination CLI, MCP, scheduler,
-and audit work. The primary user-facing surface is the read-only
+Status: implemented helper contract shared by coordination CLI, scheduler, and
+audit work. The primary user-facing surface is the read-only
 `br coordination status` command.
 
 ## Purpose
@@ -96,9 +96,9 @@ Each claim row also includes advisory-only reclaim guidance:
   fresh claims, active reservations, missing/invalid snapshots, and human or
   unknown ownership.
 
-Future CLI and MCP surfaces should expose this shape directly in JSON mode and
-may convert it to TOON using the normal output layer. Human text output should be
-a projection of the same fields, not a separate policy.
+Future CLI surfaces should expose this shape directly in JSON mode and may
+convert it to TOON using the normal output layer. Human text output should be a
+projection of the same fields, not a separate policy.
 
 ## CLI Surface
 

@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
-# Activate the sibling-path frankensqlite/fastmcp_rust patches for local
-# co-development. Cargo.lock is marked skip-worktree so dev-local rewrites
+# Activate the sibling-path frankensqlite patch for local co-development. Cargo.lock is marked skip-worktree so dev-local rewrites
 # (stripping registry source/checksum lines from patched crates) are not
 # accidentally staged or committed. Pair with `deactivate-dev-local-patch.sh`.
 #
 # Usage:
-#   scripts/activate-dev-local-patch.sh           # frankensqlite only
-#   scripts/activate-dev-local-patch.sh --fastmcp # also enable fastmcp_rust
+#   scripts/activate-dev-local-patch.sh
 #
 # Idempotent: safe to re-run.
 set -euo pipefail
@@ -30,14 +28,10 @@ fi
 
 case "${1:-}" in
   "")
-    ENABLE_FASTMCP=false
-    ;;
-  "--fastmcp")
-    ENABLE_FASTMCP=true
     ;;
   *)
-    echo "error: unknown flag '${1}'" >&2
-    echo "       supported: (none) | --fastmcp" >&2
+    echo "error: unknown argument '${1}'" >&2
+    echo "       this script takes no arguments" >&2
     exit 1
     ;;
 esac
@@ -45,12 +39,6 @@ esac
 if [[ ! -d ../frankensqlite/crates/fsqlite ]]; then
   echo "error: sibling frankensqlite checkout not found at ../frankensqlite" >&2
   echo "       run \`git clone https://github.com/quangdang46/frankensqlite ../frankensqlite\` first" >&2
-  exit 1
-fi
-
-if [[ "$ENABLE_FASTMCP" == true && ! -d ../fastmcp_rust/crates/fastmcp ]]; then
-  echo "error: sibling fastmcp_rust checkout not found at ../fastmcp_rust" >&2
-  echo "       run \`git clone https://github.com/quangdang46/fastmcp_rust ../fastmcp_rust\` first" >&2
   exit 1
 fi
 
@@ -69,14 +57,8 @@ if [[ -f .cargo/config.toml ]] \
   exit 1
 fi
 
-if [[ "$ENABLE_FASTMCP" == true ]]; then
-  # Strip the leading `# ` from the fastmcp_rust block so those entries activate too.
-  sed -E 's/^# (fastmcp-[a-z]+ +=)/\1/' scripts/dev-local-frankensqlite.toml > .cargo/config.toml
-  echo "activated dev-local patch (frankensqlite + fastmcp_rust)"
-else
-  cp scripts/dev-local-frankensqlite.toml .cargo/config.toml
-  echo "activated dev-local patch (frankensqlite only — pass --fastmcp to also enable fastmcp_rust)"
-fi
+cp scripts/dev-local-frankensqlite.toml .cargo/config.toml
+echo "activated dev-local patch (frankensqlite only)"
 
 git update-index --skip-worktree Cargo.lock
 echo "Cargo.lock: skip-worktree on (cargo rewrites are now invisible to git)"

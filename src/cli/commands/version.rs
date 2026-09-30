@@ -59,10 +59,7 @@ pub fn execute(args: &VersionArgs, ctx: &OutputContext) -> Result<()> {
     let target = option_env!("VERGEN_CARGO_TARGET_TRIPLE").filter(|s| !s.trim().is_empty());
 
     // Collect enabled features
-    let mut features = Vec::new();
-    if cfg!(feature = "mcp") {
-        features.push("mcp");
-    }
+    let features: Vec<&str> = Vec::new();
 
     if ctx.is_toon() {
         let output = VersionOutput {
@@ -328,7 +325,7 @@ mod tests {
             branch: Some("main"),
             rust_version: Some("1.85.0"),
             target: Some("x86_64-unknown-linux-gnu"),
-            features: vec!["mcp"],
+            features: vec!["web"],
         };
 
         let json = serde_json::to_value(&output).unwrap();
@@ -338,7 +335,7 @@ mod tests {
         assert_eq!(json["branch"], "main");
         assert_eq!(json["rust_version"], "1.85.0");
         assert_eq!(json["target"], "x86_64-unknown-linux-gnu");
-        assert_eq!(json["features"], serde_json::json!(["mcp"]));
+        assert_eq!(json["features"], serde_json::json!(["web"]));
     }
 
     #[test]
@@ -379,15 +376,6 @@ mod tests {
         }
         if let Some(b) = branch {
             assert!(!b.trim().is_empty() || b.is_empty());
-        }
-    }
-
-    #[test]
-    fn test_feature_flags_detection() {
-        // Test that feature flags can be detected at compile time
-        let mut features = Vec::new();
-        if cfg!(feature = "mcp") {
-            features.push("mcp");
         }
     }
 

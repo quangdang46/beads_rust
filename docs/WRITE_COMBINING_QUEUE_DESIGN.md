@@ -114,8 +114,8 @@ earlier accepted queue entries and before all later accepted queue entries.
 
 Combining should be explicit and default-off until proven by benchmarks.
 
-1. An operator, test harness, or future MCP integration starts an explicit
-   combiner process for one project.
+1. An operator or test harness starts an explicit combiner process for one
+   project.
 2. The combiner acquires `.beads/.write.lock`, opens storage once, performs any
    startup recovery/import work allowed for normal mutating commands, and begins
    accepting local requests.
@@ -220,8 +220,6 @@ BR_CONTENTION_64=1 cargo test --test bench_contention_replay manual_64_worker_co
 4. Prove direct versus combined parity with golden and failure-injection tests.
 5. Add an explicit opt-in local combiner process.
 6. Add contention replay benchmarks comparing direct and combined profiles.
-7. Consider MCP integration only after the explicit combiner has artifact-backed
-   wins and a clean fallback story.
 
 Combining must remain disableable with a config value or environment variable
 while it is experimental.

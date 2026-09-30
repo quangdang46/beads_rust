@@ -12,7 +12,6 @@ This guide covers how AI coding agents can effectively use `br` (beads_rust) for
 - [Workflow Patterns](#workflow-patterns)
 - [Parsing JSON Output](#parsing-json-output)
 - [Error Handling](#error-handling)
-- [MCP Server](#mcp-server)
 - [Robot Mode Flags](#robot-mode-flags)
 - [Degraded Coordination Without Agent Mail](#degraded-coordination-without-agent-mail)
 - [Swarm-Scale Tuning](#swarm-scale-tuning)
@@ -267,12 +266,6 @@ snapshot when available:
 ```bash
 br coordination status --reservations reservations.json --agents agents.jsonl --json
 ```
-
-MCP-capable agents can read `beads://coordination/status` for the same
-`br.coordination.v1` evidence envelope without shelling out. The MCP resource is
-read-only and does not call Agent Mail, so it reports
-`reservation.state == "no_snapshot"` unless you use the CLI command above with
-offline reservation and agent snapshots.
 
 Operator runbook for a queue that appears dry:
 
@@ -576,103 +569,6 @@ def safe_close(issue_id, reason):
 
 ---
 
-## MCP Server
-
-`br serve` exposes the issue tracker as a Model Context Protocol server. It is
-an alternative to shelling out to `br --json ...` when an MCP-capable agent wants
-tool discovery, resource reads, guided prompts, and structured tool errors.
-
-### Build and Start
-
-The MCP server is feature-gated and is not included in default builds:
-
-```bash
-cargo build --release --features mcp
-RUST_LOG=error ./target/release/br serve --actor codex
-```
-
-Installed binary:
-
-```bash
-cargo install --git https://github.com/quangdang46/beads_rust.git --features mcp
-RUST_LOG=error br serve --actor codex
-```
-
-Transport is stdio. Configure your MCP client to launch `br` as a child process;
-do not point it at a port.
-
-```json
-{
-  "mcpServers": {
-    "br": {
-      "command": "br",
-      "args": ["serve", "--actor", "codex"],
-      "env": {
-        "RUST_LOG": "error"
-      }
-    }
-  }
-}
-```
-
-### Exposed Surface
-
-Tools:
-
-- `list_issues`
-- `show_issue`
-- `create_issue`
-- `update_issue`
-- `close_issue`
-- `manage_dependencies`
-- `project_overview`
-
-Resources:
-
-- `beads://project/info`
-- `beads://issues/{id}`
-- `beads://schema`
-- `beads://labels`
-- `beads://issues/ready`
-- `beads://issues/blocked`
-- `beads://issues/in_progress`
-- `beads://coordination/status`
-- `beads://issues/deferred`
-- `beads://issues/bottlenecks`
-- `beads://graph/health`
-- `beads://events/recent`
-
-Prompts:
-
-- `triage`
-- `status_report`
-- `plan_next_work`
-- `polish_backlog`
-
-### Safety and Locking
-
-MCP serve uses the same local storage contract as the CLI:
-
-- It opens the current workspace discovered from the process working directory
-  and CLI overrides.
-- It does not run git, push, pull, or talk to remote services.
-- It does not listen on a network socket; access is limited to the client that
-  starts the stdio process.
-- Mutating tools acquire the workspace `.write.lock`, write audit events with
-  the configured `--actor`, and attempt the normal JSONL auto-flush after a
-  successful mutation.
-- Handlers open fresh SQLite connections rather than sharing one long-lived
-  connection across MCP calls.
-
-### When to Prefer MCP
-
-Use MCP when an agent is already MCP-native, needs to discover available actions
-without memorizing CLI flags, or should receive structured recovery data such as
-`suggested_tool_calls`. Use shell commands with `--json` for short scripts,
-bulk pipelines, and workflows that need standard Unix composition with `jq`.
-
----
-
 ## Robot Mode Flags
 
 These flags enable machine-friendly output:
@@ -704,8 +600,8 @@ br close br-123 --quiet --json
 For 256GB+ RAM and 64+ core agent hosts, see
 [Swarm-Scale Tuning](SWARM_SCALE_TUNING.md). It covers conservative defaults,
 high-core build hygiene, `.write.lock` timeout profiles, Agent Mail reservation
-patterns, MCP serve topology, performance evidence collection, and rollback
-rules for future snapshot/cache/controller features.
+patterns, performance evidence collection, and rollback rules for future
+snapshot/cache/controller features.
 
 ---
 

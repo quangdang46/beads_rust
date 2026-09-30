@@ -1,14 +1,13 @@
 # Local contributor template: sibling-checkout path overrides for
-# frankensqlite (and, optionally, fastmcp_rust).
+# frankensqlite.
 #
 # Recommended usage (from the beads_rust repo root):
-#   scripts/activate-dev-local-patch.sh             # frankensqlite only
-#   scripts/activate-dev-local-patch.sh --fastmcp   # also enable fastmcp_rust
+#   scripts/activate-dev-local-patch.sh
 #
 # When done:
 #   scripts/deactivate-dev-local-patch.sh
 #
-# Manual usage (equivalent for `--frankensqlite-only`):
+# Manual usage:
 #   mkdir -p .cargo
 #   cp scripts/dev-local-frankensqlite.toml .cargo/config.toml
 #   git update-index --skip-worktree Cargo.lock     # avoid committing dev-local lockfile diff
@@ -16,8 +15,6 @@
 # Requirements:
 #   - frankensqlite must be checked out as a sibling directory
 #     (`../frankensqlite/crates/fsqlite` and friends must exist)
-#   - fastmcp_rust is optional — uncomment the last line only if you
-#     also want to hack on it locally
 #
 # Effects:
 #   - Every `fsqlite*` crate resolves to the sibling path instead of
@@ -53,18 +50,3 @@ fsqlite-vfs           = { path = "../frankensqlite/crates/fsqlite-vfs" }
 fsqlite-wal           = { path = "../frankensqlite/crates/fsqlite-wal" }
 fsqlite-ext-icu       = { path = "../frankensqlite/crates/fsqlite-ext-icu" }
 fsqlite-ext-misc      = { path = "../frankensqlite/crates/fsqlite-ext-misc" }
-
-# fastmcp_rust is on crates.io at 0.2.1+ and the `mcp` feature is off by
-# default, so most contributors can ignore the block below.  Uncomment
-# whichever lines you need when co-developing fastmcp_rust — they must
-# all be consistent (overriding only the facade while leaving the
-# transitive crates pointing at crates.io is rarely what you want).
-# fastmcp-rust      = { path = "../fastmcp_rust/crates/fastmcp" }
-# fastmcp-core      = { path = "../fastmcp_rust/crates/fastmcp-core" }
-# fastmcp-protocol  = { path = "../fastmcp_rust/crates/fastmcp-protocol" }
-# fastmcp-transport = { path = "../fastmcp_rust/crates/fastmcp-transport" }
-# fastmcp-server    = { path = "../fastmcp_rust/crates/fastmcp-server" }
-# fastmcp-client    = { path = "../fastmcp_rust/crates/fastmcp-client" }
-# fastmcp-console   = { path = "../fastmcp_rust/crates/fastmcp-console" }
-# fastmcp-cli       = { path = "../fastmcp_rust/crates/fastmcp-cli" }
-# fastmcp-derive    = { path = "../fastmcp_rust/crates/fastmcp-macros" }  # package is fastmcp-derive, dir is fastmcp-macros

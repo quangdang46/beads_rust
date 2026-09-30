@@ -2,8 +2,5 @@
   "version": "0.2.0",
   "build": "<build>",
   "target": "<target>",
-  "features": [
-    "mcp"
-  ],
   "rust_version": "<rust_version>"
 }

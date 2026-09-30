@@ -113,6 +113,29 @@ way. Everything below under "Since v0.1.3" is new in this release.
   `--memories-only` as a literal argument string, so it compiled cleanly and
   failed only at runtime; it now runs plain `br prime`.
   ([`51867a19`](https://github.com/quangdang46/beads_rust/commit/51867a19))
+- **`br serve` and the `mcp` feature are gone.** The Model Context Protocol
+  stdio server — roughly 300 KB of `src/mcp/` plus its `fastmcp-rust`
+  dependency — is removed outright, along with the `mcp` cargo feature and the
+  `br serve` subcommand.
+
+  The feature was never in the default set (`default = ["web"]`), so it had to
+  be opted into with `--features mcp` and most builds never compiled it at all.
+  What it exposed was already reachable from the CLI: seven tools
+  (`list_issues`, `show_issue`, `create_issue`, `update_issue`, `close_issue`,
+  `manage_dependencies`, `project_overview`) mapped one-to-one onto
+  `br list`, `br show`, `br create`, `br update`, `br close` and `br dep`, each
+  with `--json`; twelve `beads://` resources onto `br schema` and
+  `br coordination status`; and four guided prompts onto `br robot-docs`. A
+  server outside the default build is a server nobody exercises, and the docs
+  were still telling agents to configure one. The CLI is the product; agents
+  read `--json` and `--robot` output, which is a stable versioned schema and is
+  already what `AGENTS.md` and `docs/AGENT_INTEGRATION.md` point them at.
+
+  No data migration is implied. The server shared the CLI's SQLite database,
+  JSONL export path, `.write.lock`, and audit-event stream, so nothing was ever
+  stored exclusively in it. Agent Mail is a separate system and is unaffected —
+  it remains the reservation and swarm-coordination layer.
+  ([`PENDING`](https://github.com/quangdang46/beads_rust/commit/PENDING))
 
 #### Fixes
 
@@ -174,8 +197,8 @@ way. Everything below under "Since v0.1.3" is new in this release.
     quietly exposing an unauthenticated read-write API to the network.
     `--allow-remote` is the explicit opt-in for people who have their own auth
     and firewall in front of it.
-  - Requests with no `Origin` are still served, so curl, the MCP client, and
-    other local tools are unaffected.
+  - Requests with no `Origin` are still served, so curl and other local tools
+    are unaffected.
 
 #### Fixes
 
@@ -249,6 +272,22 @@ way. Everything below under "Since v0.1.3" is new in this release.
   the stated basis for recommending against a `bd-` lint — does not exist in
   the repository at any commit. A dated correction is recorded at the head of
   the file; the original text is left intact as the record of what was believed.
+- **Every document that told an agent to configure a `br serve` stdio server is
+  gone.** `AGENTS.md` (feature-flag block and the whole "MCP Serve for Agents"
+  section), `README.md` ("Enable MCP Server Support"), `docs/CLI_REFERENCE.md`
+  (the `serve` entry and its TOC line), `docs/AGENT_INTEGRATION.md` (the whole
+  "MCP Server" chapter, plus its TOC line and a sentence in the swarm-tuning
+  pointer), `docs/SWARM_SCALE_TUNING.md` ("MCP Serve Topology"), and the `br
+  serve` rows and bullets in `docs/BD_VS_BR.md` are all removed or rewritten.
+  Where a paragraph or table row mixed MCP with live content — the RPC-daemon
+  row and the `bd daemon start` migration note in `docs/BD_VS_BR.md`, the
+  no-`Origin` carve-out in the web security entry above, the feature-discovery
+  sentence and the rollout ladder in `docs/SWARM_SCALE_TUNING.md` — the
+  surviving half was kept and rewritten rather than dropped.
+
+  Agent Mail references were left alone throughout: it is a separate system,
+  and its reservations, messaging, and degraded-coordination guidance are
+  unaffected.
 
 ### v0.1.3-era work retained below
 

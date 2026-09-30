@@ -6,8 +6,8 @@ keep the issue tracker local, keep writes explicit, use Agent Mail for edit
 reservations, and collect evidence before enabling any new adaptive path.
 
 Validation note: commands marked "validated" were smoke-checked on
-2026-05-03. Commands marked "manual" are intentionally host-specific, expensive,
-or require an MCP client.
+2026-05-03. Commands marked "manual" are intentionally host-specific or
+expensive.
 
 ## Baseline Mode
 
@@ -182,36 +182,6 @@ RUST_LOG=error br coordination status --reservations reservations.jsonl --agents
 `br coordination status` is read-only. It does not call Agent Mail, run git,
 create reservations, release reservations, or auto-reclaim work.
 
-## MCP Serve Topology
-
-`br serve` is optional and requires the `mcp` feature. It runs over stdio, not a
-TCP port, and it uses the same SQLite/JSONL workspace and lock model as the CLI.
-
-Validated feature discovery:
-
-```bash
-cargo metadata --format-version=1 --no-deps | jq '.packages[0].features | keys'
-```
-
-Manual build and client launch:
-
-```bash
-MCP_TARGET="/data/tmp/br-mcp-target-${AGENT_NAME:-mcp}"
-cargo build --release --features mcp --target-dir "$MCP_TARGET"
-RUST_LOG=error "$MCP_TARGET/release/br" serve --actor "${AGENT_NAME:-mcp}"
-```
-
-Topology guidance:
-
-- One MCP server process per active workspace is usually enough.
-- Use MCP for agents that benefit from discoverable tools/resources/prompts.
-- Use direct CLI calls for simple scripts and batch shell pipelines.
-- Agent Mail remains the reservation layer. MCP is an API surface, not a lock
-  manager.
-- `beads://coordination/status` mirrors `br coordination status --json` for
-  MCP-native agents, but it has no live Agent Mail access; use CLI snapshots for
-  reservation correlation.
-
 ## Evidence Workflow
 
 Any performance claim should carry three things:
@@ -265,8 +235,7 @@ controller features:
 2. Shadow mode. Compute the candidate result but serve the direct result.
 3. Advisory mode. Emit candidate decision evidence while direct fallback remains
    available.
-4. Opt-in serve mode. Enable only for the workspace or MCP process that needs
-   it.
+4. Opt-in serve mode. Enable only for the workspace that needs it.
 5. Default-on consideration. Only after a perf bundle proves a win and parity
    tests cover stale, corrupted, and routed workspaces.
 

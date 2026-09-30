@@ -232,9 +232,9 @@ Output mode is auto-detected:
 ### 6. Focused Local Scope
 
 br has grown into a full CLI surface for local issue tracking: routing, recovery,
-TOON/JSON schemas, MCP support, conformance checks, and sync safety tools are
-all part of the current scope. The focus is still local-first operation, explicit
-git/VCS handoff, and no background services installed behind your back.
+TOON/JSON schemas, conformance checks, and sync safety tools are all part of the
+current scope. The focus is still local-first operation, explicit git/VCS handoff,
+and no background services installed behind your back.
 
 ---
 
@@ -321,35 +321,6 @@ cargo build --release --no-default-features
 # Or install without it
 cargo install --git https://github.com/quangdang46/beads_rust.git --no-default-features
 ```
-
-### Enable MCP Server Support
-
-`br serve` is optional and is not built by the default feature set. Build with
-the `mcp` feature when you want an AI agent to talk to `br` over the Model
-Context Protocol instead of shelling out to CLI commands.
-
-```bash
-cargo build --release --features mcp
-
-# Or install globally with MCP support
-cargo install --git https://github.com/quangdang46/beads_rust.git --features mcp
-```
-
-Run it from an initialized beads workspace:
-
-```bash
-RUST_LOG=error br serve --actor codex
-```
-
-The server uses MCP over stdio. It is launched by an MCP client, does not listen
-on a network port, and uses the same SQLite database, JSONL export path, write
-locks, audit events, and sync safety model as the normal CLI. It does not run
-git. Use shell/JSON
-commands for simple scripts; use MCP when an agent benefits from discoverable
-tools, resources, prompts, and structured recovery hints. MCP clients can read
-`beads://coordination/status` for the same `br.coordination.v1` stale-claim
-evidence shape as `br coordination status --json`; use the CLI snapshot flags
-when Agent Mail reservation or liveness evidence is required.
 
 ### Verify Installation
 
