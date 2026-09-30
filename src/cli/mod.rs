@@ -1023,6 +1023,10 @@ EXAMPLES:
     /// Undefer issues (make ready again)
     Undefer(UndeferArgs),
 
+    /// Upgrade br to the latest version
+    #[cfg(feature = "self_update")]
+    Upgrade(UpgradeArgs),
+
     /// Manage wisps (ephemeral, JSONL-excluded issues)
     Wisp {
         #[command(subcommand)]
@@ -3897,6 +3901,27 @@ impl Default for WebArgs {
             db: None,
         }
     }
+}
+
+/// Arguments for the upgrade command.
+#[cfg(feature = "self_update")]
+#[derive(Args, Debug, Clone, Default)]
+pub struct UpgradeArgs {
+    /// Check only, don't install
+    #[arg(long)]
+    pub check: bool,
+
+    /// Force reinstall current version
+    #[arg(long)]
+    pub force: bool,
+
+    /// Install specific version (e.g., "0.2.0")
+    #[arg(long)]
+    pub version: Option<String>,
+
+    /// Show what would happen without making changes
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 /// Arguments for the orphans command.

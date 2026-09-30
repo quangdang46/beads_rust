@@ -118,8 +118,18 @@ tokio = { version = "1", optional = true, features = ["rt-multi-thread", "macros
 tower-http = { version = "0.6", optional = true, features = ["cors"] }
 rust-embed = { version = "8", optional = true }
 
-# Self-update removed for RUSTSEC-2026-0194/0195. Users install via install.sh
-# (https://github.com/quangdang46/beads_rust#installation).
+# Self-update. The `self_update` 0.44 line this command was written against
+# pins quick-xml ^0.38 and so cannot reach the fix for RUSTSEC-2026-0194
+# (quadratic attribute check) or RUSTSEC-2026-0195 (unbounded namespace
+# allocation in NsReader); that is why the command was removed. The 1.x line
+# drops the transitive dependency entirely -- `cargo tree -i quick-xml` finds
+# nothing -- so both advisories are unreachable here. The feature stays
+# optional and off by default: install.sh is still the recommended path.
+self_update = { version = "1.3", features = ["github", "rustls", "reqwest", "archive-tar", "archive-zip", "compression-tar-gz", "compression-zip-deflate"], default-features = false, optional = true }
+# `self_update` 1.x stopped re-exporting the in-place replacement helper, so
+# the upgrade path brings its own. (`tempfile` is already a direct dependency
+# above.)
+self-replace = { version = "1", optional = true }
 
 # Cooperative shutdown so SIGINT/SIGTERM/SIGHUP unwind through main and let
 # SqliteStorage::Drop flush the WAL instead of stranding frames on disk (#270).
@@ -177,6 +187,19 @@ debug = "line-tables-only"
 [features]
 default = ["web"]
 web = ["dep:axum", "dep:tokio", "dep:tower-http", "dep:rust-embed"]
+# `br upgrade`. Off by default so that a plain `cargo install br` pulls in no
+# HTTP and archive machinery it will not use; install.sh is the recommended
+# path for everyone who does not enable this.
+self_update = [
+    "dep:self_update",
+    "dep:self-replace",
+    "self_update/github",
+    "self_update/rustls",
+    "self_update/archive-tar",
+    "self_update/archive-zip",
+    "self_update/compression-tar-gz",
+    "self_update/compression-zip-deflate",
+]
 
 # NOTE: no `[patch.crates-io]` here.
 #

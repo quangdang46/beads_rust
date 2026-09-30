@@ -671,6 +671,13 @@ impl StructuredError {
                 ErrorCode::IoError,
                 Some(json!({"command": command, "reason": reason})),
             ),
+            // The variant exists whether or not the `self_update` feature is
+            // on, so this arm is not cfg-gated; without the feature it simply
+            // never matches.
+            BeadsError::Upgrade { reason } => (
+                ErrorCode::IoError,
+                Some(json!({"operation": "upgrade", "reason": reason})),
+            ),
             BeadsError::Internal { message } => {
                 (ErrorCode::InternalError, Some(json!({"message": message})))
             }

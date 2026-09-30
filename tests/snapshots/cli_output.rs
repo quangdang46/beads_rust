@@ -8,10 +8,6 @@ fn snapshot_help_output() {
     let output = run_br(&workspace, ["--help"], "help");
     assert!(output.status.success(), "help failed: {}", output.stderr);
     let stdout = &output.stdout;
-    assert!(
-        !stdout.contains("upgrade"),
-        "help should not list upgrade subcommand (removed for RUSTSEC-2026-0194/0195)"
-    );
     for cmd in ["create", "list", "show", "close", "search"] {
         assert!(
             stdout.contains(cmd),

@@ -353,7 +353,7 @@ default = ["web"]
 web = ["dep:axum", "dep:tokio", "dep:tower-http", "dep:rust-embed"]   # embedded web UI (`br web`)
 ```
 
-Self-update was removed; there is no `self_update` feature and no `upgrade` command.
+Self-update is available behind the optional `self_update` cargo feature (`br upgrade`), which is off by default. install.sh is the recommended path for a fresh install.
 
 ### Core Types Quick Reference
 

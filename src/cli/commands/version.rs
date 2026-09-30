@@ -259,7 +259,7 @@ fn execute_update_check(current_version: &str, ctx: &OutputContext) {
     } else if ctx.is_quiet() {
     } else if update_available {
         println!("Update available: {current_version} → {latest}");
-        println!("To update, see docs/INSTALLING.md (br upgrade was removed in v0.2.16+).");
+        println!("To update: br upgrade --check, then br upgrade. Or see docs/INSTALLING.md.");
     } else {
         println!("br {current_version} is up to date (latest: {latest})");
     }

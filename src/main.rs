@@ -554,6 +554,10 @@ fn main() {
             commands::defer::execute_undefer(&args, cli.json || args.robot, &overrides, &output_ctx)
         }
         Commands::Wisp { command } => commands::wisp::execute(&command, &overrides, &output_ctx),
+
+        #[cfg(feature = "self_update")]
+        Commands::Upgrade(args) => commands::upgrade::execute(&args, &output_ctx),
+
         Commands::Prime(args) => commands::prime::execute(&args, cli.json, &overrides, &output_ctx),
         Commands::Reflect(args) => {
             commands::reflect::execute(&args, cli.json, &overrides, &output_ctx)
@@ -1038,6 +1042,11 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Template { .. }
         | Commands::RenamePrefix(_)
         | Commands::Export(_) => true,
+
+        // Replacing the running binary touches the workspace file the storage
+        // layer holds open, so an auto-import first would race the swap.
+        #[cfg(feature = "self_update")]
+        Commands::Upgrade(_) => false,
 
         Commands::Mol { .. }
         | Commands::Init { .. }

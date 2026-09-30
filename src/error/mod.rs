@@ -157,6 +157,10 @@ pub enum BeadsError {
     #[error("External command failed: {command}: {reason}")]
     ExternalCommand { command: String, reason: String },
 
+    /// Self-update or upgrade operation failed.
+    #[error("Upgrade failed: {reason}")]
+    Upgrade { reason: String },
+
     /// Internal consistency check failed.
     #[error("Internal error: {message}")]
     Internal { message: String },
@@ -409,6 +413,15 @@ impl BeadsError {
     pub fn internal(message: impl Into<String>) -> Self {
         Self::Internal {
             message: message.into(),
+        }
+    }
+
+    /// Create an upgrade failure.
+    #[cfg(feature = "self_update")]
+    #[must_use]
+    pub fn upgrade(reason: impl Into<String>) -> Self {
+        Self::Upgrade {
+            reason: reason.into(),
         }
     }
 

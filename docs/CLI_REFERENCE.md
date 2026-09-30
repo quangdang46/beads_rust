@@ -1796,6 +1796,25 @@ br lint [OPTIONS]
 
 ## Utilities
 
+### upgrade
+
+Upgrade br to the latest version. Gated behind the optional `self_update` cargo
+feature, which is off by default; `install.sh` is the recommended install path.
+
+```bash
+br upgrade [OPTIONS]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--check` | Check for updates without installing |
+| `--force` | Force reinstall current version |
+| `--version <VERSION>` | Install a specific version (e.g. "0.2.0") |
+| `--dry-run` | Report what would happen without making changes |
+
+---
+
 ### completions
 
 Generate shell completions.

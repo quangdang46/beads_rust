@@ -249,6 +249,28 @@ way. Everything below under "Since v0.1.3" is new in this release.
   job or an agent gating on exit status read a broken dependency graph as
   clean. The machine-readable branches now match.
 
+- **`br prime --mcp` and `br reflect --mcp` still work.** These are
+  output-format flags on those two commands, not the MCP server, and are
+  untouched. Agent Mail is a separate system and all of its guidance
+  survives.
+
+#### Fixes
+
+- **`br upgrade` is back.** The self-update command was removed in v0.2.16 for
+  RUSTSEC-2026-0194 and RUSTSEC-2026-0195 — two `quick-xml` denial-of-service
+  advisories, both reachable only through the `self_update` 0.44 line, which
+  pins `quick-xml ^0.38` and cannot reach the fix. `self_update` 1.3 drops
+  that transitive dependency entirely: `cargo tree -i quick-xml` finds
+  nothing, so both advisories are unreachable. The command is ported to the
+  1.x API — `get_latest_release` now returns a release list, `version` /
+  `assets` / `name` / `download_url` became accessors, `Status` is
+  `VersionStatus` with `is_updated()`, and the in-place replacement helper is
+  no longer re-exported, so `self-replace` is a direct dependency. SHA-256
+  verification against the published `checksums.sha256` is unchanged.
+
+  The feature is off by default. A plain `cargo install br` pulls in no HTTP
+  or archive machinery, and `install.sh` remains the recommended path.
+
 #### Tooling
 
 - **`ubs` and `rch` are no longer referenced.** Neither tool exists on any

@@ -53,6 +53,7 @@ Commands:
   status         Alias for stats
   sync           Sync database with JSONL file (export or import)
   undefer        Undefer issues (make ready again)
+  upgrade        Upgrade br to the latest version
   wisp           Manage wisps (ephemeral, JSONL-excluded issues)
   custom-status  Manage custom statuses (Issue #5)
   custom-type    Manage custom types (Issue #5)
