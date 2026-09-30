@@ -217,6 +217,18 @@ way. Everything below under "Since v0.1.3" is new in this release.
     and firewall in front of it.
   - Requests with no `Origin` are still served, so curl and other local tools
     are unaffected.
+- **A yanked transitive dependency is off the lockfile.** `yoke-derive 0.8.3`
+  was withdrawn from crates.io and `cargo audit --deny yanked` — the one hard
+  gate in the Security Audit workflow — failed on it. It reaches the
+  `--all-features` build through `self_update` → `reqwest` → `url` → `idna` →
+  `icu_*` → `yoke`, so it was compiled into the release binaries, not merely
+  present in the lock. It carries no RustSec advisory: 0.8.3 was a bad publish
+  re-released as 0.8.4, so nothing was wrong with the shipped code. The lock
+  now pins 0.8.4, the only line it changed.
+
+  The two remaining advisories — `faster-hex` RUSTSEC-2026-0306 and `lru`
+  RUSTSEC-2026-0253, both `unsound` — are unchanged and still advisory. The
+  workflow reports known advisories without enforcing them, so they do not gate.
 
 #### Fixes
 
