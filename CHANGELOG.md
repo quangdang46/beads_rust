@@ -221,10 +221,12 @@ way. Everything below under "Since v0.1.3" is new in this release.
   was withdrawn from crates.io and `cargo audit --deny yanked` — the one hard
   gate in the Security Audit workflow — failed on it. It reaches the
   `--all-features` build through `self_update` → `reqwest` → `url` → `idna` →
-  `icu_*` → `yoke`, so it was compiled into the release binaries, not merely
-  present in the lock. It carries no RustSec advisory: 0.8.3 was a bad publish
-  re-released as 0.8.4, so nothing was wrong with the shipped code. The lock
-  now pins 0.8.4, the only line it changed.
+  `icu_*` → `yoke`. That is the build CI runs, so the gate was right to fail —
+  but the release binaries are unaffected: `self_update` is an optional feature
+  and the release jobs build with default features, which do not pull `yoke`
+  at all. It carries no RustSec advisory: 0.8.3 was a bad publish re-released
+  as 0.8.4, so nothing was wrong with the shipped code. The lock now pins
+  0.8.4, the only line it changed.
 
   The two remaining advisories — `faster-hex` RUSTSEC-2026-0306 and `lru`
   RUSTSEC-2026-0253, both `unsound` — are unchanged and still advisory. The
