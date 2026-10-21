@@ -784,6 +784,7 @@ Quick reference for all error codes:
 | 3 | `AMBIGUOUS_ID` | Issue | Partial match multiple |
 | 3 | `ID_COLLISION` | Issue | Duplicate ID |
 | 3 | `INVALID_ID` | Issue | Bad ID format |
+| 3 | `NOT_FOUND` | Not found | Named entity missing (merge slot, federation peer, worktree) |
 | 4 | `VALIDATION_FAILED` | Validation | Field invalid |
 | 4 | `INVALID_STATUS` | Validation | Bad status |
 | 4 | `INVALID_TYPE` | Validation | Bad type |

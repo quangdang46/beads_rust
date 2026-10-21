@@ -1967,6 +1967,7 @@ pub const fn command_requests_robot_json(cmd: &Commands) -> bool {
         Commands::Orphans(args) => args.robot,
         Commands::Changelog(args) => args.robot,
         Commands::Sync(args) => args.robot,
+        Commands::Formula { command } => formula_command_requests_robot_json(command),
         Commands::Gate { command } => match command {
             GateCommands::Report(args) => args.robot,
             GateCommands::List(args) => args.robot,
@@ -1981,6 +1982,23 @@ pub const fn command_requests_robot_json(cmd: &Commands) -> bool {
 const fn coordination_command_requests_robot_json(command: &CoordinationCommands) -> bool {
     match command {
         CoordinationCommands::Status(args) => args.robot,
+    }
+}
+
+/// `--robot` on a `br formula` subcommand selects JSON output.
+///
+/// Without this the formula group stayed in plain-text mode, and its
+/// `--json` branch wrote the document through `OutputContext::print`,
+/// which is a no-op in JSON mode — so `br formula expand --json` printed
+/// nothing at all.
+const fn formula_command_requests_robot_json(command: &FormulaCommands) -> bool {
+    match command {
+        FormulaCommands::Validate(args) => args.robot,
+        FormulaCommands::Expand(args) => args.robot,
+        FormulaCommands::Apply(args) => args.robot,
+        FormulaCommands::List(args) => args.robot,
+        FormulaCommands::Show(args) => args.robot,
+        FormulaCommands::Convert(args) => args.robot,
     }
 }
 
@@ -4077,6 +4095,58 @@ mod tests {
     use tempfile::TempDir;
 
     const CLI_REFERENCE: &str = include_str!("../../docs/CLI_REFERENCE.md");
+
+    /// Every command in the tree must have unique short flags.
+    ///
+    /// `br formula expand` declared `--var` with `-v`, which the global
+    /// `--verbose` also claims. Clap's own uniqueness assertion only fires
+    /// in debug builds, so contributors and debug CI got a panic
+    /// ("Short option names must be unique for each argument, but '-v' is in
+    /// use by both 'vars' and 'verbose'") while release builds silently
+    /// listed `-v` twice and bound it to whichever argument came last.
+    ///
+    /// Walking the tree here catches that class of mistake for every
+    /// command, not just the one that broke.
+    #[test]
+    fn test_no_duplicate_short_flags_in_command_tree() {
+        fn walk(cmd: &clap::Command, path: &str, seen: &mut Vec<String>) {
+            let mut shorts: Vec<(&str, String)> = Vec::new();
+            for arg in cmd.get_arguments() {
+                if let Some(short) = arg.get_short() {
+                    shorts.push((arg.get_id().as_str(), short.to_string()));
+                }
+            }
+            shorts.sort_by(|a, b| a.1.cmp(&b.1));
+            for pair in shorts.windows(2) {
+                assert_ne!(
+                    pair[0].1, pair[1].1,
+                    "duplicate short flag '{}' in '{path}' ({} and {})",
+                    pair[0].1, pair[0].0, pair[1].0
+                );
+            }
+            for arg in cmd.get_arguments() {
+                if let Some(short) = arg.get_short() {
+                    seen.push(format!("{path}:{short}"));
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                let sub_path = format!("{path} {}", sub.get_name());
+                walk(sub, &sub_path, seen);
+            }
+        }
+
+        let mut seen = Vec::new();
+        // `build()` is what propagates the global args (`--verbose`, `--json`,
+        // …) down into every subcommand — the collision only exists once
+        // they have been propagated.
+        let mut command = Cli::command();
+        command.build();
+        walk(&command, "br", &mut seen);
+        assert!(
+            !seen.is_empty(),
+            "the command tree should expose short flags"
+        );
+    }
 
     #[test]
     fn test_list_limit_is_none_when_omitted() {

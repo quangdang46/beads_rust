@@ -365,22 +365,13 @@ fn cmd_remove(conn: &Connection, args: &FederationRemoveArgs, ctx: &OutputContex
     let peer = match peer {
         Some(p) => p,
         None => {
-            let msg = format!("peer not found: {}", args.name);
-            if ctx.is_json() {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "ok": false,
-                        "error": msg
-                    }))
-                    .map_err(|e| BeadsError::Internal {
-                        message: e.to_string()
-                    })?
-                );
-            } else {
-                println!("{}", msg);
-            }
-            return Err(BeadsError::Internal { message: msg });
+            // Returning the error is enough: the dispatcher renders the
+            // structured envelope. Printing a second document here put two
+            // JSON objects on stdout in `--json` mode, which broke `| jq`.
+            return Err(BeadsError::NotFound {
+                kind: "federation peer".to_string(),
+                id: args.name.clone(),
+            });
         }
     };
 
@@ -415,8 +406,10 @@ fn cmd_sync(conn: &Connection, args: &FederationSyncArgs, ctx: &OutputContext) -
     let peer = match peer {
         Some(p) => p,
         None => {
-            let msg = format!("peer not found: {}", args.name);
-            return Err(BeadsError::Internal { message: msg });
+            return Err(BeadsError::NotFound {
+                kind: "federation peer".to_string(),
+                id: args.name.clone(),
+            });
         }
     };
 
@@ -566,24 +559,10 @@ fn cmd_info(conn: &Connection, args: &FederationInfoArgs, ctx: &OutputContext) -
             }
             Ok(())
         }
-        None => {
-            let msg = format!("peer not found: {}", args.name);
-            if ctx.is_json() {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "ok": false,
-                        "error": msg
-                    }))
-                    .map_err(|e| BeadsError::Internal {
-                        message: e.to_string()
-                    })?
-                );
-            } else {
-                println!("{}", msg);
-            }
-            Err(BeadsError::Internal { message: msg })
-        }
+        None => Err(BeadsError::NotFound {
+            kind: "federation peer".to_string(),
+            id: args.name.clone(),
+        }),
     }
 }
 

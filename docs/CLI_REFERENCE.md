@@ -1847,7 +1847,7 @@ br formula <COMMAND> [OPTIONS]
 **Options:**
 - `--json`, `-j` — Output raw JSON
 - `--robot` — Output machine-readable JSON
-- `--var <KEY=VALUE>`, `-v <KEY=VALUE>` — Variable overrides (expand only)
+- `--var <KEY=VALUE>` — Variable overrides (expand only)
 
 **Example:**
 ```bash

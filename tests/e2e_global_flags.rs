@@ -1804,3 +1804,230 @@ fn e2e_no_color_across_commands() {
         );
     }
 }
+
+// ============================================================================
+// --json flag tests for the wisp command group
+// ============================================================================
+
+/// `--json` is a global flag, so clap accepted it on `br wisp create` even
+/// though the wisp command never consulted the output mode: the call
+/// printed "Created wisp: <id>" as plain text and any `| jq` pipeline broke.
+#[test]
+fn e2e_json_flag_wisp_create_emits_json() {
+    let _log = common::test_log("e2e_json_flag_wisp_create_emits_json");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["wisp", "create", "json probe", "--json"],
+        "wisp_create_json",
+    );
+    assert!(
+        create.status.success(),
+        "wisp create failed: {}",
+        create.stderr
+    );
+
+    let payload: Value = serde_json::from_str(create.stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "wisp create --json must emit JSON ({e}); stdout was: {}",
+            create.stdout
+        )
+    });
+    let id = payload["id"].as_str().expect("wisp id");
+    assert!(
+        id.starts_with("wsp-"),
+        "wisp id should carry the wsp- prefix: {id}"
+    );
+    assert_eq!(payload["title"].as_str(), Some("json probe"));
+}
+
+/// An empty result still has to be a JSON document. `br wisp list --json`
+/// used to print "No wisps found." before it ever reached the JSON branch,
+/// so `| jq` failed on an otherwise successful call.
+#[test]
+fn e2e_json_flag_wisp_list_empty_is_json_array() {
+    let _log = common::test_log("e2e_json_flag_wisp_list_empty_is_json_array");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    for args in [
+        vec!["wisp", "list", "--json"],
+        vec!["--json", "wisp", "list"],
+    ] {
+        let list = run_br(&workspace, args.clone(), "wisp_list_json");
+        assert!(list.status.success(), "{args:?} failed: {}", list.stderr);
+
+        let payload: Value = serde_json::from_str(list.stdout.trim()).unwrap_or_else(|e| {
+            panic!(
+                "{args:?} must emit JSON ({e}); stdout was: {}",
+                list.stdout
+            )
+        });
+        assert_eq!(
+            payload,
+            Value::Array(vec![]),
+            "{args:?} should emit an empty array, got {payload}"
+        );
+    }
+}
+
+/// `br wisp close --json` reports the closed IDs as JSON.
+#[test]
+fn e2e_json_flag_wisp_close_emits_json() {
+    let _log = common::test_log("e2e_json_flag_wisp_close_emits_json");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["wisp", "create", "closable", "--json"],
+        "wisp_create_for_close",
+    );
+    assert!(create.status.success(), "wisp create failed: {}", create.stderr);
+    let created: Value = serde_json::from_str(create.stdout.trim()).expect("create json");
+    let id = created["id"].as_str().expect("wisp id").to_string();
+
+    let close = run_br(
+        &workspace,
+        ["wisp", "close", &id, "--json"],
+        "wisp_close_json",
+    );
+    assert!(close.status.success(), "wisp close failed: {}", close.stderr);
+
+    let payload: Value = serde_json::from_str(close.stdout.trim())
+        .unwrap_or_else(|e| panic!("wisp close --json must emit JSON ({e}): {}", close.stdout));
+    assert_eq!(
+        payload["closed"],
+        Value::Array(vec![Value::String(id)]),
+        "close payload should list the closed wisp: {payload}"
+    );
+}
+
+// ============================================================================
+// --json flag tests for the formula command group
+// ============================================================================
+
+/// A minimal valid formula: two steps, one of them using a variable.
+const FORMULA_JSON: &str = r#"{
+  "formula": "demo",
+  "description": "demo formula",
+  "vars": [{"name": "component", "default": "core"}],
+  "steps": [
+    {"id": "s1", "type": "task", "title": "Step one for {{component}}", "priority": 1},
+    {"id": "s2", "type": "task", "title": "Step two"}
+  ]
+}"#;
+
+fn write_demo_formula(workspace: &BrWorkspace) -> std::path::PathBuf {
+    let path = workspace.root.join("demo.formula.json");
+    fs::write(&path, FORMULA_JSON).expect("write formula file");
+    path
+}
+
+/// `br formula expand --json` printed nothing.
+///
+/// The formula group wrote its JSON document through `OutputContext::print`,
+/// which is a no-op in JSON mode, so the document never reached stdout.
+#[test]
+fn e2e_json_flag_formula_expand_emits_json() {
+    let _log = common::test_log("e2e_json_flag_formula_expand_emits_json");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    let formula = write_demo_formula(&workspace);
+
+    let expand = run_br(
+        &workspace,
+        ["formula", "expand", formula.to_str().unwrap(), "--json"],
+        "formula_expand_json",
+    );
+    assert!(
+        expand.status.success(),
+        "formula expand failed: {}",
+        expand.stderr
+    );
+
+    let payload: Value = serde_json::from_str(expand.stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "formula expand --json must emit JSON ({e}); stdout was: {}",
+            expand.stdout
+        )
+    });
+    assert_eq!(payload["formula"], "demo");
+    assert_eq!(payload["step_count"], 2);
+}
+
+/// `br formula validate --json` had the same swallowed-document problem.
+#[test]
+fn e2e_json_flag_formula_validate_emits_json() {
+    let _log = common::test_log("e2e_json_flag_formula_validate_emits_json");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    let formula = write_demo_formula(&workspace);
+
+    let validate = run_br(
+        &workspace,
+        ["formula", "validate", formula.to_str().unwrap(), "--json"],
+        "formula_validate_json",
+    );
+    assert!(
+        validate.status.success(),
+        "formula validate failed: {}",
+        validate.stderr
+    );
+
+    let payload: Value = serde_json::from_str(validate.stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "formula validate --json must emit JSON ({e}); stdout was: {}",
+            validate.stdout
+        )
+    });
+    assert_eq!(payload["valid"], true);
+    assert_eq!(payload["step_count"], 2);
+}
+
+/// The formula group's text output ran every line together on one line,
+/// because `OutputContext::print` does not terminate the line.
+#[test]
+fn e2e_formula_text_output_has_line_breaks() {
+    let _log = common::test_log("e2e_formula_text_output_has_line_breaks");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    let formula = write_demo_formula(&workspace);
+
+    let expand = run_br(
+        &workspace,
+        ["formula", "expand", formula.to_str().unwrap()],
+        "formula_expand_text",
+    );
+    assert!(
+        expand.status.success(),
+        "formula expand failed: {}",
+        expand.stderr
+    );
+
+    let lines: Vec<&str> = expand.stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert!(
+        lines.len() >= 4,
+        "expected the formula preview on separate lines, got: {:?}",
+        expand.stdout
+    );
+    assert!(
+        expand.stdout.contains("Step one for {{component}}"),
+        "unexpected preview: {}",
+        expand.stdout
+    );
+}

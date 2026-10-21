@@ -15,6 +15,80 @@ This changelog is organized by capability rather than diff order. Each version s
 
 ---
 
+## Unreleased
+
+**Bugs found by exercising the released binary against a real repository.**
+
+Every entry below was reproduced against the published `v0.2.0` binary driving the
+`beads_rust` repository itself, then fixed and covered by a regression test.
+
+#### Fixed
+
+- **`br worktree create` could never create a worktree.** It shelled out to
+  `git worktree add <path> <branch>`, and git only accepts that form for a branch that
+  already exists — a missing branch fails with `fatal: invalid reference`. Every call
+  failed, including the default case where the branch name is the path's basename, so
+  the feature was unusable. A branch that does not exist yet is now created (`-b`), and
+  one that does exist is still checked out.
+- **Errors from the worktree, merge-slot, and federation commands reported
+  `INTERNAL_ERROR` and doubled their prefix.** `br merge-slot check` on a workspace
+  without a merge slot printed
+  `Error: Internal error: Internal error: merge slot not found: ...`: the dispatcher
+  re-wrapped an already-formatted message in `BeadsError::Internal`, and the merge-slot
+  command stringified its typed error into an untyped one on the way out. The original
+  error code, message, and exit code are now preserved end to end.
+- **`br federation remove <missing>` printed its failure twice** — once to stdout and
+  once as an error — and in `--json` mode emitted two JSON documents, so `| jq` read
+  only the first. The failure is now reported once, as a structured error.
+- **`br wisp create --json` printed plain text.** `--json` is a global flag, so clap
+  accepted it on the wisp subcommand, but the wisp command never consulted the output
+  mode. `br wisp create`, `br wisp close`, and `br wisp gc` now honour it, and
+  `br wisp list --json` returns `[]` instead of `No wisps found.` when there are no
+  wisps.
+- **`br doctor` reported a healthy workspace as broken.** The `write_lock` check
+  treated a leftover `.beads/.write.lock` whose mtime was older than five minutes as
+  an "orphaned" lock and told the operator to move it aside. The lock is an advisory
+  `flock`, and the kernel releases it when the holder exits — the file is never
+  unlinked, so *every* `br` command leaves one behind, including the read-only ones
+  and the doctor itself. On any repository that had not been written to for five
+  minutes the check warned, and `br doctor` exited non-zero even though the
+  workspace was healthy and writers acquired the lock instantly. The check now
+  probes the lock instead of the clock: a file nobody holds is `ok`, a lock held
+  by a live process is `warn`. `BR_DOCTOR_STALE_LOCK_THRESHOLD_SECS` is no
+  longer read — it only ever fed the mtime heuristic, and the check no longer
+  guesses from the clock.
+- **`br formula validate/expand/apply` claimed `-v` twice.** The formula
+  subcommands declared `--var` with a `-v` short flag, which the global
+  `--verbose` also claims. Clap's short-option uniqueness assertion fires only
+  in debug builds, so a debug build panicked outright ("Short option names
+  must be unique for each argument, but '-v' is in use by both 'vars' and
+  'verbose'"), while the release binary listed `-v` twice in its help and
+  bound it to whichever argument came last. `--var` keeps its long form; `-v`
+  is `--verbose` again, as on every other command.
+- **`br formula … --json` printed nothing.** The whole formula group wrote
+  its output through `OutputContext::print`, which is a no-op in JSON mode —
+  so the JSON document never reached stdout, and a `| jq` pipeline got an
+  empty stream from a successful command. The JSON branches now go through
+  `json_pretty`, `--robot` selects JSON mode for the group, and the text
+  branches use `print_line` so the preview no longer collapses onto one
+  line.
+
+#### Changed
+
+- **New `NOT_FOUND` error code (exit 3)** for entities looked up by name rather than by
+  issue ID — merge slots, federation peers, worktrees. These previously reported
+  `INTERNAL_ERROR` (exit 1), which reads as "the tool broke" rather than "that is not
+  there". `ISSUE_NOT_FOUND` is unchanged for issue-ID lookups.
+
+#### Documentation
+
+- `docs/agent/ERRORS.md` described the pre-`#336` error stream. In JSON mode the
+  structured envelope is written to **stdout** (one parseable document per invocation);
+  only human-mode errors go to stderr. The documented regression check read `err.json`
+  and would have failed against the shipped binary.
+
+---
+
 ## v0.2.0 -- 2026-09-30 (Release)
 
 **The storage engine changes.** `br` moves off frankensqlite to

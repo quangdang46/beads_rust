@@ -48,6 +48,35 @@ const DEFAULT_JSONL_EXPORT_PARALLELISM: usize = 64;
 const IMPORT_EXPORT_HASH_BATCH_SIZE: usize = 512;
 const MAX_JSONL_TEMP_PATH_ATTEMPTS: u32 = 64;
 
+/// Whether a process currently holds the workspace write lock.
+///
+/// Returns `Some(true)` when a live process holds the lock, `Some(false)`
+/// when nobody holds it, and `None` when the state could not be determined.
+///
+/// `.beads/.write.lock` is an advisory `flock`: the kernel releases it when
+/// the holder exits, and the file itself is never unlinked, because
+/// unlinking it would race with a waiter that already holds an open handle
+/// to the old inode. A leftover file therefore holds no lock and cannot
+/// wedge the workspace — the file's presence says nothing, only the lock
+/// does.
+#[allow(clippy::incompatible_msrv)]
+#[must_use]
+pub fn write_lock_is_held(beads_dir: &Path) -> Option<bool> {
+    let lock_path = beads_dir.join(".write.lock");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .ok()?;
+    match file.try_lock() {
+        // The handle drops here, releasing the probe's own lock.
+        Ok(()) => Some(false),
+        Err(TryLockError::WouldBlock) => Some(true),
+        Err(TryLockError::Error(_)) => None,
+    }
+}
+
 /// Acquire a blocking exclusive lock on `.beads/.write.lock`.
 ///
 /// This serializes all mutating operations across processes, preventing

@@ -498,22 +498,16 @@ fn main() {
         Commands::Where => commands::r#where::execute(&overrides, &output_ctx),
         Commands::Worktree(command) => {
             let result = commands::worktree::execute(&command, &output_ctx);
-            result.map_err(|e| beads_rust::error::BeadsError::Internal {
-                message: e.to_string(),
-            })
+            result.map_err(into_beads_error)
         }
         Commands::MergeSlot(command) => {
             let result = commands::merge_slot::execute(&command, &output_ctx);
-            result.map_err(|e| beads_rust::error::BeadsError::Internal {
-                message: e.to_string(),
-            })
+            result.map_err(into_beads_error)
         }
         Commands::Federation(command) => {
-            commands::federation::run(&command, &output_ctx).map_err(|e| {
-                beads_rust::error::BeadsError::Internal {
-                    message: e.to_string(),
-                }
-            })
+            // `federation::run` already returns a `BeadsError`; wrapping it
+            // again is what produced the doubled "Internal error:" prefix.
+            commands::federation::run(&command, &output_ctx)
         }
         Commands::Version(args) => commands::version::execute(&args, &output_ctx),
 
@@ -1256,6 +1250,25 @@ fn should_color_human_errors_for_cli(cli: &Cli) -> bool {
         std::env::var_os("NO_COLOR").is_some(),
         io::stderr().is_terminal(),
     )
+}
+
+/// Convert an `anyhow::Error` raised by a command module into a [`BeadsError`].
+///
+/// The worktree and merge-slot command modules speak `anyhow`, so their
+/// failures reach the dispatcher untyped. Wrapping them with
+/// `BeadsError::Internal { message: e.to_string() }` re-wrapped an
+/// already-formatted message: an error that was itself a [`BeadsError`]
+/// printed its prefix twice ("Internal error: Internal error: ...") and every
+/// failure in these groups reported `INTERNAL_ERROR` regardless of its real
+/// cause. Downcasting keeps the original code, message, and exit code;
+/// genuinely untyped errors still become an internal error.
+fn into_beads_error(err: anyhow::Error) -> BeadsError {
+    match err.downcast::<BeadsError>() {
+        Ok(original) => original,
+        Err(untyped) => BeadsError::Internal {
+            message: untyped.to_string(),
+        },
+    }
 }
 
 /// Handle errors with structured output support.

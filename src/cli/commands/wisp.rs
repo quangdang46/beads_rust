@@ -95,7 +95,7 @@ pub struct WispGcArgs {
 pub fn execute(
     command: &WispCommands,
     overrides: &CliOverrides,
-    _output_ctx: &OutputContext,
+    ctx: &OutputContext,
 ) -> Result<()> {
     // Resolve beads dir and open storage
     let beads_dir = config::discover_beads_dir_with_cli(overrides)?;
@@ -105,10 +105,10 @@ pub fn execute(
     let actor = overrides.actor.as_deref().unwrap_or("wisp");
 
     match command {
-        WispCommands::List(args) => execute_list(args, store, actor),
-        WispCommands::Create(args) => execute_create(args, store, actor),
-        WispCommands::Close(args) => execute_close(args, store, actor),
-        WispCommands::Gc(args) => execute_gc(args, store, actor),
+        WispCommands::List(args) => execute_list(args, store, actor, ctx),
+        WispCommands::Create(args) => execute_create(args, store, actor, ctx),
+        WispCommands::Close(args) => execute_close(args, store, actor, ctx),
+        WispCommands::Gc(args) => execute_gc(args, store, actor, ctx),
     }
 }
 
@@ -116,7 +116,12 @@ pub fn execute(
 // List implementation
 // ---------------------------------------------------------------------------
 
-fn execute_list(args: &WispListArgs, store: &mut SqliteStorage, _actor: &str) -> Result<()> {
+fn execute_list(
+    args: &WispListArgs,
+    store: &mut SqliteStorage,
+    _actor: &str,
+    ctx: &OutputContext,
+) -> Result<()> {
     let all_issues = store.list_issues(&crate::storage::ListFilters {
         include_closed: args.all,
         include_templates: false,
@@ -126,12 +131,10 @@ fn execute_list(args: &WispListArgs, store: &mut SqliteStorage, _actor: &str) ->
 
     let wisps: Vec<&Issue> = all_issues.iter().filter(|i| i.ephemeral).collect();
 
-    if wisps.is_empty() {
-        println!("No wisps found.");
-        return Ok(());
-    }
-
-    if args.json {
+    // JSON mode is checked before the empty check: an empty list still has
+    // to be a JSON document, or `br wisp list --json | jq` breaks on an
+    // otherwise-successful call.
+    if args.json || ctx.is_json() {
         let output: Vec<serde_json::Value> = wisps
             .iter()
             .map(|i| {
@@ -147,20 +150,26 @@ fn execute_list(args: &WispListArgs, store: &mut SqliteStorage, _actor: &str) ->
                 })
             })
             .collect();
-        println!("{}", serde_json::to_string_pretty(&output)?);
-    } else {
-        for wisp in &wisps {
-            let age_h = (Utc::now() - wisp.created_at).num_hours();
-            println!(
-                "{:20} {:31} {:7} p{} {:12} created {}h ago",
-                wisp.id,
-                truncate(&wisp.title, 30),
-                wisp.status.as_str(),
-                wisp.priority.0,
-                wisp.issue_type.as_str(),
-                age_h,
-            );
-        }
+        ctx.json_pretty(&output);
+        return Ok(());
+    }
+
+    if wisps.is_empty() {
+        println!("No wisps found.");
+        return Ok(());
+    }
+
+    for wisp in &wisps {
+        let age_h = (Utc::now() - wisp.created_at).num_hours();
+        println!(
+            "{:20} {:31} {:7} p{} {:12} created {}h ago",
+            wisp.id,
+            truncate(&wisp.title, 30),
+            wisp.status.as_str(),
+            wisp.priority.0,
+            wisp.issue_type.as_str(),
+            age_h,
+        );
     }
     Ok(())
 }
@@ -177,45 +186,23 @@ fn truncate(s: &str, max: usize) -> String {
 // Create implementation
 // ---------------------------------------------------------------------------
 
-fn execute_create(args: &WispCreateArgs, store: &mut SqliteStorage, actor: &str) -> Result<()> {
-    let title = if args.title.is_empty() {
-        return Err(BeadsError::validation("title", "cannot be empty"));
-    } else {
-        args.title.join(" ")
-    };
-
-    let priority = if let Some(ref p) = args.priority {
-        Priority::from_str(p)?
-    } else {
-        Priority::from_str("P3")?
-    };
-
-    let issue_type = if let Some(ref t) = args.type_ {
-        IssueType::from_str(t)?
-    } else {
-        IssueType::Task
-    };
-
-    let now = Utc::now();
-
-    // Generate a wsp-prefixed ID
-    // NOTE: store.id_exists() checks the shared `issues` table, so it
-    // naturally catches collisions with regular issues too (cross-namespace
-    // uniqueness). See SqliteStorage::check_id_uniqueness for the documented
-    // wrapper around this guarantee.
-    let issue_count = store.count_issues()?;
-    let id_gen = crate::util::id::IdGenerator::new(crate::util::id::IdConfig::with_prefix("wsp"));
-    let id = id_gen.generate(
-        &title,
-        None,
-        Some(actor),
-        now,
-        issue_count,
-        |candidate: &str| store.id_exists(candidate).unwrap_or(false),
-    );
-
-    let issue = Issue {
-        id: id.clone(),
+/// Build the issue row for a new wisp.
+///
+/// Wisps are ordinary rows in the `issues` table flagged `ephemeral`, so
+/// everything except the ephemeral marker and the `wsp-` ID is left at its
+/// default.
+#[allow(clippy::too_many_lines)]
+fn build_wisp_issue(
+    id: String,
+    title: String,
+    priority: Priority,
+    issue_type: IssueType,
+    assignee: Option<String>,
+    actor: &str,
+    now: DateTime<Utc>,
+) -> Issue {
+    Issue {
+        id,
         title,
         description: None,
         status: Status::Open,
@@ -223,7 +210,7 @@ fn execute_create(args: &WispCreateArgs, store: &mut SqliteStorage, actor: &str)
         issue_type,
         created_at: now,
         updated_at: now,
-        assignee: args.assignee.clone(),
+        assignee,
         owner: None,
         estimated_minutes: None,
         due_at: None,
@@ -278,10 +265,77 @@ fn execute_create(args: &WispCreateArgs, store: &mut SqliteStorage, actor: &str)
         waiters: vec![],
         dependencies: vec![],
         comments: vec![],
+    }
+}
+
+fn execute_create(
+    args: &WispCreateArgs,
+    store: &mut SqliteStorage,
+    actor: &str,
+    ctx: &OutputContext,
+) -> Result<()> {
+    let title = if args.title.is_empty() {
+        return Err(BeadsError::validation("title", "cannot be empty"));
+    } else {
+        args.title.join(" ")
     };
 
+    let priority = if let Some(ref p) = args.priority {
+        Priority::from_str(p)?
+    } else {
+        Priority::from_str("P3")?
+    };
+
+    let issue_type = if let Some(ref t) = args.type_ {
+        IssueType::from_str(t)?
+    } else {
+        IssueType::Task
+    };
+
+    let now = Utc::now();
+
+    // Generate a wsp-prefixed ID
+    // NOTE: store.id_exists() checks the shared `issues` table, so it
+    // naturally catches collisions with regular issues too (cross-namespace
+    // uniqueness). See SqliteStorage::check_id_uniqueness for the documented
+    // wrapper around this guarantee.
+    let issue_count = store.count_issues()?;
+    let id_gen = crate::util::id::IdGenerator::new(crate::util::id::IdConfig::with_prefix("wsp"));
+    let id = id_gen.generate(
+        &title,
+        None,
+        Some(actor),
+        now,
+        issue_count,
+        |candidate: &str| store.id_exists(candidate).unwrap_or(false),
+    );
+
+    let issue = build_wisp_issue(
+        id.clone(),
+        title,
+        priority,
+        issue_type,
+        args.assignee.clone(),
+        actor,
+        now,
+    );
+
     store.create_issue(&issue, actor)?;
-    println!("Created wisp: {}", id);
+
+    if ctx.is_json() {
+        ctx.json_pretty(&serde_json::json!({
+            "id": issue.id,
+            "title": issue.title,
+            "status": issue.status.as_str(),
+            "priority": issue.priority.0,
+            "issue_type": issue.issue_type.as_str(),
+            "assignee": issue.assignee,
+            "created_at": issue.created_at.to_rfc3339(),
+            "updated_at": issue.updated_at.to_rfc3339(),
+        }));
+    } else {
+        println!("Created wisp: {}", id);
+    }
     info!(id = %id, "wisp created");
     Ok(())
 }
@@ -290,8 +344,14 @@ fn execute_create(args: &WispCreateArgs, store: &mut SqliteStorage, actor: &str)
 // Close implementation
 // ---------------------------------------------------------------------------
 
-fn execute_close(args: &WispCloseArgs, store: &mut SqliteStorage, actor: &str) -> Result<()> {
+fn execute_close(
+    args: &WispCloseArgs,
+    store: &mut SqliteStorage,
+    actor: &str,
+    ctx: &OutputContext,
+) -> Result<()> {
     let now = Utc::now();
+    let mut closed = Vec::new();
     for id in &args.ids {
         let updates = crate::storage::IssueUpdate {
             status: Some(Status::Closed),
@@ -300,8 +360,15 @@ fn execute_close(args: &WispCloseArgs, store: &mut SqliteStorage, actor: &str) -
             ..Default::default()
         };
         store.update_issue(id, &updates, actor)?;
-        println!("Closed wisp: {}", id);
+        closed.push(id.clone());
+        if !ctx.is_json() {
+            println!("Closed wisp: {}", id);
+        }
         info!(id = %id, "wisp closed");
+    }
+
+    if ctx.is_json() {
+        ctx.json_pretty(&serde_json::json!({ "closed": closed }));
     }
     Ok(())
 }
@@ -310,7 +377,12 @@ fn execute_close(args: &WispCloseArgs, store: &mut SqliteStorage, actor: &str) -
 // GC implementation
 // ---------------------------------------------------------------------------
 
-fn execute_gc(args: &WispGcArgs, store: &mut SqliteStorage, actor: &str) -> Result<()> {
+fn execute_gc(
+    args: &WispGcArgs,
+    store: &mut SqliteStorage,
+    actor: &str,
+    ctx: &OutputContext,
+) -> Result<()> {
     let max_age = chrono::Duration::hours(args.max_age_hours as i64);
     let cutoff = Utc::now() - max_age;
 
@@ -328,25 +400,43 @@ fn execute_gc(args: &WispGcArgs, store: &mut SqliteStorage, actor: &str) -> Resu
         .collect();
 
     if stale.is_empty() {
-        println!("No stale wisps to garbage-collect.");
+        if ctx.is_json() {
+            ctx.json_pretty(&serde_json::json!({ "collected": 0, "ids": [] }));
+        } else {
+            println!("No stale wisps to garbage-collect.");
+        }
         return Ok(());
     }
 
     if args.dry_run {
-        println!("Would delete {} stale wisps:", stale.len());
-        for wisp in &stale {
-            let age_h = (Utc::now() - wisp.created_at).num_hours();
-            println!("  {}  {}  ({}h old)", wisp.id, wisp.title, age_h);
+        if ctx.is_json() {
+            ctx.json_pretty(&serde_json::json!({
+                "dry_run": true,
+                "would_collect": stale.len(),
+                "ids": stale.iter().map(|w| w.id.clone()).collect::<Vec<_>>(),
+            }));
+        } else {
+            println!("Would delete {} stale wisps:", stale.len());
+            for wisp in &stale {
+                let age_h = (Utc::now() - wisp.created_at).num_hours();
+                println!("  {}  {}  ({}h old)", wisp.id, wisp.title, age_h);
+            }
         }
         return Ok(());
     }
 
     let mut deleted = 0u64;
+    let mut ids = Vec::new();
     for wisp in &stale {
         store.delete_issue(&wisp.id, actor, "wisp gc: stale", None)?;
         deleted += 1;
+        ids.push(wisp.id.clone());
         info!(id = %wisp.id, "wisp gc deleted");
     }
-    println!("Garbage-collected {} stale wisps.", deleted);
+    if ctx.is_json() {
+        ctx.json_pretty(&serde_json::json!({ "collected": deleted, "ids": ids }));
+    } else {
+        println!("Garbage-collected {} stale wisps.", deleted);
+    }
     Ok(())
 }

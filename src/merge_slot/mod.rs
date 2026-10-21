@@ -147,11 +147,9 @@ impl SqliteStorage {
 
         let slot = self
             .get_issue(&slot_id)?
-            .ok_or_else(|| BeadsError::Internal {
-                message: format!(
-                    "merge slot not found: {} (run 'br merge-slot create' first)",
-                    slot_id
-                ),
+            .ok_or_else(|| BeadsError::NotFound {
+                kind: "merge slot".to_string(),
+                id: slot_id.clone(),
             })?;
 
         let meta = parse_slot_meta(&slot);
@@ -207,11 +205,9 @@ impl SqliteStorage {
             let slot = match self.get_issue(&slot_id)? {
                 Some(s) => s,
                 None => {
-                    return Err(BeadsError::Internal {
-                        message: format!(
-                            "merge slot not found: {} (run 'br merge-slot create' first)",
-                            slot_id
-                        ),
+                    return Err(BeadsError::NotFound {
+                        kind: "merge slot".to_string(),
+                        id: slot_id.clone(),
                     });
                 }
             };

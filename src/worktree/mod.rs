@@ -20,6 +20,7 @@
 //! - Worktree removal checks for uncommitted changes and unpushed commits
 //!   unless `--force` is passed.
 
+use crate::error::BeadsError;
 use anyhow::{Context as _, Result};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -176,7 +177,16 @@ pub fn create_worktree(
 
     let resolved_str = resolved_path.to_string_lossy().to_string();
 
-    capture_git(&root, &["worktree", "add", &resolved_str, &branch_name])?;
+    // `git worktree add <path> <branch>` only checks out a branch that
+    // already exists — git answers "fatal: invalid reference" otherwise, and
+    // that was every `br worktree create` call, including the default where
+    // the branch name is the path's basename. Pass `-b` for a branch that
+    // does not exist yet so the worktree creates it.
+    if branch_exists(&root, &branch_name) {
+        capture_git(&root, &["worktree", "add", &resolved_str, &branch_name])?;
+    } else {
+        capture_git(&root, &["worktree", "add", "-b", &branch_name, &resolved_str])?;
+    }
 
     // Add to .gitignore if worktree is inside the repo root
     if resolved_path.starts_with(&root) {
@@ -396,7 +406,26 @@ fn resolve_worktree_path(name_or_path: &str, repo_root: &Path) -> Result<PathBuf
         }
     }
 
-    anyhow::bail!("worktree not found: {name_or_path}");
+    // Typed so the dispatcher can report NOT_FOUND instead of an internal
+    // error: a missing worktree is a user mistake, not a broken invariant.
+    Err(anyhow::Error::new(BeadsError::NotFound {
+        kind: "worktree".to_string(),
+        id: name_or_path.to_string(),
+    }))
+}
+
+/// Check whether a local branch already exists in the repository.
+fn branch_exists(repo_root: &Path, branch: &str) -> bool {
+    capture_git(
+        repo_root,
+        &[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .is_ok()
 }
 
 /// Minimal porcelain parser just for path resolution (avoids borrow issues with WorktreeInfo).
@@ -686,5 +715,86 @@ bare
         assert_eq!(BeadsState::Local.as_str(), "local");
         assert_eq!(BeadsState::Shared.as_str(), "shared");
         assert_eq!(BeadsState::Redirect.as_str(), "redirect");
+    }
+
+    // -----------------------------------------------------------------------
+    // Worktree creation
+    // -----------------------------------------------------------------------
+
+    /// `git worktree add <path> <branch>` only checks out a branch that
+    /// already exists, so every `br worktree create` failed with
+    /// "fatal: invalid reference" unless the caller passed an existing
+    /// branch. A branch that does not exist yet must be created.
+    #[test]
+    fn test_create_worktree_creates_missing_branch() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = dir.path();
+        capture_git(repo, &["init"]).unwrap();
+        capture_git(repo, &["config", "user.email", "t@example.com"]).unwrap();
+        capture_git(repo, &["config", "user.name", "t"]).unwrap();
+        std::fs::write(repo.join("f"), "x").unwrap();
+        capture_git(repo, &["add", "f"]).unwrap();
+        capture_git(repo, &["commit", "-m", "init"]).unwrap();
+
+        let target = repo.join("wt-new");
+        let info = create_worktree(&target, Some("brand-new"), Some(repo)).unwrap();
+
+        assert_eq!(info.branch, "brand-new");
+        assert!(
+            branch_exists(repo, "brand-new"),
+            "the new branch should exist after create_worktree"
+        );
+        let listed = capture_git(repo, &["worktree", "list", "--porcelain"]).unwrap();
+        assert!(
+            listed.contains("branch refs/heads/brand-new"),
+            "worktree should be on the new branch: {listed}"
+        );
+    }
+
+    /// A branch that already exists must be checked out, not re-created.
+    #[test]
+    fn test_create_worktree_checks_out_existing_branch() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = dir.path();
+        capture_git(repo, &["init"]).unwrap();
+        capture_git(repo, &["config", "user.email", "t@example.com"]).unwrap();
+        capture_git(repo, &["config", "user.name", "t"]).unwrap();
+        std::fs::write(repo.join("f"), "x").unwrap();
+        capture_git(repo, &["add", "f"]).unwrap();
+        capture_git(repo, &["commit", "-m", "init"]).unwrap();
+        capture_git(repo, &["branch", "existing"]).unwrap();
+
+        let target = repo.join("wt-existing");
+        let info = create_worktree(&target, Some("existing"), Some(repo)).unwrap();
+
+        assert_eq!(info.branch, "existing");
+        let listed = capture_git(repo, &["worktree", "list", "--porcelain"]).unwrap();
+        assert!(
+            listed.contains("branch refs/heads/existing"),
+            "worktree should be on the existing branch: {listed}"
+        );
+    }
+
+    /// With no explicit branch the worktree name is used, and that branch
+    /// does not exist yet — it has to be created for the call to succeed.
+    #[test]
+    fn test_create_worktree_default_branch_is_created() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = dir.path();
+        capture_git(repo, &["init"]).unwrap();
+        capture_git(repo, &["config", "user.email", "t@example.com"]).unwrap();
+        capture_git(repo, &["config", "user.name", "t"]).unwrap();
+        std::fs::write(repo.join("f"), "x").unwrap();
+        capture_git(repo, &["add", "f"]).unwrap();
+        capture_git(repo, &["commit", "-m", "init"]).unwrap();
+
+        let target = repo.join("wt-default");
+        let info = create_worktree(&target, None, Some(repo)).unwrap();
+
+        assert_eq!(info.branch, "wt-default");
+        assert!(
+            branch_exists(repo, "wt-default"),
+            "the default branch should be created"
+        );
     }
 }

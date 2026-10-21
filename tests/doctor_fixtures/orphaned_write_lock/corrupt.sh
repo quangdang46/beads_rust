@@ -2,14 +2,14 @@
 # Fixture: orphaned_write_lock
 # FM: fm-concurrency_primitives-orphaned-write-lock (P1) — detect-only.
 #
-# Plants a fresh `.beads/.write.lock` regular file. The detector
-# normally treats <300s as "still in flight"; we set
-# BR_DOCTOR_STALE_LOCK_THRESHOLD_SECS=0 in assert.sh so any
-# non-future mtime trips the warn branch.
+# Plants a regular-file `.beads/.write.lock` that no process holds —
+# exactly the state every workspace is left in after any `br` command,
+# because the advisory flock is released on exit and the file is never
+# unlinked. The doctor must report it as healthy.
 #
-# This is the only fixture that intentionally plants the lock
-# itself; production code holds it via flock and never leaves
-# a regular file unless the writer crashed.
+# The "lock is held by a live process" branch needs a live holder, which
+# bash cannot create portably; it is covered by the Rust unit test
+# `check_orphaned_write_lock_held_is_warn`.
 
 set -euo pipefail
 target_dir="${1:?usage: corrupt.sh <target_dir>}"
@@ -19,9 +19,7 @@ mkdir -p "$target_dir"
 cd "$target_dir"
 "$tool_bin" init >/dev/null 2>&1
 
-# Plant a regular-file write.lock. fs::write would also work but
-# touch keeps the file empty + sets mtime to "now" which is what
-# we want.
+# Plant a regular-file write.lock. `touch` keeps the file empty.
 : > .beads/.write.lock
 
 if [ -e .fixture_baseline ]; then

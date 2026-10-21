@@ -47,7 +47,7 @@ fn cmd_create(
 ) -> Result<()> {
     let slot = storage
         .merge_slot_create(actor, prefix)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
+        .map_err(anyhow::Error::new)?;
 
     if ctx.is_json() {
         println!(
@@ -68,7 +68,7 @@ fn cmd_create(
 fn cmd_check(storage: &mut SqliteStorage, prefix: &str, ctx: &OutputContext) -> Result<()> {
     let status = storage
         .merge_slot_check(prefix)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
+        .map_err(anyhow::Error::new)?;
 
     if ctx.is_json() {
         println!(
@@ -103,7 +103,7 @@ fn cmd_acquire(
 ) -> Result<()> {
     let result = storage
         .merge_slot_acquire(actor, actor, args.wait, prefix)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
+        .map_err(anyhow::Error::new)?;
 
     if ctx.is_json() {
         println!(
@@ -153,7 +153,7 @@ fn cmd_wait(
     loop {
         let result = storage
             .merge_slot_acquire(actor, actor, true, prefix)
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+            .map_err(anyhow::Error::new)?;
 
         if result.acquired {
             if ctx.is_json() {
@@ -191,7 +191,7 @@ fn cmd_release(
 ) -> Result<()> {
     storage
         .merge_slot_release(actor, actor, prefix)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
+        .map_err(anyhow::Error::new)?;
 
     if ctx.is_json() {
         println!(

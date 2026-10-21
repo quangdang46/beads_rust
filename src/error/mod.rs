@@ -148,6 +148,14 @@ pub enum BeadsError {
         binary_version: i32,
     },
 
+    // === Not Found Errors ===
+    /// A named entity that is not an issue could not be found.
+    ///
+    /// Used for lookups by name rather than by issue ID — federation peers,
+    /// merge slots, worktrees. [`crate::error::ErrorCode::NotFound`].
+    #[error("{kind} not found: {id}")]
+    NotFound { kind: String, id: String },
+
     // === Configuration Errors ===
     /// Configuration file error.
     #[error("Configuration error: {0}")]

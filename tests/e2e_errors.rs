@@ -3374,3 +3374,123 @@ fn e2e_json_failure_emits_parseable_json_on_stdout() {
         "human-mode error should be on stderr"
     );
 }
+
+// ============================================================================
+// Named-entity not-found errors
+// ============================================================================
+
+/// A named entity that is not an issue must report NOT_FOUND with exit code
+/// 3. `br merge-slot check` used to report INTERNAL_ERROR (exit 1) and
+/// doubled the error prefix ("Internal error: Internal error: ...").
+#[test]
+fn e2e_merge_slot_check_missing_reports_not_found() {
+    let _log = common::test_log("e2e_merge_slot_check_missing_reports_not_found");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let check = run_br(&workspace, ["merge-slot", "check"], "merge_slot_check");
+    assert!(
+        !check.status.success(),
+        "merge-slot check should fail when no slot exists"
+    );
+    assert_eq!(
+        check.status.code(),
+        Some(3),
+        "not-found should exit 3; stderr was: {}",
+        check.stderr
+    );
+    assert!(
+        check.stderr.contains("merge slot not found"),
+        "stderr should name the missing entity: {}",
+        check.stderr
+    );
+    assert!(
+        !check.stderr.contains("Internal error: Internal error:"),
+        "the error prefix must not be doubled: {}",
+        check.stderr
+    );
+}
+
+/// In JSON mode the failure must be exactly one error document on stdout.
+#[test]
+fn e2e_merge_slot_check_missing_json_is_single_not_found_document() {
+    let _log = common::test_log("e2e_merge_slot_check_missing_json_is_single_not_found_document");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let check = run_br(
+        &workspace,
+        ["merge-slot", "check", "--json"],
+        "merge_slot_check_json",
+    );
+    assert!(!check.status.success(), "merge-slot check should fail");
+    assert_eq!(check.status.code(), Some(3), "stderr: {}", check.stderr);
+
+    let payload: Value = serde_json::from_str(check.stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "merge-slot check --json must emit one JSON document ({e}); stdout was: {}",
+            check.stdout
+        )
+    });
+    assert_eq!(payload["error"]["code"], "NOT_FOUND");
+    assert!(
+        payload["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("merge slot not found")),
+        "unexpected message: {payload}"
+    );
+}
+
+/// `br federation remove <missing>` used to print the failure to stdout AND
+/// return it as an error, so the message appeared twice and `--json` mode
+/// emitted two JSON documents.
+#[test]
+fn e2e_federation_remove_missing_reports_not_found_once() {
+    let _log = common::test_log("e2e_federation_remove_missing_reports_not_found_once");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let remove = run_br(
+        &workspace,
+        ["federation", "remove", "nosuchpeer"],
+        "federation_remove_missing",
+    );
+    assert!(!remove.status.success(), "removing a missing peer should fail");
+    assert_eq!(
+        remove.status.code(),
+        Some(3),
+        "not-found should exit 3; stderr was: {}",
+        remove.stderr
+    );
+    assert!(
+        remove.stdout.trim().is_empty(),
+        "the failure must not also be printed to stdout: {}",
+        remove.stdout
+    );
+    assert!(
+        !remove.stderr.contains("Internal error: Internal error:"),
+        "the error prefix must not be doubled: {}",
+        remove.stderr
+    );
+
+    let remove_json = run_br(
+        &workspace,
+        ["federation", "remove", "nosuchpeer", "--json"],
+        "federation_remove_missing_json",
+    );
+    assert!(!remove_json.status.success(), "removing a missing peer should fail");
+
+    let payload: Value = serde_json::from_str(remove_json.stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "federation remove --json must emit one JSON document ({e}); stdout was: {}",
+            remove_json.stdout
+        )
+    });
+    assert_eq!(payload["error"]["code"], "NOT_FOUND");
+}

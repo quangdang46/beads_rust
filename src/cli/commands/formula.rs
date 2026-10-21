@@ -46,7 +46,11 @@ pub struct FormulaValidateArgs {
     pub file: PathBuf,
 
     /// Variable overrides in key=value format (can be repeated)
-    #[arg(long = "var", short = 'v', value_name = "KEY=VALUE")]
+    // No short flag: the global `-v` is `--verbose` on every command,
+    // and a second `-v` here made clap's short-option uniqueness
+    // assertion fail (panic in debug builds) and left `-v` ambiguous
+    // in release builds. `--var` is the discoverable long form.
+    #[arg(long = "var", value_name = "KEY=VALUE")]
     pub vars: Vec<String>,
 
     /// Output format (text, json)
@@ -69,7 +73,11 @@ pub struct FormulaExpandArgs {
     pub file: PathBuf,
 
     /// Variable overrides in key=value format (can be repeated)
-    #[arg(long = "var", short = 'v', value_name = "KEY=VALUE")]
+    // No short flag: the global `-v` is `--verbose` on every command,
+    // and a second `-v` here made clap's short-option uniqueness
+    // assertion fail (panic in debug builds) and left `-v` ambiguous
+    // in release builds. `--var` is the discoverable long form.
+    #[arg(long = "var", value_name = "KEY=VALUE")]
     pub vars: Vec<String>,
 
     /// Output format (text, json)
@@ -150,7 +158,11 @@ pub struct FormulaApplyArgs {
     pub file: PathBuf,
 
     /// Variable overrides in key=value format (can be repeated)
-    #[arg(long = "var", short = 'v', value_name = "KEY=VALUE")]
+    // No short flag: the global `-v` is `--verbose` on every command,
+    // and a second `-v` here made clap's short-option uniqueness
+    // assertion fail (panic in debug builds) and left `-v` ambiguous
+    // in release builds. `--var` is the discoverable long form.
+    #[arg(long = "var", value_name = "KEY=VALUE")]
     pub vars: Vec<String>,
 
     /// Dry-run: show what would be created without writing to the database
@@ -286,9 +298,9 @@ fn execute_validate(args: &FormulaValidateArgs, output_ctx: &OutputContext) -> c
             "valid": true,
             "step_count": steps.len(),
         });
-        output_ctx.print(&serde_json::to_string_pretty(&output).unwrap_or_default());
+        output_ctx.json_pretty(&output);
     } else {
-        output_ctx.print(&format!(
+        output_ctx.print_line(&format!(
             "Formula is valid: {} step(s) would be created",
             steps.len()
         ));
@@ -319,31 +331,31 @@ fn execute_expand(args: &FormulaExpandArgs, output_ctx: &OutputContext) -> crate
             }).collect::<Vec<_>>(),
             "vars": resolved.vars.unwrap_or_default(),
         });
-        output_ctx.print(&serde_json::to_string_pretty(&output).unwrap_or_default());
+        output_ctx.json_pretty(&output);
     } else {
-        output_ctx.print(&format!(
+        output_ctx.print_line(&format!(
             "Formula: {} ({} steps)",
             resolved.formula,
             steps.len()
         ));
         if let Some(desc) = resolved.description.as_deref() {
-            output_ctx.print(&format!("  Description: {desc}"));
+            output_ctx.print_line(&format!("  Description: {desc}"));
         }
         for (i, step) in steps.iter().enumerate() {
-            output_ctx.print(&format!(
+            output_ctx.print_line(&format!(
                 "  {}.{}: {}",
                 i + 1,
                 step.id,
                 step.title.as_deref().unwrap_or("(untitled)")
             ));
             if !step.depends_on.is_empty() {
-                output_ctx.print(&format!(
+                output_ctx.print_line(&format!(
                     "       Depends on: {}",
                     step.depends_on.join(", ")
                 ));
             }
             if !step.needs.is_empty() {
-                output_ctx.print(&format!("       Needs: {}", step.needs.join(", ")));
+                output_ctx.print_line(&format!("       Needs: {}", step.needs.join(", ")));
             }
         }
     }
@@ -397,28 +409,28 @@ fn execute_apply(
                     obj
                 }).collect::<Vec<_>>(),
             });
-            output_ctx.print(&serde_json::to_string_pretty(&output).unwrap_or_default());
+            output_ctx.json_pretty(&output);
         } else {
-            output_ctx.print(&format!(
+            output_ctx.print_line(&format!(
                 "[DRY-RUN] Would create {} issue(s) from '{}'",
                 steps.len(),
                 resolved.formula
             ));
             for (i, step) in steps.iter().enumerate() {
-                output_ctx.print(&format!(
+                output_ctx.print_line(&format!(
                     "  {}.{}: {}",
                     i + 1,
                     step.id,
                     step.title.as_deref().unwrap_or("(untitled)")
                 ));
                 if !step.depends_on.is_empty() {
-                    output_ctx.print(&format!(
+                    output_ctx.print_line(&format!(
                         "       Depends on: {}",
                         step.depends_on.join(", ")
                     ));
                 }
                 if let Some(gate) = &step.gate {
-                    output_ctx.print(&format!(
+                    output_ctx.print_line(&format!(
                         "       Gate: await_type={}, await_id={}, timeout={}",
                         gate.r#type,
                         gate.await_id.as_deref().unwrap_or("-"),
@@ -571,10 +583,10 @@ fn execute_apply(
             "gated_issues": gate_count,
             "issue_ids": issue_ids,
         });
-        output_ctx.print(&serde_json::to_string_pretty(&output).unwrap_or_default());
+        output_ctx.json_pretty(&output);
     } else {
         let gate_count = step_to_gate_issue.len();
-        output_ctx.print(&format!(
+        output_ctx.print_line(&format!(
             "Applied formula '{}': created {} issue(s) and {} dependency(ies) ({} gated)",
             resolved.formula,
             step_to_issue.len(),
@@ -586,7 +598,7 @@ fn execute_apply(
                 .get(step_id)
                 .map(|g| format!(" [gate: {}]", g.id))
                 .unwrap_or_default();
-            output_ctx.print(&format!("  {step_id} -> {}{gate_info}", issue.id));
+            output_ctx.print_line(&format!("  {step_id} -> {}{gate_info}", issue.id));
         }
     }
 
@@ -689,20 +701,20 @@ fn execute_list(args: &FormulaListArgs, output_ctx: &OutputContext) -> crate::Re
     entries.sort_by(|a, b| a.name.cmp(&b.name));
 
     if use_json {
-        output_ctx.print(&serde_json::to_string_pretty(&entries).unwrap_or_default());
+        output_ctx.json_pretty(&entries);
         return Ok(());
     }
 
     if entries.is_empty() {
-        output_ctx.print("No formulas found.");
-        output_ctx.print("Search paths:");
+        output_ctx.print_line("No formulas found.");
+        output_ctx.print_line("Search paths:");
         for p in &search_paths {
-            output_ctx.print(&format!("  {}", p.display()));
+            output_ctx.print_line(&format!("  {}", p.display()));
         }
         return Ok(());
     }
 
-    output_ctx.print(&format!("Formulas ({} found)", entries.len()));
+    output_ctx.print_line(&format!("Formulas ({} found)", entries.len()));
 
     // Group by type
     let mut by_type: HashMap<String, Vec<&ListEntry>> = HashMap::new();
@@ -715,14 +727,14 @@ fn execute_list(args: &FormulaListArgs, output_ctx: &OutputContext) -> crate::Re
         let Some(type_entries) = by_type.get(*t) else {
             continue;
         };
-        output_ctx.print(&format!("  {}:", t));
+        output_ctx.print_line(&format!("  {}:", t));
         for e in type_entries {
             let var_info = if e.vars > 0 {
                 format!(" ({} vars)", e.vars)
             } else {
                 String::new()
             };
-            output_ctx.print(&format!("    {:<25} {}{}", e.name, e.description, var_info));
+            output_ctx.print_line(&format!("    {:<25} {}{}", e.name, e.description, var_info));
         }
     }
 
@@ -744,31 +756,31 @@ fn execute_show(args: &FormulaShowArgs, output_ctx: &OutputContext) -> crate::Re
         .map_err(|e| BeadsError::Config(format!("Formula {:?} not found: {}", args.name, e)))?;
 
     if use_json {
-        output_ctx.print(&serde_json::to_string_pretty(&formula).unwrap_or_default());
+        output_ctx.json_pretty(&formula);
         return Ok(());
     }
 
-    output_ctx.print(&format!("Formula: {}", formula.formula));
-    output_ctx.print(&format!("  Type: {:?}", formula.r#type));
+    output_ctx.print_line(&format!("Formula: {}", formula.formula));
+    output_ctx.print_line(&format!("  Type: {:?}", formula.r#type));
     if let Some(ref desc) = formula.description {
-        output_ctx.print(&format!("  Description: {}", desc));
+        output_ctx.print_line(&format!("  Description: {}", desc));
     }
     if let Some(ref source) = formula.source {
-        output_ctx.print(&format!("  Source: {}", source));
+        output_ctx.print_line(&format!("  Source: {}", source));
     }
 
     // Print extends
     if !formula.extends.is_empty() {
-        output_ctx.print("  Extends:");
+        output_ctx.print_line("  Extends:");
         for ext in &formula.extends {
-            output_ctx.print(&format!("    - {}", ext));
+            output_ctx.print_line(&format!("    - {}", ext));
         }
     }
 
     // Print variables
     if let Some(vars) = &formula.vars {
         if !vars.is_empty() {
-            output_ctx.print("  Variables:");
+            output_ctx.print_line("  Variables:");
             for v in vars {
                 let mut attrs: Vec<String> = Vec::new();
                 if v.required {
@@ -790,7 +802,7 @@ fn execute_show(args: &FormulaShowArgs, output_ctx: &OutputContext) -> crate::Re
                     .as_ref()
                     .map(|d| format!(": {}", d))
                     .unwrap_or_default();
-                output_ctx.print(&format!("    {{{{{}}}}}{}{}", v.name, desc, attr_str));
+                output_ctx.print_line(&format!("    {{{{{}}}}}{}{}", v.name, desc, attr_str));
             }
         }
     }
@@ -799,7 +811,7 @@ fn execute_show(args: &FormulaShowArgs, output_ctx: &OutputContext) -> crate::Re
     if let Some(steps) = &formula.steps {
         if !steps.is_empty() {
             let count = count_steps(steps);
-            output_ctx.print(&format!("  Steps ({}):", count));
+            output_ctx.print_line(&format!("  Steps ({}):", count));
             print_steps_tree(steps, "    ", output_ctx);
         }
     }
@@ -807,7 +819,7 @@ fn execute_show(args: &FormulaShowArgs, output_ctx: &OutputContext) -> crate::Re
     // Print template (for expansion formulas)
     if let Some(template) = &formula.template {
         if !template.is_empty() {
-            output_ctx.print(&format!("  Template ({} steps):", template.len()));
+            output_ctx.print_line(&format!("  Template ({} steps):", template.len()));
             print_steps_tree(template, "    ", output_ctx);
         }
     }
@@ -823,11 +835,11 @@ fn execute_show(args: &FormulaShowArgs, output_ctx: &OutputContext) -> crate::Re
             || compose.aspects.as_ref().map_or(false, |a| !a.is_empty());
 
         if has_rules {
-            output_ctx.print("  Composition:");
+            output_ctx.print_line("  Composition:");
 
             if let Some(bond_points) = &compose.bond_points {
                 if !bond_points.is_empty() {
-                    output_ctx.print("    Bond Points:");
+                    output_ctx.print_line("    Bond Points:");
                     for bp in bond_points {
                         let loc = if let Some(ref after) = bp.after_step {
                             format!("after {}", after)
@@ -836,32 +848,32 @@ fn execute_show(args: &FormulaShowArgs, output_ctx: &OutputContext) -> crate::Re
                         } else {
                             "standalone".to_string()
                         };
-                        output_ctx.print(&format!("      - {} ({})", bp.id, loc));
+                        output_ctx.print_line(&format!("      - {} ({})", bp.id, loc));
                     }
                 }
             }
 
             if let Some(expand_rules) = &compose.expand {
                 if !expand_rules.is_empty() {
-                    output_ctx.print("    Expansions:");
+                    output_ctx.print_line("    Expansions:");
                     for e in expand_rules {
-                        output_ctx.print(&format!("      - {} -> {}", e.target, e.with));
+                        output_ctx.print_line(&format!("      - {} -> {}", e.target, e.with));
                     }
                 }
             }
 
             if let Some(map_rules) = &compose.r#map {
                 if !map_rules.is_empty() {
-                    output_ctx.print("    Maps:");
+                    output_ctx.print_line("    Maps:");
                     for m in map_rules {
-                        output_ctx.print(&format!("      - {} -> {}", m.select, m.with));
+                        output_ctx.print_line(&format!("      - {} -> {}", m.select, m.with));
                     }
                 }
             }
 
             if let Some(aspects) = &compose.aspects {
                 if !aspects.is_empty() {
-                    output_ctx.print(&format!("    Aspects: {}", aspects.join(", ")));
+                    output_ctx.print_line(&format!("    Aspects: {}", aspects.join(", ")));
                 }
             }
         }
@@ -923,7 +935,7 @@ fn execute_convert(args: &FormulaConvertArgs, output_ctx: &OutputContext) -> cra
         .map_err(|e| BeadsError::Config(format!("converting to TOML: {}", e)))?;
 
     if args.stdout {
-        output_ctx.print(&toml_string);
+        output_ctx.print_line(&toml_string);
         return Ok(());
     }
 
@@ -937,16 +949,16 @@ fn execute_convert(args: &FormulaConvertArgs, output_ctx: &OutputContext) -> cra
             "from": json_path.to_string_lossy(),
             "to": toml_path.to_string_lossy(),
         });
-        output_ctx.print(&serde_json::to_string_pretty(&output).unwrap_or_default());
+        output_ctx.json_pretty(&output);
     } else {
-        output_ctx.print(&format!("Converted: {}", toml_path.display()));
+        output_ctx.print_line(&format!("Converted: {}", toml_path.display()));
     }
 
     if args.delete {
         fs::remove_file(&json_path)
             .map_err(|e| BeadsError::Config(format!("deleting {}: {}", json_path.display(), e)))?;
         if !use_json {
-            output_ctx.print(&format!("Deleted: {}", json_path.display()));
+            output_ctx.print_line(&format!("Deleted: {}", json_path.display()));
         }
     }
 
@@ -979,7 +991,7 @@ fn convert_all_formulas(output_ctx: &OutputContext, use_json: bool) -> crate::Re
             let toml_path = path.with_extension("formula.toml");
             if toml_path.exists() {
                 if !use_json {
-                    output_ctx.print(&format!("Skipped (TOML exists): {}", fname));
+                    output_ctx.print_line(&format!("Skipped (TOML exists): {}", fname));
                 }
                 continue;
             }
@@ -989,7 +1001,7 @@ fn convert_all_formulas(output_ctx: &OutputContext, use_json: bool) -> crate::Re
                 Ok(f) => f,
                 Err(e) => {
                     if !use_json {
-                        output_ctx.print(&format!("Error parsing {}: {}", fname, e));
+                        output_ctx.print_line(&format!("Error parsing {}: {}", fname, e));
                     }
                     errors += 1;
                     continue;
@@ -1000,7 +1012,7 @@ fn convert_all_formulas(output_ctx: &OutputContext, use_json: bool) -> crate::Re
                 Ok(s) => s,
                 Err(e) => {
                     if !use_json {
-                        output_ctx.print(&format!("Error converting {}: {}", fname, e));
+                        output_ctx.print_line(&format!("Error converting {}: {}", fname, e));
                     }
                     errors += 1;
                     continue;
@@ -1009,14 +1021,14 @@ fn convert_all_formulas(output_ctx: &OutputContext, use_json: bool) -> crate::Re
 
             if let Err(e) = fs::write(&toml_path, &toml_string) {
                 if !use_json {
-                    output_ctx.print(&format!("Error writing {}: {}", toml_path.display(), e));
+                    output_ctx.print_line(&format!("Error writing {}: {}", toml_path.display(), e));
                 }
                 errors += 1;
                 continue;
             }
 
             if !use_json {
-                output_ctx.print(&format!("Converted: {}", toml_path.display()));
+                output_ctx.print_line(&format!("Converted: {}", toml_path.display()));
             }
             converted += 1;
         }
@@ -1027,11 +1039,11 @@ fn convert_all_formulas(output_ctx: &OutputContext, use_json: bool) -> crate::Re
             "converted": converted,
             "errors": errors,
         });
-        output_ctx.print(&serde_json::to_string_pretty(&output).unwrap_or_default());
+        output_ctx.json_pretty(&output);
     } else {
-        output_ctx.print(&format!("Converted {} formulas", converted));
+        output_ctx.print_line(&format!("Converted {} formulas", converted));
         if errors > 0 {
-            output_ctx.print(&format!(" ({} errors)", errors));
+            output_ctx.print_line(&format!(" ({} errors)", errors));
         }
     }
 
@@ -1092,7 +1104,7 @@ fn print_steps_tree(steps: &[crate::formula::Step], indent: &str, output_ctx: &O
             format!(" ({})", step.r#type.as_deref().unwrap_or("task"))
         };
 
-        output_ctx.print(&format!(
+        output_ctx.print_line(&format!(
             "{}{} {}: {}{}{}",
             indent,
             connector,

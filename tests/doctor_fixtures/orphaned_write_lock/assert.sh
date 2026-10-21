@@ -6,36 +6,30 @@ stage="${2:?usage: assert.sh <target_dir> <stage>}"
 tool_bin="${TOOL_BIN:-br}"
 cd "$target_dir"
 
-# Force the stale branch by overriding the staleness threshold to 0.
-# Any non-future mtime is then "older than threshold" → warn.
-export BR_DOCTOR_STALE_LOCK_THRESHOLD_SECS=0
-
 case "$stage" in
   detect)
+    # A leftover `.write.lock` that nobody holds is the normal state of
+    # every workspace that has ever run `br`. The doctor must not warn
+    # about it: an mtime-based detector made `br doctor` exit non-zero
+    # on healthy repositories.
     out=$("$tool_bin" doctor --json 2>/dev/null) || true
     echo "$out" | jq -e '
       .checks[] | select(.name == "write_lock")
-      | select(.status == "warn" or .status == "error")
+      | select(.status == "ok")
     ' >/dev/null || {
-      echo "ASSERT FAIL[$stage]: write_lock not flagged" >&2
+      echo "ASSERT FAIL[$stage]: write_lock flagged a leftover, unheld lock file" >&2
       echo "$out" | jq '.checks[] | select(.name == "write_lock")' >&2
       exit 1
     }
-    # reason must be stale_mtime.
+    # The reason must be one of the two non-warning verdicts. "not_held"
+    # is the leftover-file case; "held_by_this_run" is what the CLI sees,
+    # because the doctor holds the workspace write lock for its own run.
     echo "$out" | jq -e '
       .checks[] | select(.name == "write_lock")
-      | .details.reason == "stale_mtime"
+      | .details.reason == "not_held" or .details.reason == "held_by_this_run"
     ' >/dev/null || {
-      echo "ASSERT FAIL[$stage]: details.reason != stale_mtime" >&2
+      echo "ASSERT FAIL[$stage]: unexpected write_lock reason" >&2
       echo "$out" | jq '.checks[] | select(.name == "write_lock") | .details' >&2
-      exit 1
-    }
-    # recommended_fix must include the .stale-<ts> rename suffix.
-    echo "$out" | jq -e '
-      .checks[] | select(.name == "write_lock")
-      | .details.recommended_fix | test("\\.stale-")
-    ' >/dev/null || {
-      echo "ASSERT FAIL[$stage]: recommended_fix missing .stale- rename suffix" >&2
       exit 1
     }
     ;;

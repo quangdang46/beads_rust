@@ -69,6 +69,10 @@ pub enum ErrorCode {
     /// Invalid issue ID format
     InvalidId,
 
+    // === Not Found Errors (exit code 3) ===
+    /// A named entity that is not an issue was not found
+    NotFound,
+
     // === Validation Errors (exit code 4) ===
     /// Field validation failed
     ValidationFailed,
@@ -154,6 +158,8 @@ impl ErrorCode {
             Self::AmbiguousId => "AMBIGUOUS_ID",
             Self::IdCollision => "ID_COLLISION",
             Self::InvalidId => "INVALID_ID",
+            // Not found
+            Self::NotFound => "NOT_FOUND",
             // Validation
             Self::ValidationFailed => "VALIDATION_FAILED",
             Self::InvalidStatus => "INVALID_STATUS",
@@ -236,6 +242,7 @@ impl ErrorCode {
             | Self::AmbiguousId
             | Self::IdCollision
             | Self::InvalidId
+            | Self::NotFound
             | Self::NothingToDo => 3,
             // Validation (4)
             Self::ValidationFailed
@@ -563,6 +570,10 @@ impl StructuredError {
             BeadsError::IssueNotFound { id } => {
                 (ErrorCode::IssueNotFound, Some(json!({"searched_id": id})))
             }
+            BeadsError::NotFound { kind, id } => (
+                ErrorCode::NotFound,
+                Some(json!({"kind": kind, "id": id})),
+            ),
             BeadsError::AmbiguousId { partial, matches } => (
                 ErrorCode::AmbiguousId,
                 Some(json!({"partial_id": partial, "matches": matches})),
@@ -746,6 +757,18 @@ impl StructuredError {
             BeadsError::IssueNotFound { .. } => {
                 Some("Run 'br list' to see available issues.".to_string())
             }
+            BeadsError::NotFound { kind, .. } => Some(match kind.as_str() {
+                "merge slot" => {
+                    "Run 'br merge-slot create' to create the merge slot.".to_string()
+                }
+                "federation peer" => {
+                    "Run 'br federation list' to see configured peers.".to_string()
+                }
+                "worktree" => {
+                    "Run 'br worktree list' to see available worktrees.".to_string()
+                }
+                _ => format!("Run 'br list' to see available {kind}s."),
+            }),
             BeadsError::InvalidPriority { priority } => {
                 Some(detect_priority_intent(priority).map_or_else(
                     || PRIORITY_SHORT_HINT.to_string(),
@@ -1242,6 +1265,58 @@ mod tests {
         assert_eq!(
             context["wrapper_context"],
             "failed to rename recovered database"
+        );
+    }
+
+    /// A named entity that is not an issue must report NOT_FOUND (exit 3),
+    /// not INTERNAL_ERROR (exit 1), and must never have its message prefix
+    /// doubled.
+    #[test]
+    fn test_not_found_error_maps_to_not_found_code() {
+        let err = BeadsError::NotFound {
+            kind: "merge slot".to_string(),
+            id: "bd-abc-merge-slot".to_string(),
+        };
+
+        let structured = StructuredError::from_error(&err);
+        assert_eq!(structured.code, ErrorCode::NotFound);
+        assert_eq!(structured.code.exit_code(), 3);
+        assert_eq!(structured.message, "merge slot not found: bd-abc-merge-slot");
+        assert!(!structured.retryable);
+
+        let context = structured.context.expect("context");
+        assert_eq!(context["kind"], "merge slot");
+        assert_eq!(context["id"], "bd-abc-merge-slot");
+
+        let hint = structured.hint.expect("hint");
+        assert!(
+            hint.contains("br merge-slot create"),
+            "hint should name the remediation: {hint}"
+        );
+    }
+
+    #[test]
+    fn test_not_found_error_code_is_stable() {
+        assert_eq!(ErrorCode::NotFound.as_str(), "NOT_FOUND");
+    }
+
+    /// The prefix must appear exactly once. Re-wrapping an already-formatted
+    /// message produced "Internal error: Internal error: ...".
+    #[test]
+    fn test_not_found_human_output_has_single_prefix() {
+        let err = BeadsError::NotFound {
+            kind: "federation peer".to_string(),
+            id: "peer1".to_string(),
+        };
+
+        let plain = StructuredError::from_error(&err).to_human(false);
+        assert!(
+            plain.starts_with("Error: federation peer not found: peer1"),
+            "unexpected error rendering: {plain}"
+        );
+        assert!(
+            !plain.contains("Internal error: Internal error:"),
+            "error prefix must not be doubled: {plain}"
         );
     }
 
