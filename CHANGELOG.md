@@ -15,7 +15,7 @@ This changelog is organized by capability rather than diff order. Each version s
 
 ---
 
-## Unreleased
+## v0.2.1 -- 2026-10-21 (Release)
 
 **Bugs found by exercising the released binary against a real repository.**
 
