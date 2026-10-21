@@ -15,12 +15,17 @@ This changelog is organized by capability rather than diff order. Each version s
 
 ---
 
-## v0.2.1 -- 2026-10-21 (Release)
+## v0.2.2 -- 2026-10-21 (Release)
 
 **Bugs found by exercising the released binary against a real repository.**
 
 Every entry below was reproduced against the published `v0.2.0` binary driving the
 `beads_rust` repository itself, then fixed and covered by a regression test.
+
+> The `v0.2.1` tag exists but was never published: the release workflow's
+> reliability gate rejected it because two golden files (`agent_baseline`'s
+> `version.json` and the `doctor_output` snapshot) still recorded the old
+> behaviour. Those goldens are regenerated in this release.
 
 #### Fixed
 

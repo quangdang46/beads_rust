@@ -22,7 +22,7 @@ OK permissions.beads_dir: <platform message>
 OK config.yaml: config.yaml parses cleanly (99 bytes)
 OK metadata.json: metadata.json parses cleanly (62 bytes); declared targets exist on disk
 OK binary_version: Running br X.Y.Z; no beads_rust Cargo.toml reachable from .beads/ — not flagging
-OK write_lock: .beads/.write.lock is 0s old (within 300s threshold); not stale
+OK write_lock: .beads/.write.lock is held by this doctor run; expected
 OK routes.targets: No local or town routes.jsonl present (route targets are optional)
 OK startup_cache.health
 OK permissions.jsonl_world_writable
