@@ -1845,7 +1845,7 @@ br formula <COMMAND> [OPTIONS]
 - `expand <file>` — Preview what issues would be created
 
 **Options:**
-- `--json`, `-j` — Output raw JSON
+- `--json` — Output raw JSON
 - `--robot` — Output machine-readable JSON
 - `--var <KEY=VALUE>` — Variable overrides (expand only)
 
