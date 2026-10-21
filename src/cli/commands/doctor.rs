@@ -7982,11 +7982,7 @@ fn push_write_lock_non_file(meta: &fs::Metadata, checks: &mut Vec<CheckResult>) 
 /// command: the advisory lock is released when the writer exits, but the
 /// file is deliberately never unlinked (unlinking it would race with a
 /// waiter holding an open handle to the old inode).
-fn push_write_lock_not_held(
-    lock_path: &Path,
-    meta: &fs::Metadata,
-    checks: &mut Vec<CheckResult>,
-) {
+fn push_write_lock_not_held(lock_path: &Path, meta: &fs::Metadata, checks: &mut Vec<CheckResult>) {
     let mut details = serde_json::json!({
         "path": lock_path.display().to_string(),
         "reason": "not_held",
@@ -8040,9 +8036,7 @@ fn push_write_lock_held_by_this_run(lock_path: &Path, checks: &mut Vec<CheckResu
         checks,
         "write_lock",
         CheckStatus::Ok,
-        Some(
-            ".beads/.write.lock is held by this doctor run; expected".to_string(),
-        ),
+        Some(".beads/.write.lock is held by this doctor run; expected".to_string()),
         Some(serde_json::json!({
             "path": lock_path.display().to_string(),
             "reason": "held_by_this_run",
@@ -8051,11 +8045,7 @@ fn push_write_lock_held_by_this_run(lock_path: &Path, checks: &mut Vec<CheckResu
 }
 
 /// The lock state could not be determined.
-fn push_write_lock_unknown(
-    lock_path: &Path,
-    meta: &fs::Metadata,
-    checks: &mut Vec<CheckResult>,
-) {
+fn push_write_lock_unknown(lock_path: &Path, meta: &fs::Metadata, checks: &mut Vec<CheckResult>) {
     let mut details = serde_json::json!({
         "path": lock_path.display().to_string(),
         "reason": "lock_state_unknown",

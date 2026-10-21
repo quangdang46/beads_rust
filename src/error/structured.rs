@@ -570,10 +570,9 @@ impl StructuredError {
             BeadsError::IssueNotFound { id } => {
                 (ErrorCode::IssueNotFound, Some(json!({"searched_id": id})))
             }
-            BeadsError::NotFound { kind, id } => (
-                ErrorCode::NotFound,
-                Some(json!({"kind": kind, "id": id})),
-            ),
+            BeadsError::NotFound { kind, id } => {
+                (ErrorCode::NotFound, Some(json!({"kind": kind, "id": id})))
+            }
             BeadsError::AmbiguousId { partial, matches } => (
                 ErrorCode::AmbiguousId,
                 Some(json!({"partial_id": partial, "matches": matches})),
@@ -758,15 +757,11 @@ impl StructuredError {
                 Some("Run 'br list' to see available issues.".to_string())
             }
             BeadsError::NotFound { kind, .. } => Some(match kind.as_str() {
-                "merge slot" => {
-                    "Run 'br merge-slot create' to create the merge slot.".to_string()
-                }
+                "merge slot" => "Run 'br merge-slot create' to create the merge slot.".to_string(),
                 "federation peer" => {
                     "Run 'br federation list' to see configured peers.".to_string()
                 }
-                "worktree" => {
-                    "Run 'br worktree list' to see available worktrees.".to_string()
-                }
+                "worktree" => "Run 'br worktree list' to see available worktrees.".to_string(),
                 _ => format!("Run 'br list' to see available {kind}s."),
             }),
             BeadsError::InvalidPriority { priority } => {
@@ -1281,7 +1276,10 @@ mod tests {
         let structured = StructuredError::from_error(&err);
         assert_eq!(structured.code, ErrorCode::NotFound);
         assert_eq!(structured.code.exit_code(), 3);
-        assert_eq!(structured.message, "merge slot not found: bd-abc-merge-slot");
+        assert_eq!(
+            structured.message,
+            "merge slot not found: bd-abc-merge-slot"
+        );
         assert!(!structured.retryable);
 
         let context = structured.context.expect("context");

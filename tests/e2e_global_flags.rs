@@ -1864,10 +1864,7 @@ fn e2e_json_flag_wisp_list_empty_is_json_array() {
         assert!(list.status.success(), "{args:?} failed: {}", list.stderr);
 
         let payload: Value = serde_json::from_str(list.stdout.trim()).unwrap_or_else(|e| {
-            panic!(
-                "{args:?} must emit JSON ({e}); stdout was: {}",
-                list.stdout
-            )
+            panic!("{args:?} must emit JSON ({e}); stdout was: {}", list.stdout)
         });
         assert_eq!(
             payload,
@@ -1891,7 +1888,11 @@ fn e2e_json_flag_wisp_close_emits_json() {
         ["wisp", "create", "closable", "--json"],
         "wisp_create_for_close",
     );
-    assert!(create.status.success(), "wisp create failed: {}", create.stderr);
+    assert!(
+        create.status.success(),
+        "wisp create failed: {}",
+        create.stderr
+    );
     let created: Value = serde_json::from_str(create.stdout.trim()).expect("create json");
     let id = created["id"].as_str().expect("wisp id").to_string();
 
@@ -1900,7 +1901,11 @@ fn e2e_json_flag_wisp_close_emits_json() {
         ["wisp", "close", &id, "--json"],
         "wisp_close_json",
     );
-    assert!(close.status.success(), "wisp close failed: {}", close.stderr);
+    assert!(
+        close.status.success(),
+        "wisp close failed: {}",
+        close.stderr
+    );
 
     let payload: Value = serde_json::from_str(close.stdout.trim())
         .unwrap_or_else(|e| panic!("wisp close --json must emit JSON ({e}): {}", close.stdout));
@@ -2019,7 +2024,11 @@ fn e2e_formula_text_output_has_line_breaks() {
         expand.stderr
     );
 
-    let lines: Vec<&str> = expand.stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+    let lines: Vec<&str> = expand
+        .stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
     assert!(
         lines.len() >= 4,
         "expected the formula preview on separate lines, got: {:?}",

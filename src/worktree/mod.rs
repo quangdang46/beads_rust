@@ -185,7 +185,10 @@ pub fn create_worktree(
     if branch_exists(&root, &branch_name) {
         capture_git(&root, &["worktree", "add", &resolved_str, &branch_name])?;
     } else {
-        capture_git(&root, &["worktree", "add", "-b", &branch_name, &resolved_str])?;
+        capture_git(
+            &root,
+            &["worktree", "add", "-b", &branch_name, &resolved_str],
+        )?;
     }
 
     // Add to .gitignore if worktree is inside the repo root

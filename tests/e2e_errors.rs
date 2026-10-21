@@ -3461,7 +3461,10 @@ fn e2e_federation_remove_missing_reports_not_found_once() {
         ["federation", "remove", "nosuchpeer"],
         "federation_remove_missing",
     );
-    assert!(!remove.status.success(), "removing a missing peer should fail");
+    assert!(
+        !remove.status.success(),
+        "removing a missing peer should fail"
+    );
     assert_eq!(
         remove.status.code(),
         Some(3),
@@ -3484,7 +3487,10 @@ fn e2e_federation_remove_missing_reports_not_found_once() {
         ["federation", "remove", "nosuchpeer", "--json"],
         "federation_remove_missing_json",
     );
-    assert!(!remove_json.status.success(), "removing a missing peer should fail");
+    assert!(
+        !remove_json.status.success(),
+        "removing a missing peer should fail"
+    );
 
     let payload: Value = serde_json::from_str(remove_json.stdout.trim()).unwrap_or_else(|e| {
         panic!(
