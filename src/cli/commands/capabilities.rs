@@ -248,7 +248,7 @@ const SAFETY: &[SafetyCapability] = &[
     },
     SafetyCapability {
         name: "structured_errors",
-        guarantee: "machine-output contexts render structured error envelopes on stderr.",
+        guarantee: "machine-output contexts render structured error envelopes on stdout (stderr if a document was already emitted).",
     },
 ];
 
@@ -808,8 +808,8 @@ fn command_contract(name: &str) -> CommandContract {
         "init" => CommandContract {
             operation: "write",
             workspace: "none",
-            machine_output: &["text"],
-            examples: &["br init --prefix br"],
+            machine_output: &["json", "text"],
+            examples: &["br init --prefix br", "br init --json"],
         },
         "create" => CommandContract {
             operation: "write",
@@ -969,6 +969,137 @@ fn command_contract(name: &str) -> CommandContract {
             workspace: "required",
             machine_output: &["json", "toon", "text"],
             examples: parent_examples(name),
+        },
+        "admin" => CommandContract {
+            operation: "mixed",
+            workspace: "required",
+            machine_output: &["json", "toon", "text"],
+            examples: &["br admin stats --json", "br admin doctor --json"],
+        },
+        "export" => CommandContract {
+            operation: "mixed",
+            workspace: "required",
+            machine_output: &["json", "text"],
+            examples: &["br export --format jsonl", "br export --json"],
+        },
+        "import" => CommandContract {
+            operation: "write",
+            workspace: "required",
+            machine_output: &["json", "toon", "text"],
+            examples: &["br import issues.jsonl --json"],
+        },
+        "sql" => CommandContract {
+            operation: "read",
+            workspace: "required",
+            machine_output: &["text"],
+            examples: &["br sql \"SELECT count(*) FROM issues\""],
+        },
+        "web" => CommandContract {
+            operation: "read",
+            workspace: "optional",
+            machine_output: &["text"],
+            examples: &["br web --port 8080"],
+        },
+        "worktree" => CommandContract {
+            operation: "mixed",
+            workspace: "required",
+            machine_output: &["json", "text"],
+            examples: &["br worktree list --json", "br worktree info --json"],
+        },
+        "federation" => CommandContract {
+            operation: "mixed",
+            workspace: "required",
+            machine_output: &["json", "text"],
+            examples: &["br federation list --json", "br federation info --json"],
+        },
+        "merge-slot" => CommandContract {
+            operation: "mixed",
+            workspace: "required",
+            machine_output: &["json", "text"],
+            examples: &["br merge-slot check --json", "br merge-slot status --json"],
+        },
+        "hooks" => CommandContract {
+            operation: "mixed",
+            workspace: "required",
+            machine_output: &["json", "toon", "text"],
+            examples: &["br hooks list --json", "br hooks install --json"],
+        },
+        "gate" => CommandContract {
+            operation: "mixed",
+            workspace: "required",
+            machine_output: &["json", "toon", "text"],
+            examples: &["br gate list --json", "br gate report --json"],
+        },
+        "formula" => CommandContract {
+            operation: "mixed",
+            workspace: "required",
+            machine_output: &["json", "toon", "text"],
+            examples: &["br formula list --json", "br formula validate --json"],
+        },
+        "mol" => CommandContract {
+            operation: "mixed",
+            workspace: "required",
+            machine_output: &["json", "toon", "text"],
+            examples: &["br mol swarm validate --json", "br mol bond --json"],
+        },
+        "wisp" => CommandContract {
+            operation: "mixed",
+            workspace: "required",
+            machine_output: &["json", "text"],
+            examples: &["br wisp list --json", "br wisp create --json"],
+        },
+        "template" => CommandContract {
+            operation: "mixed",
+            workspace: "required",
+            machine_output: &["json", "toon", "text"],
+            examples: &["br template list --json", "br template show --json"],
+        },
+        "recipes" => CommandContract {
+            operation: "mixed",
+            workspace: "required",
+            machine_output: &["json", "text"],
+            examples: &["br recipes list --json"],
+        },
+        "rename" => CommandContract {
+            operation: "write",
+            workspace: "required",
+            machine_output: &["json", "text"],
+            examples: &["br rename <old-id> <new-id> --json"],
+        },
+        "rename-prefix" => CommandContract {
+            operation: "write",
+            workspace: "required",
+            machine_output: &["json", "text"],
+            examples: &["br rename-prefix <old> <new> --json"],
+        },
+        "quickstart" => CommandContract {
+            operation: "read",
+            workspace: "optional",
+            machine_output: &["text"],
+            examples: &["br quickstart"],
+        },
+        "custom-status" => CommandContract {
+            operation: "mixed",
+            workspace: "required",
+            machine_output: &["json", "text"],
+            examples: &[
+                "br custom-status list --json",
+                "br custom-status add --json",
+            ],
+        },
+        "custom-type" => CommandContract {
+            operation: "mixed",
+            workspace: "required",
+            machine_output: &["json", "text"],
+            examples: &["br custom-type list --json", "br custom-type add --json"],
+        },
+        // Hidden Codex CLI lifecycle hook: stdout is always a JSON hook
+        // response; there is no user-selectable output format.
+        "codex-hook" => CommandContract {
+            operation: "mixed",
+            workspace: "none",
+            machine_output: &["json"],
+            examples: &[],
         },
         "graph" | "orphans" | "changelog" | "lint" | "audit" => CommandContract {
             operation: "mixed",

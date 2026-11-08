@@ -1401,9 +1401,27 @@ fn e2e_routing_label_add_sets_invoking_workspace_last_touched_for_follow_up_upda
         label_add.stderr
     );
 
+    // `br update` with no IDs requires an interactive TTY; verify the label
+    // add recorded the external issue as last-touched in the invoking
+    // workspace, then pass that ID explicitly.
+    let last_touched = fs::read_to_string(last_touched_path(&main_workspace))
+        .expect("read last-touched")
+        .trim()
+        .to_string();
+    assert_eq!(
+        last_touched, external_id,
+        "label add should record the external issue as last-touched"
+    );
+
     let update = run_br(
         &main_workspace,
-        ["update", "--status", "in_progress", "--json"],
+        [
+            "update",
+            last_touched.as_str(),
+            "--status",
+            "in_progress",
+            "--json",
+        ],
         "update_follow_up_using_label_last_touched",
     );
     assert!(update.status.success(), "update failed: {}", update.stderr);
@@ -1640,9 +1658,27 @@ fn e2e_routing_comments_add_sets_invoking_workspace_last_touched_for_follow_up_u
         comment_add.stderr
     );
 
+    // `br update` with no IDs requires an interactive TTY; verify the comments
+    // add recorded the external issue as last-touched in the invoking
+    // workspace, then pass that ID explicitly.
+    let last_touched = fs::read_to_string(last_touched_path(&main_workspace))
+        .expect("read last-touched")
+        .trim()
+        .to_string();
+    assert_eq!(
+        last_touched, external_id,
+        "comments add should record the external issue as last-touched"
+    );
+
     let update = run_br(
         &main_workspace,
-        ["update", "--status", "in_progress", "--json"],
+        [
+            "update",
+            last_touched.as_str(),
+            "--status",
+            "in_progress",
+            "--json",
+        ],
         "update_follow_up_using_comment_last_touched",
     );
     assert!(update.status.success(), "update failed: {}", update.stderr);
@@ -1815,9 +1851,27 @@ fn e2e_routing_dep_add_sets_invoking_workspace_last_touched_for_follow_up_update
         dep_add.stderr
     );
 
+    // `br update` with no IDs requires an interactive TTY; verify the dep add
+    // recorded the child issue as last-touched in the invoking workspace,
+    // then pass that ID explicitly.
+    let last_touched = fs::read_to_string(last_touched_path(&main_workspace))
+        .expect("read last-touched")
+        .trim()
+        .to_string();
+    assert_eq!(
+        last_touched, child_id,
+        "dep add should record the issue side as last-touched"
+    );
+
     let update = run_br(
         &main_workspace,
-        ["update", "--title", "Updated after routed dep", "--json"],
+        [
+            "update",
+            last_touched.as_str(),
+            "--title",
+            "Updated after routed dep",
+            "--json",
+        ],
         "update_follow_up_using_dep_last_touched",
     );
     assert!(update.status.success(), "update failed: {}", update.stderr);
@@ -2188,15 +2242,18 @@ fn e2e_routing_lint_external_issue_via_main_workspace() {
     let issue_id = create_json["id"].as_str().expect("issue id").to_string();
 
     let routed_issue = routed_partial_id(&issue_id);
+    // Lint exits 1 when template warnings are present (bd parity); the routed
+    // issue intentionally lacks sections, so allow warnings to keep exit 0
+    // while still asserting on the JSON payload.
     let lint = run_br(
         &main_workspace,
-        ["lint", &routed_issue, "--json"],
+        ["lint", &routed_issue, "--json", "--allow-warnings"],
         "lint_external_via_route",
     );
     assert!(lint.status.success(), "lint failed: {}", lint.stderr);
 
     let json: Value = serde_json::from_str(&extract_json_payload(&lint.stdout)).expect("lint json");
-    assert_eq!(json["issues"].as_u64(), Some(1));
+    assert_eq!(json["checked"].as_u64(), Some(1));
     let results = json["results"].as_array().expect("lint results");
     assert_eq!(results[0]["id"].as_str(), Some(issue_id.as_str()));
     assert!(

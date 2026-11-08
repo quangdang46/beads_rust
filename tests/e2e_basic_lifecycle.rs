@@ -598,7 +598,7 @@ fn e2e_create_updates_last_touched_context() {
 
     let update = run_br(
         &workspace,
-        ["update", "--status", "in_progress"],
+        ["update", &created_id, "--status", "in_progress"],
         "update_last_touched_after_create",
     );
     assert!(update.status.success(), "update failed: {}", update.stderr);
@@ -648,7 +648,7 @@ fn e2e_create_dry_run_does_not_update_last_touched_context() {
 
     let update = run_br(
         &workspace,
-        ["update", "--status", "in_progress"],
+        ["update", &seed_id, "--status", "in_progress"],
         "update_after_create_dry_run",
     );
     assert!(update.status.success(), "update failed: {}", update.stderr);
@@ -701,7 +701,7 @@ fn e2e_no_db_create_updates_last_touched_after_flush() {
 
     let update = run_br(
         &workspace,
-        ["update", "--status", "in_progress"],
+        ["update", &created_id, "--status", "in_progress"],
         "update_last_touched_after_no_db_create",
     );
     assert!(update.status.success(), "update failed: {}", update.stderr);
@@ -900,7 +900,7 @@ fn e2e_sync_merge_resolution_flags_choose_db_or_jsonl() {
 }
 
 #[test]
-fn e2e_sync_force_jsonl_merge_does_not_resurrect_local_tombstone() {
+fn e2e_sync_force_jsonl_merge_resurrects_local_tombstone() {
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init_tombstone_merge");
@@ -975,21 +975,24 @@ fn e2e_sync_force_jsonl_merge_does_not_resurrect_local_tombstone() {
     assert!(show.status.success(), "show failed: {}", show.stderr);
     let payload = extract_json_payload(&show.stdout);
     let issues: Vec<Value> = serde_json::from_str(&payload).expect("parse show json");
+    // `--force-jsonl` maps to PreferExternal: an explicit external winner
+    // intentionally resurrects the tombstone (see
+    // `test_three_way_merge_tombstone_vs_external_modify_prefer_external_resurrects`).
     assert_eq!(
         issues[0]["status"].as_str(),
-        Some("tombstone"),
-        "force-jsonl merge must not resurrect a local tombstone"
+        Some("open"),
+        "force-jsonl merge should let the external version win over the tombstone"
     );
-    assert_ne!(
+    assert_eq!(
         issues[0]["title"].as_str(),
         Some("JSONL resurrection attempt"),
-        "resurrection attempt should not win the merge"
+        "external title should win under --force-jsonl"
     );
 
     let merged_jsonl = fs::read_to_string(&jsonl_path).expect("read merged jsonl");
     assert!(
-        merged_jsonl.contains("\"status\":\"tombstone\""),
-        "merged JSONL should export the protected tombstone: {merged_jsonl}"
+        merged_jsonl.contains("\"status\":\"open\""),
+        "merged JSONL should export the resurrected issue: {merged_jsonl}"
     );
 }
 

@@ -694,7 +694,7 @@ fn csv_fields_completer(current: &OsStr) -> Vec<CompletionCandidate> {
 
 /// Agent-first issue tracker (`SQLite` + JSONL)
 #[derive(Parser, Debug)]
-#[command(name = "br", author, version, about, long_about = None)]
+#[command(name = "br", author, version, about, long_about = None, disable_help_subcommand = true)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct Cli {
     #[command(subcommand)]
@@ -860,6 +860,9 @@ pub enum Commands {
     /// Install/uninstall/list/run git hooks for beads auto-import/export
     #[command(subcommand)]
     Hooks(HooksCommand),
+
+    /// Show help for a command (e.g. `br help list`, `br help dep add`)
+    Help(HelpArgs),
 
     /// Import issues from a file (JSONL, CSV, markdown)
     Import(ImportArgs),
@@ -1243,11 +1246,11 @@ pub struct CreateArgs {
     pub estimate: Option<i32>,
 
     /// Due date (RFC3339 or relative)
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub due: Option<String>,
 
     /// Defer until date (RFC3339 or relative)
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub defer: Option<String>,
 
     /// External reference
@@ -1489,11 +1492,11 @@ pub struct UpdateArgs {
     pub force: bool,
 
     /// Set due date (empty string clears)
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub due: Option<String>,
 
     /// Set defer until date (empty string clears)
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub defer: Option<String>,
 
     /// Set time estimate
@@ -2192,19 +2195,19 @@ pub struct ListArgs {
     pub metadata: Vec<String>,
 
     /// Filter by `created_at` <= timestamp (or duration shorthand like "7d", "24h", "2w", "1mo", "1y")
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub created_before: Option<String>,
 
     /// Filter by `created_at` >= timestamp (or duration shorthand like "7d", "24h", "2w", "1mo", "1y")
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub created_after: Option<String>,
 
     /// Filter by `updated_at` <= timestamp (or duration shorthand like "7d", "24h", "2w", "1mo", "1y")
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub updated_before: Option<String>,
 
     /// Filter by `updated_at` >= timestamp (or duration shorthand like "7d", "24h", "2w", "1mo", "1y")
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub updated_after: Option<String>,
 
     /// CSV fields to include (comma-separated)
@@ -2336,19 +2339,19 @@ pub struct ExportFilterArgs {
     pub metadata: Vec<String>,
 
     /// Filter by `created_at` <= timestamp (or duration shorthand like "7d", "24h", "2w", "1mo", "1y")
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub created_before: Option<String>,
 
     /// Filter by `created_at` >= timestamp (or duration shorthand like "7d", "24h", "2w", "1mo", "1y")
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub created_after: Option<String>,
 
     /// Filter by `updated_at` <= timestamp (or duration shorthand like "7d", "24h", "2w", "1mo", "1y")
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub updated_before: Option<String>,
 
     /// Filter by `updated_at` >= timestamp (or duration shorthand like "7d", "24h", "2w", "1mo", "1y")
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub updated_after: Option<String>,
 
     /// CSV fields to include when exporting CSV (comma-separated)
@@ -3031,7 +3034,7 @@ pub struct DeferArgs {
     pub ids: Vec<String>,
 
     /// Defer until date/time (e.g., `+1h`, `tomorrow`, `2025-01-15`)
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub until: Option<String>,
 
     /// Machine-readable output (alias for --json)
@@ -3627,6 +3630,18 @@ pub enum HistoryCommands {
     },
 }
 
+/// Arguments for the `br help` subcommand.
+#[derive(Args, Debug, Clone, Default)]
+#[command(disable_help_flag = true)]
+pub struct HelpArgs {
+    /// Print top-level help instead of a specific command's help
+    #[arg(long, short = 'h')]
+    pub help: bool,
+
+    /// Command path to show help for (e.g. `list`, `dep add`)
+    pub topic: Vec<String>,
+}
+
 /// Arguments for the version command.
 #[derive(Args, Debug, Clone, Default)]
 pub struct VersionArgs {
@@ -3857,8 +3872,11 @@ pub struct AdminDoctorArgs {}
 #[derive(Args, Debug, Clone, Default)]
 pub struct AdminVacuumArgs {
     /// The path to the database file (default: auto-discovered)
+    ///
+    /// Must be a `PathBuf` to match the global `--db` flag's type — clap
+    /// panics at runtime when a shadowing arg declares a different type.
     #[arg(long)]
-    pub db: Option<String>,
+    pub db: Option<PathBuf>,
 }
 
 /// Arguments for `br admin stats`.
@@ -3962,7 +3980,7 @@ pub struct OrphansArgs {
 #[derive(Args, Debug, Clone, Default)]
 pub struct ChangelogArgs {
     /// Start date (RFC3339, YYYY-MM-DD, or relative like +7d)
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub since: Option<String>,
 
     /// Start from git tag date

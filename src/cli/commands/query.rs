@@ -10,6 +10,7 @@ use crate::output::{OutputContext, OutputMode};
 use chrono::{DateTime, Utc};
 use rich_rust::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 use tracing::{debug, info};
 
 /// Prefix for saved query keys in the config table.
@@ -74,6 +75,31 @@ pub struct SavedFilters {
     pub deferred: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub overdue: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pinned: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mol_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metadata: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_before: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_after: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_before: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_after: Option<String>,
+    /// Query DSL filter expression (`-F`/`--filter`), e.g. "status=open AND priority>1".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
+    /// CSV fields projection (`--fields`); persisted so `query run` reproduces
+    /// the same column selection as `query save`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fields: Option<String>,
 }
 
 /// Helper for serde `skip_serializing_if` (requires reference signature).
@@ -105,6 +131,17 @@ impl From<&ListArgs> for SavedFilters {
             reverse: args.reverse,
             deferred: args.deferred,
             overdue: args.overdue,
+            owner: args.owner.clone(),
+            pinned: args.pinned,
+            mol_type: args.mol_type.clone(),
+            external_ref: args.external_ref.clone(),
+            metadata: args.metadata.clone(),
+            created_before: args.created_before.clone(),
+            created_after: args.created_after.clone(),
+            updated_before: args.updated_before.clone(),
+            updated_after: args.updated_after.clone(),
+            filter: args.filter.clone(),
+            fields: args.fields.clone(),
         }
     }
 }
@@ -140,22 +177,33 @@ impl SavedFilters {
             wrap: false,
             format: None,
             stats: false,
-            fields: None,
-            // Filter fields — use defaults
-            owner: None,
-            pinned: false,
-            mol_type: None,
-            external_ref: None,
-            metadata: Vec::new(),
-            created_before: None,
-            created_after: None,
-            updated_before: None,
-            updated_after: None,
-            filter: None,
+            // Filter fields — restored from the saved query
+            owner: self.owner.clone(),
+            pinned: self.pinned,
+            mol_type: self.mol_type.clone(),
+            external_ref: self.external_ref.clone(),
+            metadata: self.metadata.clone(),
+            created_before: self.created_before.clone(),
+            created_after: self.created_after.clone(),
+            updated_before: self.updated_before.clone(),
+            updated_after: self.updated_after.clone(),
+            filter: self.filter.clone(),
+            fields: self.fields.clone(),
         }
     }
 
-    /// Merge CLI args onto saved filters. CLI takes precedence for non-empty values.
+    /// Merge CLI args onto saved filters.
+    ///
+    /// Merge semantics are AND: a `query run` invocation narrows the saved
+    /// query rather than replacing it. Fields that are OR-ed within a single
+    /// flag value (`--status`, `--type`, `--priority`, `--id`) are intersected;
+    /// AND-ed list fields (`--label`, `--label-any`, `--metadata`) are unioned;
+    /// scalar options keep the CLI value when present (two different scalars
+    /// cannot both hold, so the explicit CLI flag wins).
+    ///
+    /// When an intersected set becomes empty (e.g. saved `status=open` +
+    /// `-s closed`), the merged query must match nothing; an impossible `--id`
+    /// sentinel is injected to express the empty set.
     #[must_use]
     pub fn merge_with_cli(&self, cli: &ListArgs) -> ListArgs {
         let base = self.to_list_args();
@@ -166,42 +214,62 @@ impl SavedFilters {
             (Some(assignee), true) => (Some(assignee.clone()), true),
             (None, false) => (base.assignee.clone(), base.unassigned),
         };
+
+        let mut force_empty = false;
+        let (status, status_empty) =
+            intersect_filters(&cli.status, &base.status, str::to_lowercase);
+        force_empty |= status_empty;
+        let (type_, type_empty) = intersect_filters(&cli.type_, &base.type_, str::to_lowercase);
+        force_empty |= type_empty;
+        let (priority, priority_empty) = intersect_filters(&cli.priority, &base.priority, |v| {
+            crate::model::Priority::from_str(v)
+                .map(|p| p.0.to_string())
+                .unwrap_or_else(|_| v.to_lowercase())
+        });
+        force_empty |= priority_empty;
+        let (id, id_empty) = intersect_filters(&cli.id, &base.id, std::string::ToString::to_string);
+        force_empty |= id_empty;
+
+        // AND-ed list fields: union (deduplicated) so both saved and CLI
+        // constraints apply simultaneously.
+        let label = union_filters(&cli.label, &base.label);
+        let label_any = union_filters(&cli.label_any, &base.label_any);
+        let metadata = union_filters(&cli.metadata, &base.metadata);
+
+        // Priority bounds tighten: the effective range is the intersection.
+        let priority_min = match (cli.priority_min, base.priority_min) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        let priority_max = match (cli.priority_max, base.priority_max) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+
+        // DSL filters combine with AND; parenthesize so precedence is preserved.
+        let filter = match (&base.filter, &cli.filter) {
+            (Some(saved), Some(extra)) => Some(format!("({saved}) AND ({extra})")),
+            (Some(saved), None) => Some(saved.clone()),
+            (None, Some(extra)) => Some(extra.clone()),
+            (None, None) => None,
+        };
+
+        let mut merged_id = id;
+        if force_empty {
+            merged_id.push(EMPTY_INTERSECTION_SENTINEL_ID.to_string());
+        }
+
         ListArgs {
-            // Vec fields: CLI overrides if non-empty
-            status: if cli.status.is_empty() {
-                base.status
-            } else {
-                cli.status.clone()
-            },
-            type_: if cli.type_.is_empty() {
-                base.type_
-            } else {
-                cli.type_.clone()
-            },
-            id: if cli.id.is_empty() {
-                base.id
-            } else {
-                cli.id.clone()
-            },
-            label: if cli.label.is_empty() {
-                base.label
-            } else {
-                cli.label.clone()
-            },
-            label_any: if cli.label_any.is_empty() {
-                base.label_any
-            } else {
-                cli.label_any.clone()
-            },
-            priority: if cli.priority.is_empty() {
-                base.priority
-            } else {
-                cli.priority.clone()
-            },
+            status,
+            type_,
+            id: merged_id,
+            label,
+            label_any,
+            priority,
             // Option fields: CLI overrides if Some
             assignee,
-            priority_min: cli.priority_min.or(base.priority_min),
-            priority_max: cli.priority_max.or(base.priority_max),
+            priority_min,
+            priority_max,
             title_contains: cli.title_contains.clone().or(base.title_contains),
             desc_contains: cli.desc_contains.clone().or(base.desc_contains),
             notes_contains: cli.notes_contains.clone().or(base.notes_contains),
@@ -220,24 +288,68 @@ impl SavedFilters {
             wrap: cli.wrap,
             format: cli.format,
             stats: cli.stats,
-            fields: cli.fields.clone(),
+            fields: cli.fields.clone().or(base.fields),
             // Extended filter fields — CLI overrides if present
             owner: cli.owner.clone().or(base.owner),
             pinned: cli.pinned || base.pinned,
             mol_type: cli.mol_type.clone().or(base.mol_type),
-            external_ref: cli.external_ref.clone().or(base.external_ref.clone()),
-            metadata: if cli.metadata.is_empty() {
-                base.metadata.clone()
-            } else {
-                cli.metadata.clone()
-            },
+            external_ref: cli
+                .external_ref
+                .clone()
+                .or_else(|| base.external_ref.clone()),
+            metadata,
             created_before: cli.created_before.clone().or(base.created_before),
             created_after: cli.created_after.clone().or(base.created_after),
             updated_before: cli.updated_before.clone().or(base.updated_before),
             updated_after: cli.updated_after.clone().or(base.updated_after),
-            filter: cli.filter.clone().or(base.filter),
+            filter,
         }
     }
+}
+
+/// Sentinel issue ID that can never exist, used to express an empty
+/// intersection between saved and CLI filters (`query run q -s closed` on a
+/// query saved with `status=open` must match nothing, not everything).
+const EMPTY_INTERSECTION_SENTINEL_ID: &str = "__br_empty_intersection__";
+
+/// Intersect two OR-semantics filter lists. Returns the merged values plus a
+/// flag that is `true` when both sides were non-empty but share no value —
+/// i.e. the conjunction is unsatisfiable.
+fn intersect_filters(
+    cli: &[String],
+    saved: &[String],
+    canonical: impl Fn(&str) -> String,
+) -> (Vec<String>, bool) {
+    if cli.is_empty() {
+        return (saved.to_vec(), false);
+    }
+    if saved.is_empty() {
+        return (cli.to_vec(), false);
+    }
+    let saved_keys: std::collections::HashSet<String> =
+        saved.iter().map(|v| canonical(v)).collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut merged = Vec::new();
+    let mut empty = true;
+    for value in cli {
+        let key = canonical(value);
+        if saved_keys.contains(&key) && seen.insert(key) {
+            merged.push(value.clone());
+            empty = false;
+        }
+    }
+    (merged, empty)
+}
+
+/// Union two AND-semantics filter lists, deduplicated by exact value.
+fn union_filters(cli: &[String], saved: &[String]) -> Vec<String> {
+    let mut merged = saved.to_vec();
+    for value in cli {
+        if !merged.iter().any(|existing| existing == value) {
+            merged.push(value.clone());
+        }
+    }
+    merged
 }
 
 /// JSON output for query list.
@@ -684,25 +796,135 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_cli_overrides_saved() {
+    fn test_merge_cli_intersects_saved_vec_filters() {
         let saved = SavedFilters {
-            status: vec!["open".to_string()],
+            status: vec!["open".to_string(), "in_progress".to_string()],
             assignee: Some("alice".to_string()),
             limit: Some(10),
             ..Default::default()
         };
 
         let cli = ListArgs {
-            status: vec!["closed".to_string()], // Override
-            assignee: None,                     // Keep saved
-            limit: Some(20),                    // Override
+            status: vec!["open".to_string(), "closed".to_string()], // ∩ = [open]
+            assignee: None,                                         // Keep saved
+            limit: Some(20),                                        // Override
             ..Default::default()
         };
 
         let merged = saved.merge_with_cli(&cli);
-        assert_eq!(merged.status, vec!["closed"]); // CLI wins
+        assert_eq!(merged.status, vec!["open"]); // AND semantics
         assert_eq!(merged.assignee, Some("alice".to_string())); // Saved retained
         assert_eq!(merged.limit, Some(20)); // CLI wins
+        assert!(
+            !merged
+                .id
+                .iter()
+                .any(|id| id == EMPTY_INTERSECTION_SENTINEL_ID)
+        );
+    }
+
+    #[test]
+    fn test_merge_disjoint_vec_filters_match_nothing() {
+        let saved = SavedFilters {
+            status: vec!["open".to_string()],
+            ..Default::default()
+        };
+
+        let cli = ListArgs {
+            status: vec!["closed".to_string()],
+            ..Default::default()
+        };
+
+        let merged = saved.merge_with_cli(&cli);
+        assert_eq!(merged.status, Vec::<String>::new());
+        assert!(
+            merged
+                .id
+                .iter()
+                .any(|id| id == EMPTY_INTERSECTION_SENTINEL_ID),
+            "empty intersection must inject the no-match sentinel: {:?}",
+            merged.id
+        );
+    }
+
+    #[test]
+    fn test_merge_type_intersection() {
+        let saved = SavedFilters {
+            type_: vec!["bug".to_string(), "task".to_string()],
+            ..Default::default()
+        };
+
+        let cli = ListArgs {
+            type_: vec!["bug".to_string()],
+            ..Default::default()
+        };
+
+        let merged = saved.merge_with_cli(&cli);
+        assert_eq!(merged.type_, vec!["bug"]);
+    }
+
+    #[test]
+    fn test_merge_labels_union() {
+        let saved = SavedFilters {
+            label: vec!["backend".to_string()],
+            ..Default::default()
+        };
+        let cli = ListArgs {
+            label: vec!["urgent".to_string(), "backend".to_string()],
+            ..Default::default()
+        };
+
+        let merged = saved.merge_with_cli(&cli);
+        // AND semantics: issue must carry both saved and CLI labels.
+        assert_eq!(merged.label, vec!["backend", "urgent"]);
+    }
+
+    #[test]
+    fn test_merge_filter_exprs_and_combine() {
+        let saved = SavedFilters {
+            filter: Some("status=open".to_string()),
+            ..Default::default()
+        };
+        let cli = ListArgs {
+            filter: Some("priority>1".to_string()),
+            ..Default::default()
+        };
+
+        let merged = saved.merge_with_cli(&cli);
+        assert_eq!(
+            merged.filter.as_deref(),
+            Some("(status=open) AND (priority>1)")
+        );
+
+        let cli_only = saved.merge_with_cli(&ListArgs::default());
+        assert_eq!(cli_only.filter.as_deref(), Some("status=open"));
+    }
+
+    #[test]
+    fn test_merge_persists_extended_filter_fields() {
+        let saved = SavedFilters {
+            owner: Some("carol".to_string()),
+            pinned: true,
+            mol_type: Some("swarm".to_string()),
+            external_ref: Some("JIRA-1".to_string()),
+            metadata: vec!["component=api".to_string()],
+            created_after: Some("7d".to_string()),
+            updated_before: Some("2026-01-01".to_string()),
+            filter: Some("status=open".to_string()),
+            fields: Some("id,title".to_string()),
+            ..Default::default()
+        };
+
+        let merged = saved.merge_with_cli(&ListArgs::default());
+        assert_eq!(merged.owner.as_deref(), Some("carol"));
+        assert!(merged.pinned);
+        assert_eq!(merged.mol_type.as_deref(), Some("swarm"));
+        assert_eq!(merged.external_ref.as_deref(), Some("JIRA-1"));
+        assert_eq!(merged.metadata, vec!["component=api"]);
+        assert_eq!(merged.created_after.as_deref(), Some("7d"));
+        assert_eq!(merged.updated_before.as_deref(), Some("2026-01-01"));
+        assert_eq!(merged.filter.as_deref(), Some("status=open"));
+        assert_eq!(merged.fields.as_deref(), Some("id,title"));
     }
 
     #[test]
@@ -828,14 +1050,14 @@ mod tests {
     #[test]
     fn test_saved_filters_default() {
         let filters = SavedFilters::default();
-        assert!(filters.status.is_empty());
-        assert!(filters.type_.is_empty());
+        assert_eq!(filters.status, Vec::<String>::new());
+        assert_eq!(filters.type_, Vec::<String>::new());
         assert!(filters.assignee.is_none());
         assert!(!filters.unassigned);
-        assert!(filters.id.is_empty());
-        assert!(filters.label.is_empty());
-        assert!(filters.label_any.is_empty());
-        assert!(filters.priority.is_empty());
+        assert_eq!(filters.id, Vec::<String>::new());
+        assert_eq!(filters.label, Vec::<String>::new());
+        assert_eq!(filters.label_any, Vec::<String>::new());
+        assert_eq!(filters.priority, Vec::<String>::new());
         assert!(filters.priority_min.is_none());
         assert!(filters.priority_max.is_none());
         assert!(filters.title_contains.is_none());
@@ -969,23 +1191,26 @@ mod tests {
         assert_eq!(merged.label_any, vec!["maybe"]);
         assert_eq!(merged.priority, vec!["1", "2"]);
 
-        // CLI with non-empty vecs - cli values win
+        // CLI with non-empty vecs - OR-fields intersect (AND semantics)
         let cli2 = ListArgs {
-            status: vec!["closed".to_string()],
-            type_: vec!["feature".to_string()],
-            id: vec!["xyz".to_string()],
-            label: vec!["low".to_string()],
+            status: vec!["open".to_string(), "closed".to_string()],
+            type_: vec!["bug".to_string(), "feature".to_string()],
+            id: vec!["abc".to_string(), "xyz".to_string()],
+            label: vec!["urgent".to_string(), "extra".to_string()],
             label_any: vec!["high".to_string()],
-            priority: vec!["3".to_string()],
+            priority: vec!["1".to_string(), "2".to_string(), "3".to_string()],
             ..Default::default()
         };
         let merged2 = saved.merge_with_cli(&cli2);
-        assert_eq!(merged2.status, vec!["closed"]);
-        assert_eq!(merged2.type_, vec!["feature"]);
-        assert_eq!(merged2.id, vec!["xyz"]);
-        assert_eq!(merged2.label, vec!["low"]);
-        assert_eq!(merged2.label_any, vec!["high"]);
-        assert_eq!(merged2.priority, vec!["3"]);
+        assert_eq!(merged2.status, vec!["open"]);
+        assert_eq!(merged2.type_, vec!["bug"]);
+        assert_eq!(merged2.id, vec!["abc"]);
+        // labels union: saved {urgent} + cli {urgent, extra}
+        assert_eq!(merged2.label, vec!["urgent", "extra"]);
+        // label_any unions as well (OR-within cannot express cross-AND exactly)
+        assert_eq!(merged2.label_any, vec!["maybe", "high"]);
+        // priority intersect on canonical values: {1,2} ∩ {1,2,3} = {1,2}
+        assert_eq!(merged2.priority, vec!["1".to_string(), "2".to_string()]);
     }
 
     #[test]
@@ -1032,7 +1257,8 @@ mod tests {
         let merged2 = saved.merge_with_cli(&cli2);
         assert_eq!(merged2.assignee, Some("bob".to_string()));
         assert_eq!(merged2.priority_min, Some(2));
-        assert_eq!(merged2.priority_max, Some(4));
+        // Bounds tighten (intersection): min(3, 4) = 3, not the CLI's 4.
+        assert_eq!(merged2.priority_max, Some(3));
         assert_eq!(merged2.title_contains, Some("feature".to_string()));
         assert_eq!(merged2.desc_contains, Some("new".to_string()));
         assert_eq!(merged2.notes_contains, Some("todo".to_string()));
@@ -1099,6 +1325,17 @@ mod tests {
             reverse: true,
             deferred: true,
             overdue: true,
+            owner: Some("dave".to_string()),
+            pinned: true,
+            mol_type: Some("swarm".to_string()),
+            external_ref: Some("EXT-9".to_string()),
+            metadata: vec!["team=core".to_string()],
+            created_before: Some("30d".to_string()),
+            created_after: Some("7d".to_string()),
+            updated_before: Some("1d".to_string()),
+            updated_after: Some("1h".to_string()),
+            filter: Some("status=open".to_string()),
+            fields: Some("id,title,status".to_string()),
         };
 
         let json = serde_json::to_string(&filters).unwrap();
@@ -1124,6 +1361,17 @@ mod tests {
         assert_eq!(parsed.reverse, filters.reverse);
         assert_eq!(parsed.deferred, filters.deferred);
         assert_eq!(parsed.overdue, filters.overdue);
+        assert_eq!(parsed.owner, filters.owner);
+        assert_eq!(parsed.pinned, filters.pinned);
+        assert_eq!(parsed.mol_type, filters.mol_type);
+        assert_eq!(parsed.external_ref, filters.external_ref);
+        assert_eq!(parsed.metadata, filters.metadata);
+        assert_eq!(parsed.created_before, filters.created_before);
+        assert_eq!(parsed.created_after, filters.created_after);
+        assert_eq!(parsed.updated_before, filters.updated_before);
+        assert_eq!(parsed.updated_after, filters.updated_after);
+        assert_eq!(parsed.filter, filters.filter);
+        assert_eq!(parsed.fields, filters.fields);
     }
 
     #[test]
@@ -1143,21 +1391,26 @@ mod tests {
     }
 
     #[test]
-    fn test_from_list_args_ignores_output_fields() {
+    fn test_from_list_args_captures_filters_but_not_presentation() {
         let args = ListArgs {
             status: vec!["open".to_string()],
             long: true,
             pretty: true,
             format: Some(OutputFormat::Json),
             fields: Some("id,title".to_string()),
+            filter: Some("status=open".to_string()),
+            owner: Some("carol".to_string()),
             ..Default::default()
         };
 
         let filters = SavedFilters::from(&args);
 
-        // Saved filters should not contain output-related fields
-        // They're simply not part of the SavedFilters struct
         assert_eq!(filters.status, vec!["open"]);
+        // --fields and -F are persisted (they affect `query run` output).
+        assert_eq!(filters.fields.as_deref(), Some("id,title"));
+        assert_eq!(filters.filter.as_deref(), Some("status=open"));
+        assert_eq!(filters.owner.as_deref(), Some("carol"));
+        // Presentation flags are not part of SavedFilters at all.
     }
 
     #[test]

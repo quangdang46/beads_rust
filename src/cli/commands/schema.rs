@@ -118,9 +118,13 @@ struct CommandShape {
     /// the `schemas` map (e.g. `"Issue"`, `"IssueWithCounts"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     item_schema: Option<&'static str>,
-    /// On error, the same command writes an `ErrorEnvelope` to stderr.
+    /// On error, the same command emits an `ErrorEnvelope`. The channel is
+    /// global, not per-command: in `--json`/`--toon` mode the envelope goes
+    /// to **stdout** (one parseable stream) unless the command already
+    /// wrote a document — then it goes to stderr so stdout stays a single
+    /// document; in human mode it is human-readable on stderr.
     /// True for commands that may fail per-call (e.g. lookups that miss).
-    error_envelope_on_stderr: bool,
+    may_emit_error_envelope: bool,
     /// Free-form notes describing quirks of the envelope.
     #[serde(skip_serializing_if = "Option::is_none")]
     notes: Option<&'static str>,
@@ -171,13 +175,48 @@ pub fn execute(
             ctx.json_pretty(&payload);
         }
         OutputFormat::Text | OutputFormat::Csv => {
-            // Text mode: still emit JSON Schema; don't require callers to pass --json.
-            let json = serde_json::to_string_pretty(&payload).expect("schema payload is JSON");
-            println!("{json}");
+            // Text mode renders a human-readable digest of the same
+            // payload; `--format json`/`toon` remain the machine channels.
+            render_schema_text(&payload);
         }
     }
 
     Ok(())
+}
+
+/// Human-readable rendering of [`SchemaOutput`] for `--format text`.
+///
+/// Lists schema names and per-command envelope shapes instead of emitting
+/// the JSON document, so `br schema --format text` is genuinely distinct
+/// from `--format json`.
+fn render_schema_text(payload: &SchemaOutput) {
+    println!(
+        "br schema — generated {}",
+        payload.generated_at.to_rfc3339()
+    );
+
+    if !payload.schemas.is_empty() {
+        println!("\nSchemas ({}):", payload.schemas.len());
+        for name in payload.schemas.keys() {
+            println!("  {name}");
+        }
+    }
+
+    if !payload.commands.is_empty() {
+        println!("\nCommands ({}):", payload.commands.len());
+        for (name, shape) in &payload.commands {
+            let item_schema = shape.item_schema.unwrap_or("-");
+            let items_at = shape.items_at.unwrap_or("-");
+            println!(
+                "  {name:<24} {:<8} jq: {:<10} items_at: {:<10} item_schema: {item_schema}",
+                shape.shape, shape.jq_filter, items_at
+            );
+        }
+    }
+
+    if payload.schemas.is_empty() && payload.commands.is_empty() {
+        println!("\n(no schema data for this target)");
+    }
 }
 
 fn build_schemas(target: SchemaTarget) -> BTreeMap<&'static str, Schema> {
@@ -273,11 +312,11 @@ fn insert_issue_command_shapes(commands: &mut BTreeMap<&'static str, CommandShap
             jq_filter: ".[0]",
             items_at: Some("."),
             item_schema: Some("IssueDetails"),
-            error_envelope_on_stderr: true,
+            may_emit_error_envelope: true,
             notes: Some(
                 "Always a single-element array on success (wrapped for shape consistency \
-                 with list-style commands). On a missing id, an ErrorEnvelope is written \
-                 to stderr and exit code is non-zero.",
+                 with list-style commands). On a missing id, an ErrorEnvelope is emitted \
+                 and exit code is non-zero.",
             ),
         },
     );
@@ -288,7 +327,7 @@ fn insert_issue_command_shapes(commands: &mut BTreeMap<&'static str, CommandShap
             jq_filter: ".issues[]",
             items_at: Some(".issues"),
             item_schema: Some("IssueWithCounts"),
-            error_envelope_on_stderr: false,
+            may_emit_error_envelope: false,
             notes: Some(
                 "Wrapper object with pagination metadata; iterate with `.issues[]`. \
                  The wrapper exists so totals/cursors can ride alongside the rows.",
@@ -302,7 +341,7 @@ fn insert_issue_command_shapes(commands: &mut BTreeMap<&'static str, CommandShap
             jq_filter: ".[]",
             items_at: Some("."),
             item_schema: Some("ReadyIssue"),
-            error_envelope_on_stderr: false,
+            may_emit_error_envelope: false,
             notes: None,
         },
     );
@@ -313,7 +352,7 @@ fn insert_issue_command_shapes(commands: &mut BTreeMap<&'static str, CommandShap
             jq_filter: ".[]",
             items_at: Some("."),
             item_schema: Some("BlockedIssue"),
-            error_envelope_on_stderr: false,
+            may_emit_error_envelope: false,
             notes: None,
         },
     );
@@ -324,7 +363,7 @@ fn insert_issue_command_shapes(commands: &mut BTreeMap<&'static str, CommandShap
             jq_filter: ".[]",
             items_at: Some("."),
             item_schema: Some("StaleIssue"),
-            error_envelope_on_stderr: false,
+            may_emit_error_envelope: false,
             notes: None,
         },
     );
@@ -335,7 +374,7 @@ fn insert_issue_command_shapes(commands: &mut BTreeMap<&'static str, CommandShap
             jq_filter: ".[]",
             items_at: Some("."),
             item_schema: Some("IssueWithCounts"),
-            error_envelope_on_stderr: false,
+            may_emit_error_envelope: false,
             notes: None,
         },
     );
@@ -349,9 +388,9 @@ fn insert_comment_command_shapes(commands: &mut BTreeMap<&'static str, CommandSh
             jq_filter: ".[]",
             items_at: Some("."),
             item_schema: None,
-            error_envelope_on_stderr: true,
+            may_emit_error_envelope: true,
             notes: Some(
-                "Empty array if no comments. ErrorEnvelope on stderr if the issue id \
+                "Empty array if no comments. ErrorEnvelope is emitted if the issue id \
                  cannot be resolved.",
             ),
         },
@@ -366,7 +405,7 @@ fn insert_dependency_command_shapes(commands: &mut BTreeMap<&'static str, Comman
             jq_filter: ".[]",
             items_at: Some("."),
             item_schema: Some("TreeNode"),
-            error_envelope_on_stderr: true,
+            may_emit_error_envelope: true,
             notes: Some("Pre-order traversal; each node carries a `depth` field."),
         },
     );
@@ -377,7 +416,7 @@ fn insert_dependency_command_shapes(commands: &mut BTreeMap<&'static str, Comman
             jq_filter: ".[]",
             items_at: Some("."),
             item_schema: None,
-            error_envelope_on_stderr: true,
+            may_emit_error_envelope: true,
             notes: None,
         },
     );
@@ -394,7 +433,7 @@ fn insert_aggregate_command_shapes(commands: &mut BTreeMap<&'static str, Command
         jq_filter: ".",
         items_at: None,
         item_schema: Some("Statistics"),
-        error_envelope_on_stderr: false,
+        may_emit_error_envelope: false,
         notes: Some("Single aggregate object."),
     };
     let mut status_alias = stats_base.clone();
@@ -409,7 +448,7 @@ fn insert_aggregate_command_shapes(commands: &mut BTreeMap<&'static str, Command
             jq_filter: ".count",
             items_at: None,
             item_schema: None,
-            error_envelope_on_stderr: false,
+            may_emit_error_envelope: false,
             notes: Some(
                 "Ungrouped `br count --json`; scalar count under `.count`. \
                  Grouped variants use the `count --by` entry.",
@@ -423,7 +462,7 @@ fn insert_aggregate_command_shapes(commands: &mut BTreeMap<&'static str, Command
             jq_filter: ".groups[]",
             items_at: Some(".groups"),
             item_schema: Some("CountGroup"),
-            error_envelope_on_stderr: false,
+            may_emit_error_envelope: false,
             notes: Some(
                 "For `br count --by <status|priority|type|assignee|label> --json`. \
                  The wrapper object also includes `total`.",
@@ -437,7 +476,7 @@ fn insert_aggregate_command_shapes(commands: &mut BTreeMap<&'static str, Command
             jq_filter: ".",
             items_at: None,
             item_schema: None,
-            error_envelope_on_stderr: false,
+            may_emit_error_envelope: false,
             notes: Some("Workspace info object (paths, mode, config snapshot)."),
         },
     );
@@ -448,7 +487,7 @@ fn insert_aggregate_command_shapes(commands: &mut BTreeMap<&'static str, Command
             jq_filter: ".",
             items_at: None,
             item_schema: None,
-            error_envelope_on_stderr: false,
+            may_emit_error_envelope: false,
             notes: Some(
                 "Machine-readable command, feature, safety, exit-code, and env-var inventory.",
             ),
@@ -461,7 +500,7 @@ fn insert_aggregate_command_shapes(commands: &mut BTreeMap<&'static str, Command
             jq_filter: ".",
             items_at: None,
             item_schema: None,
-            error_envelope_on_stderr: false,
+            may_emit_error_envelope: false,
             notes: Some(
                 "JSON/TOON modes wrap the concise agent guide; text mode prints the guide directly.",
             ),
@@ -474,7 +513,7 @@ fn insert_aggregate_command_shapes(commands: &mut BTreeMap<&'static str, Command
             jq_filter: ".claims[]",
             items_at: Some(".claims"),
             item_schema: Some("CoordinationClaimRow"),
-            error_envelope_on_stderr: false,
+            may_emit_error_envelope: false,
             notes: Some(
                 "Read-only object with workspace summary and `claims[]` rows. The \
                  full envelope schema is `CoordinationStatusOutput`.",
@@ -491,7 +530,7 @@ fn insert_label_command_shapes(commands: &mut BTreeMap<&'static str, CommandShap
             jq_filter: ".[]",
             items_at: Some("."),
             item_schema: None,
-            error_envelope_on_stderr: false,
+            may_emit_error_envelope: false,
             notes: None,
         },
     );
@@ -631,8 +670,8 @@ mod tests {
         assert_eq!(stats.items_at, status.items_at);
         assert_eq!(stats.item_schema, status.item_schema);
         assert_eq!(
-            stats.error_envelope_on_stderr,
-            status.error_envelope_on_stderr
+            stats.may_emit_error_envelope,
+            status.may_emit_error_envelope
         );
     }
 

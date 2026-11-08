@@ -1060,26 +1060,17 @@ fn e2e_harness_label_rename_nonexistent() {
     let init = ws.init_br();
     init.assert_success();
 
-    // Try to rename non-existent label
-    // Expected behavior: success with affected_issues=0 (no-op)
+    // Renaming a non-existent label is an error (exit 3), not a silent no-op.
     let rename = ws.run_br(
         ["label", "rename", "nonexistent", "newname", "--json"],
         "rename_nonexistent",
     );
 
-    // Should succeed (exit code 0) - it's a no-op
-    rename.assert_success();
+    assert!(!rename.success, "rename of nonexistent label should fail");
 
-    // Verify JSON shows 0 affected issues
     let payload = harness_extract_json(&rename.stdout);
     let result: Value = serde_json::from_str(&payload).expect("rename json");
-
-    assert_eq!(result["old_name"], "nonexistent");
-    assert_eq!(result["new_name"], "newname");
-    assert_eq!(
-        result["affected_issues"], 0,
-        "affected_issues should be 0 for nonexistent label"
-    );
+    assert_eq!(result["error"]["code"], "NOT_FOUND");
 
     ws.finish(true);
 }

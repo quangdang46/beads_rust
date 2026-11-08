@@ -189,8 +189,18 @@ fn cmd_release(
     prefix: &str,
     ctx: &OutputContext,
 ) -> Result<()> {
+    // When the slot is free its metadata holder is empty; passing the actor
+    // name as the expected holder would trip the "slot held by X, not Y"
+    // mismatch check before the idempotent free-slot path runs. Pass an
+    // empty expected-holder in that case so release succeeds (or promotes
+    // the next waiter).
+    let status = storage
+        .merge_slot_check(prefix)
+        .map_err(anyhow::Error::new)?;
+    let expected_holder = if status.holder.is_empty() { "" } else { actor };
+
     storage
-        .merge_slot_release(actor, actor, prefix)
+        .merge_slot_release(expected_holder, actor, prefix)
         .map_err(anyhow::Error::new)?;
 
     if ctx.is_json() {

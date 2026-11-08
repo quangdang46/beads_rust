@@ -294,7 +294,15 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
 
-    /// Tombstone protection: a tombstoned issue in left cannot be resurrected by right.
+    /// Tombstone vs external modify: the merge strategy decides the outcome.
+    ///
+    /// Local tombstoned the issue while external modified it — a delete-vs-
+    /// modify. Under `Manual` this surfaces as an explicit
+    /// `ConflictType::DeleteVsModify` (conflicts must not be silently
+    /// discarded). `PreferLocal`/`PreferNewer` keep the tombstone and mark it
+    /// protected (external `updated_at` equals local here, so PreferNewer
+    /// keeps local). `PreferExternal` is the explicit external-wins escape
+    /// hatch and resurrects the external edit.
     #[test]
     fn three_way_merge_tombstone_protection(
         suffix in "[a-z0-9]{4,8}",
@@ -322,13 +330,42 @@ proptest! {
         tombstones.insert(id.clone());
 
         let report = three_way_merge(&ctx, strategy, Some(&tombstones));
-        prop_assert!(
-            report.tombstone_protected.contains(&id),
-            "Tombstoned issue should be protected, got report: {:?}",
-            report,
-        );
-        let resurrected = report.kept.iter().any(|i| i.id == id && i.status != Status::Tombstone);
-        prop_assert!(!resurrected, "Tombstoned issue must not be resurrected");
+        let kept_for_id = report.kept.iter().find(|i| i.id == id);
+
+        match strategy {
+            ConflictResolution::Manual => {
+                prop_assert!(
+                    report
+                        .conflicts
+                        .iter()
+                        .any(|(cid, kind)| cid == &id && *kind == ConflictType::DeleteVsModify),
+                    "Manual strategy must surface a DeleteVsModify conflict, got report: {:?}",
+                    report,
+                );
+                prop_assert!(
+                    kept_for_id.is_none(),
+                    "Manual strategy must not auto-resolve the delete-vs-modify"
+                );
+            }
+            ConflictResolution::PreferLocal | ConflictResolution::PreferNewer => {
+                prop_assert!(
+                    report.tombstone_protected.contains(&id),
+                    "Tombstoned issue should be protected under {strategy:?}, got report: {:?}",
+                    report,
+                );
+                prop_assert!(
+                    kept_for_id.is_some_and(|issue| issue.status == Status::Tombstone),
+                    "Tombstoned issue must be kept as a tombstone under {strategy:?}"
+                );
+            }
+            ConflictResolution::PreferExternal => {
+                // Explicit external-wins: the external edit is resurrected.
+                prop_assert!(
+                    kept_for_id.is_some_and(|issue| issue.status != Status::Tombstone),
+                    "PreferExternal should keep the external (non-tombstone) version"
+                );
+            }
+        }
     }
 
     /// All issues present and identical in all three maps → all kept, no deletes/conflicts.

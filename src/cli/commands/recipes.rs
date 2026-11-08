@@ -78,14 +78,38 @@ fn execute_list(args: &RecipesListArgs, ctx: &OutputContext) -> Result<()> {
 fn execute_install(args: &RecipesInstallArgs, ctx: &OutputContext) -> Result<()> {
     let project_dir = resolve_project_dir(args.project_dir.as_deref())?;
 
-    let recipe = recipes::find_recipe(&args.recipe).ok_or_else(|| BeadsError::Internal {
-        message: format!(
-            "Unknown recipe '{}'. Use `br recipes list` to see available recipes.",
-            args.recipe
-        ),
+    let recipe = recipes::find_recipe(&args.recipe).ok_or_else(|| {
+        BeadsError::validation(
+            "recipe",
+            format!(
+                "unknown recipe '{}'. Use `br recipes list` to see available recipes.",
+                args.recipe
+            ),
+        )
     })?;
 
-    let written = recipes::install_recipe(recipe, &project_dir)?;
+    // Hooks-type recipes (Claude Code, Gemini CLI) have no single `path`;
+    // `install_recipe` would try to write to the project directory itself.
+    // Write a SessionStart settings file for each configured settings path.
+    let written = if recipe.recipe_type == crate::recipes::RecipeType::Hooks {
+        install_hooks_recipe(recipe, &project_dir)?
+    } else {
+        recipes::install_recipe(recipe, &project_dir)?
+    };
+
+    if ctx.is_json() {
+        let files: Vec<serde_json::Value> = written
+            .iter()
+            .map(|p| serde_json::Value::String(p.display().to_string()))
+            .collect();
+        let output = serde_json::to_string_pretty(&serde_json::json!({
+            "recipe": recipe.name,
+            "type": recipe.recipe_type.as_str(),
+            "files": files,
+        }))?;
+        println!("{output}");
+        return Ok(());
+    }
 
     ctx.print_line(&format!(
         "Installed recipe '{}' ({} file(s)):",
@@ -129,4 +153,76 @@ fn resolve_project_dir(dir: Option<&str>) -> Result<PathBuf> {
         Some(d) => Ok(Path::new(d).to_path_buf()),
         None => Ok(env::current_dir()?),
     }
+}
+
+/// Settings JSON that registers `br prime` as a SessionStart hook.
+///
+/// Claude Code (`settings.json` / `settings.local.json`) and Gemini CLI
+/// (`settings.json`) both accept this hooks shape.
+const SESSION_START_HOOKS_JSON: &str = r#"{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "br prime",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
+"#;
+
+/// Install a hooks-type recipe (Claude Code, Gemini CLI).
+///
+/// These recipes declare `paths` (e.g. `.claude/settings.local.json`,
+/// `~/.claude/settings.json`) rather than a single `path`. For each entry
+/// we expand a leading `~/` against `$HOME`, create parent directories,
+/// and write the SessionStart hooks settings — merging into an existing
+/// JSON object when possible so we don't clobber user settings.
+fn install_hooks_recipe(
+    recipe: &crate::recipes::Recipe,
+    project_dir: &Path,
+) -> Result<Vec<PathBuf>> {
+    let mut written = Vec::new();
+    for raw in recipe.paths {
+        let target = if let Some(stripped) = raw.strip_prefix("~/") {
+            let home = env::var("HOME").map_err(|_| {
+                BeadsError::validation("HOME", "cannot expand '~/' recipe path: HOME is not set")
+            })?;
+            Path::new(&home).join(stripped)
+        } else {
+            project_dir.join(raw)
+        };
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        merge_or_write_settings(&target)?;
+        written.push(target);
+    }
+    Ok(written)
+}
+
+/// Write hooks settings to `target`, preserving an existing JSON object.
+fn merge_or_write_settings(target: &Path) -> Result<()> {
+    let mut doc: serde_json::Map<String, serde_json::Value> = match std::fs::read_to_string(target)
+    {
+        Ok(existing) => match serde_json::from_str::<serde_json::Value>(&existing) {
+            Ok(serde_json::Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        },
+        Err(_) => serde_json::Map::new(),
+    };
+    if let Ok(serde_json::Value::Object(hooks)) =
+        serde_json::from_str::<serde_json::Value>(SESSION_START_HOOKS_JSON)
+            .map(|v| v.get("hooks").cloned().unwrap_or(serde_json::Value::Null))
+    {
+        doc.insert("hooks".to_string(), serde_json::Value::Object(hooks));
+    }
+    let out = serde_json::to_string_pretty(&serde_json::Value::Object(doc))?;
+    std::fs::write(target, format!("{out}\n"))?;
+    Ok(())
 }

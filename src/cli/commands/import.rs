@@ -11,7 +11,7 @@ use crate::model::*;
 use crate::output::OutputContext;
 use crate::util::markdown_import;
 use chrono::Utc;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::str::FromStr;
 
 /// Execute the import command.
@@ -115,9 +115,7 @@ fn execute_inner(
         }
         ExportFormat::Json => {
             let content = std::fs::read_to_string(&input_path)?;
-            let issues: Vec<Issue> = serde_json::from_str(&content).map_err(|e| {
-                BeadsError::Config(format!("Invalid JSON in '{}': {e}", input_path.display()))
-            })?;
+            let issues = parse_json_issues(&content, &input_path)?;
             let (imported, skipped) = import_issues(storage, &issues, args.strict)?;
             report_count(imported, skipped, issues.len(), &input_path, ctx);
         }
@@ -127,7 +125,13 @@ fn execute_inner(
             report_count(imported, skipped, issues.len(), &input_path, ctx);
         }
         ExportFormat::Obsidian => {
-            let issues = read_issues_from_markdown(&input_path)?;
+            // Generated IDs use the configured workspace prefix, like every
+            // other import path, instead of a hardcoded "md-import-N".
+            let prefix = storage
+                .get_config("issue_prefix")?
+                .filter(|p| !p.trim().is_empty())
+                .unwrap_or_else(|| "br".to_string());
+            let issues = read_issues_from_markdown(&input_path, &prefix)?;
             let (imported, skipped) = import_issues(storage, &issues, args.strict)?;
             report_count(imported, skipped, issues.len(), &input_path, ctx);
         }
@@ -200,6 +204,22 @@ fn import_issues(
         }
     }
     Ok((imported, skipped))
+}
+
+/// Parse `-f json` input: either a JSON array of issues or a single issue
+/// object (treated as a one-element import).
+fn parse_json_issues(content: &str, input_path: &Path) -> Result<Vec<Issue>> {
+    match serde_json::from_str::<Vec<Issue>>(content) {
+        Ok(issues) => Ok(issues),
+        Err(array_err) => serde_json::from_str::<Issue>(content)
+            .map(|issue| vec![issue])
+            .map_err(|_| {
+                BeadsError::Config(format!(
+                    "Invalid JSON in '{}': expected an array of issues or a single issue object ({array_err})",
+                    input_path.display()
+                ))
+            }),
+    }
 }
 
 /// Read issues from a CSV file.
@@ -330,7 +350,10 @@ fn issue_from_csv_row(
 }
 
 /// Read issues from a markdown file using the existing parser.
-fn read_issues_from_markdown(path: &Path) -> Result<Vec<Issue>> {
+///
+/// `prefix` is the configured workspace ID prefix used for generated
+/// stand-in IDs (`<prefix>-md-import-N`).
+fn read_issues_from_markdown(path: &Path, prefix: &str) -> Result<Vec<Issue>> {
     let parsed = markdown_import::parse_markdown_file(path)?;
     let mut issues = Vec::new();
     for (idx, p) in parsed.iter().enumerate() {
@@ -340,7 +363,7 @@ fn read_issues_from_markdown(path: &Path) -> Result<Vec<Issue>> {
         issue.id = p
             .stand_in_id
             .clone()
-            .unwrap_or_else(|| format!("md-import-{idx}"));
+            .unwrap_or_else(|| format!("{prefix}-md-import-{idx}"));
 
         issue.title = p.title.clone();
 
@@ -411,4 +434,44 @@ fn parse_datetime(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_issue_json() -> String {
+        let issue = Issue {
+            id: "br-json-1".to_string(),
+            title: "single object import".to_string(),
+            status: Status::Open,
+            priority: Priority::HIGH,
+            issue_type: IssueType::Task,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            ..Default::default()
+        };
+        serde_json::to_string(&issue).unwrap()
+    }
+
+    #[test]
+    fn parse_json_issues_accepts_array() {
+        let content = format!("[{}, {}]", sample_issue_json(), sample_issue_json());
+        let issues = parse_json_issues(&content, Path::new("in.json")).unwrap();
+        assert_eq!(issues.len(), 2);
+    }
+
+    #[test]
+    fn parse_json_issues_accepts_single_object() {
+        let content = sample_issue_json();
+        let issues = parse_json_issues(&content, Path::new("in.json")).unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].id, "br-json-1");
+    }
+
+    #[test]
+    fn parse_json_issues_rejects_garbage() {
+        let err = parse_json_issues("not json", Path::new("in.json")).unwrap_err();
+        assert!(matches!(err, BeadsError::Config(_)));
+    }
 }

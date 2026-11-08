@@ -94,8 +94,8 @@ fn e2e_lint_clean_workspace_json_empty_results() {
     let json_str = extract_json_payload(&lint.stdout);
     let json: Value = serde_json::from_str(&json_str).expect("valid JSON");
 
-    assert_eq!(json["total"], 0, "expected 0 warnings");
-    assert_eq!(json["issues"], 0, "expected 0 issues with warnings");
+    assert_eq!(json["checked"], 0, "expected 0 issues checked");
+    assert_eq!(json["warnings"], 0, "expected 0 warnings");
     assert!(
         json["results"].as_array().unwrap().is_empty(),
         "expected empty results array"
@@ -137,14 +137,19 @@ fn e2e_lint_bug_missing_steps_to_reproduce() {
     let id = create_issue_with_description(&workspace, "Incomplete bug", "bug", Some(description));
 
     let lint = run_br(&workspace, ["lint", "--json"], "lint_bug_missing_steps");
-    // In JSON mode, exit code is always 0
-    assert!(lint.status.success(), "lint failed: {}", lint.stderr);
+    // JSON mode emits the payload, then exits 1 when warnings exist
+    assert_eq!(
+        lint.status.code(),
+        Some(1),
+        "lint with warnings should exit 1, got: {}",
+        lint.status
+    );
 
     let json_str = extract_json_payload(&lint.stdout);
     let json: Value = serde_json::from_str(&json_str).expect("valid JSON");
 
     assert!(
-        json["total"].as_i64().unwrap() >= 1,
+        json["warnings"].as_i64().unwrap() >= 1,
         "expected at least 1 warning"
     );
 
@@ -172,7 +177,12 @@ fn e2e_lint_bug_missing_acceptance_criteria() {
     let id = create_issue_with_description(&workspace, "Bug without AC", "bug", Some(description));
 
     let lint = run_br(&workspace, ["lint", "--json"], "lint_bug_missing_ac");
-    assert!(lint.status.success(), "lint failed: {}", lint.stderr);
+    assert_eq!(
+        lint.status.code(),
+        Some(1),
+        "lint with warnings should exit 1, got: {}",
+        lint.status
+    );
 
     let json_str = extract_json_payload(&lint.stdout);
     let json: Value = serde_json::from_str(&json_str).expect("valid JSON");
@@ -200,7 +210,12 @@ fn e2e_lint_bug_missing_all_sections() {
     let id = create_issue_with_description(&workspace, "Bare bug", "bug", Some("Just a bug"));
 
     let lint = run_br(&workspace, ["lint", "--json"], "lint_bug_missing_all");
-    assert!(lint.status.success(), "lint failed: {}", lint.stderr);
+    assert_eq!(
+        lint.status.code(),
+        Some(1),
+        "lint with warnings should exit 1, got: {}",
+        lint.status
+    );
 
     let json_str = extract_json_payload(&lint.stdout);
     let json: Value = serde_json::from_str(&json_str).expect("valid JSON");
@@ -227,7 +242,12 @@ fn e2e_lint_task_missing_acceptance_criteria() {
         create_issue_with_description(&workspace, "Task without AC", "task", Some("Just do it"));
 
     let lint = run_br(&workspace, ["lint", "--json"], "lint_task_missing_ac");
-    assert!(lint.status.success(), "lint failed: {}", lint.stderr);
+    assert_eq!(
+        lint.status.code(),
+        Some(1),
+        "lint with warnings should exit 1, got: {}",
+        lint.status
+    );
 
     let json_str = extract_json_payload(&lint.stdout);
     let json: Value = serde_json::from_str(&json_str).expect("valid JSON");
@@ -256,7 +276,12 @@ fn e2e_lint_epic_missing_success_criteria() {
         create_issue_with_description(&workspace, "Epic without SC", "epic", Some("Big project"));
 
     let lint = run_br(&workspace, ["lint", "--json"], "lint_epic_missing_sc");
-    assert!(lint.status.success(), "lint failed: {}", lint.stderr);
+    assert_eq!(
+        lint.status.code(),
+        Some(1),
+        "lint with warnings should exit 1, got: {}",
+        lint.status
+    );
 
     let json_str = extract_json_payload(&lint.stdout);
     let json: Value = serde_json::from_str(&json_str).expect("valid JSON");
@@ -313,7 +338,12 @@ fn e2e_lint_filter_by_type_bug() {
         ["lint", "--type", "bug", "--json"],
         "lint_filter_bug",
     );
-    assert!(lint.status.success(), "lint failed: {}", lint.stderr);
+    assert_eq!(
+        lint.status.code(),
+        Some(1),
+        "lint with warnings should exit 1, got: {}",
+        lint.status
+    );
 
     let json_str = extract_json_payload(&lint.stdout);
     let json: Value = serde_json::from_str(&json_str).expect("valid JSON");
@@ -357,8 +387,15 @@ fn e2e_lint_filter_by_status_all() {
     );
     assert!(defer.status.success(), "defer failed: {}", defer.stderr);
 
-    // Default lint should not include closed or deferred.
+    // Default lint should not include closed issues, but includes deferred
+    // (default ListFilters now include deferred — active-set semantics).
     let lint_default = run_br(&workspace, ["lint", "--json"], "lint_status_default");
+    assert_eq!(
+        lint_default.status.code(),
+        Some(1),
+        "lint with warnings should exit 1, got: {}",
+        lint_default.status
+    );
     let json_str = extract_json_payload(&lint_default.stdout);
     let json: Value = serde_json::from_str(&json_str).expect("valid JSON");
     let default_results = json["results"].as_array().unwrap();
@@ -367,8 +404,8 @@ fn e2e_lint_filter_by_status_all() {
         "closed issue should not appear in default lint"
     );
     assert!(
-        !default_results.iter().any(|r| r["id"] == deferred_bug),
-        "deferred issue should not appear in default lint"
+        default_results.iter().any(|r| r["id"] == deferred_bug),
+        "deferred issue should appear in default lint"
     );
 
     // --status all should include closed and deferred.
@@ -377,10 +414,11 @@ fn e2e_lint_filter_by_status_all() {
         ["lint", "--status", "all", "--json"],
         "lint_status_all",
     );
-    assert!(
-        lint_all.status.success(),
-        "lint failed: {}",
-        lint_all.stderr
+    assert_eq!(
+        lint_all.status.code(),
+        Some(1),
+        "lint with warnings should exit 1, got: {}",
+        lint_all.status
     );
 
     let json_str = extract_json_payload(&lint_all.stdout);
@@ -424,7 +462,12 @@ fn e2e_lint_filter_by_status_deferred() {
         ["lint", "--status", "deferred", "--json"],
         "lint_status_deferred",
     );
-    assert!(lint.status.success(), "lint failed: {}", lint.stderr);
+    assert_eq!(
+        lint.status.code(),
+        Some(1),
+        "lint with warnings should exit 1, got: {}",
+        lint.status
+    );
 
     let json_str = extract_json_payload(&lint.stdout);
     let json: Value = serde_json::from_str(&json_str).expect("valid JSON");
@@ -453,7 +496,12 @@ fn e2e_lint_specific_issue_id() {
 
     // Lint only bug1
     let lint = run_br(&workspace, ["lint", &bug1_id, "--json"], "lint_specific_id");
-    assert!(lint.status.success(), "lint failed: {}", lint.stderr);
+    assert_eq!(
+        lint.status.code(),
+        Some(1),
+        "lint with warnings should exit 1, got: {}",
+        lint.status
+    );
 
     let json_str = extract_json_payload(&lint.stdout);
     let json: Value = serde_json::from_str(&json_str).expect("valid JSON");
@@ -484,14 +532,19 @@ fn e2e_lint_json_output_structure() {
     create_issue_with_description(&workspace, "Test bug", "bug", Some("Minimal"));
 
     let lint = run_br(&workspace, ["lint", "--json"], "lint_json_structure");
-    assert!(lint.status.success(), "lint failed: {}", lint.stderr);
+    assert_eq!(
+        lint.status.code(),
+        Some(1),
+        "lint with warnings should exit 1, got: {}",
+        lint.status
+    );
 
     let json_str = extract_json_payload(&lint.stdout);
     let json: Value = serde_json::from_str(&json_str).expect("valid JSON");
 
     // Check top-level fields
-    assert!(json.get("total").is_some(), "missing 'total' field");
-    assert!(json.get("issues").is_some(), "missing 'issues' field");
+    assert!(json.get("checked").is_some(), "missing 'checked' field");
+    assert!(json.get("warnings").is_some(), "missing 'warnings' field");
     assert!(json.get("results").is_some(), "missing 'results' field");
 
     // Check results array structure
@@ -526,9 +579,10 @@ fn e2e_lint_json_output_structure() {
 }
 
 #[test]
-fn e2e_lint_json_exit_code_always_zero() {
-    let _log = common::test_log("e2e_lint_json_exit_code_always_zero");
-    // In JSON mode, exit code should always be 0 (even with warnings)
+fn e2e_lint_json_exit_code_with_warnings() {
+    let _log = common::test_log("e2e_lint_json_exit_code_with_warnings");
+    // JSON mode emits the payload, then exits 1 when warnings exist
+    // (bd parity); --allow-warnings restores exit 0.
     let workspace = BrWorkspace::new();
     init_workspace(&workspace);
 
@@ -536,10 +590,41 @@ fn e2e_lint_json_exit_code_always_zero() {
     create_issue_with_description(&workspace, "Buggy", "bug", Some("No sections"));
 
     let lint = run_br(&workspace, ["lint", "--json"], "lint_json_exit_code");
-    assert!(
-        lint.status.success(),
-        "JSON mode should always exit 0, got: {}",
+    assert_eq!(
+        lint.status.code(),
+        Some(1),
+        "JSON mode with warnings should exit 1, got: {}",
         lint.status
+    );
+
+    // Payload is still emitted on stdout for scripts to parse.
+    let json_str = extract_json_payload(&lint.stdout);
+    let json: Value = serde_json::from_str(&json_str).expect("valid JSON");
+    assert!(
+        json["warnings"].as_i64().unwrap() >= 1,
+        "expected warnings in JSON payload"
+    );
+
+    // --allow-warnings treats findings as advisory: exit 0.
+    let lint_allowed = run_br(
+        &workspace,
+        ["lint", "--json", "--allow-warnings"],
+        "lint_json_exit_code_allow_warnings",
+    );
+    assert!(
+        lint_allowed.status.success(),
+        "--allow-warnings should exit 0, got: {}",
+        lint_allowed.status
+    );
+
+    // A clean workspace exits 0 even without --allow-warnings.
+    let clean_workspace = BrWorkspace::new();
+    init_workspace(&clean_workspace);
+    let lint_clean = run_br(&clean_workspace, ["lint", "--json"], "lint_json_exit_clean");
+    assert!(
+        lint_clean.status.success(),
+        "JSON mode with no warnings should exit 0, got: {}",
+        lint_clean.status
     );
 }
 
@@ -702,18 +787,22 @@ fn e2e_lint_multiple_issues_with_warnings() {
     let task = create_issue_with_description(&workspace, "Task 1", "task", Some("Missing too"));
 
     let lint = run_br(&workspace, ["lint", "--json"], "lint_multiple");
-    assert!(lint.status.success(), "lint failed: {}", lint.stderr);
+    assert_eq!(
+        lint.status.code(),
+        Some(1),
+        "lint with warnings should exit 1, got: {}",
+        lint.status
+    );
 
     let json_str = extract_json_payload(&lint.stdout);
     let json: Value = serde_json::from_str(&json_str).expect("valid JSON");
 
-    let issues_count = json["issues"].as_i64().unwrap();
+    let results = json["results"].as_array().unwrap();
+    let issues_count = results.len() as i64;
     assert!(
         issues_count >= 3,
         "expected at least 3 issues with warnings, got {issues_count}"
     );
-
-    let results = json["results"].as_array().unwrap();
     assert!(
         results.iter().any(|r| r["id"] == bug1),
         "bug1 should be in results"

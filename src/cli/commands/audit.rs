@@ -96,9 +96,9 @@ struct AuditLogOutput {
     events: Vec<AuditEventOutput>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct AuditEventOutput {
-    id: i64,
+    id: String,
     event_type: String,
     actor: String,
     timestamp: DateTime<Utc>,
@@ -159,7 +159,7 @@ pub fn execute(
     let actor = config::resolve_actor(&layer);
 
     match command {
-        AuditCommands::Record(args) => record_entry(args, &beads_dir, &actor, ctx),
+        AuditCommands::Record(args) => record_entry(args, &beads_dir, &actor, cli, ctx),
         AuditCommands::Coordination(args) => {
             record_coordination_entries(args, &beads_dir, &actor, ctx)
         }
@@ -175,18 +175,25 @@ fn execute_log(
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let (storage_ctx, issue_id, _routed_write_lock) =
+    let (storage_ctx, issue_id, route_beads_dir, _routed_write_lock) =
         open_routed_storage_for_issue_input(beads_dir, cli, &args.id)?;
     let events = storage_ctx.storage.get_events(&issue_id, 0)?;
+    // Audit record/label entries live in `.beads/interactions.jsonl`, not the
+    // events table — merge them so `audit log` shows the full audit trail.
+    let audit_events = load_issue_audit_entries(&route_beads_dir, &issue_id)?;
 
     if ctx.is_quiet() {
         return Ok(());
     }
 
+    let mut all_events: Vec<AuditEventOutput> = events.iter().map(map_event_to_output).collect();
+    all_events.extend(audit_events.iter().cloned());
+    all_events.sort_by_key(|e| e.timestamp);
+
     if ctx.is_toon() {
         let output = AuditLogOutput {
             issue_id,
-            events: events.iter().map(map_event_to_output).collect(),
+            events: all_events,
         };
         ctx.toon(&output);
         return Ok(());
@@ -195,7 +202,7 @@ fn execute_log(
     if ctx.is_json() {
         let output = AuditLogOutput {
             issue_id,
-            events: events.iter().map(map_event_to_output).collect(),
+            events: all_events,
         };
         ctx.json_pretty(&output);
         return Ok(());
@@ -206,6 +213,8 @@ fn execute_log(
     } else {
         render_audit_log_plain(&issue_id, &events);
     }
+    // Show only the JSONL audit entries here — DB events were rendered above.
+    render_audit_entries_plain(&audit_events);
 
     Ok(())
 }
@@ -214,7 +223,12 @@ fn open_routed_storage_for_issue_input(
     local_beads_dir: &Path,
     cli: &config::CliOverrides,
     issue_input: &str,
-) -> Result<(config::OpenStorageResult, String, RoutedWorkspaceWriteLock)> {
+) -> Result<(
+    config::OpenStorageResult,
+    String,
+    PathBuf,
+    RoutedWorkspaceWriteLock,
+)> {
     let route = config::routing::resolve_route(issue_input, local_beads_dir)?;
     let mut route_cli = cli_for_routed_workspace(cli, route.is_external);
 
@@ -231,7 +245,7 @@ fn open_routed_storage_for_issue_input(
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
     let issue_id = resolve_issue_id(&storage_ctx.storage, &resolver, issue_input)?;
 
-    Ok((storage_ctx, issue_id, routed_write_lock))
+    Ok((storage_ctx, issue_id, route.beads_dir, routed_write_lock))
 }
 
 fn execute_summary(
@@ -324,7 +338,7 @@ fn execute_summary(
 
 fn map_event_to_output(event: &crate::model::Event) -> AuditEventOutput {
     AuditEventOutput {
-        id: event.id,
+        id: event.id.to_string(),
         event_type: event.event_type.as_str().to_string(),
         actor: event.actor.clone(),
         timestamp: event.created_at,
@@ -337,10 +351,126 @@ fn map_event_to_output(event: &crate::model::Event) -> AuditEventOutput {
     }
 }
 
+/// Load audit entries for `issue_id` from `.beads/interactions.jsonl`.
+///
+/// `audit record`/`audit label`/`audit coordination` append to this JSONL
+/// file; the DB `events` table only tracks issue mutations, so the audit
+/// trail would otherwise be invisible to `audit log`.
+fn load_issue_audit_entries(beads_dir: &Path, issue_id: &str) -> Result<Vec<AuditEventOutput>> {
+    let path = interactions_file_path(beads_dir);
+    require_valid_sync_path(&path, beads_dir)?;
+
+    let file = match fs::File::open(&path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err.into()),
+    };
+
+    let mut entries = Vec::new();
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<AuditEntry>(&line) {
+            Ok(entry) => entries.push(entry),
+            Err(e) => {
+                tracing::debug!(error = %e, "Skipping malformed audit entry in log");
+            }
+        }
+    }
+
+    // Label entries carry `parent_id` instead of `issue_id`; resolve parents
+    // so labels on this issue's audit entries are included too.
+    let issue_by_entry_id: HashMap<&str, &str> = entries
+        .iter()
+        .filter_map(|e| e.id.as_deref().zip(e.issue_id.as_deref()))
+        .collect();
+
+    let mut out = Vec::new();
+    for entry in &entries {
+        let direct = entry.issue_id.as_deref() == Some(issue_id);
+        let via_parent = entry
+            .parent_id
+            .as_deref()
+            .and_then(|pid| issue_by_entry_id.get(pid).copied())
+            == Some(issue_id);
+        if direct || via_parent {
+            out.push(audit_entry_to_output(entry));
+        }
+    }
+    Ok(out)
+}
+
+fn audit_entry_to_output(entry: &AuditEntry) -> AuditEventOutput {
+    let extra_str = |key: &str| {
+        entry
+            .extra
+            .as_ref()
+            .and_then(|m| m.get(key))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let comment = entry
+        .reason
+        .clone()
+        .or_else(|| entry.prompt.clone())
+        .or_else(|| entry.response.clone())
+        .or_else(|| entry.error.clone())
+        .or_else(|| entry.label.as_ref().map(|l| format!("label: {l}")));
+
+    AuditEventOutput {
+        id: entry.id.clone().unwrap_or_default(),
+        event_type: entry.kind.clone(),
+        actor: entry.actor.clone().unwrap_or_default(),
+        timestamp: entry.created_at.unwrap_or_else(Utc::now),
+        old_value: None,
+        new_value: entry.label.clone(),
+        comment,
+        agent_name: extra_str("agent_name"),
+        harness: extra_str("harness"),
+        model: extra_str("model"),
+    }
+}
+
+/// Render JSONL-sourced audit entries in plain text (used by non-JSON log
+/// output where DB events are rendered separately).
+fn render_audit_entries_plain(entries: &[AuditEventOutput]) {
+    if entries.is_empty() {
+        return;
+    }
+    println!("Audit entries:");
+    for entry in entries {
+        println!(
+            "{}  @{:<10}  {}",
+            entry.timestamp.format("%Y-%m-%d %H:%M"),
+            sanitize_terminal_inline(&entry.actor),
+            sanitize_terminal_inline(&entry.event_type)
+        );
+        if let Some(comment) = &entry.comment {
+            println!("   \"{}\"", sanitize_terminal_text(comment));
+        }
+    }
+}
+
+/// Resolve and validate an issue ID against storage, returning the canonical ID.
+fn resolve_and_validate_issue_id(
+    beads_dir: &Path,
+    cli: &config::CliOverrides,
+    issue_id: &str,
+) -> Result<String> {
+    let storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
+    let layer = storage_ctx.load_config(cli)?;
+    let id_config = config::id_config_from_layer(&layer);
+    let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+    resolve_issue_id(&storage_ctx.storage, &resolver, issue_id)
+}
+
 fn record_entry(
     args: &AuditRecordArgs,
     beads_dir: &Path,
     actor: &str,
+    cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
     let use_stdin = args.stdin;
@@ -386,6 +516,13 @@ fn record_entry(
             extra: None,
         }
     };
+
+    // Validate --issue-id / stdin issue_id resolves to a real issue, matching
+    // the existence check `audit label` performs for entry IDs.
+    if let Some(ref issue_id) = entry.issue_id {
+        let resolved = resolve_and_validate_issue_id(beads_dir, cli, issue_id)?;
+        entry.issue_id = Some(resolved);
+    }
 
     let id = append_entry(beads_dir, &mut entry)?;
     let output = AuditRecordOutput {

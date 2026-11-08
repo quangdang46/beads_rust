@@ -2369,105 +2369,105 @@ commands:
     jq_filter: ".[]"
     items_at: .
     item_schema: BlockedIssue
-    error_envelope_on_stderr: false
+    may_emit_error_envelope: false
   capabilities:
     shape: object
     jq_filter: .
-    error_envelope_on_stderr: false
+    may_emit_error_envelope: false
     notes: "Machine-readable command, feature, safety, exit-code, and env-var inventory."
   "comments list":
     shape: array
     jq_filter: ".[]"
     items_at: .
-    error_envelope_on_stderr: true
-    notes: Empty array if no comments. ErrorEnvelope on stderr if the issue id cannot be resolved.
+    may_emit_error_envelope: true
+    notes: Empty array if no comments. ErrorEnvelope is emitted if the issue id cannot be resolved.
   "coordination status":
     shape: object
     jq_filter: ".claims[]"
     items_at: .claims
     item_schema: CoordinationClaimRow
-    error_envelope_on_stderr: false
+    may_emit_error_envelope: false
     notes: "Read-only object with workspace summary and `claims[]` rows. The full envelope schema is `CoordinationStatusOutput`."
   count:
     shape: object
     jq_filter: .count
-    error_envelope_on_stderr: false
+    may_emit_error_envelope: false
     notes: Ungrouped `br count --json`; scalar count under `.count`. Grouped variants use the `count --by` entry.
   "count --by":
     shape: object
     jq_filter: ".groups[]"
     items_at: .groups
     item_schema: CountGroup
-    error_envelope_on_stderr: false
+    may_emit_error_envelope: false
     notes: For `br count --by <status|priority|type|assignee|label> --json`. The wrapper object also includes `total`.
   "dep list":
     shape: array
     jq_filter: ".[]"
     items_at: .
-    error_envelope_on_stderr: true
+    may_emit_error_envelope: true
   "dep tree":
     shape: array
     jq_filter: ".[]"
     items_at: .
     item_schema: TreeNode
-    error_envelope_on_stderr: true
+    may_emit_error_envelope: true
     notes: Pre-order traversal; each node carries a `depth` field.
   info:
     shape: object
     jq_filter: .
-    error_envelope_on_stderr: false
+    may_emit_error_envelope: false
     notes: "Workspace info object (paths, mode, config snapshot)."
   "label list":
     shape: array
     jq_filter: ".[]"
     items_at: .
-    error_envelope_on_stderr: false
+    may_emit_error_envelope: false
   list:
     shape: object
     jq_filter: ".issues[]"
     items_at: .issues
     item_schema: IssueWithCounts
-    error_envelope_on_stderr: false
+    may_emit_error_envelope: false
     notes: "Wrapper object with pagination metadata; iterate with `.issues[]`. The wrapper exists so totals/cursors can ride alongside the rows."
   ready:
     shape: array
     jq_filter: ".[]"
     items_at: .
     item_schema: ReadyIssue
-    error_envelope_on_stderr: false
+    may_emit_error_envelope: false
   "robot-docs guide":
     shape: object
     jq_filter: .
-    error_envelope_on_stderr: false
+    may_emit_error_envelope: false
     notes: JSON/TOON modes wrap the concise agent guide; text mode prints the guide directly.
   search:
     shape: array
     jq_filter: ".[]"
     items_at: .
     item_schema: IssueWithCounts
-    error_envelope_on_stderr: false
+    may_emit_error_envelope: false
   show:
     shape: array
     jq_filter: ".[0]"
     items_at: .
     item_schema: IssueDetails
-    error_envelope_on_stderr: true
-    notes: "Always a single-element array on success (wrapped for shape consistency with list-style commands). On a missing id, an ErrorEnvelope is written to stderr and exit code is non-zero."
+    may_emit_error_envelope: true
+    notes: "Always a single-element array on success (wrapped for shape consistency with list-style commands). On a missing id, an ErrorEnvelope is emitted and exit code is non-zero."
   stale:
     shape: array
     jq_filter: ".[]"
     items_at: .
     item_schema: StaleIssue
-    error_envelope_on_stderr: false
+    may_emit_error_envelope: false
   stats:
     shape: object
     jq_filter: .
     item_schema: Statistics
-    error_envelope_on_stderr: false
+    may_emit_error_envelope: false
     notes: Single aggregate object.
   status:
     shape: object
     jq_filter: .
     item_schema: Statistics
-    error_envelope_on_stderr: false
+    may_emit_error_envelope: false
     notes: Alias for `stats` — identical envelope.

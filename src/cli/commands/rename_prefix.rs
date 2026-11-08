@@ -8,7 +8,7 @@ use crate::cli::RenamePrefixArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::output::{OutputContext, OutputMode};
-use crate::util::id::{normalize_prefix, split_prefix_remainder};
+use crate::util::id::normalize_prefix;
 use rich_rust::prelude::*;
 use serde::Serialize;
 use tracing::info;
@@ -60,12 +60,18 @@ pub fn execute(
     }
 
     // Collect all issues and compute their new IDs.
+    //
+    // IDs are `{prefix}-{slug?}-{hash}` and special IDs like the merge slot
+    // are `{prefix}-merge-slot` — the remainder may itself contain hyphens,
+    // so `split_prefix_remainder` (which splits on the LAST '-') cannot be
+    // used to find the prefix. Strip the literal `{old_prefix}-` prefix instead.
     let all_issues = storage.get_all_issues_for_export()?;
+    let old_prefix_with_dash = format!("{old_prefix}-");
     let mut renames: Vec<(String, String)> = Vec::new();
 
     for issue in &all_issues {
-        if let Some((prefix, remainder)) = split_prefix_remainder(&issue.id) {
-            if prefix == old_prefix {
+        if let Some(remainder) = issue.id.strip_prefix(&old_prefix_with_dash) {
+            if !remainder.is_empty() {
                 let new_id = format!("{new_prefix}-{remainder}");
                 renames.push((issue.id.clone(), new_id));
             }

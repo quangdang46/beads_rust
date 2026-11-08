@@ -373,16 +373,6 @@ fn write_backup_metadata(beads_dir: &Path, target_path: &Path, backup_path: &Pat
     Ok(())
 }
 
-fn legacy_backup_target_path(beads_dir: &Path, backup_name: &str) -> Result<PathBuf> {
-    let Some((stem, _timestamp)) = parse_backup_filename(backup_name) else {
-        return Err(BeadsError::Config(format!(
-            "Invalid backup filename format: {backup_name}"
-        )));
-    };
-
-    Ok(beads_dir.join(format!("{stem}.jsonl")))
-}
-
 fn invalid_metadata_target_path(backup_name: &str) -> PathBuf {
     PathBuf::from(format!("<invalid metadata: {backup_name}>"))
 }
@@ -412,18 +402,16 @@ fn backup_target_details(
                 )
             }
         },
-        Ok(None) => legacy_backup_target_path(beads_dir, backup_name).map_or_else(
-            |_| {
-                let fallback = PathBuf::from(backup_name);
-                (fallback, format!("legacy-name:{backup_name}"))
-            },
-            |target_path| {
-                let target_key = BackupMetadata::from_target_path(beads_dir, &target_path)
-                    .target
-                    .key();
-                (target_path, target_key)
-            },
-        ),
+        Ok(None) => {
+            // No `.meta.json` sidecar: `resolve_backup_target_path` rejects
+            // these backups, so they can never be restored or diffed. Group
+            // them under a per-file unrestorable key instead of letting them
+            // occupy `keep` slots meant for restorable backups.
+            (
+                invalid_metadata_target_path(backup_name),
+                format!("missing-metadata:{backup_name}"),
+            )
+        }
         Err(err) => {
             tracing::warn!(
                 backup = %backup_path.display(),
@@ -459,10 +447,9 @@ pub(crate) fn resolve_backup_target_path(beads_dir: &Path, backup_path: &Path) -
             "Invalid backup filename format: {backup_name}"
         )));
     }
-    let metadata = read_backup_metadata(backup_path)?.ok_or_else(|| {
-        BeadsError::Config(format!(
-            "History backup '{backup_name}' is missing target metadata and cannot be safely restored or diffed"
-        ))
+    let metadata = read_backup_metadata(backup_path)?.ok_or_else(|| BeadsError::NotFound {
+        kind: "History backup target metadata".to_string(),
+        id: backup_name.to_string(),
     })?;
     let target_path = metadata.target.resolve_path(beads_dir)?;
 
@@ -487,6 +474,18 @@ pub fn backup_before_export(
     let history_dir = beads_dir.join(".br_history");
 
     if history_artifact_metadata(target_path, "backup source")?.is_none() {
+        return Ok(());
+    }
+
+    // Never snapshot an empty source. The first-ever export runs this hook
+    // before issues.jsonl has content (init creates a 0-byte file), and
+    // copying it produced a useless 0-byte "backup" that `history restore`
+    // would happily write back over real data.
+    if fs::metadata(target_path).map_or(true, |m| m.len() == 0) {
+        tracing::debug!(
+            target = %target_path.display(),
+            "Skipping history backup: source file is empty"
+        );
         return Ok(());
     }
 
@@ -751,10 +750,21 @@ pub fn prune_backups(
         backups.sort_by_key(|b| std::cmp::Reverse(b.timestamp));
 
         for (i, entry) in backups.iter().enumerate() {
-            let is_count_exceeded = i >= keep;
-            let is_age_exceeded = cutoff.is_some_and(|c| entry.timestamp < c);
+            // Backups whose target metadata is missing or invalid cannot be
+            // restored or diffed (`resolve_backup_target_path` rejects them),
+            // and each one lands in its own `invalid-metadata:`/
+            // `missing-metadata:`/`orphan-history:` singleton group. They are
+            // deleted outright: retaining them would both waste space and —
+            // worse under the old grouping — let unrestorable files occupy the
+            // `keep` slots meant for restorable backups.
+            let unrestorable = entry.target_key.starts_with("invalid-metadata:")
+                || entry.target_key.starts_with("missing-metadata:")
+                || entry.target_key.starts_with("orphan-history:");
 
-            if is_count_exceeded || is_age_exceeded {
+            let is_count_exceeded = !unrestorable && i >= keep;
+            let is_age_exceeded = !unrestorable && cutoff.is_some_and(|c| entry.timestamp < c);
+
+            if unrestorable || is_count_exceeded || is_age_exceeded {
                 remove_backup_artifacts(&entry.path).map_err(|err| {
                     BeadsError::Config(format!(
                         "Failed to delete backup '{}': {err}",
@@ -806,7 +816,11 @@ mod tests {
         let test_files = [&file1, &file2, &file3];
 
         for name in &test_files {
-            File::create(history_dir.join(name)).unwrap();
+            let path = history_dir.join(name);
+            File::create(&path).unwrap();
+            // Restorable backups carry a `.meta.json` sidecar; without one the
+            // entry is grouped as unrestorable and rotation ignores it.
+            write_test_backup_meta(&path, "issues.jsonl");
         }
 
         // Verify initial state
@@ -1155,16 +1169,27 @@ mod tests {
         assert_eq!(backups.len(), 2);
     }
 
+    /// Write a `.meta.json` sidecar so a hand-crafted backup file counts as
+    /// restorable (mirrors what `backup_before_export` produces).
+    fn write_test_backup_meta(backup_path: &Path, target_name: &str) {
+        let meta = serde_json::json!({
+            "target": { "kind": "relative", "path": target_name }
+        });
+        fs::write(backup_metadata_path(backup_path), meta.to_string()).unwrap();
+    }
+
     #[test]
     fn test_prune_backups() {
         let temp = TempDir::new().unwrap();
         let history_dir = temp.path();
 
-        // Create 5 files
+        // Create 5 restorable files (meta sidecar marks the target)
         for i in 0..5 {
             let ts = Utc::now() - chrono::Duration::days(i64::from(i));
             let ts_str = ts.format("%Y%m%d_%H%M%S");
-            File::create(history_dir.join(format!("issues.{ts_str}.jsonl"))).unwrap();
+            let path = history_dir.join(format!("issues.{ts_str}.jsonl"));
+            File::create(&path).unwrap();
+            write_test_backup_meta(&path, "issues.jsonl");
         }
 
         // Keep 3
@@ -1182,6 +1207,91 @@ mod tests {
     }
 
     #[test]
+    fn test_backup_before_export_skips_missing_and_empty_source() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let history_dir = beads_dir.join(".br_history");
+        let config = HistoryConfig::default();
+
+        // Missing source: nothing to snapshot, and no .br_history dir is
+        // created just to hold an empty backup.
+        let missing = beads_dir.join("issues.jsonl");
+        backup_before_export(&beads_dir, &config, &missing).unwrap();
+        assert!(!history_dir.exists());
+
+        // Empty (0-byte) source: the first-ever export must not record a
+        // useless empty "backup" that restore could write back over data.
+        fs::write(&missing, "").unwrap();
+        backup_before_export(&beads_dir, &config, &missing).unwrap();
+        assert!(
+            !history_dir.exists(),
+            "empty source must not produce a backup"
+        );
+
+        // Non-empty source still backs up normally.
+        fs::write(&missing, "{\"id\":\"br-1\"}\n").unwrap();
+        backup_before_export(&beads_dir, &config, &missing).unwrap();
+        assert_eq!(list_backups(&history_dir, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_list_backups_marks_missing_metadata_without_guessing_target() {
+        let temp = TempDir::new().unwrap();
+        let history_dir = temp.path().join(".br_history");
+        fs::create_dir_all(&history_dir).unwrap();
+        let backup_path = history_dir.join("issues.20260307_120000.jsonl");
+        fs::write(&backup_path, "backup\n").unwrap();
+        // Deliberately no `.meta.json` sidecar.
+
+        let backups = list_backups(&history_dir, None).unwrap();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            backups[0].target_key,
+            format!(
+                "missing-metadata:{}",
+                backup_path.file_name().unwrap().to_string_lossy()
+            )
+        );
+        assert_eq!(
+            backups[0].target_path,
+            invalid_metadata_target_path(
+                backup_path.file_name().unwrap().to_string_lossy().as_ref()
+            )
+        );
+    }
+
+    #[test]
+    fn test_prune_backups_deletes_unrestorable_and_keeps_restorable() {
+        let temp = TempDir::new().unwrap();
+        let history_dir = temp.path();
+        let now = Utc::now();
+
+        // Three restorable backups for the same target.
+        for hours_ago in [3_i64, 2, 1] {
+            let ts = (now - chrono::Duration::hours(hours_ago)).format("%Y%m%d_%H%M%S");
+            let path = history_dir.join(format!("issues.{ts}.jsonl"));
+            File::create(&path).unwrap();
+            write_test_backup_meta(&path, "issues.jsonl");
+        }
+
+        // One backup with no `.meta.json`: unrestorable, must not occupy a
+        // `keep` slot nor survive pruning.
+        let ts = (now - chrono::Duration::hours(4)).format("%Y%m%d_%H%M%S");
+        let orphan_path = history_dir.join(format!("legacy.{ts}.jsonl"));
+        File::create(&orphan_path).unwrap();
+
+        let deleted = prune_backups(history_dir, 1, None).unwrap();
+        // keep=1 retains the newest restorable backup, deletes the other two,
+        // and deletes the unrestorable meta-less backup.
+        assert_eq!(deleted, 3);
+        let remaining = list_backups(history_dir, None).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert!(remaining[0].target_key.starts_with("relative:"));
+        assert!(!orphan_path.exists());
+    }
+
+    #[test]
     fn test_prune_backups_applies_keep_per_stem() {
         let temp = TempDir::new().unwrap();
         let history_dir = temp.path();
@@ -1194,7 +1304,9 @@ mod tests {
             ("archive", 1),
         ] {
             let ts = (now - chrono::Duration::hours(hours_ago)).format("%Y%m%d_%H%M%S");
-            File::create(history_dir.join(format!("{stem}.{ts}.jsonl"))).unwrap();
+            let path = history_dir.join(format!("{stem}.{ts}.jsonl"));
+            File::create(&path).unwrap();
+            write_test_backup_meta(&path, &format!("{stem}.jsonl"));
         }
 
         let deleted = prune_backups(history_dir, 1, None).unwrap();

@@ -192,12 +192,23 @@ fn rotation_by_age_deletes_old() {
 
     let now = Utc::now();
 
-    // Create backups: one recent (1 hour ago), one old (40 days ago)
+    // Create backups: one recent (1 hour ago), one old (40 days ago).
+    // Each backup needs a `.meta.json` sidecar (`<name>.jsonl.meta.json`)
+    // describing its restore target; without one the entry is grouped as
+    // unrestorable and `prune_backups` deletes it outright regardless of age.
     let recent_ts = (now - Duration::hours(1)).format("%Y%m%d_%H%M%S");
     let old_ts = (now - Duration::days(40)).format("%Y%m%d_%H%M%S");
 
-    write_file(&hdir.join(format!("issues.{recent_ts}.jsonl")), b"recent");
-    write_file(&hdir.join(format!("issues.{old_ts}.jsonl")), b"old");
+    for ts in [&recent_ts, &old_ts] {
+        let backup_name = format!("issues.{ts}.jsonl");
+        write_file(&hdir.join(&backup_name), b"data");
+        // `<stem>.<ts>.jsonl` -> `with_extension("jsonl.meta.json")` yields
+        // `<stem>.<ts>.jsonl.meta.json`.
+        write_file(
+            &hdir.join(format!("{backup_name}.meta.json")),
+            br#"{"target":{"kind":"relative","path":"issues.jsonl"}}"#,
+        );
+    }
 
     // Prune: keep 100, older than 30 days
     let deleted = prune_backups(&hdir, 100, Some(30)).unwrap();

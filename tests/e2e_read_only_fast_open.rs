@@ -201,7 +201,9 @@ fn status_and_report_commands() -> Vec<MatrixCommand> {
             strings(["count", "--by", "label", "--json"]),
         ),
         exact_command("stale_json", strings(["stale", "--days", "0", "--json"])),
-        exact_command("lint_json", strings(["lint", "--json"])),
+        // --allow-warnings keeps exit 0 so the harness treats the command as
+        // successful; lint now exits 1 whenever warnings exist.
+        exact_command("lint_json", strings(["lint", "--json", "--allow-warnings"])),
         exact_command("sync_status_json", strings(["sync", "--status", "--json"])),
         exact_command(
             "stats_no_activity_json",

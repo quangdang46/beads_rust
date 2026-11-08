@@ -869,10 +869,10 @@ fn e2e_list_deferred_flag() {
 
     let issues = parse_list_issues(&list.stdout);
 
-    // Should include all open + deferred issues (5 total)
-    assert_eq!(issues.len(), 5);
+    // `--deferred` is a restrictive filter: only deferred issues are shown
+    assert_eq!(issues.len(), 1);
 
-    // Verify deferred issue is present
+    // Verify the deferred issue is present
     assert!(
         issues.iter().any(|i| i["id"] == ids[4]),
         "deferred issue should be included with --deferred flag"
@@ -1123,8 +1123,8 @@ fn e2e_list_custom_status() {
         "list with custom status should succeed (custom statuses are allowed)"
     );
     assert!(
-        list.stdout.trim().is_empty(),
-        "list with unknown custom status should return an empty plain-text result: {}",
+        list.stdout.contains("No issues found."),
+        "list with unknown custom status should report an empty result: {}",
         list.stdout
     );
 }

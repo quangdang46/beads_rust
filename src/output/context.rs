@@ -305,9 +305,12 @@ fn write_toon_list_page_to_writer<W: Write>(
 }
 
 fn list_page_supports_streamed_toon(page: &ListPage) -> bool {
-    page.issues
-        .iter()
-        .all(|row| row.issue.dependencies.is_empty() && row.issue.comments.is_empty())
+    page.issues.iter().all(|row| {
+        row.issue.dependencies.is_empty()
+            && row.issue.comments.is_empty()
+            && row.issue.waiters.is_empty()
+            && row.issue.bonded_from.is_empty()
+    })
 }
 
 fn write_toon_issue_counts_object_to_writer<W: Write>(
@@ -324,6 +327,7 @@ fn write_toon_issue_counts_object_to_writer<W: Write>(
     write_toon_issue_workflow_fields(writer, &mut line, issue)?;
     write_toon_issue_time_fields(writer, &mut line, issue)?;
     write_toon_issue_source_fields(writer, &mut line, issue)?;
+    write_toon_issue_extended_fields(writer, &mut line, issue)?;
     write_toon_usize_field(writer, &mut line, "dependency_count", row.dependency_count)?;
     write_toon_usize_field(writer, &mut line, "dependent_count", row.dependent_count)
 }
@@ -391,6 +395,18 @@ fn write_toon_issue_source_fields<W: Write>(
         issue.source_system.as_deref(),
     )?;
     write_optional_toon_string_field(writer, line, "source_repo", issue.source_repo.as_deref())?;
+    write_optional_toon_string_field(
+        writer,
+        line,
+        "source_repo_path",
+        issue.source_repo_path.as_deref(),
+    )?;
+    write_optional_toon_string_field(
+        writer,
+        line,
+        "agent_context",
+        issue.agent_context.as_deref(),
+    )?;
     write_optional_toon_datetime_field(writer, line, "deleted_at", issue.deleted_at.as_ref())?;
     write_optional_toon_string_field(writer, line, "deleted_by", issue.deleted_by.as_deref())?;
     write_optional_toon_string_field(
@@ -407,14 +423,68 @@ fn write_toon_issue_source_fields<W: Write>(
     )?;
     write_optional_toon_string_field(writer, line, "sender", issue.sender.as_deref())?;
     write_toon_true_field_if_set(writer, line, "ephemeral", issue.ephemeral)?;
+    write_toon_true_field_if_set(writer, line, "no_history", issue.no_history)?;
     write_toon_true_field_if_set(writer, line, "pinned", issue.pinned)?;
-    write_toon_true_field_if_set(writer, line, "is_template", issue.is_template)?;
+    write_toon_true_field_if_set(writer, line, "is_template", issue.is_template)
+}
+
+/// Emit the molecule/gate/quality fields that `serde` always or
+/// conditionally serializes on [`crate::model::Issue`]. Kept in the same
+/// order as the `Issue` struct so streamed TOON matches the
+/// `toon_with_stats` (serde) encoder field-for-field.
+fn write_toon_issue_extended_fields<W: Write>(
+    writer: &mut W,
+    line: &mut String,
+    issue: &crate::model::Issue,
+) -> serde_json::Result<()> {
+    write_toon_string_field(writer, line, "mol_type", issue.mol_type.as_str())?;
+    write_toon_string_field(writer, line, "work_type", issue.work_type.as_str())?;
+    write_toon_string_field(writer, line, "wisp_type", issue.wisp_type.as_str())?;
+    write_optional_toon_string_field(writer, line, "spec_id", issue.spec_id.as_deref())?;
+    write_optional_toon_i32_field(writer, line, "points", issue.points)?;
+    write_optional_toon_datetime_field(writer, line, "started_at", issue.started_at.as_ref())?;
+    write_optional_toon_string_field(writer, line, "metadata", issue.metadata.as_deref())?;
+    write_optional_toon_string_field(
+        writer,
+        line,
+        "source_formula",
+        issue.source_formula.as_deref(),
+    )?;
+    write_optional_toon_string_field(
+        writer,
+        line,
+        "source_location",
+        issue.source_location.as_deref(),
+    )?;
+    write_optional_toon_string_field(writer, line, "await_type", issue.await_type.as_deref())?;
+    write_optional_toon_string_field(writer, line, "await_id", issue.await_id.as_deref())?;
+    write_optional_toon_i64_field(writer, line, "timeout_seconds", issue.timeout_seconds)?;
+    write_optional_toon_string_field(writer, line, "holder", issue.holder.as_deref())?;
+    write_optional_toon_string_field(writer, line, "hook_bead", issue.hook_bead.as_deref())?;
+    write_optional_toon_string_field(writer, line, "role_bead", issue.role_bead.as_deref())?;
+    write_optional_toon_string_field(writer, line, "agent_state", issue.agent_state.as_deref())?;
+    write_optional_toon_string_field(writer, line, "role_type", issue.role_type.as_deref())?;
+    write_optional_toon_string_field(writer, line, "rig", issue.rig.as_deref())?;
+    write_optional_toon_string_field(writer, line, "event_kind", issue.event_kind.as_deref())?;
+    write_optional_toon_string_field(writer, line, "target", issue.target.as_deref())?;
+    write_optional_toon_string_field(writer, line, "payload", issue.payload.as_deref())?;
+    write_optional_toon_f64_field(writer, line, "quality_score", issue.quality_score)?;
+    write_toon_true_field_if_set(writer, line, "crystallizes", issue.crystallizes)?;
+    // `labels` is the last `Issue` field the streamed encoder can emit:
+    // `bonded_from`, `waiters`, `dependencies`, and `comments` force the
+    // caller to fall back to the serde encoder (see
+    // `list_page_supports_streamed_toon` / `issue_counts_toon_fields`).
     write_toon_labels_field(writer, line, &issue.labels)
 }
 
 fn issue_counts_toon_fields(row: &IssueWithCounts) -> Option<Vec<&'static str>> {
     let issue = &row.issue;
-    if !issue.labels.is_empty() || !issue.dependencies.is_empty() || !issue.comments.is_empty() {
+    if !issue.labels.is_empty()
+        || !issue.dependencies.is_empty()
+        || !issue.comments.is_empty()
+        || !issue.waiters.is_empty()
+        || !issue.bonded_from.is_empty()
+    {
         return None;
     }
 
@@ -454,6 +524,12 @@ fn issue_counts_toon_fields(row: &IssueWithCounts) -> Option<Vec<&'static str>> 
     push_optional_toon_field(&mut fields, issue.external_ref.as_ref(), "external_ref");
     push_optional_toon_field(&mut fields, issue.source_system.as_ref(), "source_system");
     push_optional_toon_field(&mut fields, issue.source_repo.as_ref(), "source_repo");
+    push_optional_toon_field(
+        &mut fields,
+        issue.source_repo_path.as_ref(),
+        "source_repo_path",
+    );
+    push_optional_toon_field(&mut fields, issue.agent_context.as_ref(), "agent_context");
     push_optional_toon_field(&mut fields, issue.deleted_at.as_ref(), "deleted_at");
     push_optional_toon_field(&mut fields, issue.deleted_by.as_ref(), "deleted_by");
     push_optional_toon_field(&mut fields, issue.delete_reason.as_ref(), "delete_reason");
@@ -462,11 +538,47 @@ fn issue_counts_toon_fields(row: &IssueWithCounts) -> Option<Vec<&'static str>> 
     if issue.ephemeral {
         fields.push("ephemeral");
     }
+    if issue.no_history {
+        fields.push("no_history");
+    }
     if issue.pinned {
         fields.push("pinned");
     }
     if issue.is_template {
         fields.push("is_template");
+    }
+    fields.push("mol_type");
+    fields.push("work_type");
+    fields.push("wisp_type");
+    push_optional_toon_field(&mut fields, issue.spec_id.as_ref(), "spec_id");
+    push_optional_toon_field(&mut fields, issue.points.as_ref(), "points");
+    push_optional_toon_field(&mut fields, issue.started_at.as_ref(), "started_at");
+    push_optional_toon_field(&mut fields, issue.metadata.as_ref(), "metadata");
+    push_optional_toon_field(&mut fields, issue.source_formula.as_ref(), "source_formula");
+    push_optional_toon_field(
+        &mut fields,
+        issue.source_location.as_ref(),
+        "source_location",
+    );
+    push_optional_toon_field(&mut fields, issue.await_type.as_ref(), "await_type");
+    push_optional_toon_field(&mut fields, issue.await_id.as_ref(), "await_id");
+    push_optional_toon_field(
+        &mut fields,
+        issue.timeout_seconds.as_ref(),
+        "timeout_seconds",
+    );
+    push_optional_toon_field(&mut fields, issue.holder.as_ref(), "holder");
+    push_optional_toon_field(&mut fields, issue.hook_bead.as_ref(), "hook_bead");
+    push_optional_toon_field(&mut fields, issue.role_bead.as_ref(), "role_bead");
+    push_optional_toon_field(&mut fields, issue.agent_state.as_ref(), "agent_state");
+    push_optional_toon_field(&mut fields, issue.role_type.as_ref(), "role_type");
+    push_optional_toon_field(&mut fields, issue.rig.as_ref(), "rig");
+    push_optional_toon_field(&mut fields, issue.event_kind.as_ref(), "event_kind");
+    push_optional_toon_field(&mut fields, issue.target.as_ref(), "target");
+    push_optional_toon_field(&mut fields, issue.payload.as_ref(), "payload");
+    push_optional_toon_field(&mut fields, issue.quality_score.as_ref(), "quality_score");
+    if issue.crystallizes {
+        fields.push("crystallizes");
     }
     fields.push("dependency_count");
     fields.push("dependent_count");
@@ -532,6 +644,12 @@ fn push_toon_issue_counts_field(out: &mut String, row: &IssueWithCounts, field: 
             push_toon_string_value(out, issue.source_system.as_deref().unwrap_or(""));
         }
         "source_repo" => push_toon_string_value(out, issue.source_repo.as_deref().unwrap_or("")),
+        "source_repo_path" => {
+            push_toon_string_value(out, issue.source_repo_path.as_deref().unwrap_or(""));
+        }
+        "agent_context" => {
+            push_toon_string_value(out, issue.agent_context.as_deref().unwrap_or(""));
+        }
         "deleted_at" => push_optional_toon_datetime_value(out, issue.deleted_at.as_ref()),
         "deleted_by" => push_toon_string_value(out, issue.deleted_by.as_deref().unwrap_or("")),
         "delete_reason" => {
@@ -541,7 +659,37 @@ fn push_toon_issue_counts_field(out: &mut String, row: &IssueWithCounts, field: 
             push_toon_string_value(out, issue.original_type.as_deref().unwrap_or(""));
         }
         "sender" => push_toon_string_value(out, issue.sender.as_deref().unwrap_or("")),
-        "ephemeral" | "pinned" | "is_template" => out.push_str("true"),
+        "ephemeral" | "no_history" | "pinned" | "is_template" | "crystallizes" => {
+            out.push_str("true");
+        }
+        "mol_type" => push_toon_string_value(out, issue.mol_type.as_str()),
+        "work_type" => push_toon_string_value(out, issue.work_type.as_str()),
+        "wisp_type" => push_toon_string_value(out, issue.wisp_type.as_str()),
+        "spec_id" => push_toon_string_value(out, issue.spec_id.as_deref().unwrap_or("")),
+        "points" => out.push_str(&issue.points.unwrap_or_default().to_string()),
+        "started_at" => push_optional_toon_datetime_value(out, issue.started_at.as_ref()),
+        "metadata" => push_toon_string_value(out, issue.metadata.as_deref().unwrap_or("")),
+        "source_formula" => {
+            push_toon_string_value(out, issue.source_formula.as_deref().unwrap_or(""));
+        }
+        "source_location" => {
+            push_toon_string_value(out, issue.source_location.as_deref().unwrap_or(""));
+        }
+        "await_type" => push_toon_string_value(out, issue.await_type.as_deref().unwrap_or("")),
+        "await_id" => push_toon_string_value(out, issue.await_id.as_deref().unwrap_or("")),
+        "timeout_seconds" => {
+            out.push_str(&issue.timeout_seconds.unwrap_or_default().to_string());
+        }
+        "holder" => push_toon_string_value(out, issue.holder.as_deref().unwrap_or("")),
+        "hook_bead" => push_toon_string_value(out, issue.hook_bead.as_deref().unwrap_or("")),
+        "role_bead" => push_toon_string_value(out, issue.role_bead.as_deref().unwrap_or("")),
+        "agent_state" => push_toon_string_value(out, issue.agent_state.as_deref().unwrap_or("")),
+        "role_type" => push_toon_string_value(out, issue.role_type.as_deref().unwrap_or("")),
+        "rig" => push_toon_string_value(out, issue.rig.as_deref().unwrap_or("")),
+        "event_kind" => push_toon_string_value(out, issue.event_kind.as_deref().unwrap_or("")),
+        "target" => push_toon_string_value(out, issue.target.as_deref().unwrap_or("")),
+        "payload" => push_toon_string_value(out, issue.payload.as_deref().unwrap_or("")),
+        "quality_score" => push_optional_toon_f64_value(out, issue.quality_score),
         "dependency_count" => out.push_str(&row.dependency_count.to_string()),
         "dependent_count" => out.push_str(&row.dependent_count.to_string()),
         _ => {}
@@ -615,6 +763,52 @@ fn write_optional_toon_i32_field<W: Write>(
 ) -> serde_json::Result<()> {
     if let Some(value) = value {
         write_toon_i32_field(writer, line, field, value)?;
+    }
+    Ok(())
+}
+
+fn write_toon_i64_field<W: Write>(
+    writer: &mut W,
+    line: &mut String,
+    field: &str,
+    value: i64,
+) -> serde_json::Result<()> {
+    write_toon_field_with(writer, line, field, |line| {
+        line.push_str(&value.to_string());
+    })
+}
+
+fn write_optional_toon_i64_field<W: Write>(
+    writer: &mut W,
+    line: &mut String,
+    field: &str,
+    value: Option<i64>,
+) -> serde_json::Result<()> {
+    if let Some(value) = value {
+        write_toon_i64_field(writer, line, field, value)?;
+    }
+    Ok(())
+}
+
+fn write_toon_f64_field<W: Write>(
+    writer: &mut W,
+    line: &mut String,
+    field: &str,
+    value: f64,
+) -> serde_json::Result<()> {
+    write_toon_field_with(writer, line, field, |line| {
+        push_toon_f64_value(line, value);
+    })
+}
+
+fn write_optional_toon_f64_field<W: Write>(
+    writer: &mut W,
+    line: &mut String,
+    field: &str,
+    value: Option<f64>,
+) -> serde_json::Result<()> {
+    if let Some(value) = value {
+        write_toon_f64_field(writer, line, field, value)?;
     }
     Ok(())
 }
@@ -718,6 +912,24 @@ fn push_toon_datetime_value(out: &mut String, value: &DateTime<Utc>) {
 fn push_optional_toon_datetime_value(out: &mut String, value: Option<&DateTime<Utc>>) {
     if let Some(value) = value {
         push_toon_datetime_value(out, value);
+    } else {
+        out.push_str("null");
+    }
+}
+
+/// Format an `f64` the way `serde_json` does (shortest round-trip, `1.0`
+/// keeps its `.0`) so streamed TOON numbers parse identically to the serde
+/// encoder's output.
+fn push_toon_f64_value(out: &mut String, value: f64) {
+    match serde_json::to_string(&value) {
+        Ok(rendered) => out.push_str(&rendered),
+        Err(_) => out.push_str("null"),
+    }
+}
+
+fn push_optional_toon_f64_value(out: &mut String, value: Option<f64>) {
+    if let Some(value) = value {
+        push_toon_f64_value(out, value);
     } else {
         out.push_str("null");
     }
@@ -829,6 +1041,51 @@ fn toon_string_is_numeric_like(value: &str) -> bool {
     }
 
     bytes.next().is_none()
+}
+
+fn detect_terminal_width() -> usize {
+    detect_terminal_width_from(
+        std::env::var("COLUMNS").ok().as_deref(),
+        crossterm::terminal::size().ok(),
+    )
+}
+
+fn detect_terminal_width_from(columns_env: Option<&str>, size: Option<(u16, u16)>) -> usize {
+    const FALLBACK_WIDTH: usize = 80;
+
+    if let Some(columns) = columns_env
+        && let Ok(width) = columns.trim().parse::<usize>()
+        && width > 0
+    {
+        return width;
+    }
+
+    size.map(|(width, _)| usize::from(width))
+        .filter(|width| *width > 0)
+        .unwrap_or(FALLBACK_WIDTH)
+}
+
+fn detect_terminal_height() -> usize {
+    const FALLBACK_HEIGHT: usize = 24;
+    crossterm::terminal::size()
+        .ok()
+        .map(|(_, height)| usize::from(height))
+        .filter(|height| *height > 0)
+        .unwrap_or(FALLBACK_HEIGHT)
+}
+
+/// Whether the terminal is known to be incapable of ANSI styling or
+/// Unicode box drawing (`TERM=dumb` or `TERM=unknown`).
+///
+/// Rich output degrades to plain text in this case; callers that bypass
+/// [`OutputContext`] (e.g. hand-rolled color helpers) should also consult
+/// this so `TERM=dumb` never leaks escape sequences.
+#[must_use]
+pub fn terminal_is_dumb() -> bool {
+    std::env::var("TERM").is_ok_and(|term| {
+        let term = term.to_lowercase();
+        term == "dumb" || term == "unknown"
+    })
 }
 
 fn is_broken_pipe_serialization_error(err: &serde_json::Error) -> bool {
@@ -956,7 +1213,10 @@ impl OutputContext {
             OutputMode::Json
         } else if quiet {
             OutputMode::Quiet
-        } else if no_color || std::env::var("NO_COLOR").is_ok() || !std::io::stdout().is_terminal()
+        } else if no_color
+            || std::env::var("NO_COLOR").is_ok()
+            || terminal_is_dumb()
+            || !std::io::stdout().is_terminal()
         {
             OutputMode::Plain
         } else {
@@ -982,6 +1242,7 @@ impl OutputContext {
                     OutputMode::Quiet
                 } else if no_color
                     || std::env::var("NO_COLOR").is_ok()
+                    || terminal_is_dumb()
                     || !std::io::stdout().is_terminal()
                 {
                     OutputMode::Plain
@@ -1017,7 +1278,7 @@ impl OutputContext {
                 OutputFormat::Text | OutputFormat::Csv => {}
             }
         }
-        if args.no_color || std::env::var("NO_COLOR").is_ok() {
+        if args.no_color || std::env::var("NO_COLOR").is_ok() || terminal_is_dumb() {
             return OutputMode::Plain;
         }
         if !std::io::stdout().is_terminal() {
@@ -1029,7 +1290,15 @@ impl OutputContext {
     /// Lazily create console based on mode.
     fn console(&self) -> &Console {
         self.console.get_or_init(|| match self.mode {
-            OutputMode::Rich => Console::new(),
+            // Pin the console to the width/height detected by
+            // [`detect_terminal_width`]: renderables receive
+            // `console.width()` as `max_width` and clamp to it, so a pty
+            // reporting winsize 0 (e.g. `script -q /dev/null`) would
+            // otherwise collapse every panel to an empty box.
+            OutputMode::Rich => Console::builder()
+                .width(self.width())
+                .height(detect_terminal_height())
+                .build(),
             OutputMode::Plain | OutputMode::Quiet | OutputMode::Json | OutputMode::Toon => {
                 Console::builder().no_color().force_terminal(false).build()
             }
@@ -1069,8 +1338,14 @@ impl OutputContext {
     }
 
     /// Get terminal width (lazy-initialized).
+    ///
+    /// Resolution order mirrors coreutils/Python `shutil.get_terminal_size`:
+    /// `COLUMNS` env var first, then the terminal ioctl, then an 80-column
+    /// fallback. A reported width of `0` (e.g. a pty whose winsize was never
+    /// set, as under `script -q /dev/null`) is treated as "unknown" so rich
+    /// panels never collapse to an empty body.
     pub fn width(&self) -> usize {
-        *self.width.get_or_init(|| self.console().width())
+        *self.width.get_or_init(detect_terminal_width)
     }
 
     /// Get theme (lazy-initialized).
@@ -1784,7 +2059,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TOON streaming/materialized divergence with new Issue fields"]
     fn write_toon_issue_counts_array_to_writer_matches_materialized_encode_output() {
         let rows = vec![
             IssueWithCounts {
@@ -1817,12 +2091,11 @@ mod tests {
         assert!(
             String::from_utf8(streamed)
                 .expect("TOON output should be utf8")
-            .starts_with("[2]{id,title,description,design,acceptance_criteria,notes,status,priority,issue_type,created_at,created_by,updated_at,source_repo,dependency_count,dependent_count}:")
+            .starts_with("[2]{id,title,description,design,acceptance_criteria,notes,status,priority,issue_type,created_at,created_by,updated_at,source_repo,mol_type,work_type,wisp_type,dependency_count,dependent_count}:")
         );
     }
 
     #[test]
-    #[ignore = "TOON streaming/materialized divergence with new Issue fields"]
     fn write_toon_list_page_to_writer_matches_materialized_encode_output() {
         let closed_at = Utc
             .with_ymd_and_hms(2026, 4, 2, 1, 40, 2)
@@ -2081,5 +2354,73 @@ mod tests {
         assert!(rendered.contains("created\n"));
         assert!(rendered.contains("details\n"));
         assert!(rendered.contains("careful\n"));
+    }
+
+    #[test]
+    fn detect_terminal_width_prefers_positive_columns_env() {
+        assert_eq!(detect_terminal_width_from(Some("132"), Some((80, 24))), 132);
+        assert_eq!(detect_terminal_width_from(Some(" 100 "), None), 100);
+    }
+
+    #[test]
+    fn detect_terminal_width_ignores_invalid_and_zero_columns() {
+        // Invalid COLUMNS falls through to the ioctl size.
+        assert_eq!(detect_terminal_width_from(Some("abc"), Some((90, 24))), 90);
+        // Zero COLUMNS (pty with unset winsize) falls through too.
+        assert_eq!(detect_terminal_width_from(Some("0"), Some((90, 24))), 90);
+        // Negative/garbage values are rejected by the usize parse.
+        assert_eq!(detect_terminal_width_from(Some("-5"), None), 80);
+    }
+
+    #[test]
+    fn detect_terminal_width_ignores_zero_ioctl_width() {
+        // `script -q /dev/null` ptys can report winsize (0, 0); the width
+        // detector must not propagate that zero into panel rendering.
+        assert_eq!(detect_terminal_width_from(None, Some((0, 0))), 80);
+        assert_eq!(detect_terminal_width_from(Some(""), Some((0, 24))), 80);
+        assert_eq!(detect_terminal_width_from(None, None), 80);
+    }
+
+    #[test]
+    fn toon_streamed_issue_includes_extended_issue_fields() {
+        // Regression for `br list --format toon` omitting fields that the
+        // serde (`toon_with_stats`) encoder emits: source_repo_path,
+        // mol_type, work_type, wisp_type and the remaining Issue fields.
+        let mut issue = toon_test_issue("bd-t-00001", "Extended fields");
+        issue.source_repo_path = Some("/tmp/repo".to_string());
+        issue.no_history = true;
+        issue.spec_id = Some("spec-1".to_string());
+        issue.points = Some(3);
+        issue.quality_score = Some(0.5);
+        issue.crystallizes = true;
+        let rows = vec![IssueWithCounts {
+            issue,
+            dependency_count: 0,
+            dependent_count: 0,
+        }];
+        let fields = uniform_issue_counts_toon_fields(&rows).expect("uniform primitive fields");
+        let mut streamed = Vec::new();
+
+        write_toon_issue_counts_array_to_writer(&mut streamed, &rows, &fields)
+            .expect("streaming issue count TOON output failed");
+        let text = String::from_utf8(streamed).expect("TOON output should be utf8");
+
+        for field in [
+            "source_repo_path",
+            "mol_type",
+            "work_type",
+            "wisp_type",
+            "no_history",
+            "spec_id",
+            "points",
+            "quality_score",
+            "crystallizes",
+        ] {
+            assert!(
+                text.contains(field),
+                "streamed TOON missing `{field}`:\n{text}"
+            );
+        }
+        assert!(text.contains("/tmp/repo"), "source_repo_path value missing");
     }
 }

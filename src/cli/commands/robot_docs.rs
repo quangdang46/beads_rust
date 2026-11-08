@@ -17,9 +17,13 @@ Purpose:
   exports .beads/issues.jsonl for git-friendly handoff. br never runs git.
 
 Machine-output defaults:
-  Use --json or --format json for scripts. Diagnostics and structured errors
-  go to stderr. For token-efficient structured output, use --format toon where
-  the command supports it.
+  Use --json or --format json for scripts. Failures emit a structured
+  ErrorEnvelope: in machine-output modes it goes to stdout (one parseable
+  stream), unless the command already wrote a document — then it goes to
+  stderr so stdout stays a single document. In human mode the envelope is
+  human-readable on stderr. Log/diagnostic lines always go to stderr.
+  For token-efficient structured output, use --format toon where the
+  command supports it.
 
 Start of session:
   br capabilities --format json

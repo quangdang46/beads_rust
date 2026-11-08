@@ -536,7 +536,7 @@ br list --json --assignee $(whoami) | jq '.issues[].title'
 
 ### Structured Error Response
 
-With `--json`, successful command data is written to stdout. Structured errors are written to stderr and the process exits non-zero, so agents must parse the stream that matches the exit code.
+With `--json`, successful command data is written to stdout. Structured errors are also written to stdout as a JSON envelope (so robot callers read one clean, parseable stream), and the process exits non-zero. Diagnostic log lines always stay on stderr.
 
 ```json
 {

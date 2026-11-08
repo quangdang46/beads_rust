@@ -121,6 +121,11 @@ fn e2e_audit_record_with_all_optional_fields() {
     let init = run_br(&workspace, ["init"], "init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
 
+    // `audit record --issue-id` validates that the issue exists.
+    let create = run_br(&workspace, ["create", "Audit target"], "create");
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let issue_id = parse_created_id(&create.stdout);
+
     // Record with all optional fields
     let record = run_br(
         &workspace,
@@ -130,7 +135,7 @@ fn e2e_audit_record_with_all_optional_fields() {
             "--kind",
             "llm_call",
             "--issue-id",
-            "bd-test123",
+            &issue_id,
             "--model",
             "claude-3-opus",
             "--prompt",
@@ -151,7 +156,7 @@ fn e2e_audit_record_with_all_optional_fields() {
     let entries = read_interactions(&workspace);
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["kind"], "llm_call");
-    assert_eq!(entries[0]["issue_id"], "bd-test123"); // invariant: fixture round-trip
+    assert_eq!(entries[0]["issue_id"], issue_id); // invariant: fixture round-trip
     assert_eq!(entries[0]["model"], "claude-3-opus");
     assert_eq!(entries[0]["prompt"], "What is 2+2?");
     assert_eq!(entries[0]["response"], "The answer is 4.");

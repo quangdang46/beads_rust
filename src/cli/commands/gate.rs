@@ -402,6 +402,16 @@ fn execute_remove_waiter(
     let resolver = build_resolver(&config_layer);
     let issue_id = resolve_issue_id(&storage_ctx.storage, &resolver, &args.id)?;
 
+    // Make removal of a never-registered waiter a consistent, explicit
+    // error instead of a silent no-op DELETE.
+    let registered = storage_ctx.storage.get_gate_waiters(&issue_id)?;
+    if !registered.iter().any(|w| w == waiter) {
+        return Err(BeadsError::validation(
+            "waiter",
+            format!("waiter '{waiter}' is not registered on gate {issue_id}"),
+        ));
+    }
+
     storage_ctx.storage.remove_gate_waiter(&issue_id, waiter)?;
 
     let output = GateRemoveWaiterOutput {

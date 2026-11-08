@@ -39,10 +39,13 @@ pub fn execute(
             execute_list(&list_args.id, json, cli, ctx, &beads_dir, list_args.wrap)
         }
         None => {
-            let id = args
-                .id
-                .as_deref()
-                .ok_or_else(|| BeadsError::validation("id", "missing issue id"))?;
+            let id = args.id.as_deref().ok_or_else(|| {
+                BeadsError::validation(
+                    "id",
+                    "missing issue id (usage: br comments <id>, \
+                     br comments list <id>, or br comments add <id> <text...>)",
+                )
+            })?;
             execute_list(id, json, cli, ctx, &beads_dir, args.wrap)
         }
     }
@@ -75,10 +78,13 @@ pub fn execute_with_storage_ctx(
             storage_ctx,
         ),
         None => {
-            let id = args
-                .id
-                .as_deref()
-                .ok_or_else(|| BeadsError::validation("id", "missing issue id"))?;
+            let id = args.id.as_deref().ok_or_else(|| {
+                BeadsError::validation(
+                    "id",
+                    "missing issue id (usage: br comments <id>, \
+                     br comments list <id>, or br comments add <id> <text...>)",
+                )
+            })?;
             execute_list_with_storage_ctx(
                 id,
                 json,
@@ -429,6 +435,20 @@ fn read_limited_string<R: Read>(reader: &mut R, byte_limit: usize, field: &str) 
 }
 
 fn read_comment_text(args: &CommentAddArgs) -> Result<String> {
+    // Exactly one text source may be given. Previously a positional `text`
+    // was silently discarded when -m/-f was present, and -f silently beat
+    // -m — a comment could be lost without any signal. Conflicting sources
+    // are now a validation error.
+    let source_count = usize::from(args.file.is_some())
+        + usize::from(args.message.is_some())
+        + usize::from(!args.text.is_empty());
+    if source_count > 1 {
+        return Err(BeadsError::validation(
+            "text",
+            "conflicting comment sources: use exactly one of positional \
+             text, --message/-m, or --file/-f",
+        ));
+    }
     if let Some(path) = &args.file {
         if path.as_os_str() == "-" {
             let mut stdin = std::io::stdin();
@@ -622,24 +642,47 @@ mod tests {
     }
 
     #[test]
-    fn test_read_comment_text_file_takes_precedence() {
+    fn test_read_comment_text_rejects_conflicting_sources() {
         init_test_logging();
-        info!("test_read_comment_text_file_takes_precedence: starting");
+        info!("test_read_comment_text_rejects_conflicting_sources: starting");
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, "File content").unwrap();
         file.flush().unwrap();
 
-        let args = CommentAddArgs {
-            id: "test-id".to_string(),
-            text: vec!["text content".to_string()],
-            file: Some(file.path().to_path_buf()),
-            author: None,
-            message: Some("message content".to_string()),
-        };
-        let result = read_comment_text(&args).unwrap();
-        // File should take precedence
-        assert!(result.contains("File content"));
-        info!("test_read_comment_text_file_takes_precedence: assertions passed");
+        // Every combination of two or more sources must be rejected —
+        // previously positional text was silently dropped and -f silently
+        // beat -m.
+        for args in [
+            CommentAddArgs {
+                id: "test-id".to_string(),
+                text: vec!["positional".to_string()],
+                file: Some(file.path().to_path_buf()),
+                author: None,
+                message: None,
+            },
+            CommentAddArgs {
+                id: "test-id".to_string(),
+                text: vec!["positional".to_string()],
+                file: None,
+                author: None,
+                message: Some("message".to_string()),
+            },
+            CommentAddArgs {
+                id: "test-id".to_string(),
+                text: vec!["positional".to_string()],
+                file: Some(file.path().to_path_buf()),
+                author: None,
+                message: Some("message".to_string()),
+            },
+        ] {
+            let err = read_comment_text(&args).expect_err("conflicting sources must fail");
+            assert!(
+                matches!(&err, BeadsError::Validation { field, reason }
+                    if field == "text" && reason.contains("conflicting comment sources")),
+                "unexpected error: {err:?}"
+            );
+        }
+        info!("test_read_comment_text_rejects_conflicting_sources: assertions passed");
     }
 
     #[test]

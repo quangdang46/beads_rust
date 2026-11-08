@@ -712,9 +712,16 @@ fn e2e_reopen_tombstone_skips_without_resurrection() {
         ["reopen", issue_id, "--json"],
         "reopen_tombstone_reopen",
     );
+    // Reopening a batch where every target is skipped now exits non-zero with
+    // a structured NOTHING_TO_DO error; the skipped outcome is still reported
+    // on stdout before the error.
     assert!(
-        reopen.status.success(),
-        "reopen tombstone failed: {}",
+        !reopen.status.success(),
+        "reopen of an all-skipped batch should fail with NOTHING_TO_DO"
+    );
+    assert!(
+        reopen.stderr.contains("Nothing to do"),
+        "expected NOTHING_TO_DO error, stderr: {}",
         reopen.stderr
     );
 

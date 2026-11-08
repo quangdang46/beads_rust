@@ -28,6 +28,7 @@ Commands:
   graph          Visualize dependency graph
   history        Manage local history backups
   hooks          Install/uninstall/list/run git hooks for beads auto-import/export
+  help           Show help for a command (e.g. `br help list`, `br help dep add`)
   import         Import issues from a file (JSONL, CSV, markdown)
   info           Show diagnostic metadata about the workspace
   init           Initialize a beads workspace
@@ -53,7 +54,6 @@ Commands:
   status         Alias for stats
   sync           Sync database with JSONL file (export or import)
   undefer        Undefer issues (make ready again)
-  upgrade        Upgrade br to the latest version
   wisp           Manage wisps (ephemeral, JSONL-excluded issues)
   custom-status  Manage custom statuses (Issue #5)
   custom-type    Manage custom types (Issue #5)
@@ -61,14 +61,12 @@ Commands:
   reflect        Agent instructions to sync beads with the current codebase (prime-style)
   template       Issue tracking template commands
   update         Update an issue
-  web            Start the embedded web UI server
   version        Show version information
   worktree       Manage git worktrees
   federation     Manage federation peers for P2P sync
   merge-slot     Manage the merge slot for exclusive conflict resolution access
   where          Show the active .beads directory
   sql            Execute a read-only SQL query against the database
-  help           Print this message or the help of the given subcommand(s)
 
 Options:
       --db <DB>                      Database path (auto-discover .beads/*.db if not set)

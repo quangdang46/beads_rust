@@ -459,19 +459,37 @@ fn e2e_history_prune_with_older_than_days() {
     create_issue(&workspace, "Issue for age prune", "create_age");
     sync_flush(&workspace);
 
-    // Prune with --older-than 0 (should delete all backups)
-    let prune = run_br(
+    // `--older-than 0` is rejected (it would delete every backup); `--keep 0`
+    // is the supported way to drop all backups.
+    let rejected = run_br(
         &workspace,
         ["history", "prune", "--keep", "100", "--older-than", "0"],
+        "history_prune_age_zero_rejected",
+    );
+    assert!(
+        !rejected.status.success(),
+        "--older-than 0 should be rejected: {}",
+        rejected.stdout
+    );
+    let combined = format!("{}{}", rejected.stdout, rejected.stderr);
+    assert!(
+        combined.contains("older-than 0") || combined.contains("every backup"),
+        "rejection should explain the degenerate value: {combined}"
+    );
+
+    // Prune keeping 0 backups (deletes all of them)
+    let prune = run_br(
+        &workspace,
+        ["history", "prune", "--keep", "0"],
         "history_prune_age",
     );
     assert!(prune.status.success(), "prune failed: {}", prune.stderr);
 
-    // All backups should be deleted (they're all older than 0 days, i.e., created before now)
+    // All backups should be deleted
     let backups = list_backup_files(&workspace);
     assert!(
         backups.is_empty(),
-        "all backups should be deleted with --older-than 0: {backups:?}"
+        "all backups should be deleted with --keep 0: {backups:?}"
     );
 }
 

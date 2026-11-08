@@ -18,6 +18,14 @@ fn parse_created_id(stdout: &str) -> String {
     id_part.trim().to_string()
 }
 
+/// Read the last-touched issue ID recorded in `.beads/last-touched`.
+fn read_last_touched_id(workspace: &BrWorkspace) -> String {
+    fs::read_to_string(workspace.root.join(".beads").join("last-touched"))
+        .expect("read .beads/last-touched")
+        .trim()
+        .to_string()
+}
+
 #[test]
 fn e2e_dep_cycles_default_hides_closed_archive_and_include_closed_exposes_it() {
     common::init_test_logging();
@@ -254,14 +262,28 @@ fn e2e_label_add_updates_last_touched_context() {
         label_add.stderr
     );
 
+    // `br update` with no IDs requires an interactive TTY; verify the label
+    // add recorded the target as last-touched, then pass that ID explicitly.
+    let last_touched = read_last_touched_id(&workspace);
+    assert_eq!(
+        last_touched, target_id,
+        "label add should record the target as last-touched"
+    );
+
     let update = run_br(
         &workspace,
-        ["update", "--title", "Label-touched target", "--json"],
+        [
+            "update",
+            last_touched.as_str(),
+            "--title",
+            "Label-touched target",
+            "--json",
+        ],
         "update_after_label_add_last_touched",
     );
     assert!(
         update.status.success(),
-        "update without explicit id failed after label add: {}",
+        "update via last-touched id failed after label add: {}",
         update.stderr
     );
 
@@ -331,14 +353,28 @@ fn e2e_comments_add_updates_last_touched_context() {
         comment_add.stderr
     );
 
+    // `br update` with no IDs requires an interactive TTY; verify the comments
+    // add recorded the target as last-touched, then pass that ID explicitly.
+    let last_touched = read_last_touched_id(&workspace);
+    assert_eq!(
+        last_touched, target_id,
+        "comments add should record the target as last-touched"
+    );
+
     let update = run_br(
         &workspace,
-        ["update", "--title", "Comment-touched target", "--json"],
+        [
+            "update",
+            last_touched.as_str(),
+            "--title",
+            "Comment-touched target",
+            "--json",
+        ],
         "update_after_comments_add_last_touched",
     );
     assert!(
         update.status.success(),
-        "update without explicit id failed after comments add: {}",
+        "update via last-touched id failed after comments add: {}",
         update.stderr
     );
 
@@ -498,10 +534,19 @@ fn e2e_dep_add_updates_last_touched_context() {
         dep_add.stderr
     );
 
+    // `br update` with no IDs requires an interactive TTY; verify the dep add
+    // recorded the blocked issue as last-touched, then pass that ID explicitly.
+    let last_touched = read_last_touched_id(&workspace);
+    assert_eq!(
+        last_touched, blocked_id,
+        "dep add should record the issue side as last-touched"
+    );
+
     let update = run_br(
         &workspace,
         [
             "update",
+            last_touched.as_str(),
             "--title",
             "Blocked renamed via last touched",
             "--json",
@@ -510,7 +555,7 @@ fn e2e_dep_add_updates_last_touched_context() {
     );
     assert!(
         update.status.success(),
-        "update without explicit id failed after dep add: {}",
+        "update via last-touched id failed after dep add: {}",
         update.stderr
     );
 
@@ -590,10 +635,20 @@ fn e2e_dep_remove_updates_last_touched_context() {
         dep_remove.stderr
     );
 
+    // `br update` with no IDs requires an interactive TTY; verify the dep
+    // remove recorded the blocked issue as last-touched, then pass that ID
+    // explicitly.
+    let last_touched = read_last_touched_id(&workspace);
+    assert_eq!(
+        last_touched, blocked_id,
+        "dep remove should record the issue side as last-touched"
+    );
+
     let update = run_br(
         &workspace,
         [
             "update",
+            last_touched.as_str(),
             "--title",
             "Blocked renamed after dep remove",
             "--json",
@@ -602,7 +657,7 @@ fn e2e_dep_remove_updates_last_touched_context() {
     );
     assert!(
         update.status.success(),
-        "update without explicit id failed after dep remove: {}",
+        "update via last-touched id failed after dep remove: {}",
         update.stderr
     );
 

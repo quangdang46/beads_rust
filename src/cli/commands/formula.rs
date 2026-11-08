@@ -11,6 +11,8 @@ use crate::formula::Parser;
 use crate::formula::types::FormulaType;
 use crate::model::{Issue, IssueType, Priority, Status};
 use crate::output::OutputContext;
+use crate::storage::SqliteStorage;
+use crate::util::id::IdGenerator;
 use crate::validation::IssueValidator;
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -207,6 +209,40 @@ pub fn execute(
 // Shared helpers (parse, resolve, substitute)
 // ---------------------------------------------------------------------------
 
+/// Whether machine-readable JSON output was requested via flags, `--format`,
+/// or the inherited outer output mode.
+fn wants_json(
+    format: Option<crate::cli::OutputFormatBasic>,
+    json: bool,
+    robot: bool,
+    output_ctx: &OutputContext,
+) -> bool {
+    json || robot
+        || matches!(format, Some(crate::cli::OutputFormatBasic::Json))
+        || output_ctx.is_json()
+}
+
+/// Whether TOON output was requested via `--format toon` or the inherited
+/// outer output mode (and JSON was not explicitly requested).
+fn wants_toon(
+    format: Option<crate::cli::OutputFormatBasic>,
+    json: bool,
+    robot: bool,
+    output_ctx: &OutputContext,
+) -> bool {
+    !wants_json(format, json, robot, output_ctx)
+        && (matches!(format, Some(crate::cli::OutputFormatBasic::Toon)) || output_ctx.is_toon())
+}
+
+/// Emit a JSON value as TOON or pretty JSON depending on the resolved mode.
+fn emit_structured(output_ctx: &OutputContext, value: &serde_json::Value, use_toon: bool) {
+    if use_toon {
+        output_ctx.toon(value);
+    } else {
+        output_ctx.json_pretty(value);
+    }
+}
+
 /// Parse the formula from file, validate, resolve extends, and return the
 /// resolved formula + steps.  Returns a `BeadsError::Config` on any failure.
 fn parse_and_resolve(
@@ -219,9 +255,7 @@ fn parse_and_resolve(
         .parse_file(file)
         .map_err(|e| BeadsError::Config(format!("Failed to parse formula: {e}")))?;
 
-    formula
-        .validate()
-        .map_err(|e| BeadsError::Config(format!("Formula validation failed: {e}")))?;
+    formula.validate().map_err(|e| BeadsError::Config(e))?;
 
     let formula = if formula.extends.is_empty() {
         formula
@@ -231,8 +265,13 @@ fn parse_and_resolve(
             .map_err(|e| BeadsError::Config(format!("Formula resolution failed: {e}")))?
     };
 
-    // Apply variable overrides
+    // Build the variable map: VarDef defaults first, then CLI overrides.
     let mut vars: HashMap<String, String> = HashMap::new();
+    for var in formula.vars.as_deref().unwrap_or_default() {
+        if let Some(ref default) = var.default {
+            vars.insert(var.name.clone(), default.clone());
+        }
+    }
     for kv in var_overrides {
         if let Some((key, value)) = kv.split_once('=') {
             vars.insert(key.to_string(), value.to_string());
@@ -240,6 +279,42 @@ fn parse_and_resolve(
             return Err(BeadsError::Config(format!(
                 "Invalid variable override {kv:?}: expected KEY=VALUE format"
             )));
+        }
+    }
+
+    // Enforce VarDef constraints: required vars must be present, provided
+    // values must satisfy enum and pattern restrictions.
+    for var in formula.vars.as_deref().unwrap_or_default() {
+        match vars.get(&var.name) {
+            None if var.required => {
+                return Err(BeadsError::Config(format!(
+                    "Missing required variable {:?} for formula {:?}",
+                    var.name, formula.formula
+                )));
+            }
+            Some(value) => {
+                if !var.r#enum.is_empty() && !var.r#enum.iter().any(|v| v == value) {
+                    return Err(BeadsError::Config(format!(
+                        "Variable {:?} value {value:?} is not one of {:?}",
+                        var.name, var.r#enum
+                    )));
+                }
+                if let Some(ref pattern) = var.pattern {
+                    let re = regex::Regex::new(pattern).map_err(|e| {
+                        BeadsError::Config(format!(
+                            "Invalid pattern {pattern:?} for variable {:?}: {e}",
+                            var.name
+                        ))
+                    })?;
+                    if !re.is_match(value) {
+                        return Err(BeadsError::Config(format!(
+                            "Variable {:?} value {value:?} does not match pattern {pattern:?}",
+                            var.name
+                        )));
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -291,14 +366,15 @@ fn substitute_str(s: &str, vars: &HashMap<String, String>) -> Result<String> {
 fn execute_validate(args: &FormulaValidateArgs, output_ctx: &OutputContext) -> crate::Result<()> {
     let (_formula, steps) = parse_and_resolve(&args.file, &args.vars)?;
 
-    let use_json = args.json || args.robot || output_ctx.is_json();
+    let use_json = wants_json(args.format, args.json, args.robot, output_ctx);
+    let use_toon = wants_toon(args.format, args.json, args.robot, output_ctx);
 
-    if use_json {
+    if use_json || use_toon {
         let output = serde_json::json!({
             "valid": true,
             "step_count": steps.len(),
         });
-        output_ctx.json_pretty(&output);
+        emit_structured(output_ctx, &output, use_toon);
     } else {
         output_ctx.print_line(&format!(
             "Formula is valid: {} step(s) would be created",
@@ -317,9 +393,10 @@ fn execute_validate(args: &FormulaValidateArgs, output_ctx: &OutputContext) -> c
 fn execute_expand(args: &FormulaExpandArgs, output_ctx: &OutputContext) -> crate::Result<()> {
     let (resolved, steps) = parse_and_resolve(&args.file, &args.vars)?;
 
-    let use_json = args.json || args.robot || output_ctx.is_json();
+    let use_json = wants_json(args.format, args.json, args.robot, output_ctx);
+    let use_toon = wants_toon(args.format, args.json, args.robot, output_ctx);
 
-    if use_json {
+    if use_json || use_toon {
         let output = serde_json::json!({
             "formula": resolved.formula,
             "type": format!("{:?}", resolved.r#type),
@@ -331,7 +408,7 @@ fn execute_expand(args: &FormulaExpandArgs, output_ctx: &OutputContext) -> crate
             }).collect::<Vec<_>>(),
             "vars": resolved.vars.unwrap_or_default(),
         });
-        output_ctx.json_pretty(&output);
+        emit_structured(output_ctx, &output, use_toon);
     } else {
         output_ctx.print_line(&format!(
             "Formula: {} ({} steps)",
@@ -375,12 +452,13 @@ fn execute_apply(
 ) -> crate::Result<()> {
     let (resolved, steps) = parse_and_resolve(&args.file, &args.vars)?;
 
-    let use_json = args.json || args.robot || output_ctx.is_json();
+    let use_json = wants_json(args.format, args.json, args.robot, output_ctx);
+    let use_toon = wants_toon(args.format, args.json, args.robot, output_ctx);
     let now = chrono::Utc::now();
 
     // In dry-run mode, just preview what would be created.
     if args.dry_run {
-        if use_json {
+        if use_json || use_toon {
             let output = serde_json::json!({
                 "dry_run": true,
                 "formula": resolved.formula,
@@ -409,7 +487,7 @@ fn execute_apply(
                     obj
                 }).collect::<Vec<_>>(),
             });
-            output_ctx.json_pretty(&output);
+            emit_structured(output_ctx, &output, use_toon);
         } else {
             output_ctx.print_line(&format!(
                 "[DRY-RUN] Would create {} issue(s) from '{}'",
@@ -446,10 +524,14 @@ fn execute_apply(
 
     let beads_dir = config::discover_beads_dir_with_cli(overrides)?;
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, overrides)?;
+    let layer = storage_ctx.load_config(overrides)?;
+    let id_config = config::id_config_from_layer(&layer);
+    let id_gen = IdGenerator::new(id_config);
     let storage = &mut storage_ctx.storage;
 
     // Resolve actor for audit trail
     let actor = "formula";
+    let issue_count = storage.count_issues()?;
 
     // Build a map of step ID -> created issue ID
     let mut step_to_issue: HashMap<String, Issue> = HashMap::new();
@@ -496,8 +578,17 @@ fn execute_apply(
                     d
                 })
             });
+            let gate_id = generate_step_issue_id(
+                storage,
+                &id_gen,
+                &gate_title,
+                gate_desc.as_deref(),
+                actor,
+                now,
+                issue_count,
+            )?;
             let gate_issue = Issue {
-                id: String::new(),
+                id: gate_id,
                 title: gate_title.into_owned(),
                 description: gate_desc,
                 status: Status::Open,
@@ -516,8 +607,18 @@ fn execute_apply(
             step_to_gate_issue.insert(step.id.clone(), gate_issue);
         }
 
+        let new_id = generate_step_issue_id(
+            storage,
+            &id_gen,
+            &title,
+            step.description.as_deref(),
+            actor,
+            now,
+            issue_count,
+        )?;
+
         let new_issue = Issue {
-            id: String::new(), // storage will assign
+            id: new_id,
             title,
             description: step.description.clone(),
             notes: step.notes.clone(),
@@ -562,15 +663,21 @@ fn execute_apply(
         let deps: Vec<&String> = step.depends_on.iter().chain(step.needs.iter()).collect();
 
         for dep_id in deps {
-            if step_to_issue.contains_key(dep_id) {
-                storage.add_dependency(&issue.id, dep_id, "blocks", actor)?;
-                dep_count += 1;
+            // `depends_on`/`needs` reference *step* IDs; translate to the
+            // created issue's real ID before adding the edge.
+            let Some(dep_issue) = step_to_issue.get(dep_id) else {
+                continue;
+            };
+            if dep_issue.id == issue.id {
+                continue;
             }
+            storage.add_dependency(&issue.id, &dep_issue.id, "blocks", actor)?;
+            dep_count += 1;
         }
     }
 
     // Report results
-    if use_json {
+    if use_json || use_toon {
         let gate_count = step_to_gate_issue.len();
         let mut issue_ids: Vec<String> = step_to_issue.values().map(|i| i.id.clone()).collect();
         let gate_ids: Vec<String> = step_to_gate_issue.values().map(|i| i.id.clone()).collect();
@@ -583,7 +690,7 @@ fn execute_apply(
             "gated_issues": gate_count,
             "issue_ids": issue_ids,
         });
-        output_ctx.json_pretty(&output);
+        emit_structured(output_ctx, &output, use_toon);
     } else {
         let gate_count = step_to_gate_issue.len();
         output_ctx.print_line(&format!(
@@ -939,7 +1046,7 @@ fn execute_convert(args: &FormulaConvertArgs, output_ctx: &OutputContext) -> cra
         return Ok(());
     }
 
-    let toml_path = json_path.with_extension("formula.toml");
+    let toml_path = toml_path_for_json(&json_path);
     fs::write(&toml_path, &toml_string)
         .map_err(|e| BeadsError::Config(format!("writing {}: {}", toml_path.display(), e)))?;
 
@@ -965,6 +1072,19 @@ fn execute_convert(args: &FormulaConvertArgs, output_ctx: &OutputContext) -> cra
     Ok(())
 }
 
+/// Derive the TOML output path for a `*.formula.json` file.
+///
+/// `Path::with_extension` would turn `x.formula.json` into
+/// `x.formula.formula.toml`; strip the full `.formula.json` suffix instead.
+fn toml_path_for_json(json_path: &std::path::Path) -> PathBuf {
+    let s = json_path.to_string_lossy();
+    if let Some(stripped) = s.strip_suffix(".formula.json") {
+        PathBuf::from(format!("{stripped}.formula.toml"))
+    } else {
+        json_path.with_extension("formula.toml")
+    }
+}
+
 /// Convert all JSON formulas in search paths to TOML.
 fn convert_all_formulas(output_ctx: &OutputContext, use_json: bool) -> crate::Result<()> {
     let search_paths = Parser::default_search_paths();
@@ -988,7 +1108,7 @@ fn convert_all_formulas(output_ctx: &OutputContext, use_json: bool) -> crate::Re
                 continue;
             }
 
-            let toml_path = path.with_extension("formula.toml");
+            let toml_path = toml_path_for_json(&path);
             if toml_path.exists() {
                 if !use_json {
                     output_ctx.print_line(&format!("Skipped (TOML exists): {}", fname));
@@ -1144,6 +1264,38 @@ fn parse_timeout_seconds(s: &str) -> Option<i64> {
         _ => return None,
     };
     Some(secs)
+}
+
+/// Generate a collision-free issue ID for a formula-created issue, using the
+/// same `IdGenerator` scheme as `br create`.
+fn generate_step_issue_id(
+    storage: &SqliteStorage,
+    id_gen: &IdGenerator,
+    title: &str,
+    description: Option<&str>,
+    actor: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    issue_count: usize,
+) -> Result<String> {
+    let id_check_err = std::cell::RefCell::new(None);
+    let id = id_gen.generate(
+        title,
+        description,
+        Some(actor),
+        now,
+        issue_count,
+        |candidate| match storage.id_exists(candidate) {
+            Ok(exists) => exists,
+            Err(e) => {
+                id_check_err.replace(Some(e));
+                true
+            }
+        },
+    );
+    if let Some(err) = id_check_err.into_inner() {
+        return Err(err);
+    }
+    Ok(id)
 }
 
 /// Parse an optional type string into an IssueType.

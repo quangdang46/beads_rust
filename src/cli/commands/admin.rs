@@ -28,41 +28,56 @@ pub fn execute(
 /// Execute `br admin doctor` — delegates to `br doctor`.
 fn execute_doctor(
     _args: &AdminDoctorArgs,
-    _cli: &config::CliOverrides,
-    _ctx: &OutputContext,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
 ) -> Result<()> {
     // Delegate to the doctor command's execute function.
     let doctor_args = crate::cli::DoctorArgs {
         repair: false,
         ..crate::cli::DoctorArgs::default()
     };
-    super::doctor::execute(&doctor_args, _cli, _ctx)
+    super::doctor::execute(&doctor_args, cli, ctx)
+}
+
+/// Admin subcommands (except `doctor`) operate directly on the database;
+/// `--no-db` is meaningless for them and must not be silently ignored.
+fn reject_no_db(cli: &config::CliOverrides) -> Result<()> {
+    if cli.no_db == Some(true) {
+        return Err(BeadsError::validation(
+            "--no-db",
+            "br admin database commands require a database; --no-db is not supported",
+        ));
+    }
+    Ok(())
 }
 
 /// Execute `br admin vacuum` — runs VACUUM on the SQLite database.
 fn execute_vacuum(
-    _args: &AdminVacuumArgs,
+    args: &AdminVacuumArgs,
     cli: &config::CliOverrides,
-    _ctx: &OutputContext,
+    ctx: &OutputContext,
 ) -> Result<()> {
+    reject_no_db(cli)?;
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-    let paths = config::ConfigPaths::resolve(&beads_dir, cli.db.as_ref())?;
+    // The subcommand-level `--db` shadows the global flag; honor it.
+    let db_override = args.db.as_ref().or(cli.db.as_ref());
+    let paths = config::ConfigPaths::resolve(&beads_dir, db_override)?;
 
     if !paths.db_path.is_file() {
         return Err(crate::error::BeadsError::validation(
             "db_path",
-            &format!("Database file not found at {}", paths.db_path.display()),
+            format!("Database file not found at {}", paths.db_path.display()),
         ));
     }
 
-    if !_ctx.is_quiet() {
+    if !ctx.is_quiet() {
         println!("Vacuuming database: {}", paths.db_path.display());
     }
 
     let storage = crate::storage::SqliteStorage::open(&paths.db_path)?;
     storage.execute_raw("VACUUM")?;
 
-    if !_ctx.is_quiet() {
+    if !ctx.is_quiet() {
         println!("VACUUM completed successfully");
     }
 
@@ -75,6 +90,7 @@ fn execute_stats(
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
+    reject_no_db(cli)?;
     // Delegate to the stats command for issue counts by status.
     super::stats::execute(
         &crate::cli::StatsArgs {
@@ -101,11 +117,12 @@ fn execute_stats(
 /// sequences. Preserves the database file and workspace structure.
 /// Requires `--force` as a safety guard.
 fn execute_reset(
-    _args: &AdminResetArgs,
+    args: &AdminResetArgs,
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
-    if !_args.force {
+    reject_no_db(cli)?;
+    if !args.force {
         return Err(BeadsError::validation(
             "force",
             "Factory reset requires --force to confirm. This will permanently delete all issues, \
@@ -120,7 +137,7 @@ fn execute_reset(
     if !paths.db_path.is_file() {
         return Err(BeadsError::validation(
             "db_path",
-            &format!("Database file not found at {}", paths.db_path.display()),
+            format!("Database file not found at {}", paths.db_path.display()),
         ));
     }
 
@@ -171,6 +188,25 @@ fn execute_reset(
     // Re-initialize essential config
     if !issue_prefix.is_empty() {
         storage.set_config("issue_prefix", &issue_prefix)?;
+    }
+    drop(storage);
+
+    // The JSONL export still contains every deleted issue; the next
+    // command's auto-import would resurrect the entire database. Truncate
+    // the workspace JSONL so the reset is durable. An external JSONL path
+    // is never touched — it does not belong to this workspace.
+    if paths.jsonl_path.is_file()
+        && !config::resolved_jsonl_path_is_external(&paths.beads_dir, &paths.jsonl_path)
+    {
+        std::fs::write(&paths.jsonl_path, "")?;
+        if !ctx.is_quiet() {
+            println!("Cleared JSONL export: {}", paths.jsonl_path.display());
+        }
+    } else if paths.jsonl_path.is_file() && !ctx.is_quiet() {
+        println!(
+            "Note: external JSONL {} left untouched; clear it manually if it should not re-import",
+            paths.jsonl_path.display()
+        );
     }
 
     if !ctx.is_quiet() {

@@ -58,7 +58,13 @@ pub fn execute_with_storage(
 }
 
 fn execute_inner(args: &CountArgs, ctx: &OutputContext, storage: &SqliteStorage) -> Result<()> {
-    let mut filters = ListFilters::default();
+    // Default scope matches `br list`: all non-terminal issues including
+    // deferred ones. An explicit `--status` filter still narrows correctly
+    // because the status `IN (...)` clause takes precedence.
+    let mut filters = ListFilters {
+        include_deferred: true,
+        ..ListFilters::default()
+    };
     let statuses = parse_trimmed_values(&args.status)?;
     let types = parse_trimmed_values(&args.types)?;
     let priorities = parse_trimmed_values(&args.priority)?;
@@ -760,8 +766,9 @@ mod tests {
         assert_eq!(groups_to_map(actual_groups), expected);
         assert_eq!(expected.get("backend"), Some(&1));
         assert_eq!(expected.get("(no labels)"), Some(&1));
+        // Deferred issues are visible by default (consistent with `br list`).
+        assert_eq!(expected.get("deferred-only"), Some(&1));
         assert!(!expected.contains_key("closed-only"));
-        assert!(!expected.contains_key("deferred-only"));
         assert!(!expected.contains_key("template-only"));
         info!("test_default_visible_label_counts_match_default_filtering: assertions passed");
 

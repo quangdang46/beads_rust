@@ -10,7 +10,7 @@ use crate::config::{
 };
 use crate::error::Result;
 use crate::format::{BlockedIssue, BlockedIssueOutput, sanitize_terminal_inline};
-use crate::model::{IssueType, Priority};
+use crate::model::{IssueType, Priority, Status};
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::SqliteStorage;
 use std::path::Path;
@@ -195,6 +195,11 @@ fn execute_inner(
             }
         }
     }
+
+    // Deferred issues are excluded, matching `br ready`'s default scope:
+    // deferred work is intentionally parked, not actionable blocked work.
+    // (`br list --deferred` and `br show` still surface deferred issues.)
+    blocked_issues.retain(|bi| bi.issue.status != Status::Deferred);
 
     // Apply filters
     filter_by_type(&mut blocked_issues, &args.type_)?;
@@ -415,11 +420,28 @@ fn print_text_output(
             // Note: bd uses "dependencies" even for count=1 (grammatically incorrect but we match for conformance)
             let count = bi.blocked_by.len();
             // Extract just the IDs from blocker refs (strip :status suffix)
-            println!(
-                "  Blocked by {} open dependencies: [{}]",
-                count,
-                blocked_id_list_text(&bi.blocked_by)
-            );
+            let ids = blocked_id_list_text(&bi.blocked_by);
+            // Blocker refs carry "id:status"; only claim "open dependencies"
+            // when every blocker really is open — a deferred (or otherwise
+            // non-open) blocker must be labelled truthfully.
+            let statuses: std::collections::BTreeSet<&str> = bi
+                .blocked_by
+                .iter()
+                .filter_map(|r| r.rsplit_once(':').map(|(_, s)| s))
+                .collect();
+            if statuses.len() == 1 && statuses.contains("open") {
+                println!("  Blocked by {count} open dependencies: [{ids}]");
+            } else {
+                let kind = if statuses.is_empty() {
+                    "dependencies".to_string()
+                } else {
+                    format!(
+                        "dependencies ({})",
+                        statuses.iter().copied().collect::<Vec<_>>().join("/")
+                    )
+                };
+                println!("  Blocked by {count} {kind}: [{ids}]");
+            }
         }
     }
 }

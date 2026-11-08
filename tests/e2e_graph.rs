@@ -295,6 +295,18 @@ fn e2e_graph_all_includes_custom_status_issues() {
     );
     let review_id = parse_created_id(&review.stdout);
 
+    // Custom statuses must be registered before they can be assigned.
+    let register = run_br(
+        &workspace,
+        ["custom-status", "add", "review", "--category", "wip"],
+        "register_review_status",
+    );
+    assert!(
+        register.status.success(),
+        "register review status failed: {}",
+        register.stderr
+    );
+
     let update = run_br(
         &workspace,
         ["update", &review_id, "--status", "review"],

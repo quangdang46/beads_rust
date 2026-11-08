@@ -120,17 +120,35 @@ pub fn execute(
     let beads_dir = resolve_init_beads_dir(base_dir);
 
     let mut created_dir = false;
-    if beads_dir.exists() {
-        // Check if DB exists (in cache dir if BEADS_CACHE_DIR is set)
-        let effective_db_path = db_path(&beads_dir);
-        if effective_db_path.exists() && !force {
-            return Err(BeadsError::AlreadyInitialized {
-                path: effective_db_path,
-            });
+    match fs::symlink_metadata(&beads_dir) {
+        Ok(_) => {
+            // The path exists (or is a dangling symlink). `Path::exists`
+            // follows symlinks, so a dangling `.beads` symlink would slip
+            // through and fail later with a cryptic "File exists" from
+            // `create_dir`. Resolve through the link and require a real
+            // directory.
+            let is_dir = fs::metadata(&beads_dir)
+                .map(|metadata| metadata.is_dir())
+                .unwrap_or(false);
+            if !is_dir {
+                return Err(BeadsError::Config(format!(
+                    "Cannot initialize workspace: {} exists and is not a directory",
+                    beads_dir.display()
+                )));
+            }
+            // Check if DB exists (in cache dir if BEADS_CACHE_DIR is set)
+            let effective_db_path = db_path(&beads_dir);
+            if effective_db_path.exists() && !force {
+                return Err(BeadsError::AlreadyInitialized {
+                    path: effective_db_path,
+                });
+            }
         }
-    } else {
-        fs::create_dir(&beads_dir)?;
-        created_dir = true;
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(&beads_dir)?;
+            created_dir = true;
+        }
+        Err(error) => return Err(error.into()),
     }
 
     let effective_db_path = db_path(&beads_dir);
@@ -144,24 +162,30 @@ pub fn execute(
     // Initialize DB (creates file and applies schema)
     let mut storage = SqliteStorage::open(&effective_db_path)?;
 
-    // Set prefix in config table if provided, otherwise derive from directory name
-    // Normalize to lowercase since ID validation requires lowercase prefixes
-    let actual_prefix = prefix.unwrap_or_else(|| {
-        let mut dir_name = "br".to_string();
-        if let Ok(canon) = dunce::canonicalize(base_dir)
-            && let Some(name) = canon.file_name().and_then(|n| n.to_str())
-        {
-            let cleaned: String = name
-                .chars()
-                .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-                .collect();
-            if !cleaned.is_empty() {
-                dir_name = cleaned;
+    // Resolve the issue prefix. An explicit `--prefix` is validated and
+    // run through the same normalization ID generation uses, so the stored
+    // value can never diverge from the IDs it produces. Without an explicit
+    // prefix, an existing workspace prefix is preserved — `init --force`
+    // must not silently rewrite IDs mid-flight — and only a fresh database
+    // derives a prefix from the directory name.
+    let stored_prefix = storage.get_config("issue_prefix").ok().flatten();
+    let candidate_prefix = match prefix {
+        Some(requested) => {
+            if requested.trim().is_empty() {
+                return Err(BeadsError::validation(
+                    "prefix",
+                    "issue prefix cannot be empty",
+                ));
             }
+            requested
         }
-        dir_name
-    });
-    let normalized = actual_prefix.to_ascii_lowercase();
+        None => stored_prefix
+            .filter(|stored| !stored.trim().is_empty())
+            .unwrap_or_else(|| derive_init_prefix(base_dir)),
+    };
+    // Store the same normalized form ID generation derives, so the config
+    // value and generated IDs can never diverge.
+    let normalized = crate::util::id::normalize_prefix(&candidate_prefix);
     storage.set_config("issue_prefix", &normalized)?;
     let prefix_set = Some(normalized.clone());
 
@@ -270,6 +294,23 @@ redirect
         return Ok(());
     }
 
+    if matches!(ctx.mode(), OutputMode::Json) {
+        let payload = serde_json::json!({
+            "ok": true,
+            "beads_dir": beads_dir.display().to_string(),
+            "database": effective_db_path.display().to_string(),
+            "jsonl": beads_dir.join("issues.jsonl").display().to_string(),
+            "issue_prefix": prefix_set.as_deref(),
+            "created": created_dir,
+            "forced": force,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string())
+        );
+        return Ok(());
+    }
+
     if matches!(ctx.mode(), OutputMode::Rich) {
         let steps = build_init_steps(
             created_dir,
@@ -290,6 +331,23 @@ redirect
     }
 
     Ok(())
+}
+
+/// Derive a default issue prefix from the canonical directory name.
+fn derive_init_prefix(base_dir: &Path) -> String {
+    let mut dir_name = "br".to_string();
+    if let Ok(canon) = dunce::canonicalize(base_dir)
+        && let Some(name) = canon.file_name().and_then(|n| n.to_str())
+    {
+        let cleaned: String = name
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .collect();
+        if !cleaned.is_empty() {
+            dir_name = cleaned;
+        }
+    }
+    dir_name
 }
 
 #[derive(Clone, Copy)]

@@ -23,9 +23,9 @@ pub enum QueryNode {
         value: String,
     },
     /// Logical AND
-    And(Box<QueryNode>, Box<QueryNode>),
+    And(Box<Self>, Box<Self>),
     /// Logical OR
-    Or(Box<QueryNode>, Box<QueryNode>),
+    Or(Box<Self>, Box<Self>),
     /// Logical NOT
-    Not(Box<QueryNode>),
+    Not(Box<Self>),
 }

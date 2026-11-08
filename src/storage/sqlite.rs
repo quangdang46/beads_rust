@@ -136,6 +136,65 @@ fn unique_label_refs(labels: &[String]) -> Vec<&String> {
     unique_labels
 }
 
+/// Order-insensitive label comparison matching `Issue::sync_equals`.
+fn import_labels_equal(left: &[String], right: &[String]) -> bool {
+    let mut left_sorted = left.to_vec();
+    left_sorted.sort_unstable();
+    left_sorted.dedup();
+    let mut right_sorted = right.to_vec();
+    right_sorted.sort_unstable();
+    right_sorted.dedup();
+    left_sorted == right_sorted
+}
+
+/// Order-insensitive dependency comparison matching `Issue::sync_equals`.
+fn import_dependencies_equal(left: &[Dependency], right: &[Dependency]) -> bool {
+    fn sort_key(
+        dep: &Dependency,
+    ) -> (
+        String,
+        String,
+        String,
+        DateTime<Utc>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) {
+        (
+            dep.issue_id.clone(),
+            dep.depends_on_id.clone(),
+            dep.dep_type.as_str().to_string(),
+            dep.created_at,
+            dep.created_by.clone(),
+            dep.metadata.clone(),
+            dep.thread_id.clone(),
+        )
+    }
+    let mut left_sorted = left.to_vec();
+    left_sorted.sort_by_key(sort_key);
+    let mut right_sorted = right.to_vec();
+    right_sorted.sort_by_key(sort_key);
+    left_sorted == right_sorted
+}
+
+/// Order-insensitive comment comparison matching `Issue::sync_equals`.
+fn import_comments_equal(left: &[Comment], right: &[Comment]) -> bool {
+    fn sort_key(comment: &Comment) -> (String, DateTime<Utc>, String, String, i64) {
+        (
+            comment.issue_id.clone(),
+            comment.created_at,
+            comment.author.clone(),
+            comment.body.clone(),
+            comment.id,
+        )
+    }
+    let mut left_sorted = left.to_vec();
+    left_sorted.sort_by_key(sort_key);
+    let mut right_sorted = right.to_vec();
+    right_sorted.sort_by_key(sort_key);
+    left_sorted == right_sorted
+}
+
 fn append_label_membership_filters(
     sql: &mut String,
     params: &mut Vec<SqlValue>,
@@ -927,8 +986,12 @@ impl SqliteStorage {
                 EXISTS(SELECT 1 FROM issues WHERE status IN ('open', 'deferred') LIMIT 1),
                 COALESCE((SELECT value = ? FROM metadata WHERE key = ? ORDER BY rowid DESC LIMIT 1), 0)"
         } else {
+            // `open` candidates plus deferred issues whose `defer_until` has
+            // already passed — the ready query admits those as ready work.
             "SELECT
-                EXISTS(SELECT 1 FROM issues WHERE status = 'open' LIMIT 1),
+                EXISTS(SELECT 1 FROM issues WHERE status = 'open'
+                       OR (status = 'deferred' AND defer_until IS NOT NULL
+                           AND datetime(defer_until) <= datetime('now')) LIMIT 1),
                 COALESCE((SELECT value = ? FROM metadata WHERE key = ? ORDER BY rowid DESC LIMIT 1), 0)"
         };
         let row = db::query_row_with(
@@ -2614,10 +2677,22 @@ impl SqliteStorage {
                     continue;
                 }
                 Self::ensure_dependency_target_exists_in_tx(conn, &dep.depends_on_id)?;
-                // Check cycle if blocking
-                if dep.dep_type.is_blocking()
-                    && Self::check_cycle(conn, &issue.id, &dep.depends_on_id, true)?
-                {
+                // Cycle scope matches `dep add` / `dep cycles`: ordering and
+                // ancestry types are probed over the unified edge graph
+                // (`blocking_only = false`); associative types may form
+                // cycles legitimately. `parent-child` is stored child ->
+                // parent but traversed parent -> child, so its probe swaps
+                // endpoints — identical to the CLI `dep add` pre-check.
+                let cycle_check = match &dep.dep_type {
+                    DependencyType::ParentChild => {
+                        Self::check_cycle(conn, &dep.depends_on_id, &issue.id, false)?
+                    }
+                    dep_kind if dep_kind.affects_ready_work() => {
+                        Self::check_cycle(conn, &issue.id, &dep.depends_on_id, false)?
+                    }
+                    _ => false,
+                };
+                if cycle_check {
                     return Err(BeadsError::DependencyCycle {
                         path: format!(
                             "Adding dependency {} -> {} would create a cycle",
@@ -3398,8 +3473,9 @@ impl SqliteStorage {
     /// or any database update fails.
     pub fn update_issue_id(&mut self, old_id: &str, new_id: &str, actor: &str) -> Result<Issue> {
         self.mutate("update_issue_id", actor, |conn, ctx| {
-            // Fetch the existing issue
-            let issue = Self::get_issue_from_conn(conn, old_id)?.ok_or_else(|| {
+            // Fetch the existing issue (existence check; the row itself is
+            // re-read under the new id before returning).
+            let _issue = Self::get_issue_from_conn(conn, old_id)?.ok_or_else(|| {
                 BeadsError::IssueNotFound {
                     id: old_id.to_string(),
                 }
@@ -3413,8 +3489,10 @@ impl SqliteStorage {
                 });
             }
 
-            // Validate new ID format: prefix-suffix (e.g. acme-dolt, gt-auth)
-            if !regex::Regex::new(r"^[a-z]+-[a-zA-Z0-9._-]+$")
+            // Validate new ID format: prefix-suffix (e.g. acme-dolt, gt-auth).
+            // Prefix charset mirrors `util::id::normalize_prefix` so prefixes
+            // containing digits or separators remain renamable.
+            if !regex::Regex::new(r"^[a-z0-9_.:#-]*[a-z0-9][a-z0-9_.:#-]*-[a-zA-Z0-9._-]+$")
                 .unwrap()
                 .is_match(new_id)
             {
@@ -3450,6 +3528,31 @@ impl SqliteStorage {
                 "UPDATE dependencies SET depends_on_id = ?1 WHERE depends_on_id = ?2",
                 &[SqlValue::from(new_id), SqlValue::from(old_id)],
             )?;
+
+            // Migrate every other issue_id-keyed relation table. Previously
+            // only `dependencies` moved, so `br rename` orphaned the issue's
+            // comments, labels, events, and cache/projection rows under the
+            // old ID.
+            for (table, column) in [
+                ("comments", "issue_id"),
+                ("labels", "issue_id"),
+                ("events", "issue_id"),
+                ("dirty_issues", "issue_id"),
+                ("export_hashes", "issue_id"),
+                ("blocked_issues_cache", "issue_id"),
+                ("close_metadata", "issue_id"),
+                ("gate_results", "issue_id"),
+                ("gate_waiters", "issue_id"),
+                ("child_counters", "parent_id"),
+                ("interactions", "issue_id"),
+            ] {
+                let sql = format!("UPDATE {table} SET {column} = ?1 WHERE {column} = ?2");
+                db::exec_with(
+                    &conn,
+                    &sql,
+                    &[SqlValue::from(new_id), SqlValue::from(old_id)],
+                )?;
+            }
 
             // Update text references in all other issues (word-bounded replacement)
             let pattern = regex::Regex::new(&format!(r"\b{}\b", regex::escape(old_id))).unwrap();
@@ -3943,6 +4046,34 @@ impl SqliteStorage {
             params.push(SqlValue::from(external_ref.as_str()));
         }
 
+        if let Some(ref owner) = filters.owner {
+            sql.push_str(" AND owner = ?");
+            params.push(SqlValue::from(owner.as_str()));
+        }
+
+        if let Some(pinned) = filters.pinned {
+            if pinned {
+                sql.push_str(" AND pinned = 1");
+            } else {
+                sql.push_str(" AND (pinned = 0 OR pinned IS NULL)");
+            }
+        }
+
+        if let Some(ref mol_type) = filters.mol_type {
+            sql.push_str(" AND mol_type = ?");
+            params.push(SqlValue::from(mol_type.as_str()));
+        }
+
+        if let Some(ts) = filters.created_before {
+            sql.push_str(" AND created_at <= ?");
+            params.push(SqlValue::from(ts.to_rfc3339()));
+        }
+
+        if let Some(ts) = filters.created_after {
+            sql.push_str(" AND created_at >= ?");
+            params.push(SqlValue::from(ts.to_rfc3339()));
+        }
+
         if !sort_default_in_rust {
             // Apply custom sort if provided
             if let Some(ref sort_field) = filters.sort {
@@ -4088,9 +4219,19 @@ impl SqliteStorage {
             || filters.title_contains.is_some()
             || filters.updated_before.is_some()
             || filters.updated_after.is_some()
+            || filters.created_before.is_some()
+            || filters.created_after.is_some()
             || filters.sort.is_some()
             || filters.reverse
-            || filters.external_ref.is_some();
+            || filters.external_ref.is_some()
+            || filters.owner.is_some()
+            || filters.pinned.is_some()
+            || filters.mol_type.is_some()
+            || filters.ids.as_ref().is_some_and(|ids| !ids.is_empty())
+            || filters
+                .metadata_filters
+                .as_ref()
+                .is_some_and(|mf| !mf.is_empty());
         if unsupported_filter {
             return self.list_issues(filters);
         }
@@ -4101,6 +4242,9 @@ impl SqliteStorage {
             return self.list_text_issues_by_priority_window(filters, limit);
         }
 
+        // This fast path is only reachable when `filters.include_deferred` is
+        // true (see the unsupported-filter guard above), so deferred issues
+        // must be admitted here to match `list_issues` semantics.
         let mut sql = String::from(
             "SELECT id, title, status, priority, issue_type, created_at, updated_at
              FROM issues
@@ -4402,7 +4546,8 @@ impl SqliteStorage {
             || filters.assignee.is_some()
             || filters.unassigned
             || filters.include_closed
-            || filters.include_deferred
+            // `include_deferred` cannot widen results here: `expected_statuses`
+            // already pins the query to open/in_progress only.
             || filters.include_templates
             || filters.title_contains.is_some()
             || filters.updated_before.is_some()
@@ -4678,6 +4823,39 @@ impl SqliteStorage {
 
         if let Some(ts) = filters.updated_after {
             sql.push_str(" AND updated_at >= ?");
+            params.push(SqlValue::from(ts.to_rfc3339()));
+        }
+
+        if let Some(ref external_ref) = filters.external_ref {
+            sql.push_str(" AND external_ref = ?");
+            params.push(SqlValue::from(external_ref.as_str()));
+        }
+
+        if let Some(ref owner) = filters.owner {
+            sql.push_str(" AND owner = ?");
+            params.push(SqlValue::from(owner.as_str()));
+        }
+
+        if let Some(pinned) = filters.pinned {
+            if pinned {
+                sql.push_str(" AND pinned = 1");
+            } else {
+                sql.push_str(" AND (pinned = 0 OR pinned IS NULL)");
+            }
+        }
+
+        if let Some(ref mol_type) = filters.mol_type {
+            sql.push_str(" AND mol_type = ?");
+            params.push(SqlValue::from(mol_type.as_str()));
+        }
+
+        if let Some(ts) = filters.created_before {
+            sql.push_str(" AND created_at <= ?");
+            params.push(SqlValue::from(ts.to_rfc3339()));
+        }
+
+        if let Some(ts) = filters.created_after {
+            sql.push_str(" AND created_at >= ?");
             params.push(SqlValue::from(ts.to_rfc3339()));
         }
 
@@ -5630,11 +5808,42 @@ impl SqliteStorage {
         // widened groups index-coverable. Single quotes are still escaped
         // defensively in case a project configures an exotic custom status.
         {
-            let escaped: Vec<String> = ready_statuses
+            let deferred_is_ready_status = ready_statuses
                 .iter()
-                .map(|status| format!("'{}'", status.replace('\'', "''")))
-                .collect();
-            let _ = write!(sql, " AND status IN ({})", escaped.join(","));
+                .any(|status| status.eq_ignore_ascii_case("deferred"));
+            if deferred_is_ready_status {
+                let escaped: Vec<String> = ready_statuses
+                    .iter()
+                    .map(|status| format!("'{}'", status.replace('\'', "''")))
+                    .collect();
+                let _ = write!(sql, " AND status IN ({})", escaped.join(","));
+            } else {
+                // `deferred` is not an explicit ready status, but an expired
+                // deferral (`defer_until <= now`) is ready work: without this
+                // clause a deferred issue whose defer_until passed would stay
+                // invisible to `br ready` forever. A deferred issue with NULL
+                // or future `defer_until` remains hidden.
+                let escaped: Vec<String> = ready_statuses
+                    .iter()
+                    .map(|status| format!("'{}'", status.replace('\'', "''")))
+                    .collect();
+                if escaped.is_empty() {
+                    sql.push_str(
+                        " AND (status = 'deferred' \
+                         AND defer_until IS NOT NULL \
+                         AND datetime(defer_until) <= datetime('now'))",
+                    );
+                } else {
+                    let _ = write!(
+                        sql,
+                        " AND (status IN ({}) \
+                         OR (status = 'deferred' \
+                             AND defer_until IS NOT NULL \
+                             AND datetime(defer_until) <= datetime('now')))",
+                        escaped.join(",")
+                    );
+                }
+            }
         }
 
         // Ready condition 2: blocked issues are filtered in SQL when the cache
@@ -6378,7 +6587,61 @@ impl SqliteStorage {
             !blockers.is_empty()
         });
 
+        // A closed or tombstoned issue is never "blocked" — nothing remains to
+        // be scheduled. Dependency edges and parent-blocked propagation can
+        // still point at terminal issues, so drop those keys here; otherwise
+        // `blocked_issues_cache` (and `get_blocked_ids`, which reads the cache
+        // raw) reports phantom blocked work for finished issues.
+        let terminal_ids = Self::load_terminal_issue_ids_impl(conn, None)?;
+        blocked_issues_map.retain(|issue_id, _| !terminal_ids.contains(issue_id));
+
         Ok(blocked_issues_map)
+    }
+
+    /// Load IDs of issues whose status is terminal (`closed` or `tombstone`).
+    ///
+    /// When `issue_ids` is `Some`, restricts the scan to those IDs (used by
+    /// the incremental cache path); `None` scans the whole table.
+    fn load_terminal_issue_ids_impl(
+        conn: &Connection,
+        issue_ids: Option<&HashSet<String>>,
+    ) -> Result<HashSet<String>> {
+        let mut terminal_ids = HashSet::new();
+        match issue_ids {
+            None => {
+                let rows = db::query_all(
+                    &conn,
+                    "SELECT id FROM issues WHERE status IN ('closed', 'tombstone')",
+                )?;
+                for row in &rows {
+                    if let Some(id) = row.get(0).and_then(SqlValue::as_text) {
+                        terminal_ids.insert(id.to_string());
+                    }
+                }
+            }
+            Some(ids) if !ids.is_empty() => {
+                let ids_vec: Vec<&String> = ids.iter().collect();
+                for chunk in ids_vec.chunks(400) {
+                    let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+                    let sql = format!(
+                        "SELECT id FROM issues
+                         WHERE status IN ('closed', 'tombstone')
+                           AND id IN ({})",
+                        placeholders.join(", ")
+                    );
+                    let params: Vec<SqlValue> =
+                        chunk.iter().map(|id| SqlValue::from(id.as_str())).collect();
+                    let rows = db::query_rows_with(&conn, &sql, &params)?;
+                    for row in &rows {
+                        if let Some(id) = row.get(0).and_then(SqlValue::as_text) {
+                            terminal_ids.insert(id.to_string());
+                        }
+                    }
+                }
+            }
+            Some(_) => {}
+        }
+        Ok(terminal_ids)
     }
 
     pub(crate) fn blocked_cache_projection_health(
@@ -6649,9 +6912,17 @@ impl SqliteStorage {
             db::exec_with(&conn, &sql, &params)?;
         }
 
+        // Terminal (closed/tombstone) issues are never blocked — mirror the
+        // full-rebuild filter in `compute_blocked_issues_map_impl` so the
+        // incremental path cannot leave phantom cache rows for finished work.
+        let terminal_ids = Self::load_terminal_issue_ids_impl(conn, Some(&affected))?;
+
         // 4. Re-insert only affected rows that have blockers.
         let mut entries = Vec::new();
         for id in &affected {
+            if terminal_ids.contains(id) {
+                continue;
+            }
             if let Some(mut blockers) = blocked_issues_map.remove(id.as_str()) {
                 if blockers.is_empty() {
                     continue;
@@ -7630,6 +7901,7 @@ impl SqliteStorage {
             &self.conn(),
             "SELECT
                 d.depends_on_id AS epic_id,
+                d.issue_id AS child_id,
                 i.status
              FROM dependencies d
              JOIN issues i ON d.issue_id = i.id
@@ -7638,20 +7910,160 @@ impl SqliteStorage {
         )?;
         let mut counts: std::collections::HashMap<String, (usize, usize)> =
             std::collections::HashMap::new();
+        // Track dep-row children per parent so dot-notation children that also
+        // have a formal `parent-child` edge are not double counted.
+        let mut dep_children: std::collections::HashMap<String, HashSet<String>> =
+            std::collections::HashMap::new();
         for row in &rows {
             let epic_id = row
                 .get(0)
                 .and_then(SqlValue::as_text)
                 .unwrap_or("")
                 .to_string();
-            let status = row.get(1).and_then(SqlValue::as_text).unwrap_or("");
+            let child_id = row
+                .get(1)
+                .and_then(SqlValue::as_text)
+                .unwrap_or("")
+                .to_string();
+            let status = row.get(2).and_then(SqlValue::as_text).unwrap_or("");
+            dep_children
+                .entry(epic_id.clone())
+                .or_default()
+                .insert(child_id);
             let entry = counts.entry(epic_id).or_insert((0, 0));
             entry.0 += 1; // total
             if status == "closed" || status == "tombstone" {
                 entry.1 += 1; // closed
             }
         }
+
+        // Dot-notation children (`<parent>.<n>`) have no `parent-child` dep
+        // row when they come from legacy DBs, bulk JSONL imports, or
+        // hand-edited files. `get_open_dot_notation_children` only covers the
+        // per-parent close guard; epic status/close-eligibility needs them
+        // counted here too. A child's direct parent is the id prefix before
+        // its last `.` segment, matching the direct-child (not grandchild)
+        // semantics of `get_open_dot_notation_children`.
+        let dot_rows = db::query_all(
+            &self.conn(),
+            "SELECT id, status FROM issues
+             WHERE id LIKE '%.%'
+               AND (is_template = 0 OR is_template IS NULL)",
+        )?;
+        for row in &dot_rows {
+            let Some(child_id) = row.get(0).and_then(SqlValue::as_text) else {
+                continue;
+            };
+            let Some(dot_pos) = child_id.rfind('.') else {
+                continue;
+            };
+            let parent_id = &child_id[..dot_pos];
+            if parent_id.is_empty() {
+                continue;
+            }
+            if dep_children
+                .get(parent_id)
+                .is_some_and(|children| children.contains(child_id))
+            {
+                continue;
+            }
+            let status = row.get(1).and_then(SqlValue::as_text).unwrap_or("");
+            let entry = counts.entry(parent_id.to_string()).or_insert((0, 0));
+            entry.0 += 1; // total
+            if status == "closed" || status == "tombstone" {
+                entry.1 += 1; // closed
+            }
+        }
+
         Ok(counts)
+    }
+
+    /// Returns a map of parent/epic ID -> IDs of its non-terminal children.
+    ///
+    /// Covers both `parent-child` dependency rows and dot-notation children
+    /// (`<parent>.<n>`) without dep rows, deduplicated the same way
+    /// [`Self::get_epic_counts`] does. "Non-terminal" matches the epic-count
+    /// definition: anything that is not `closed` or `tombstone` (deferred and
+    /// in-progress children still count as open).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_open_epic_children_map(
+        &self,
+    ) -> Result<std::collections::HashMap<String, Vec<String>>> {
+        let mut map: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        let mut seen: std::collections::HashMap<String, std::collections::HashSet<String>> =
+            std::collections::HashMap::new();
+
+        let dep_rows = db::query_all(
+            &self.conn(),
+            "SELECT d.depends_on_id, d.issue_id
+             FROM dependencies d
+             JOIN issues i ON d.issue_id = i.id
+             WHERE d.type = 'parent-child'
+               AND i.status NOT IN ('closed', 'tombstone')
+               AND (i.is_template = 0 OR i.is_template IS NULL)",
+        )?;
+        for row in &dep_rows {
+            let Some(parent) = row.get(0).and_then(SqlValue::as_text) else {
+                continue;
+            };
+            let Some(child) = row.get(1).and_then(SqlValue::as_text) else {
+                continue;
+            };
+            if seen
+                .entry(parent.to_string())
+                .or_default()
+                .insert(child.to_string())
+            {
+                map.entry(parent.to_string())
+                    .or_default()
+                    .push(child.to_string());
+            }
+        }
+
+        // Dot-notation direct children without a dep row (same parent-prefix
+        // rule as get_epic_counts: prefix before the last '.').
+        let dot_rows = db::query_all(
+            &self.conn(),
+            "SELECT id, status FROM issues
+             WHERE id LIKE '%.%'
+               AND status NOT IN ('closed', 'tombstone')
+               AND (is_template = 0 OR is_template IS NULL)",
+        )?;
+        for row in &dot_rows {
+            let Some(child_id) = row.get(0).and_then(SqlValue::as_text) else {
+                continue;
+            };
+            let Some(dot_pos) = child_id.rfind('.') else {
+                continue;
+            };
+            let parent_id = &child_id[..dot_pos];
+            if parent_id.is_empty() {
+                continue;
+            }
+            // Skip children already covered by a parent-child dep row
+            // (dep-row children were inserted into `seen` above).
+            if seen
+                .get(parent_id)
+                .is_some_and(|children| children.contains(child_id))
+            {
+                continue;
+            }
+            if seen
+                .entry(parent_id.to_string())
+                .or_default()
+                .insert(child_id.to_string())
+            {
+                map.entry(parent_id.to_string())
+                    .or_default()
+                    .push(child_id.to_string());
+            }
+        }
+
+        Ok(map)
     }
 
     /// Returns IDs of direct dot-notation children of `parent_id` that are
@@ -7782,10 +8194,31 @@ impl SqliteStorage {
             // Cycle check runs INSIDE the transaction (BEGIN IMMEDIATE) to
             // prevent TOCTOU races where a concurrent writer could insert an
             // edge between our check and our INSERT.
-            if let Ok(dt) = dep_type.parse::<DependencyType>()
-                && dt.is_blocking()
-                && Self::check_cycle(conn, issue_id, depends_on_id, true)?
-            {
+            //
+            // Scope matches the CLI `dep add` pre-check and `br dep cycles`:
+            // ordering/ancestry types (`blocks`, `conditional-blocks`,
+            // `waits-for`, `parent-child`) are rejected when they close a
+            // loop, probed over the unified edge graph (`blocking_only =
+            // false`) where every non-`parent-child` type is a forward edge
+            // and `parent-child` edges are traversed in reverse. Associative
+            // types (`related`, `duplicates`, ...) may legitimately form
+            // cycles — `dep cycles` reports them but insertion does not
+            // reject them. Previously only `blocks` edges were checked, so
+            // `dep add -t waits-for` could create a cycle that `dep cycles`
+            // then reported.
+            let cycle_check = match dep_type.parse::<DependencyType>() {
+                // `parent-child` is stored child -> parent but traversed
+                // parent -> child, so the probe runs with swapped endpoints
+                // (same as the CLI pre-check in `dep add`).
+                Ok(DependencyType::ParentChild) => {
+                    Self::check_cycle(conn, depends_on_id, issue_id, false)?
+                }
+                Ok(dep_kind) if dep_kind.affects_ready_work() => {
+                    Self::check_cycle(conn, issue_id, depends_on_id, false)?
+                }
+                _ => false,
+            };
+            if cycle_check {
                 return Err(BeadsError::DependencyCycle {
                     path: format!(
                         "Adding dependency {issue_id} -> {depends_on_id} would create a cycle"
@@ -11124,7 +11557,7 @@ fn is_transient_wal_tail_read_error(error: &dyn std::fmt::Display) -> bool {
 }
 
 /// Filter options for listing issues.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct ListFilters {
     pub statuses: Option<Vec<Status>>,
@@ -11167,6 +11600,43 @@ pub struct ListFilters {
     pub mol_type: Option<MolType>,
     /// Filter by external reference.
     pub external_ref: Option<String>,
+}
+
+impl Default for ListFilters {
+    /// Default filters match `br list`'s default visibility: non-terminal,
+    /// non-template issues *including* deferred ones. `br count` builds its
+    /// filters from `ListFilters::default()`, so this keeps `br count`
+    /// consistent with `br list`/`br stats`, which both surface deferred
+    /// issues unless a status filter excludes them.
+    fn default() -> Self {
+        Self {
+            statuses: None,
+            types: None,
+            priorities: None,
+            assignee: None,
+            unassigned: false,
+            include_closed: false,
+            include_deferred: true,
+            include_templates: false,
+            title_contains: None,
+            limit: None,
+            offset: None,
+            sort: None,
+            reverse: false,
+            labels: None,
+            labels_or: None,
+            updated_before: None,
+            updated_after: None,
+            ids: None,
+            created_after: None,
+            created_before: None,
+            metadata_filters: None,
+            owner: None,
+            pinned: None,
+            mol_type: None,
+            external_ref: None,
+        }
+    }
 }
 
 /// Closure-time policy metadata row (issue #274 Phase 1).
@@ -11387,12 +11857,13 @@ fn default_visible_limited_page_limit(filters: &ListFilters) -> Option<usize> {
         && filters.updated_before.is_none()
         && filters.updated_after.is_none()
         && filters.external_ref.is_none()
-        && filters.ids.is_none()
+        && filters.ids.as_ref().is_none_or(Vec::is_empty)
         && filters.created_after.is_none()
         && filters.created_before.is_none()
         && filters.metadata_filters.as_ref().is_none_or(Vec::is_empty)
         && filters.owner.is_none()
-        && filters.pinned.is_none();
+        && filters.pinned.is_none()
+        && filters.mol_type.is_none();
 
     is_default_visible.then_some(limit)
 }
@@ -11414,7 +11885,15 @@ fn default_visible_single_label_count_filter(filters: &ListFilters) -> Option<&s
         && filters.title_contains.is_none()
         && filters.labels_or.as_ref().is_none_or(Vec::is_empty)
         && filters.updated_before.is_none()
-        && filters.updated_after.is_none();
+        && filters.updated_after.is_none()
+        && filters.external_ref.is_none()
+        && filters.ids.as_ref().is_none_or(Vec::is_empty)
+        && filters.created_before.is_none()
+        && filters.created_after.is_none()
+        && filters.metadata_filters.as_ref().is_none_or(Vec::is_empty)
+        && filters.owner.is_none()
+        && filters.pinned.is_none()
+        && filters.mol_type.is_none();
 
     is_default_visible.then_some(label.as_str())
 }
@@ -12483,7 +12962,6 @@ impl SqliteStorage {
         ) {
             Ok(None) => Ok(None),
             Ok(Some(row)) => Ok(Some(Self::issue_from_row(&row)?)),
-            Ok(None) => Ok(None),
             Err(error) => Err(error.into()),
         }
     }
@@ -12509,7 +12987,6 @@ impl SqliteStorage {
         ) {
             Ok(None) => Ok(None),
             Ok(Some(row)) => Ok(Some(Self::issue_from_row(&row)?)),
-            Ok(None) => Ok(None),
             Err(error) => Err(error.into()),
         }
     }
@@ -13273,6 +13750,36 @@ impl SqliteStorage {
         }
 
         Ok(self.insert_issue_row_for_import(issue, &timestamps)? > 0)
+    }
+
+    /// Check whether the stored relation rows (labels, dependencies,
+    /// comments) for `issue.id` match the incoming import payload.
+    ///
+    /// `content_hash` deliberately excludes relations (they are separate
+    /// entities), so a JSONL edit that only touches `dependencies`, `labels`,
+    /// or `comments` leaves the hash — and therefore the import collision
+    /// action — unchanged. The issue is classified `Skip`, relations are
+    /// never reconciled, and `skipped_import_matches_stored_issue` then marks
+    /// the DB as needing a flush that would overwrite the user's edit.
+    ///
+    /// Callers performing JSONL import should invoke this for `Skip` actions
+    /// and, when it returns `false`, run `sync_labels_for_import`,
+    /// `sync_dependencies_for_import`, and `sync_comments_for_import` for the
+    /// issue so hand-edited relation fields actually reach the database.
+    ///
+    /// Comparison is order-insensitive and mirrors the relation portion of
+    /// `Issue::sync_equals`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn import_relations_match(&self, issue: &Issue) -> Result<bool> {
+        let Some(stored) = self.get_issue_for_export(&issue.id)? else {
+            return Ok(false);
+        };
+        Ok(import_labels_equal(&stored.labels, &issue.labels)
+            && import_dependencies_equal(&stored.dependencies, &issue.dependencies)
+            && import_comments_equal(&stored.comments, &issue.comments))
     }
 
     /// Check whether relation rows already exist for an imported issue ID.
@@ -21321,9 +21828,16 @@ mod tests {
                 .unwrap()
         );
 
-        let no_label_filters = ListFilters::default();
+        // Pin include_deferred=false so "global" covers every visible issue;
+        // ListFilters::default() now includes deferred issues, which the
+        // unlabeled deferred fixture would break coverage for.
+        let no_label_filters = ListFilters {
+            include_deferred: false,
+            ..ListFilters::default()
+        };
         let global_label_filters = ListFilters {
             labels: Some(vec!["global".to_string()]),
+            include_deferred: false,
             ..ListFilters::default()
         };
 
@@ -22538,16 +23052,13 @@ mod tests {
             let issue = make_issue(id, id, Status::Open, 2, None, t1, None);
             storage.create_issue(&issue, "tester").unwrap();
         }
-        // a -> b -> c -> a (cycle through parent-child edges).
-        storage
-            .add_dependency("cyc-b", "cyc-a", "parent-child", "tester")
-            .unwrap();
-        storage
-            .add_dependency("cyc-c", "cyc-b", "parent-child", "tester")
-            .unwrap();
-        storage
-            .add_dependency("cyc-a", "cyc-c", "parent-child", "tester")
-            .unwrap();
+        // a -> b -> c -> a (cycle through parent-child edges). Inserted via
+        // raw SQL because `add_dependency` now rejects parent-child cycles —
+        // cycles can still reach the DB via JSONL import or legacy data, and
+        // the ready walk must survive them.
+        insert_parent_child_dependency_for_test(&storage, "cyc-b", "cyc-a", t1);
+        insert_parent_child_dependency_for_test(&storage, "cyc-c", "cyc-b", t1);
+        insert_parent_child_dependency_for_test(&storage, "cyc-a", "cyc-c", t1);
 
         let filters = ReadyFilters {
             parent: Some("cyc-a".to_string()),
@@ -24847,5 +25358,481 @@ mod tests {
         let results = storage.list_issues(&filters).unwrap();
         assert_eq!(results.len(), 1, "should match both env=prod AND tier=gold");
         assert_eq!(results[0].id, "br-mm1");
+    }
+
+    #[test]
+    fn list_filters_owner_pinned_mol_type_created_range() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let t1 = Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap();
+        let t2 = Utc.with_ymd_and_hms(2026, 1, 3, 0, 0, 0).unwrap();
+
+        let mut i1 = make_issue("br-f1", "One", Status::Open, 1, None, t0, None);
+        i1.owner = Some("alice".to_string());
+        i1.pinned = true;
+        i1.mol_type = crate::model::MolType::Swarm;
+        storage.create_issue(&i1, "tester").unwrap();
+
+        let mut i2 = make_issue("br-f2", "Two", Status::Open, 1, None, t1, None);
+        i2.owner = Some("bob".to_string());
+        i2.mol_type = crate::model::MolType::Work;
+        storage.create_issue(&i2, "tester").unwrap();
+
+        let mut i3 = make_issue("br-f3", "Three", Status::Open, 1, None, t2, None);
+        i3.owner = Some("alice".to_string());
+        storage.create_issue(&i3, "tester").unwrap();
+
+        let ids = |filters: &ListFilters| -> Vec<String> {
+            let mut ids: Vec<String> = storage
+                .list_issues(filters)
+                .unwrap()
+                .into_iter()
+                .map(|i| i.id)
+                .collect();
+            ids.sort();
+            ids
+        };
+
+        let owner = ListFilters {
+            owner: Some("alice".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(ids(&owner), vec!["br-f1", "br-f3"]);
+        assert_eq!(storage.count_issues_with_filters(&owner).unwrap(), 2);
+
+        let pinned = ListFilters {
+            pinned: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(ids(&pinned), vec!["br-f1"]);
+
+        let unpinned = ListFilters {
+            pinned: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(ids(&unpinned), vec!["br-f2", "br-f3"]);
+
+        let mol = ListFilters {
+            mol_type: Some(crate::model::MolType::Swarm),
+            ..Default::default()
+        };
+        assert_eq!(ids(&mol), vec!["br-f1"]);
+        assert_eq!(storage.count_issues_with_filters(&mol).unwrap(), 1);
+
+        let before = ListFilters {
+            created_before: Some(t1),
+            ..Default::default()
+        };
+        assert_eq!(ids(&before), vec!["br-f1", "br-f2"]);
+
+        let after = ListFilters {
+            created_after: Some(t1),
+            ..Default::default()
+        };
+        assert_eq!(ids(&after), vec!["br-f2", "br-f3"]);
+        assert_eq!(storage.count_issues_with_filters(&after).unwrap(), 2);
+    }
+
+    #[test]
+    fn default_list_filters_include_deferred_for_count_parity() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        storage
+            .create_issue(
+                &make_issue("br-d1", "Open", Status::Open, 1, None, now, None),
+                "tester",
+            )
+            .unwrap();
+        storage
+            .create_issue(
+                &make_issue(
+                    "br-d2",
+                    "Deferred",
+                    Status::Deferred,
+                    1,
+                    None,
+                    now,
+                    Some(now + chrono::Duration::days(7)),
+                ),
+                "tester",
+            )
+            .unwrap();
+
+        let filters = ListFilters::default();
+        let listed = storage.list_issues(&filters).unwrap();
+        assert_eq!(listed.len(), 2, "default list must include deferred");
+        assert_eq!(
+            storage.count_issues_with_filters(&filters).unwrap(),
+            listed.len(),
+            "default count must match default list cardinality"
+        );
+
+        let no_deferred = ListFilters {
+            include_deferred: false,
+            ..Default::default()
+        };
+        assert_eq!(storage.list_issues(&no_deferred).unwrap().len(), 1);
+        assert_eq!(storage.count_issues_with_filters(&no_deferred).unwrap(), 1);
+    }
+
+    #[test]
+    fn blocked_ids_and_cache_exclude_terminal_issues() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        storage
+            .create_issue(
+                &make_issue("br-b1", "Blocker", Status::Open, 1, None, now, None),
+                "tester",
+            )
+            .unwrap();
+        storage
+            .create_issue(
+                &make_issue("br-b2", "Blocked", Status::Open, 1, None, now, None),
+                "tester",
+            )
+            .unwrap();
+        storage
+            .add_dependency("br-b2", "br-b1", "blocks", "tester")
+            .unwrap();
+        assert!(storage.is_blocked("br-b2").unwrap());
+        assert!(storage.get_blocked_ids().unwrap().contains("br-b2"));
+
+        // Close the *blocked* issue: it must drop out of every blocked view.
+        storage
+            .update_issue(
+                "br-b2",
+                &IssueUpdate {
+                    status: Some(Status::Closed),
+                    closed_at: Some(Some(now)),
+                    ..IssueUpdate::default()
+                },
+                "tester",
+            )
+            .unwrap();
+
+        assert!(
+            !storage.get_blocked_ids().unwrap().contains("br-b2"),
+            "closed issue must not be reported blocked"
+        );
+        assert!(!storage.is_blocked("br-b2").unwrap());
+
+        // Full rebuild must also exclude it.
+        storage.rebuild_blocked_cache(true).unwrap();
+        assert!(
+            !storage.get_blocked_ids().unwrap().contains("br-b2"),
+            "rebuilt cache must not contain terminal issues"
+        );
+        assert!(!storage.is_blocked("br-b2").unwrap());
+
+        // Tombstone behaves the same.
+        storage
+            .update_issue(
+                "br-b1",
+                &IssueUpdate {
+                    status: Some(Status::Tombstone),
+                    ..IssueUpdate::default()
+                },
+                "tester",
+            )
+            .unwrap();
+        storage.rebuild_blocked_cache(true).unwrap();
+        assert!(storage.get_blocked_ids().unwrap().is_empty());
+    }
+
+    #[test]
+    fn epic_counts_include_dot_notation_children_once() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        storage
+            .create_issue(
+                &make_issue("br-ep", "Epic", Status::Open, 1, None, now, None),
+                "tester",
+            )
+            .unwrap();
+        // Dot-notation child with NO explicit parent-child dep row.
+        storage
+            .create_issue(
+                &make_issue("br-ep.1", "Dot child", Status::Open, 1, None, now, None),
+                "tester",
+            )
+            .unwrap();
+        // Dot-notation child WITH an explicit parent-child dep row — must be
+        // counted exactly once.
+        let mut dep_child = make_issue("br-ep.2", "Dep child", Status::Closed, 1, None, now, None);
+        dep_child.closed_at = Some(now);
+        dep_child.close_reason = Some("done".to_string());
+        storage.create_issue(&dep_child, "tester").unwrap();
+        storage
+            .add_dependency("br-ep.2", "br-ep", "parent-child", "tester")
+            .unwrap();
+        // Unrelated dotted id whose prefix is not a real parent still counts
+        // under its derived parent key — matching get_open_dot_notation_children.
+        storage
+            .create_issue(
+                &make_issue("br-other.9", "Other", Status::Open, 1, None, now, None),
+                "tester",
+            )
+            .unwrap();
+
+        let counts = storage.get_epic_counts().unwrap();
+        let (total, closed) = counts.get("br-ep").copied().unwrap_or((0, 0));
+        assert_eq!(total, 2, "dot child + dep child, no double count");
+        assert_eq!(closed, 1, "only the dep child is closed");
+        assert_eq!(
+            counts.get("br-other").copied(),
+            Some((1, 0)),
+            "dot child counted under derived parent"
+        );
+    }
+
+    #[test]
+    fn add_dependency_rejects_cycle_for_ready_work_types_only() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for id in ["br-cy1", "br-cy2", "br-cy3"] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::Open, 1, None, now, None),
+                    "tester",
+                )
+                .unwrap();
+        }
+
+        storage
+            .add_dependency("br-cy1", "br-cy2", "blocks", "tester")
+            .unwrap();
+        // `waits-for` affects ready work but is not `is_blocking()` — the old
+        // insert check missed it. Closing the loop with it must now fail,
+        // matching the unified graph `dep cycles` reports.
+        let err = storage
+            .add_dependency("br-cy2", "br-cy1", "waits-for", "tester")
+            .expect_err("waits-for cycle must be rejected");
+        assert!(
+            matches!(err, BeadsError::DependencyCycle { .. }),
+            "expected DependencyCycle, got {err:?}"
+        );
+
+        // Associative types may legitimately form cycles: `dep cycles`
+        // reports them but insertion does not reject them (same scope as the
+        // CLI `dep add` pre-check).
+        assert!(
+            storage
+                .add_dependency("br-cy2", "br-cy1", "related", "tester")
+                .unwrap()
+        );
+        assert!(
+            storage
+                .add_dependency("br-cy3", "br-cy1", "related", "tester")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn detect_all_cycles_covers_non_blocking_edges() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for id in ["br-g1", "br-g2"] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::Open, 1, None, now, None),
+                    "tester",
+                )
+                .unwrap();
+        }
+        storage
+            .add_dependency("br-g1", "br-g2", "blocks", "tester")
+            .unwrap();
+        // Bypass the insert-time check to plant the closing `related` edge.
+        storage
+            .execute_test_sql(
+                "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at) \
+                 VALUES ('br-g2', 'br-g1', 'related', '2026-01-01T00:00:00Z')",
+            )
+            .unwrap();
+
+        assert!(
+            !storage.detect_all_cycles().unwrap().is_empty(),
+            "all-types cycle detection must see the related edge"
+        );
+        assert!(
+            storage.detect_blocking_cycles().unwrap().is_empty(),
+            "blocking-only scope must not see the related edge"
+        );
+    }
+
+    #[test]
+    fn import_relations_match_detects_relation_only_drift() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        let mut issue = make_issue("br-imp1", "Import me", Status::Open, 1, None, now, None);
+        issue.labels = vec!["bug".to_string()];
+        storage.create_issue(&issue, "tester").unwrap();
+        storage
+            .create_issue(
+                &make_issue("br-imp2", "Target", Status::Open, 1, None, now, None),
+                "tester",
+            )
+            .unwrap();
+
+        let stored = storage.get_issue_for_export("br-imp1").unwrap().unwrap();
+        assert!(storage.import_relations_match(&stored).unwrap());
+
+        // Relation-only drift (the content hash cannot see this).
+        let mut drifted = stored.clone();
+        drifted.labels = vec![];
+        assert!(!storage.import_relations_match(&drifted).unwrap());
+
+        let mut drifted = stored.clone();
+        drifted.dependencies = vec![crate::model::Dependency {
+            issue_id: "br-imp1".to_string(),
+            depends_on_id: "br-imp2".to_string(),
+            dep_type: crate::model::DependencyType::Related,
+            created_at: now,
+            created_by: None,
+            metadata: None,
+            thread_id: None,
+        }];
+        assert!(!storage.import_relations_match(&drifted).unwrap());
+
+        // The documented caller flow reconciles the drift: after the sync
+        // calls the stored relations contain the incoming dependency.
+        storage
+            .sync_labels_for_import("br-imp1", &drifted.labels)
+            .unwrap();
+        storage
+            .sync_dependencies_for_import("br-imp1", &drifted.dependencies)
+            .unwrap();
+        storage
+            .sync_comments_for_import("br-imp1", &drifted.comments)
+            .unwrap();
+        let repaired = storage.get_issue_for_export("br-imp1").unwrap().unwrap();
+        assert_eq!(repaired.dependencies.len(), 1);
+        assert_eq!(repaired.dependencies[0].depends_on_id, "br-imp2");
+        assert!(
+            storage.import_relations_match(&repaired).unwrap(),
+            "re-exported relations must match themselves"
+        );
+        // And a payload that still differs is still reported as drift.
+        let mut still_drifted = repaired.clone();
+        still_drifted.dependencies[0].depends_on_id = "br-imp2-extra".to_string();
+        assert!(!storage.import_relations_match(&still_drifted).unwrap());
+    }
+
+    #[test]
+    fn update_issue_id_migrates_comments_labels_deps_and_events() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        storage
+            .create_issue(
+                &make_issue("br-rn0", "Target", Status::Open, 1, None, now, None),
+                "tester",
+            )
+            .unwrap();
+        let mut issue = make_issue("br-rn1", "Rename me", Status::Open, 1, None, now, None);
+        issue.labels = vec!["keep".to_string()];
+        issue.dependencies = vec![crate::model::Dependency {
+            issue_id: "br-rn1".to_string(),
+            depends_on_id: "br-rn0".to_string(),
+            dep_type: crate::model::DependencyType::Related,
+            created_at: now,
+            created_by: None,
+            metadata: None,
+            thread_id: None,
+        }];
+        issue.comments = vec![crate::model::Comment {
+            id: 0,
+            issue_id: "br-rn1".to_string(),
+            author: "tester".to_string(),
+            body: "do not orphan me".to_string(),
+            created_at: now,
+        }];
+        storage.create_issue(&issue, "tester").unwrap();
+
+        storage
+            .update_issue_id("br-rn1", "br-rn2", "tester")
+            .unwrap();
+
+        assert!(storage.get_issue("br-rn1").unwrap().is_none());
+        let renamed = storage.get_issue_for_export("br-rn2").unwrap().unwrap();
+        assert_eq!(renamed.labels, vec!["keep".to_string()]);
+        assert_eq!(renamed.comments.len(), 1);
+        assert_eq!(renamed.comments[0].body, "do not orphan me");
+        assert_eq!(renamed.dependencies.len(), 1);
+        assert_eq!(renamed.dependencies[0].depends_on_id, "br-rn0");
+
+        // Events recorded under the old id move too.
+        assert!(
+            storage.get_events("br-rn1", 10).unwrap().is_empty(),
+            "no events may remain under the old id"
+        );
+        assert!(
+            !storage.get_events("br-rn2", 10).unwrap().is_empty(),
+            "events must be visible under the new id"
+        );
+    }
+
+    #[test]
+    fn ready_issues_include_expired_deferred_only() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        storage
+            .create_issue(
+                &make_issue("br-r1", "Open", Status::Open, 1, None, now, None),
+                "tester",
+            )
+            .unwrap();
+        storage
+            .create_issue(
+                &make_issue(
+                    "br-r2",
+                    "Expired defer",
+                    Status::Deferred,
+                    1,
+                    None,
+                    now,
+                    Some(now - chrono::Duration::hours(1)),
+                ),
+                "tester",
+            )
+            .unwrap();
+        storage
+            .create_issue(
+                &make_issue(
+                    "br-r3",
+                    "Future defer",
+                    Status::Deferred,
+                    1,
+                    None,
+                    now,
+                    Some(now + chrono::Duration::days(3)),
+                ),
+                "tester",
+            )
+            .unwrap();
+        storage
+            .create_issue(
+                &make_issue(
+                    "br-r4",
+                    "Forever defer",
+                    Status::Deferred,
+                    1,
+                    None,
+                    now,
+                    None,
+                ),
+                "tester",
+            )
+            .unwrap();
+
+        let ready = storage
+            .get_ready_issues(&ReadyFilters::default(), ReadySortPolicy::Oldest)
+            .unwrap();
+        let mut ids: Vec<String> = ready.into_iter().map(|i| i.id).collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["br-r1", "br-r2"],
+            "expired deferred is ready; future/NULL deferred stays hidden"
+        );
     }
 }

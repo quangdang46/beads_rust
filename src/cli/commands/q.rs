@@ -2,7 +2,7 @@ use crate::cli::QuickArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::sanitize_terminal_inline;
-use crate::model::{Dependency, DependencyType, Issue, IssueType, Priority, Status};
+use crate::model::{Dependency, DependencyType, Issue, Priority, Status};
 use crate::output::{OutputContext, OutputMode};
 use crate::util::id::{IdGenerator, IdResolver, ResolverConfig, child_id};
 use crate::validation::{IssueValidator, LabelValidator};
@@ -66,7 +66,7 @@ pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext)
     };
 
     let issue_type = if let Some(t) = args.type_ {
-        IssueType::from_str(&t)?
+        crate::cli::commands::update::parse_cli_issue_type(&t)?
     } else {
         default_issue_type
     };

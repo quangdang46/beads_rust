@@ -106,9 +106,42 @@ pub fn execute(
     Ok(())
 }
 
+/// Stealth variant: identical workflow but no git commit/push guidance —
+/// used when the agent must not perform git operations.
+const STEALTH_PRIME_TEMPLATE: &str = r#"# br — Dependency-Aware Issue Tracker
+
+## Key commands
+
+- `br ready --json` — Show unblocked work (use this first)
+- `br list --status=open --json` — All open issues
+- `br show <id> --json` — Full issue details
+- `br create --title="..." --type=task --priority=2`
+- `br update <id> --status=in_progress`
+- `br close <id> --reason "Completed"`
+- `br sync --flush-only` — Export to JSONL (NO git operations)
+
+## Workflow
+
+1. `br ready --json` → pick highest priority, no blockers
+2. `br update <id> --status=in_progress --assignee "$AGENT_NAME"`
+3. Implement the task
+4. `br close <id> --reason "Completed"`
+5. `br sync --flush-only`
+
+## Session end
+
+```bash
+br sync --flush-only
+```
+"#;
+
 /// Build the default full prime output.
-fn format_default_prime(_stealth: bool) -> String {
-    DEFAULT_PRIME_TEMPLATE.to_string()
+fn format_default_prime(stealth: bool) -> String {
+    if stealth {
+        STEALTH_PRIME_TEMPLATE.to_string()
+    } else {
+        DEFAULT_PRIME_TEMPLATE.to_string()
+    }
 }
 
 /// Discover beads dir without erroring if none exists.

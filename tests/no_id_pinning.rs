@@ -39,7 +39,7 @@ fn id_pinning_pattern() -> Regex {
 }
 
 /// True if `line_text` contains an `invariant:` annotation marking the
-/// match as deliberate. The 10 known-legitimate hits documented in
+/// match as deliberate. The 9 known-legitimate hits documented in
 /// `docs/audit_id_pinning_2026_05_09.md` are all annotated this way; any
 /// new annotation is the recommended escape hatch.
 fn has_invariant_annotation(line_text: &str) -> bool {
@@ -130,7 +130,7 @@ fn lint_regex_catches_canonical_violation_inline() {
 }
 
 /// Smoke test that the audit-baseline annotation count hasn't regressed.
-/// Per `docs/audit_id_pinning_2026_05_09.md`, exactly 10 lines in the
+/// Per `docs/audit_id_pinning_2026_05_09.md`, exactly 9 lines in the
 /// codebase carry the `// invariant: ...` annotation as legitimate
 /// exceptions. If this count changes:
 ///   - Decreased: someone removed an annotation; either fix the test
@@ -164,10 +164,10 @@ fn invariant_annotation_count_matches_2026_05_09_audit_baseline() {
             }
         }
     }
-    // Exactly 10 known-legitimate hits per docs/audit_id_pinning_2026_05_09.md
+    // Exactly 9 known-legitimate hits per docs/audit_id_pinning_2026_05_09.md
     assert_eq!(
-        annotated, 10,
-        "audit baseline drift: expected 10 lines with `// invariant:` annotation \
+        annotated, 9,
+        "audit baseline drift: expected 9 lines with `// invariant:` annotation \
          (per docs/audit_id_pinning_2026_05_09.md), found {annotated}. If you \
          intentionally added/removed an annotated exception, update both this \
          constant and the audit doc."

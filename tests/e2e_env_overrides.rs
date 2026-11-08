@@ -1387,11 +1387,18 @@ fn e2e_lint_honors_toon_env_mode() {
         [("BR_OUTPUT_FORMAT", "toon")],
         "lint_toon_env",
     );
-    assert!(lint.status.success(), "lint toon failed: {}", lint.stderr);
+    // Lint exits 1 when warnings exist in every output mode, but still
+    // emits the TOON payload first for scripts to parse.
+    assert_eq!(
+        lint.status.code(),
+        Some(1),
+        "lint toon with warnings should exit 1, got: {}",
+        lint.status
+    );
 
     let json = Value::from(try_decode(lint.stdout.trim(), None).expect("valid lint TOON"));
-    assert_eq!(toon_u64(&json["total"]), Some(2));
-    assert_eq!(toon_u64(&json["issues"]), Some(1));
+    assert_eq!(toon_u64(&json["warnings"]), Some(2));
+    assert_eq!(toon_u64(&json["checked"]), Some(1));
     let results = toon_array_items(&json["results"]);
     assert_eq!(results.len(), 1);
     assert_eq!(results[0]["type"].as_str(), Some("bug"));

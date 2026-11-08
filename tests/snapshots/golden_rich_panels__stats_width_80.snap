@@ -2,6 +2,7 @@
 source: tests/golden_rich_panels.rs
 expression: width_80
 ---
+[note] recent activity unavailable: issues.jsonl is missing or not inside a git repository
 ╭─────────────────────────────── Project Health ───────────────────────────────╮
 │ 📊 Overview                                                                  │
 │    Total: 3    Ready: 1 ✓    Blocked: 1 ⚠                                    │

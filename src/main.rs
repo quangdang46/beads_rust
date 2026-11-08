@@ -66,6 +66,42 @@ fn main() {
         should_preopen_storage(storage_enabled, needs_preopened_storage_context);
     let command_needs_write_lock = needs_write_lock(&cli.command);
 
+    // `br sql` is read-only and must never materialize a database file.
+    // Check before Phase 2 so a missing `--db`/resolved DB target errors
+    // instead of being created as a side effect of opening storage.
+    if matches!(cli.command, Commands::Sql(_))
+        && let Some(paths) = ctx.paths.as_ref()
+        && !paths.db_path.exists()
+    {
+        handle_error(
+            &BeadsError::validation(
+                "--db",
+                format!(
+                    "database does not exist: {} (br sql never creates databases)",
+                    paths.db_path.display()
+                ),
+            ),
+            json_error_mode,
+            color_error_mode,
+        );
+    }
+
+    // Warn when `--db` points outside the discovered `.beads` directory:
+    // the command will create the file if missing, auto-import a sibling
+    // JSONL, and auto-flush foreign state back into it.
+    if cli.db.is_some()
+        && let (Some(beads_dir), Some(paths)) = (ctx.beads_dir.as_deref(), ctx.paths.as_ref())
+        && config::resolved_db_path_is_external(beads_dir, &paths.db_path)
+        && !ctx.no_db()
+    {
+        eprintln!(
+            "warning: --db {} is outside the workspace {}; commands may create it and auto-import/auto-flush the sibling JSONL {}",
+            paths.db_path.display(),
+            beads_dir.display(),
+            paths.jsonl_path.display(),
+        );
+    }
+
     // Phase 1.5: Acquire exclusive write lock before any DB-family open that
     // may apply schema, recover, quarantine sidecars, write metadata, or read
     // from fsqlite while another process is in a write transaction.
@@ -271,7 +307,17 @@ fn main() {
             prefix,
             force,
             backend: _,
-        } => commands::init::execute(prefix, force, None, &output_ctx),
+        } => {
+            if cli.db.is_some() {
+                Err(BeadsError::validation(
+                    "--db",
+                    "br init always initializes ./.beads; --db is not supported",
+                ))
+            } else {
+                commands::init::execute(prefix, force, None, &output_ctx)
+            }
+        }
+        Commands::Help(args) => print_help(&args),
         Commands::Create(args) => {
             execute_create_command(&args, &overrides, &output_ctx, &mut storage_result)
         }
@@ -639,7 +685,8 @@ fn main() {
             commands::recipes::execute(&command, cli.json, &overrides, &output_ctx)
         }
         Commands::Template { command } => {
-            if let (Some(res), Some(beads_dir)) = (storage_result.as_ref(), ctx.beads_dir.as_ref())
+            if ctx.beads_dir.is_some()
+                && let Some(res) = storage_result.as_ref()
             {
                 match commands::template::execute_with_storage_ctx(
                     &command,
@@ -821,6 +868,34 @@ impl StartupContext {
             self.write_lock_timeout()
         }
     }
+}
+
+/// Render help for `br help [--help] [topic…]`.
+///
+/// `br help` (or `br help --help` / `br help -h`) prints the top-level help;
+/// `br help <cmd> [sub…]` walks the clap command tree and prints that
+/// command's help. Unknown topics produce a validation error.
+fn print_help(args: &beads_rust::cli::HelpArgs) -> Result<()> {
+    let mut cmd = Cli::command();
+    if args.help || args.topic.is_empty() {
+        print!("{}", cmd.render_long_help());
+        return Ok(());
+    }
+    for part in &args.topic {
+        let Some(next) = cmd
+            .get_subcommands()
+            .find(|sub| sub.get_name() == part || sub.get_all_aliases().any(|alias| alias == part))
+            .cloned()
+        else {
+            return Err(BeadsError::validation(
+                "help",
+                format!("unknown command '{}'", args.topic.join(" ")),
+            ));
+        };
+        cmd = next;
+    }
+    print!("{}", cmd.render_long_help());
+    Ok(())
 }
 
 fn command_is_doctor_repair(command: &Commands) -> bool {
@@ -1042,7 +1117,7 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         #[cfg(feature = "self_update")]
         Commands::Upgrade(_) => false,
 
-        Commands::Mol { .. }
+        Commands::Help(_)
         | Commands::Init { .. }
         | Commands::Sync(_)
         | Commands::Doctor(_)

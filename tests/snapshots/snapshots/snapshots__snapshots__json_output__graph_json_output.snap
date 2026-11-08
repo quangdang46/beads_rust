@@ -23,6 +23,7 @@ expression: normalize_json(&json)
   "edges": [
     [
       "ISSUE_ID",
+      "ISSUE_ID",
       "ISSUE_ID"
     ]
   ],

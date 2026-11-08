@@ -28,6 +28,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::str::FromStr;
 use tracing::{debug, info, trace};
 
 #[derive(Debug, Clone, Copy)]
@@ -375,6 +376,41 @@ fn merge_layers(layers: &[LayerWithSource]) -> ConfigLayer {
 
 fn canonical_config_key(key: &str) -> String {
     key.trim().to_lowercase().replace('-', "_")
+}
+
+/// Separator-insensitive key normalization matching `config::normalize_key`
+/// semantics (`_`, `-`, `.` all collapse).
+fn normalize_config_key_fully(key: &str) -> String {
+    key.trim().to_lowercase().replace(['-', '.'], "_")
+}
+
+/// Keys present ONLY in the CLI-override layer — i.e. flags like `--json`
+/// or `--actor` that were never persisted to any config file or env var.
+/// `config list` hides these so CLI plumbing does not appear as phantom
+/// configuration entries.
+fn cli_only_config_keys(layers: &[LayerWithSource]) -> std::collections::HashSet<String> {
+    use std::collections::HashSet;
+
+    let is_cli = |layer: &&LayerWithSource| matches!(layer.source, ConfigSource::Cli);
+    let mut persisted = HashSet::new();
+    for layer in layers.iter().filter(|layer| !is_cli(layer)) {
+        for key in layer.layer.runtime.keys().chain(layer.layer.startup.keys()) {
+            persisted.insert(normalize_config_key_fully(key));
+        }
+    }
+
+    layers
+        .iter()
+        .find(|layer| matches!(layer.source, ConfigSource::Cli))
+        .map_or_else(HashSet::new, |cli| {
+            cli.layer
+                .runtime
+                .keys()
+                .chain(cli.layer.startup.keys())
+                .map(|key| normalize_config_key_fully(key))
+                .filter(|key| !persisted.contains(key))
+                .collect()
+        })
 }
 
 fn push_unique_config_alias(aliases: &mut Vec<String>, alias: String) {
@@ -823,7 +859,8 @@ fn set_config_value(
             .split_once('=')
             .ok_or_else(|| crate::error::BeadsError::Validation {
                 field: "config".to_string(),
-                reason: "Invalid format. Use: --set key=value or --set key value".to_string(),
+                reason: "Invalid format. Use: config set key=value or config set key value"
+                    .to_string(),
             })?,
         [key, value] => (key.as_str(), value.as_str()),
         _ => {
@@ -833,6 +870,24 @@ fn set_config_value(
             });
         }
     };
+
+    let key = key.trim();
+    if key.is_empty() {
+        return Err(crate::error::BeadsError::Validation {
+            field: "config".to_string(),
+            reason: "config key cannot be empty".to_string(),
+        });
+    }
+    // Surrounding whitespace is never meaningful in a config value and made
+    // values hard to read back; trim it and reject what remains empty.
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(crate::error::BeadsError::Validation {
+            field: "config".to_string(),
+            reason: "config value cannot be empty".to_string(),
+        });
+    }
+    validate_config_value(key, value)?;
 
     // Determine target config file
     let (config_path, is_project) =
@@ -844,6 +899,13 @@ fn set_config_value(
             })?;
             (path, false)
         };
+
+    if !is_project && !ctx.is_json() && !ctx.is_quiet() {
+        eprintln!(
+            "warning: no .beads workspace found; writing '{key}' to user config {}",
+            config_path.display()
+        );
+    }
 
     // Ensure parent directory exists
     if let Some(parent) = config_path.parent() {
@@ -870,6 +932,27 @@ fn set_config_value(
         "Config updated"
     );
 
+    emit_config_set_result(
+        ctx,
+        key,
+        value,
+        old_value.as_deref(),
+        is_project,
+        &config_path,
+    );
+
+    Ok(())
+}
+
+/// Render the `config set` confirmation in the active output mode.
+fn emit_config_set_result(
+    ctx: &OutputContext,
+    key: &str,
+    value: &str,
+    old_value: Option<&str>,
+    is_project: bool,
+    config_path: &std::path::Path,
+) {
     if ctx.is_json() {
         let output = json!({
             "key": key,
@@ -878,9 +961,12 @@ fn set_config_value(
             "scope": if is_project { "project" } else { "user" }
         });
         ctx.json_pretty(&output);
-    } else if ctx.is_quiet() {
-        return Ok(());
-    } else if ctx.is_rich() {
+        return;
+    }
+    if ctx.is_quiet() {
+        return;
+    }
+    if ctx.is_rich() {
         let theme = ctx.theme();
         let mut content = Text::new("");
         content.append_styled("Configuration updated\n", theme.emphasis.clone());
@@ -896,7 +982,7 @@ fn set_config_value(
 
         if let Some(old) = old_value {
             content.append_styled("Previous: ", theme.dimmed.clone());
-            content.append(&format_config_value(&old));
+            content.append(&format_config_value(old));
             content.append("\n");
         }
 
@@ -917,7 +1003,38 @@ fn set_config_value(
     } else {
         println!("Set {key}={value} in {}", config_path.display());
     }
+}
 
+/// Validate values for config keys with a closed or safety-critical domain.
+///
+/// Without this, `config set default_priority abc` persisted a value that
+/// every later read had to reject, and `config set issue_prefix ''`
+/// produced IDs that disagreed with the stored prefix.
+fn validate_config_value(key: &str, value: &str) -> Result<()> {
+    let canonical = key.trim().to_lowercase().replace(['-', '.'], "_");
+    match canonical.as_str() {
+        "default_priority" | "priority" => {
+            crate::model::Priority::from_str(value).map_err(|_| {
+                BeadsError::validation(
+                    "value",
+                    format!("invalid priority '{value}' (expected 0-4 or P0-P4)"),
+                )
+            })?;
+        }
+        "issue_prefix" if value.trim().is_empty() => {
+            return Err(BeadsError::validation(
+                "value",
+                "issue_prefix cannot be empty",
+            ));
+        }
+        "actor" | "identity" if value.trim().is_empty() => {
+            return Err(BeadsError::validation(
+                "value",
+                format!("{canonical} cannot be empty"),
+            ));
+        }
+        _ => {}
+    }
     Ok(())
 }
 
@@ -1022,6 +1139,16 @@ fn delete_config_value(
     overrides: &CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
+    // `issue_prefix` defines the workspace's issue ID scheme; deleting it
+    // silently falls back to `br`, corrupting ID resolution. Require an
+    // explicit `config set issue_prefix <value>` instead.
+    if key.trim().to_lowercase().replace(['-', '.'], "_") == "issue_prefix" {
+        return Err(BeadsError::validation(
+            "key",
+            "issue_prefix cannot be deleted; set a new value with `br config set issue_prefix <prefix>` instead",
+        ));
+    }
+
     // Pre-validate YAML targets before any mutation so malformed config files
     // do not cause a failed command after the DB value was already deleted.
     let beads_dir = discover_optional_beads_dir_with_cli(overrides)?;
@@ -1100,16 +1227,12 @@ fn delete_config_value(
         } else {
             println!("Deleted config key: {key} (from {})", sources.join(", "));
         }
-    } else if ctx.is_rich() {
-        let theme = ctx.theme();
-        let message = format!("Config key not found: {key}");
-        let panel = Panel::from_text(&message)
-            .title(Text::styled("Config Delete", theme.panel_title.clone()))
-            .box_style(theme.box_style)
-            .border_style(theme.panel_border.clone());
-        ctx.render(&panel);
     } else {
-        println!("Config key not found: {key}");
+        // Match `config get`: a missing key is an error, not a silent
+        // success (JSON mode already emitted the not-found envelope above).
+        return Err(crate::error::BeadsError::Config(format!(
+            "Config key not found: {key}"
+        )));
     }
 
     Ok(())
@@ -1131,6 +1254,9 @@ fn prepare_yaml_delete(config_path: &Path, key: &str) -> Result<Option<PreparedY
         return Ok(None);
     }
 
+    // Removing `a.b.c` must not leave `a: { b: {} }` residue behind.
+    prune_empty_maps(&mut config);
+
     let yaml_str = serde_yml::to_string(&config)?;
     Ok(Some(PreparedYamlDelete {
         path: config_path.to_path_buf(),
@@ -1151,6 +1277,25 @@ fn apply_prepared_yaml_delete(prepared: Option<PreparedYamlDelete>) -> Result<bo
 fn delete_from_yaml(value: &mut serde_yml::Value, key: &str) -> bool {
     let parts: Vec<&str> = key.split('.').collect();
     delete_nested(value, &parts)
+}
+
+/// Recursively remove mapping entries whose value is an empty mapping, so
+/// deleting `a.b.c` does not leave `a: { b: {} }` behind. The root mapping
+/// itself is always kept (an empty config file is valid).
+fn prune_empty_maps(value: &mut serde_yml::Value) {
+    let serde_yml::Value::Mapping(map) = value else {
+        return;
+    };
+    let keys: Vec<serde_yml::Value> = map.iter().map(|(key, _)| key.clone()).collect();
+    for child_key in keys {
+        let Some(child) = map.get_mut(&child_key) else {
+            continue;
+        };
+        prune_empty_maps(child);
+        if matches!(child, serde_yml::Value::Mapping(inner) if inner.is_empty()) {
+            map.remove(&child_key);
+        }
+    }
 }
 
 fn delete_nested(value: &mut serde_yml::Value, path: &[&str]) -> bool {
@@ -1228,6 +1373,14 @@ fn show_config(
     let layers = build_layers(beads_dir, overrides)?;
     let layer = merge_layers(&layers);
 
+    // CLI flags (`--json`, `--actor`, `--color`, `--db`, …) are runtime
+    // plumbing injected by `CliOverrides::as_layer`, not persisted
+    // configuration. Hide keys that exist ONLY in the CLI layer so
+    // `config list` does not show phantom entries for flags the user
+    // never configured.
+    let cli_only_keys = cli_only_config_keys(&layers);
+    let is_cli_phantom = |key: &str| cli_only_keys.contains(&normalize_config_key_fully(key));
+
     // Compute derived values
     let id_config = id_config_from_layer(&layer);
     let actor = resolve_actor(&layer);
@@ -1236,10 +1389,14 @@ fn show_config(
         let mut all_keys: BTreeMap<String, serde_json::Value> = BTreeMap::new();
 
         for (k, v) in &layer.runtime {
-            all_keys.insert(k.clone(), json!(v));
+            if !is_cli_phantom(k) {
+                all_keys.insert(k.clone(), json!(v));
+            }
         }
         for (k, v) in &layer.startup {
-            all_keys.insert(k.clone(), json!(v));
+            if !is_cli_phantom(k) {
+                all_keys.insert(k.clone(), json!(v));
+            }
         }
 
         // Add computed values
@@ -1259,7 +1416,12 @@ fn show_config(
         return Ok(());
     } else if ctx.is_rich() {
         let mut entries = Vec::new();
-        let mut keys: Vec<_> = layer.runtime.keys().chain(layer.startup.keys()).collect();
+        let mut keys: Vec<_> = layer
+            .runtime
+            .keys()
+            .chain(layer.startup.keys())
+            .filter(|key| !is_cli_phantom(key))
+            .collect();
         keys.sort();
         keys.dedup();
 
@@ -1294,10 +1456,18 @@ fn show_config(
         println!();
 
         // Group by category
-        let mut runtime_keys: Vec<_> = layer.runtime.keys().collect();
+        let mut runtime_keys: Vec<_> = layer
+            .runtime
+            .keys()
+            .filter(|key| !is_cli_phantom(key))
+            .collect();
         runtime_keys.sort();
 
-        let mut startup_keys: Vec<_> = layer.startup.keys().collect();
+        let mut startup_keys: Vec<_> = layer
+            .startup
+            .keys()
+            .filter(|key| !is_cli_phantom(key))
+            .collect();
         startup_keys.sort();
 
         if !runtime_keys.is_empty() {

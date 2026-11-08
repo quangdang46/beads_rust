@@ -155,6 +155,54 @@ struct LocalRepairResult {
 struct DoctorRepairSession {
     run: RunDir,
     ctx: MutateContext,
+    /// Process exit code recorded for `report.json`. `None` means the run
+    /// ended via a `?`-propagated error whose code was not captured; the
+    /// report then omits `exit_code` rather than guessing.
+    exit_code: std::cell::Cell<Option<i32>>,
+}
+
+impl DoctorRepairSession {
+    /// Record the process exit code this run will produce.
+    fn mark_exit(&self, code: i32) {
+        self.exit_code.set(Some(code));
+    }
+
+    /// Write the final `report.json` (and `undo.sh`) for this run.
+    ///
+    /// Best-effort: failure to persist run artifacts must never fail the
+    /// repair itself, so all errors are logged and swallowed.
+    fn write_final_report(&self) {
+        use std::io::BufRead as _;
+        let action_count = std::fs::File::open(&self.run.actions_file)
+            .map(|file| {
+                std::io::BufReader::new(file)
+                    .lines()
+                    .map_while(std::io::Result::ok)
+                    .count()
+            })
+            .unwrap_or(0);
+        let started_at = self.run.run_id.split("__").next().unwrap_or("");
+        let report = serde_json::json!({
+            "run_id": self.run.run_id,
+            "started_at": started_at,
+            "finished_at": chrono::Utc::now().to_rfc3339(),
+            "exit_code": self.exit_code.get(),
+            "dry_run": self.ctx.dry_run,
+            "action_count": action_count,
+        });
+        if let Err(err) = run_dir::write_report(&self.run, &report) {
+            tracing::warn!(error = %err, "failed to write doctor report.json");
+        }
+        if let Err(err) = run_dir::write_undo_sh(&self.run) {
+            tracing::debug!(error = %err, "failed to write doctor undo.sh");
+        }
+    }
+}
+
+impl Drop for DoctorRepairSession {
+    fn drop(&mut self) {
+        self.write_final_report();
+    }
 }
 
 #[allow(dead_code)] // WP1 scaffold; methods are exercised once repair call sites move to mutate().
@@ -191,7 +239,11 @@ impl DoctorRepairSession {
             dry_run,
             start_ns: now_ns_for_session(),
         };
-        Ok(Self { run, ctx })
+        Ok(Self {
+            run,
+            ctx,
+            exit_code: std::cell::Cell::new(None),
+        })
     }
 
     /// Replace the `fixer_id` in-place so the next `mutate()` call records
@@ -286,6 +338,41 @@ impl FixerFilter {
     pub(crate) fn has_skip(&self) -> bool {
         !self.skip.is_empty()
     }
+
+    /// Whether at least one `--only` entry names a known fixer/finding id.
+    ///
+    /// Used to warn when `--only` matches nothing — the filter is lenient
+    /// by design (unknown names are allowed so callers can preconfigure
+    /// against future fixers), but a completely unmatched allowlist means
+    /// `--repair` will silently do nothing.
+    #[must_use]
+    pub(crate) fn only_matches_any(&self, known_ids: &[&str]) -> bool {
+        self.only
+            .iter()
+            .any(|entry| known_ids.contains(&entry.as_str()))
+    }
+}
+
+/// Every fixer/finding id the `--only`/`--skip` filter can legitimately
+/// name: the `CHECK_NAME_TO_FINDING_ID` map values plus the `FM_*`
+/// constants consulted directly by repair paths.
+fn known_fixer_ids() -> Vec<&'static str> {
+    let mut ids: Vec<&'static str> = CHECK_NAME_TO_FINDING_ID.iter().map(|(_, fm)| *fm).collect();
+    for id in [
+        FM_BLOCKED_CACHE_STALE,
+        FM_PARTIAL_INDEX_STALE,
+        FM_JSONL_ROW_COUNT_MISMATCH,
+        FM_EMPTY_OR_TRUNCATED_DATABASE,
+        FM_SQLITE_PAGE_MALFORMED,
+        FM_WAL_SHM_SIDECAR_ORPHAN,
+        FM_MISSING_REQUIRED_TABLE,
+        FM_MISSING_REQUIRED_COLUMN,
+    ] {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids
 }
 
 const FM_BLOCKED_CACHE_STALE: &str = "fm-caches_indexes-blocked-cache-stale";
@@ -11006,6 +11093,16 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     // repair_* paths run unconditionally for now.
     let fixer_filter = FixerFilter::from_args(&args.only, &args.skip);
 
+    // `--only` is lenient by design, but an allowlist that matches no
+    // known fixer means `--repair` silently does nothing. Warn loudly.
+    if args.repair && fixer_filter.has_only() && !fixer_filter.only_matches_any(&known_fixer_ids())
+    {
+        ctx.warning(&format!(
+            "--only {:?} matches no known doctor fixer/finding id; nothing will be repaired",
+            args.only
+        ));
+    }
+
     // Auto-fix root .gitignore if --repair is passed and the warning is present.
     let gitignore_repaired =
         if args.repair && fixer_filter.allows("fm-configs-gitignore-leaking-beads") {
@@ -11492,7 +11589,15 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             !initial.report.ok
         };
         if should_fail {
+            if let Some(s) = session.as_ref() {
+                s.mark_exit(DoctorExitCode::FindingsPresent.as_i32());
+                // process::exit skips destructors, so flush the report now.
+                s.write_final_report();
+            }
             std::process::exit(DoctorExitCode::FindingsPresent.as_i32());
+        }
+        if let Some(s) = session.as_ref() {
+            s.mark_exit(0);
         }
         return Ok(());
     }
@@ -11584,6 +11689,9 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                     ctx.info("Post-repair verification:");
                     print_report(&post_warning_repair.report, ctx)?;
                 }
+                if let Some(s) = session.as_ref() {
+                    s.mark_exit(0);
+                }
                 return Ok(());
             }
 
@@ -11628,6 +11736,9 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                     None,
                     None,
                 ));
+            }
+            if let Some(s) = session.as_ref() {
+                s.mark_exit(0);
             }
             return Ok(());
         }
@@ -11749,6 +11860,9 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 ctx.info("Post-repair verification:");
                 print_report(&after_local_repair.report, ctx)?;
             }
+            if let Some(s) = session.as_ref() {
+                s.mark_exit(0);
+            }
             return Ok(());
         }
     } else if local_repair.applied() {
@@ -11796,6 +11910,11 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             print_report(&initial.report, ctx)?;
             ctx.error("Refusing JSONL rebuild: filtered out by --only/--skip");
         }
+        if let Some(s) = session.as_ref() {
+            s.mark_exit(DoctorExitCode::RefusedUnsafe.as_i32());
+            // process::exit skips destructors, so flush the report now.
+            s.write_final_report();
+        }
         std::process::exit(DoctorExitCode::RefusedUnsafe.as_i32());
     }
 
@@ -11807,9 +11926,12 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             Some("no JSONL file found to rebuild from".to_string()),
         ));
         emit_recovery_audit_record(&recovery_audit);
-        return Err(BeadsError::Config(
-            "Cannot repair: no JSONL file found to rebuild from".to_string(),
-        ));
+        let err =
+            BeadsError::Config("Cannot repair: no JSONL file found to rebuild from".to_string());
+        if let Some(s) = session.as_ref() {
+            s.mark_exit(err.exit_code());
+        }
+        return Err(err);
     };
 
     if let Some(reason) = repeated_jsonl_rebuild_refusal_reason(
@@ -11824,7 +11946,11 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             Some(reason.clone()),
         ));
         emit_recovery_audit_record(&recovery_audit);
-        return Err(BeadsError::Config(reason));
+        let err = BeadsError::Config(reason);
+        if let Some(s) = session.as_ref() {
+            s.mark_exit(err.exit_code());
+        }
+        return Err(err);
     }
 
     if !ctx.is_json() {
@@ -11850,13 +11976,20 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             ));
             emit_recovery_audit_record(&recovery_audit);
             if outcome == "refused" {
+                if let Some(s) = session.as_ref() {
+                    s.mark_exit(err.exit_code());
+                }
                 return Err(err);
             }
-            return Err(BeadsError::Config(format!(
+            let err = BeadsError::Config(format!(
                 "Repair import failed: {err}. \
              The JSONL file may be corrupt. \
              Try manually editing the JSONL to fix invalid records."
-            )));
+            ));
+            if let Some(s) = session.as_ref() {
+                s.mark_exit(err.exit_code());
+            }
+            return Err(err);
         }
     };
 
@@ -11920,11 +12053,18 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     }
 
     if !post_repair_verified {
-        return Err(BeadsError::Config(
+        let err = BeadsError::Config(
             "Repair completed, but post-repair verification still found issues".to_string(),
-        ));
+        );
+        if let Some(s) = session.as_ref() {
+            s.mark_exit(err.exit_code());
+        }
+        return Err(err);
     }
 
+    if let Some(s) = session.as_ref() {
+        s.mark_exit(0);
+    }
     Ok(())
 }
 
@@ -12182,7 +12322,7 @@ mod tests {
         let rows = query_all(conn, "SELECT issue_id, depends_on_id FROM dependencies").unwrap();
         rows.iter()
             .filter(|row| {
-                let values = row.clone();
+                let values = *row;
                 // `SqlValue` is a newtype, not an enum, so this cannot be a `matches!` arm:
                 // extract the two text columns and compare them.
                 // Bound to locals rather than compared inline: the inline form trips

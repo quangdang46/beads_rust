@@ -330,6 +330,10 @@ struct DepListItem {
     title: String,
     status: String,
     priority: i32,
+    /// Optional JSON metadata stored on the dependency edge itself
+    /// (`br dep add --metadata`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<String>,
 }
 
 /// JSON output for dep tree
@@ -390,16 +394,57 @@ fn dep_add(
         return Err(BeadsError::SelfDependency { id: issue_id });
     }
 
-    // Cycle check for blocking types only
-    if dep_type.is_blocking()
-        && !depends_on_id.starts_with("external:")
-        && storage_ctx
-            .storage
-            .would_create_cycle(&issue_id, &depends_on_id, true)?
+    // A pair carries exactly one dependency type (the table's primary key is
+    // (issue_id, depends_on_id)). Surface the conflict here with a corrected
+    // hint — `dep remove` has no `-t` flag — instead of relying on the
+    // storage-layer error, which still carries the stale hint for other
+    // callers (storage agent owns that message).
+    if let Some(existing_type) =
+        dependency_type_for_pair(&storage_ctx.storage, &issue_id, &depends_on_id)?
+        && existing_type != dep_type.as_str()
     {
-        return Err(BeadsError::DependencyCycle {
-            path: format!("{issue_id} -> {depends_on_id}"),
-        });
+        return Err(BeadsError::validation(
+            "type",
+            format!(
+                "{issue_id} -> {depends_on_id} already exists as \
+                 `{existing_type}`, and a pair carries exactly one \
+                 dependency type; `{}` was not added. Remove \
+                 the existing edge first: `br dep remove {issue_id} \
+                 {depends_on_id}`",
+                dep_type.as_str()
+            ),
+        ));
+    }
+
+    // Cycle check for ordering/ancestry dependency types, using the same
+    // unified edge graph that `dep cycles` reports by default
+    // (blocking_only=false): every non-parent-child type follows
+    // issue -> depends_on, while parent-child edges are traversed in
+    // reverse (parent -> child). Associative types (related, duplicates,
+    // discovered-from, ...) may legitimately form cycles — `dep cycles`
+    // reports them, but `dep add` does not reject them.
+    //
+    // For parent-child the new edge is directed depends_on -> issue, so the
+    // cycle probe runs with swapped endpoints. The storage layer performs
+    // its own narrower check inside the write transaction; this pre-check
+    // is the authoritative CLI-surface guard for the wider graph.
+    if !depends_on_id.starts_with("external:") {
+        let is_parent_child = matches!(dep_type, DependencyType::ParentChild);
+        if dep_type.affects_ready_work() || is_parent_child {
+            let (probe_issue, probe_depends_on) = if is_parent_child {
+                (depends_on_id.as_str(), issue_id.as_str())
+            } else {
+                (issue_id.as_str(), depends_on_id.as_str())
+            };
+            if storage_ctx
+                .storage
+                .would_create_cycle(probe_issue, probe_depends_on, false)?
+            {
+                return Err(BeadsError::DependencyCycle {
+                    path: format!("{issue_id} -> {depends_on_id}"),
+                });
+            }
+        }
     }
 
     let added = retry_mutation_with_jsonl_recovery(
@@ -527,13 +572,23 @@ fn dep_remove(
     }
     crate::util::set_last_touched_id(local_beads_dir, &issue_id);
 
+    // Removing an edge that does not exist is a not-found condition, not a
+    // successful no-op: exit 3 (NOT_FOUND) in every output mode, matching
+    // how other missing-entity lookups behave.
+    if !removed {
+        return Err(BeadsError::NotFound {
+            kind: "dependency".to_string(),
+            id: format!("{issue_id} -> {depends_on_id}"),
+        });
+    }
+
     if ctx.is_json() || ctx.is_toon() {
         let result = DepActionResult {
-            status: if removed { "ok" } else { "not_found" }.to_string(),
+            status: "ok".to_string(),
             issue_id: issue_id.clone(),
             depends_on_id: depends_on_id.clone(),
             dep_type,
-            action: if removed { "removed" } else { "not_found" }.to_string(),
+            action: "removed".to_string(),
         };
         if ctx.is_toon() {
             ctx.toon(&result);
@@ -542,7 +597,7 @@ fn dep_remove(
         }
     } else if matches!(ctx.mode(), OutputMode::Quiet) {
         return Ok(());
-    } else if removed {
+    } else {
         let issue_id_display = dep_display_text(&issue_id);
         let depends_on_id_display = dep_display_text(&depends_on_id);
         if ctx.is_rich() {
@@ -559,12 +614,60 @@ fn dep_remove(
                 "Removed dependency: {issue_id_display} -> {depends_on_id_display}"
             ));
         }
-    } else {
-        let issue_id_display = dep_display_text(&issue_id);
-        let depends_on_id_display = dep_display_text(&depends_on_id);
-        ctx.warning(&format!(
-            "Dependency not found: {issue_id_display} → {depends_on_id_display}"
-        ));
+    }
+
+    Ok(())
+}
+
+/// Populate `DepListItem::metadata` from the dependency edges' stored JSON
+/// metadata (`br dep add --metadata`).
+///
+/// `issue_id` in each item is always the edge source (the issue that
+/// "depends on" `depends_on_id`), so one batched lookup over the distinct
+/// source IDs covers both directions.
+fn apply_dep_edge_metadata(storage: &SqliteStorage, items: &mut [DepListItem]) -> Result<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+
+    let mut source_ids: Vec<String> = items
+        .iter()
+        .map(|item| item.issue_id.clone())
+        .filter(|id| !id.starts_with("external:"))
+        .collect();
+    source_ids.sort();
+    source_ids.dedup();
+
+    let records = storage.get_dependencies_full_for_issues(&source_ids)?;
+    if records.is_empty() {
+        return Ok(());
+    }
+
+    // Key: (issue_id, depends_on_id, dep_type) -> metadata
+    let mut metadata_by_edge: HashMap<(String, String, String), String> = HashMap::new();
+    for deps in records.values() {
+        for dep in deps {
+            if let Some(metadata) = dep.metadata.as_ref() {
+                metadata_by_edge.insert(
+                    (
+                        dep.issue_id.clone(),
+                        dep.depends_on_id.clone(),
+                        dep.dep_type.as_str().to_string(),
+                    ),
+                    metadata.clone(),
+                );
+            }
+        }
+    }
+
+    for item in items {
+        item.metadata = metadata_by_edge
+            .get(&(
+                item.issue_id.clone(),
+                item.depends_on_id.clone(),
+                item.dep_type.clone(),
+            ))
+            .cloned();
     }
 
     Ok(())
@@ -652,6 +755,7 @@ fn dep_list(
                 title: dep.title.clone(),
                 status: dep.status.as_str().to_string(),
                 priority: dep.priority.0,
+                metadata: None,
             });
         }
     }
@@ -672,9 +776,12 @@ fn dep_list(
                 title: dep.title.clone(),
                 status: dep.status.as_str().to_string(),
                 priority: dep.priority.0,
+                metadata: None,
             });
         }
     }
+
+    apply_dep_edge_metadata(storage, &mut items)?;
 
     if !items.is_empty()
         && items.iter().any(|item| {
@@ -1788,6 +1895,7 @@ mod tests {
             title: depends_on_id.to_string(),
             status: "open".to_string(),
             priority,
+            metadata: None,
         }
     }
 
@@ -2290,6 +2398,7 @@ mod tests {
             title: "Test Issue".to_string(),
             status: "open".to_string(),
             priority: 2,
+            metadata: None,
         };
 
         let json = serde_json::to_string(&item).unwrap();
@@ -2416,6 +2525,7 @@ mod tests {
             title: "Title\x1b[31m".to_string(),
             status: "custom\x07status".to_string(),
             priority: 1,
+            metadata: None,
         };
         let refs = vec![&item];
         let theme = Theme::default();
@@ -2497,6 +2607,7 @@ mod tests {
                 title: String::new(),
                 status: "open".to_string(),
                 priority: 2,
+                metadata: None,
             },
             DepListItem {
                 issue_id: "bd-002".to_string(),
@@ -2505,6 +2616,7 @@ mod tests {
                 title: String::new(),
                 status: "open".to_string(),
                 priority: 2,
+                metadata: None,
             },
         ];
 
@@ -2532,6 +2644,7 @@ mod tests {
             title: "Already set".to_string(),
             status: "open".to_string(),
             priority: 2,
+            metadata: None,
         }];
         let mut statuses = HashMap::new();
         statuses.insert("external:proj:cap".to_string(), false);
@@ -2556,6 +2669,7 @@ mod tests {
             title: "proj:cap".to_string(),
             status: "open".to_string(),
             priority: 2,
+            metadata: None,
         }];
         let mut statuses = HashMap::new();
         statuses.insert("external:proj:cap".to_string(), false);
@@ -2580,6 +2694,7 @@ mod tests {
             title: String::new(),
             status: "open".to_string(),
             priority: 2,
+            metadata: None,
         }];
         let mut statuses = HashMap::new();
         statuses.insert("external:proj:cap".to_string(), true);

@@ -215,9 +215,20 @@ fn q_updates_last_touched_context() {
     let created_id = quick.stdout.trim().to_string();
     assert!(!created_id.is_empty(), "missing quick-capture id");
 
+    // `br update` with no IDs requires an interactive TTY; verify `q` recorded
+    // the created issue as last-touched, then pass that ID explicitly.
+    let last_touched = std::fs::read_to_string(workspace.root.join(".beads").join("last-touched"))
+        .expect("read .beads/last-touched")
+        .trim()
+        .to_string();
+    assert_eq!(
+        last_touched, created_id,
+        "q should record the created issue as last-touched"
+    );
+
     let update = run_br(
         &workspace,
-        ["update", "--status", "in_progress"],
+        ["update", last_touched.as_str(), "--status", "in_progress"],
         "update_last_touched_after_q",
     );
     assert!(update.status.success(), "update failed: {}", update.stderr);

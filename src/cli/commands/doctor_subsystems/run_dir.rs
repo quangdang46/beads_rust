@@ -39,7 +39,7 @@
 
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, OpenOptions};
-use std::io::{ErrorKind, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -479,10 +479,32 @@ echo "undo complete for run {run_id}" >&2
     Ok(())
 }
 
+/// Atomically write the final `report.json` for a run.
+///
+/// The report must be a JSON object. It is written via tmp-file + rename
+/// (same pattern as [`write_undo_sh`] callers expect for crash safety) so
+/// `br doctor ls` never observes a torn or zero-byte report.
+///
+/// # Errors
+///
+/// Returns [`BeadsError::Io`] for write/permission failures and
+/// [`BeadsError::Json`] if the report cannot be serialized.
+pub fn write_report(run: &RunDir, report: &serde_json::Value) -> Result<(), BeadsError> {
+    let bytes = serde_json::to_vec_pretty(report).map_err(BeadsError::Json)?;
+    let parent = run.report_file.parent().unwrap_or_else(|| Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(parent).map_err(BeadsError::Io)?;
+    tmp.write_all(&bytes).map_err(BeadsError::Io)?;
+    tmp.as_file().sync_data().map_err(BeadsError::Io)?;
+    tmp.persist(&run.report_file)
+        .map_err(|e| BeadsError::Io(e.error))?;
+    Ok(())
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::collections::HashSet;
+    use std::io::ErrorKind;
     use std::os::unix::fs::PermissionsExt;
 
     fn unique_temp_root(label: &str) -> tempfile::TempDir {

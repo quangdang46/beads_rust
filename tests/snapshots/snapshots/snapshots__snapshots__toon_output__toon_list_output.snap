@@ -13,6 +13,9 @@ issues[5]:
     created_by: fixture
     updated_at: "2026-02-01T00:00:00Z"
     source_repo: .
+    mol_type: ""
+    work_type: ""
+    wisp_type: ""
     labels[1]: core
     dependency_count: 0
     dependent_count: 1
@@ -25,6 +28,9 @@ issues[5]:
     created_by: fixture
     updated_at: "2026-02-02T00:00:00Z"
     source_repo: .
+    mol_type: ""
+    work_type: ""
+    wisp_type: ""
     labels[2]: agent,ops
     dependency_count: 0
     dependent_count: 0
@@ -39,6 +45,9 @@ issues[5]:
     created_by: fixture
     updated_at: "2026-02-03T00:00:00Z"
     source_repo: .
+    mol_type: ""
+    work_type: ""
+    wisp_type: ""
     labels[1]: frontend
     dependency_count: 0
     dependent_count: 0
@@ -51,6 +60,9 @@ issues[5]:
     created_by: fixture
     updated_at: "2026-02-05T00:00:00Z"
     source_repo: .
+    mol_type: ""
+    work_type: ""
+    wisp_type: ""
     labels[1]: blocked
     dependency_count: 1
     dependent_count: 0
@@ -65,6 +77,9 @@ issues[5]:
     closed_at: "2026-02-08T01:00:00Z"
     close_reason: done
     source_repo: .
+    mol_type: ""
+    work_type: ""
+    wisp_type: ""
     labels[1]: done
     dependency_count: 0
     dependent_count: 0

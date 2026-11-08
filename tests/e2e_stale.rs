@@ -142,6 +142,18 @@ fn e2e_stale_default_includes_custom_nonterminal_statuses() {
     assert!(create.status.success(), "create failed: {}", create.stderr);
     let issue_id = parse_created_id(&create.stdout);
 
+    // Custom statuses must be registered before they can be assigned.
+    let register = run_br(
+        &workspace,
+        ["custom-status", "add", "review", "--category", "wip"],
+        "register_review_status",
+    );
+    assert!(
+        register.status.success(),
+        "register review status failed: {}",
+        register.stderr
+    );
+
     let update = run_br(
         &workspace,
         ["update", &issue_id, "--status", "review"],

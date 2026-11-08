@@ -308,10 +308,10 @@ fn ensure_regular_backup_file(backup_path: &Path, backup_name: &str) -> Result<(
             }
             Ok(())
         }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Err(BeadsError::Config(format!(
-            "Backup file not found: {}",
-            history_display_text(backup_name)
-        ))),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Err(BeadsError::NotFound {
+            kind: "History backup".to_string(),
+            id: history_display_text(backup_name),
+        }),
         Err(err) => Err(err.into()),
     }
 }
@@ -486,10 +486,10 @@ fn diff_backup(
         .to_string_lossy()
         .to_string();
     if !current_path.exists() {
-        return Err(BeadsError::Config(format!(
-            "Current {} not found",
-            history_display_text(&current_name)
-        )));
+        return Err(BeadsError::NotFound {
+            kind: "Current JSONL".to_string(),
+            id: history_display_text(&current_name),
+        });
     }
 
     if ctx.is_json() {
@@ -588,7 +588,14 @@ fn restore_backup(
         .to_string_lossy()
         .to_string();
 
-    if target_path.exists() && !force {
+    // A 0-byte issues.jsonl carries no data, so overwriting it is not
+    // destructive and does not need --force. Only a non-empty target demands
+    // the explicit flag.
+    let target_has_content = target_path
+        .metadata()
+        .map(|metadata| metadata.len() > 0)
+        .unwrap_or(false);
+    if target_has_content && !force {
         return Err(BeadsError::Config(format!(
             "Current {} exists. Use --force to overwrite.",
             history_display_text(&target_name)
@@ -639,6 +646,16 @@ fn prune_backups(
     older_than_days: Option<u32>,
     ctx: &OutputContext,
 ) -> Result<()> {
+    // `--older-than 0` makes the cutoff "now", which deletes every backup
+    // with no confirmation. Refuse the degenerate value; `--keep` already
+    // expresses "retain the newest N" safely.
+    if older_than_days == Some(0) {
+        return Err(BeadsError::Validation {
+            field: "older_than".to_string(),
+            reason: "--older-than 0 would delete every backup; use --keep to retain the newest backups instead".to_string(),
+        });
+    }
+
     let deleted = crate::sync::history::prune_backups(history_dir, keep, older_than_days)?;
 
     if ctx.is_json() {
@@ -1026,14 +1043,14 @@ mod tests {
         let err = current_jsonl_path_for_backup(temp.path(), "issues.20260220_120000.jsonl", None)
             .unwrap_err();
         match err {
-            BeadsError::Config(msg) => {
+            BeadsError::NotFound { kind, .. } => {
                 assert!(
-                    msg.contains("missing target metadata"),
-                    "unexpected message: {msg}"
+                    kind.contains("metadata"),
+                    "unexpected not-found kind: {kind}"
                 );
             }
             other => assert!(
-                matches!(other, BeadsError::Config(_)),
+                matches!(other, BeadsError::NotFound { .. }),
                 "unexpected error: {other:?}"
             ),
         }
@@ -1588,13 +1605,12 @@ mod tests {
         let ctx = OutputContext::from_flags(false, true, true);
         let err = diff_backup(&beads_dir, &history_dir, &backup_name, None, &ctx).unwrap_err();
 
-        match err {
-            BeadsError::Config(msg) => assert!(msg.contains("Current custom.jsonl not found")),
-            other => assert!(
-                matches!(other, BeadsError::Config(_)),
-                "unexpected error: {other:?}"
-            ),
-        }
+        // A missing current JSONL is a not-found condition, not a config error.
+        assert!(
+            matches!(&err, BeadsError::NotFound { kind, id }
+                if kind == "Current JSONL" && id.contains("custom.jsonl")),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -1752,6 +1768,102 @@ mod tests {
             fs::read_to_string(&target).unwrap(),
             "original\n",
             "target should be unchanged after failed rename"
+        );
+    }
+
+    #[test]
+    fn test_prune_backups_rejects_older_than_zero() {
+        let temp = TempDir::new().unwrap();
+        let history_dir = temp.path().join(".br_history");
+        let ctx = OutputContext::from_flags(false, true, true);
+
+        let err = prune_backups(&history_dir, 0, Some(0), &ctx).unwrap_err();
+        assert!(
+            matches!(&err, BeadsError::Validation { field, .. } if field == "older_than"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_restore_backup_allows_empty_target_without_force() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let history_dir = beads_dir.join(".br_history");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let target_path = beads_dir.join("issues.jsonl");
+        fs::write(&target_path, "snapshot-state\n").unwrap();
+        let config = history::HistoryConfig {
+            enabled: true,
+            max_count: 10,
+            max_age_days: 30,
+            min_interval_secs: 0,
+        };
+        history::backup_before_export(&beads_dir, &config, &target_path).unwrap();
+
+        let backup_name = history::list_backups(&history_dir, None)
+            .unwrap()
+            .into_iter()
+            .next()
+            .and_then(|entry| {
+                entry
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .expect("backup filename");
+
+        // A 0-byte target carries no data: restore must not demand --force.
+        fs::write(&target_path, "").unwrap();
+        let ctx = OutputContext::from_flags(false, true, true);
+        restore_backup(&beads_dir, &history_dir, &backup_name, false, None, &ctx).unwrap();
+        assert_eq!(
+            fs::read_to_string(&target_path).unwrap(),
+            "snapshot-state\n"
+        );
+    }
+
+    #[test]
+    fn test_restore_backup_still_requires_force_for_nonempty_target() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let history_dir = beads_dir.join(".br_history");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let target_path = beads_dir.join("issues.jsonl");
+        fs::write(&target_path, "snapshot-state\n").unwrap();
+        let config = history::HistoryConfig {
+            enabled: true,
+            max_count: 10,
+            max_age_days: 30,
+            min_interval_secs: 0,
+        };
+        history::backup_before_export(&beads_dir, &config, &target_path).unwrap();
+
+        let backup_name = history::list_backups(&history_dir, None)
+            .unwrap()
+            .into_iter()
+            .next()
+            .and_then(|entry| {
+                entry
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .expect("backup filename");
+
+        fs::write(&target_path, "newer-state\n").unwrap();
+        let ctx = OutputContext::from_flags(false, true, true);
+        let err =
+            restore_backup(&beads_dir, &history_dir, &backup_name, false, None, &ctx).unwrap_err();
+        assert!(
+            matches!(&err, BeadsError::Config(message) if message.contains("--force")),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&target_path).unwrap(),
+            "newer-state\n",
+            "non-empty target must be left untouched"
         );
     }
 }

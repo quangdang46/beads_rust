@@ -8,7 +8,7 @@ use std::str::Chars;
 
 /// Token types in the query DSL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TokenType {
+pub enum TokenType {
     Eof,
     Ident,     // field names, values, logical ops
     String,    // quoted strings
@@ -30,21 +30,21 @@ pub(crate) enum TokenType {
 
 /// A token with its type, value, and position.
 #[derive(Debug, Clone)]
-pub(crate) struct Token {
-    pub(crate) type_: TokenType,
-    pub(crate) value: String,
-    pub(crate) pos: usize,
+pub struct Token {
+    pub type_: TokenType,
+    pub value: String,
+    pub pos: usize,
 }
 
 /// Lexer tokenizes query strings.
-pub(crate) struct Lexer<'a> {
+pub struct Lexer<'a> {
     input: &'a str,
     chars: Peekable<Chars<'a>>,
     pos: usize,
 }
 
 impl<'a> Lexer<'a> {
-    pub(crate) fn new(input: &'a str) -> Self {
+    pub fn new(input: &'a str) -> Self {
         Self {
             input,
             chars: input.chars().peekable(),
@@ -92,18 +92,16 @@ impl<'a> Lexer<'a> {
     }
 
     /// Read the next token from the input.
-    pub(crate) fn next_token(&mut self) -> Result<Token, String> {
+    #[allow(clippy::too_many_lines)]
+    pub fn next_token(&mut self) -> Result<Token, String> {
         self.skip_whitespace();
         let start = self.pos;
-        let ch = match self.next() {
-            None => {
-                return Ok(Token {
-                    type_: TokenType::Eof,
-                    value: String::new(),
-                    pos: start,
-                });
-            }
-            Some(c) => c,
+        let Some(ch) = self.next() else {
+            return Ok(Token {
+                type_: TokenType::Eof,
+                value: String::new(),
+                pos: start,
+            });
         };
 
         match ch {
@@ -197,32 +195,29 @@ impl<'a> Lexer<'a> {
                 })
             }
             _ if ch.is_ascii_digit() || ch == '+' || ch == '-' => {
-                self.read_number_or_duration(start)
+                Ok(self.read_number_or_duration(start))
             }
-            _ if is_ident_start(ch) => self.read_ident_or_keyword(start),
+            _ if is_ident_start(ch) => Ok(self.read_ident_or_keyword(start)),
             _ => Err(format!("unexpected character {ch:?} at position {start}")),
         }
     }
 
-    fn read_number_or_duration(&mut self, start: usize) -> Result<Token, String> {
+    fn read_number_or_duration(&mut self, start: usize) -> Token {
         let end = self.read_digits(start);
         let value = self.input[start..end].to_string();
 
         // Check if next char is a duration suffix
         match self.peek() {
-            Some(&'d') | Some(&'h') | Some(&'m') | Some(&'s') | Some(&'w') => {
+            Some(&'d' | &'h' | &'m' | &'s' | &'w') => {
                 let ch = self.next().unwrap();
-                Ok(Token {
+                Token {
                     type_: TokenType::Duration,
                     value: format!("{value}{ch}"),
                     pos: start,
-                })
+                }
             }
             Some(&'-') if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) => {
                 // ISO date pattern: YYYY-MM-DD
-                let _saved_pos = self.pos;
-                let _saved_chars = self.chars.clone();
-
                 self.next(); // consume '-'
                 let month_start = self.pos;
                 let month_end = self.read_digits(month_start);
@@ -236,32 +231,32 @@ impl<'a> Lexer<'a> {
 
                     if day_len == 2 {
                         let full = self.input[start..self.pos].to_string();
-                        return Ok(Token {
+                        return Token {
                             type_: TokenType::Ident,
                             value: full,
                             pos: start,
-                        });
+                        };
                     }
                 }
 
                 // Not a full ISO date, restore state after the first digit sequence
                 self.pos = end;
                 self.chars = self.input[end..].chars().peekable();
-                Ok(Token {
+                Token {
                     type_: TokenType::Number,
                     value,
                     pos: start,
-                })
+                }
             }
-            _ => Ok(Token {
+            _ => Token {
                 type_: TokenType::Number,
                 value,
                 pos: start,
-            }),
+            },
         }
     }
 
-    fn read_digits(&mut self, start: usize) -> usize {
+    fn read_digits(&mut self, _start: usize) -> usize {
         while let Some(&ch) = self.peek() {
             if ch.is_ascii_digit() || ch == '.' {
                 self.next();
@@ -272,7 +267,7 @@ impl<'a> Lexer<'a> {
         self.pos
     }
 
-    fn read_ident_or_keyword(&mut self, start: usize) -> Result<Token, String> {
+    fn read_ident_or_keyword(&mut self, start: usize) -> Token {
         while let Some(&ch) = self.peek() {
             if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '.' || ch == '*' {
                 self.next();
@@ -287,11 +282,11 @@ impl<'a> Lexer<'a> {
             "NOT" => TokenType::Not,
             _ => TokenType::Ident,
         };
-        Ok(Token {
+        Token {
             type_,
             value,
             pos: start,
-        })
+        }
     }
 }
 

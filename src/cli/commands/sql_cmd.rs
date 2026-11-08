@@ -5,7 +5,7 @@
 
 use crate::cli::{OutputFormatBasic, SqlArgs};
 use crate::config;
-use crate::error::Result;
+use crate::error::{BeadsError, Result};
 use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
 use crate::storage::db::SqlValue;
@@ -32,13 +32,35 @@ pub fn execute_with_storage(
 /// Returns an error if storage cannot be opened, the query fails, or the
 /// output cannot be written.
 pub fn execute(args: &SqlArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
+    if cli.no_db == Some(true) {
+        return Err(BeadsError::validation(
+            "--no-db",
+            "br sql requires a database; --no-db is not supported for this command",
+        ));
+    }
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
+
+    // `br sql` is read-only: it must never create a database file. When an
+    // explicit `--db` override (or resolved DB path) does not exist, fail
+    // instead of silently materializing an empty database.
+    let db_path = config::resolve_paths(&beads_dir, cli.db.as_ref())?.db_path;
+    if !db_path.exists() {
+        return Err(BeadsError::validation(
+            "--db",
+            format!(
+                "database does not exist: {} (br sql never creates databases)",
+                db_path.display()
+            ),
+        ));
+    }
+
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
     execute_inner(args, ctx, &storage_ctx.storage)
 }
 
 /// Shared execution logic.
 fn execute_inner(args: &SqlArgs, ctx: &OutputContext, storage: &SqliteStorage) -> Result<()> {
+    ensure_read_only_query(&args.query)?;
     let (column_names, rows) = storage.execute_read_only_query(&args.query)?;
 
     match args.format {
@@ -154,6 +176,255 @@ fn print_table(column_names: &[String], rows: &[Vec<SqlValue>]) {
             if rows.len() == 1 { "" } else { "s" }
         );
     }
+}
+
+/// Read-only pragmas that only inspect schema/state and cannot mutate the
+/// database. Everything else under `PRAGMA` is rejected: several pragmas
+/// (`writable_schema`, `journal_mode`, `wal_checkpoint`, `synchronous`, …)
+/// either write directly or escape the `BEGIN`/`ROLLBACK` wrapper because
+/// they are not transactional.
+const READ_ONLY_PRAGMAS: &[&str] = &[
+    "table_info",
+    "table_xinfo",
+    "index_list",
+    "index_info",
+    "index_xinfo",
+    "foreign_key_list",
+    "foreign_key_check",
+    "integrity_check",
+    "quick_check",
+    "database_list",
+    "table_list",
+    "compile_options",
+    "function_list",
+    "module_list",
+    "pragma_list",
+    "collation_list",
+    "encoding",
+    "schema_version",
+];
+
+/// Keywords that must never appear in a `br sql` statement. The storage
+/// layer wraps the query in `BEGIN`/`ROLLBACK`, but that does not stop
+/// non-transactional statements (`PRAGMA writable_schema`, `VACUUM`,
+/// `ATTACH`, transaction control) from taking effect, so they are rejected
+/// here before the query reaches SQLite.
+const FORBIDDEN_KEYWORDS: &[&str] = &[
+    "insert",
+    "update",
+    "delete",
+    "replace",
+    "create",
+    "drop",
+    "alter",
+    "attach",
+    "detach",
+    "vacuum",
+    "reindex",
+    "begin",
+    "commit",
+    "rollback",
+    "savepoint",
+    "release",
+    "load_extension",
+];
+
+/// Validate that `query` is a single read-only SQL statement.
+///
+/// Returns a [`BeadsError::validation`] error for empty input, multiple
+/// statements, mutating keywords, transaction control, or non-read-only
+/// pragmas.
+fn ensure_read_only_query(query: &str) -> Result<()> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Err(BeadsError::validation("query", "SQL query cannot be empty"));
+    }
+
+    for statement in split_sql_statements(trimmed) {
+        let code = blank_sql_noise(&statement);
+        let words = sql_words(&code);
+        let Some(first) = words.first().map(String::as_str) else {
+            continue;
+        };
+        let first_upper = first.to_ascii_uppercase();
+
+        // EXPLAIN only describes a statement's bytecode; it never executes
+        // the underlying statement, so it is always safe.
+        if first_upper == "EXPLAIN" {
+            continue;
+        }
+
+        match first_upper.as_str() {
+            "SELECT" | "VALUES" | "WITH" | "PRAGMA" => {}
+            other => {
+                return Err(BeadsError::validation(
+                    "query",
+                    format!(
+                        "br sql only accepts read-only statements (SELECT, WITH, VALUES, read-only PRAGMA); got '{other}'"
+                    ),
+                ));
+            }
+        }
+
+        if first_upper == "PRAGMA" {
+            // The pragma name is the second word: `PRAGMA name` or
+            // `PRAGMA schema.name`.
+            let pragma_name = words
+                .get(1)
+                .map(|word| word.rsplit('.').next().unwrap_or(word))
+                .map(|word| word.trim_start_matches('@').to_ascii_lowercase());
+            let Some(name) = pragma_name else {
+                return Err(BeadsError::validation(
+                    "query",
+                    "PRAGMA statement is missing a pragma name",
+                ));
+            };
+            if !READ_ONLY_PRAGMAS.contains(&name.as_str()) {
+                return Err(BeadsError::validation(
+                    "query",
+                    format!(
+                        "PRAGMA {name} is not allowed: br sql is read-only and only permits read-only pragmas ({})",
+                        READ_ONLY_PRAGMAS.join(", ")
+                    ),
+                ));
+            }
+            continue;
+        }
+
+        for word in &words {
+            let lowered = word.to_ascii_lowercase();
+            if FORBIDDEN_KEYWORDS.contains(&lowered.as_str()) {
+                return Err(BeadsError::validation(
+                    "query",
+                    format!("br sql is read-only; '{lowered}' is not allowed"),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Split a SQL string into statements on top-level `;` separators, ignoring
+/// semicolons inside string literals, quoted identifiers, and comments.
+fn split_sql_statements(query: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut chars = query.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' | '"' | '`' => {
+                current.push(c);
+                // Consume the quoted section verbatim (doubled quote = escape).
+                while let Some(inner) = chars.next() {
+                    current.push(inner);
+                    if inner == c {
+                        if chars.peek() == Some(&c) {
+                            current.push(chars.next().unwrap_or(c));
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            '[' => {
+                current.push(c);
+                for inner in chars.by_ref() {
+                    current.push(inner);
+                    if inner == ']' {
+                        break;
+                    }
+                }
+            }
+            '-' if chars.peek() == Some(&'-') => {
+                // Line comment: consume to end of line.
+                for inner in chars.by_ref() {
+                    if inner == '\n' {
+                        current.push(inner);
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                let mut prev = '\0';
+                for inner in chars.by_ref() {
+                    if prev == '*' && inner == '/' {
+                        break;
+                    }
+                    prev = inner;
+                }
+            }
+            ';' => {
+                statements.push(std::mem::take(&mut current));
+            }
+            _ => current.push(c),
+        }
+    }
+    statements.push(current);
+    statements
+}
+
+/// Blank out string literals, quoted identifiers, and comments so keyword
+/// scanning cannot be fooled (or broken) by their contents.
+fn blank_sql_noise(statement: &str) -> String {
+    let mut out = String::with_capacity(statement.len());
+    let mut chars = statement.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' | '"' | '`' => {
+                out.push(' ');
+                while let Some(inner) = chars.next() {
+                    if inner == c {
+                        if chars.peek() == Some(&c) {
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            '[' => {
+                out.push(' ');
+                for inner in chars.by_ref() {
+                    if inner == ']' {
+                        break;
+                    }
+                }
+            }
+            '-' if chars.peek() == Some(&'-') => {
+                for inner in chars.by_ref() {
+                    if inner == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                    out.push(' ');
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                let mut prev = '\0';
+                for inner in chars.by_ref() {
+                    if prev == '*' && inner == '/' {
+                        break;
+                    }
+                    prev = inner;
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Extract whitespace-separated words from sanitized SQL code.
+fn sql_words(code: &str) -> Vec<String> {
+    code.split(|c: char| c.is_whitespace() || c == '(' || c == ')' || c == ',')
+        .filter(|word| !word.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Render a stored value as a human-readable string.

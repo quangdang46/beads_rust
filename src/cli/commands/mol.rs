@@ -11,7 +11,7 @@ use crate::error::{BeadsError, Result};
 use crate::model::{DependencyType, Issue, IssueType, MolType, Status};
 use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
-use crate::util::id::IdResolver;
+use crate::util::id::{IdGenerator, IdResolver};
 use chrono::Utc;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -109,6 +109,7 @@ pub fn execute(
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
     let config_layer = storage_ctx.load_config(cli)?;
     let actor = config::resolve_actor(&config_layer);
+    let id_config = config::id_config_from_layer(&config_layer);
     let storage = &mut storage_ctx.storage;
 
     match command {
@@ -116,7 +117,9 @@ pub fn execute(
         MolCommands::Pour(args) => execute_pour(args, storage, &actor, ctx),
         MolCommands::Swarm { command } => match command {
             MolSwarmCommands::Validate(args) => execute_swarm_validate(args, storage, ctx),
-            MolSwarmCommands::Create(args) => execute_swarm_create(args, storage, &actor, ctx),
+            MolSwarmCommands::Create(args) => {
+                execute_swarm_create(args, storage, &actor, ctx, &id_config)
+            }
         },
     }
 }
@@ -266,23 +269,21 @@ fn execute_pour(
             id: proto_id.clone(),
         })?;
 
-    // Parse variables (reserved for future use in template substitution)
-    let _vars = parse_vars(&args.var);
+    // Parse --var key=value pairs for {{variable}} substitution.
+    let vars = parse_vars(&args.var);
 
     if args.dry_run {
-        let count = storage.get_dependents(&proto_id)?.len();
-        let children_count = count;
+        // The real pour path creates exactly one molecule issue from the proto.
         if ctx.is_json() || ctx.is_toon() {
             ctx.json_pretty(&PourOutput {
                 proto_id: proto_id.clone(),
-                created_count: children_count + 1,
+                created_count: 1,
                 root_id: None,
                 phase: "liquid".to_string(),
             });
         } else {
             ctx.info(&format!(
-                "Dry run: would pour {} issues from proto {} (phase: liquid)",
-                children_count + 1,
+                "Dry run: would pour 1 mol issue from proto {} (phase: liquid)",
                 proto_id
             ));
         }
@@ -306,6 +307,19 @@ fn execute_pour(
     new_issue.source_formula = Some(proto_id.clone());
     if let Some(assignee) = &args.assignee {
         new_issue.assignee = Some(assignee.clone());
+    }
+
+    // Apply {{variable}} substitution from --var to text fields.
+    if !vars.is_empty() {
+        new_issue.title = substitute_vars(&new_issue.title, &vars);
+        new_issue.description = new_issue
+            .description
+            .as_deref()
+            .map(|d| substitute_vars(d, &vars));
+        new_issue.notes = new_issue
+            .notes
+            .as_deref()
+            .map(|n| substitute_vars(n, &vars));
     }
 
     storage.create_issue(&new_issue, actor)?;
@@ -355,6 +369,15 @@ fn parse_vars(var_args: &[String]) -> HashMap<String, String> {
         }
     }
     vars
+}
+
+/// Replace `{{key}}` placeholders with values from `vars`.
+fn substitute_vars(text: &str, vars: &HashMap<String, String>) -> String {
+    let mut result = text.to_string();
+    for (key, value) in vars {
+        result = result.replace(&format!("{{{{{key}}}}}"), value);
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -801,6 +824,7 @@ fn execute_swarm_create(
     storage: &mut SqliteStorage,
     actor: &str,
     ctx: &OutputContext,
+    id_config: &crate::util::id::IdConfig,
 ) -> Result<()> {
     let epic_id = resolve_id(storage, &args.epic_id)?;
     let epic = storage
@@ -845,13 +869,35 @@ fn execute_swarm_create(
     // Create the swarm molecule
     let swarm_title = format!("Swarm: {}", epic.title);
     let coordinator = args.coordinator.clone().unwrap_or_default();
+    let swarm_description = format!(
+        "Swarm molecule orchestrating epic {}.\n\nEpic: {}\nCoordinator: {}",
+        epic_id, epic_id, coordinator
+    );
+    let now = Utc::now();
+    let issue_count = storage.count_issues()?;
+    let id_gen = IdGenerator::new(id_config.clone());
+    let id_check_err = std::cell::RefCell::new(None);
+    let swarm_id = id_gen.generate(
+        &swarm_title,
+        Some(swarm_description.as_str()),
+        Some(actor),
+        now,
+        issue_count,
+        |candidate| match storage.id_exists(candidate) {
+            Ok(exists) => exists,
+            Err(e) => {
+                id_check_err.replace(Some(e));
+                true
+            }
+        },
+    );
+    if let Some(err) = id_check_err.into_inner() {
+        return Err(err);
+    }
     let swarm_mol = Issue {
-        id: String::new(), // Will be auto-generated
+        id: swarm_id,
         title: swarm_title.clone(),
-        description: Some(format!(
-            "Swarm molecule orchestrating epic {}.\n\nEpic: {}\nCoordinator: {}",
-            epic_id, epic_id, coordinator
-        )),
+        description: Some(swarm_description),
         status: Status::Open,
         priority: epic.priority,
         issue_type: IssueType::Molecule,
@@ -862,8 +908,8 @@ fn execute_swarm_create(
             Some(coordinator.clone())
         },
         created_by: Some(actor.to_string()),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: now,
+        updated_at: now,
         ..Issue::default()
     };
 

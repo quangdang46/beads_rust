@@ -281,6 +281,10 @@ fn execute_inner(
                 wrap: args.wrap,
             };
             let ctx = OutputContext::from_output_format(output_format, quiet, !use_color);
+            if issues.is_empty() && !matches!(ctx.mode(), OutputMode::Rich) {
+                ctx.info("No issues found.");
+                return Ok(());
+            }
             if args.pretty {
                 render_pretty_text_issues(&ctx, &issues, format_options, args.long);
             } else if matches!(ctx.mode(), OutputMode::Rich) {
@@ -503,12 +507,10 @@ pub(crate) fn parse_metadata_filters(filters: &[String]) -> Result<Vec<(String, 
 }
 
 /// Convert CLI args to storage filter.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn build_filters(
     args: &ListArgs,
-) -> Result<(
-    ListFilters,
-    Option<Box<dyn Fn(&crate::model::Issue) -> bool + Send>>,
-)> {
+) -> Result<(ListFilters, Option<crate::query::IssuePredicate>)> {
     // Parse status strings to Status enums
     let statuses = if args.status.is_empty() {
         None
@@ -611,59 +613,96 @@ pub(crate) fn build_filters(
     };
 
     // Apply query DSL filter (--filter) on top of explicit CLI filters
-    let predicate: Option<Box<dyn Fn(&crate::model::Issue) -> bool + Send>> =
-        if let Some(filter_expr) = &args.filter {
-            let query_result =
-                parse_and_evaluate(filter_expr).map_err(|e| BeadsError::Validation {
-                    field: "filter".into(),
-                    reason: e.to_string(),
-                })?;
-            // Merge query filters into the base filters
-            let qf = query_result.filters;
-            if let Some(s) = qf.statuses {
-                filters.statuses = Some(s);
+    let predicate: Option<crate::query::IssuePredicate> = if let Some(filter_expr) = &args.filter {
+        let query_result = parse_and_evaluate(filter_expr).map_err(|e| BeadsError::Validation {
+            field: "filter".into(),
+            reason: e.to_string(),
+        })?;
+        // Merge query filters into the base filters
+        let qf = query_result.filters;
+        if let Some(s) = qf.statuses {
+            filters.statuses = Some(s);
+        }
+        if let Some(s) = qf.types {
+            filters.types = Some(s);
+        }
+        if let Some(p) = qf.priorities {
+            filters.priorities = Some(p);
+        }
+        if let Some(a) = qf.assignee {
+            filters.assignee = Some(a);
+        }
+        if qf.unassigned {
+            filters.unassigned = true;
+        }
+        if let Some(t) = qf.title_contains {
+            filters.title_contains = Some(t);
+        }
+        if let Some(l) = qf.labels {
+            filters.labels = Some(l);
+        }
+        if let Some(o) = qf.owner {
+            filters.owner = Some(o);
+        }
+        if let Some(p) = qf.pinned {
+            filters.pinned = Some(p);
+        }
+        if let Some(m) = qf.mol_type {
+            filters.mol_type = Some(m);
+        }
+        if let Some(ids) = qf.ids {
+            filters.ids = Some(ids);
+        }
+        if let Some(mf) = qf.metadata_filters {
+            filters.metadata_filters = Some(mf);
+        }
+        filters.include_closed |= qf.include_closed;
+        filters.updated_before = filters.updated_before.or(qf.updated_before);
+        filters.updated_after = filters.updated_after.or(qf.updated_after);
+        filters.created_before = filters.created_before.or(qf.created_before);
+        filters.created_after = filters.created_after.or(qf.created_after);
+        query_result.predicate
+    } else {
+        None
+    };
+
+    // `--deferred` is a *restrictive* filter: show only deferred issues. Pin
+    // the status set to `deferred`, intersecting with any explicit
+    // `--status`/`--filter` statuses (error when they exclude deferred).
+    if args.deferred {
+        let kept = filters.statuses.take().map(|list| {
+            list.into_iter()
+                .filter(|s| *s == Status::Deferred)
+                .collect::<Vec<_>>()
+        });
+        match kept {
+            None => filters.statuses = Some(vec![Status::Deferred]),
+            Some(kept) if !kept.is_empty() => filters.statuses = Some(kept),
+            Some(_) => {
+                return Err(BeadsError::validation(
+                    "status",
+                    "--deferred cannot be combined with a status filter that excludes 'deferred'",
+                ));
             }
-            if let Some(s) = qf.types {
-                filters.types = Some(s);
-            }
-            if let Some(p) = qf.priorities {
-                filters.priorities = Some(p);
-            }
-            if let Some(a) = qf.assignee {
-                filters.assignee = Some(a);
-            }
-            if qf.unassigned {
-                filters.unassigned = true;
-            }
-            if let Some(t) = qf.title_contains {
-                filters.title_contains = Some(t);
-            }
-            if let Some(l) = qf.labels {
-                filters.labels = Some(l);
-            }
-            if let Some(o) = qf.owner {
-                filters.owner = Some(o);
-            }
-            if let Some(p) = qf.pinned {
-                filters.pinned = Some(p);
-            }
-            if let Some(m) = qf.mol_type {
-                filters.mol_type = Some(m);
-            }
-            if let Some(ids) = qf.ids {
-                filters.ids = Some(ids);
-            }
-            if let Some(mf) = qf.metadata_filters {
-                filters.metadata_filters = Some(mf);
-            }
-            filters.updated_before = filters.updated_before.or(qf.updated_before);
-            filters.updated_after = filters.updated_after.or(qf.updated_after);
-            filters.created_before = filters.created_before.or(qf.created_before);
-            filters.created_after = filters.created_after.or(qf.created_after);
-            query_result.predicate
-        } else {
-            None
-        };
+        }
+    }
+
+    // Recompute closed/deferred visibility against the *merged* status set.
+    // The CLI-flag computation above cannot see statuses introduced by the
+    // DSL (`-F 'status=closed'`), and predicate-path queries (`status!=open`)
+    // signal `include_closed` through `qf.include_closed`.
+    filters.include_closed = filters.include_closed
+        || filters
+            .statuses
+            .as_ref()
+            .is_some_and(|s| s.iter().any(Status::is_terminal));
+    filters.include_deferred = args.deferred
+        || args.all
+        || filters.statuses.is_none()
+        || filters
+            .statuses
+            .as_ref()
+            .is_some_and(|s| s.contains(&Status::Deferred));
 
     Ok((filters, predicate))
 }

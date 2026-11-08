@@ -13,7 +13,6 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::sanitize_terminal_inline;
 use crate::output::OutputContext;
-use crate::storage::db::{self, SqlValue};
 use crate::storage::{ListFilters, SqliteStorage};
 use crate::util::id::{IdResolver, ResolverConfig};
 use rich_rust::prelude::*;
@@ -28,6 +27,9 @@ use std::path::{Path, PathBuf};
 pub struct DeleteResult {
     pub deleted: Vec<String>,
     pub deleted_count: usize,
+    /// IDs that were already tombstones — reported as skipped, not deleted.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<String>,
     pub dependencies_removed: usize,
     pub labels_removed: usize,
     pub events_removed: usize,
@@ -40,6 +42,7 @@ impl DeleteResult {
         Self {
             deleted: Vec::new(),
             deleted_count: 0,
+            skipped: Vec::new(),
             dependencies_removed: 0,
             labels_removed: 0,
             events_removed: 0,
@@ -351,9 +354,28 @@ pub fn execute(
         // 7. Perform deletion
         let mut result = DeleteResult::new();
 
+        // Idempotence: issues that are already tombstones are skipped and
+        // reported as such rather than counted as freshly deleted. `--hard`
+        // still purges tombstones (that is its purpose).
+        let mut final_ids: Vec<String> = final_delete_set.into_iter().collect();
+        final_ids.sort();
+        let mut live_ids = Vec::with_capacity(final_ids.len());
+        for id in final_ids {
+            let already_deleted = !args.hard
+                && storage_ctx
+                    .storage
+                    .get_issue(&id)?
+                    .is_some_and(|issue| issue.status == crate::model::Status::Tombstone);
+            if already_deleted {
+                result.skipped.push(id);
+            } else {
+                live_ids.push(id);
+            }
+        }
+
         // First, remove all dependency links for issues being deleted
         let mut batch_has_mutated = false;
-        for id in &final_delete_set {
+        for id in &live_ids {
             let deps_removed = retry_mutation_with_jsonl_recovery(
                 &mut storage_ctx,
                 !batch_has_mutated,
@@ -373,9 +395,7 @@ pub fn execute(
         }
 
         // Delete each issue (create tombstone, then purge if --hard)
-        let mut final_ids: Vec<String> = final_delete_set.into_iter().collect();
-        final_ids.sort();
-        for id in &final_ids {
+        for id in &live_ids {
             if args.hard {
                 result.labels_removed += storage_ctx.storage.get_labels(id)?.len();
                 result.events_removed += storage_ctx.storage.count_issue_events(id)?;
@@ -419,31 +439,37 @@ pub fn execute(
         } else {
             ctx.json_pretty(&result);
         }
-        return Ok(());
-    }
-
-    if ctx.is_quiet() {
-        return Ok(());
-    }
-
-    if ctx.is_rich() {
-        render_delete_result_rich(&result, &storage_ctx.storage, ctx);
-    } else {
-        println!("Deleted {} issue(s):", result.deleted_count);
-        for id in &result.deleted {
-            println!("  - {}", delete_display_text(id));
-        }
-
-        if result.dependencies_removed > 0 {
-            println!("Removed {} dependency link(s)", result.dependencies_removed);
-        }
-
-        if !result.orphaned_issues.is_empty() {
-            println!("Orphaned {} issue(s):", result.orphaned_issues.len());
-            for id in &result.orphaned_issues {
+    } else if !ctx.is_quiet() {
+        if ctx.is_rich() {
+            render_delete_result_rich(&result, &storage_ctx.storage, ctx);
+        } else {
+            println!("Deleted {} issue(s):", result.deleted_count);
+            for id in &result.deleted {
                 println!("  - {}", delete_display_text(id));
             }
+            for id in &result.skipped {
+                println!("  - {} (already deleted)", delete_display_text(id));
+            }
+
+            if result.dependencies_removed > 0 {
+                println!("Removed {} dependency link(s)", result.dependencies_removed);
+            }
+
+            if !result.orphaned_issues.is_empty() {
+                println!("Orphaned {} issue(s):", result.orphaned_issues.len());
+                for id in &result.orphaned_issues {
+                    println!("  - {}", delete_display_text(id));
+                }
+            }
         }
+    }
+
+    // Match `br close`/`br reopen` idempotence: deleting only already-
+    // tombstoned issues is a no-op (exit 3), not a fresh deletion.
+    if result.deleted_count == 0 && !result.skipped.is_empty() {
+        return Err(BeadsError::NothingToDo {
+            reason: format!("all {} issue(s) already deleted", result.skipped.len()),
+        });
     }
 
     Ok(())
@@ -550,33 +576,40 @@ fn execute_routed(
         } else {
             ctx.json_pretty(&result);
         }
-        return Ok(());
-    }
-
-    if ctx.is_quiet() {
-        return Ok(());
-    }
-
-    ctx.success(&format!("Deleted {} issue(s)", result.deleted_count));
-    for id in &result.deleted {
-        ctx.print_line(&format!("  - {}", delete_display_text(id)));
-    }
-
-    if result.dependencies_removed > 0 {
-        ctx.info(&format!(
-            "Removed {} dependency link(s)",
-            result.dependencies_removed
-        ));
-    }
-
-    if !result.orphaned_issues.is_empty() {
-        ctx.warning(&format!(
-            "Orphaned {} issue(s):",
-            result.orphaned_issues.len()
-        ));
-        for id in &result.orphaned_issues {
+    } else if !ctx.is_quiet() {
+        ctx.success(&format!("Deleted {} issue(s)", result.deleted_count));
+        for id in &result.deleted {
             ctx.print_line(&format!("  - {}", delete_display_text(id)));
         }
+        for id in &result.skipped {
+            ctx.print_line(&format!(
+                "  - {} (already deleted)",
+                delete_display_text(id)
+            ));
+        }
+
+        if result.dependencies_removed > 0 {
+            ctx.info(&format!(
+                "Removed {} dependency link(s)",
+                result.dependencies_removed
+            ));
+        }
+
+        if !result.orphaned_issues.is_empty() {
+            ctx.warning(&format!(
+                "Orphaned {} issue(s):",
+                result.orphaned_issues.len()
+            ));
+            for id in &result.orphaned_issues {
+                ctx.print_line(&format!("  - {}", delete_display_text(id)));
+            }
+        }
+    }
+
+    if result.deleted_count == 0 && !result.skipped.is_empty() {
+        return Err(BeadsError::NothingToDo {
+            reason: format!("all {} issue(s) already deleted", result.skipped.len()),
+        });
     }
 
     Ok(())
@@ -639,7 +672,24 @@ fn apply_delete_route(
 
     let mut result = DeleteResult::new();
     let mut batch_has_mutated = false;
+
+    // Idempotence: already-tombstoned issues are skipped, not re-deleted.
+    // `--hard` still purges them.
+    let mut live_ids = Vec::with_capacity(route.final_delete_ids.len());
     for id in &route.final_delete_ids {
+        let already_deleted = !args.hard
+            && storage_ctx
+                .storage
+                .get_issue(id)?
+                .is_some_and(|issue| issue.status == crate::model::Status::Tombstone);
+        if already_deleted {
+            result.skipped.push(id.clone());
+        } else {
+            live_ids.push(id.clone());
+        }
+    }
+
+    for id in &live_ids {
         let deps_removed = retry_mutation_with_jsonl_recovery(
             &mut storage_ctx,
             !batch_has_mutated,
@@ -657,7 +707,7 @@ fn apply_delete_route(
         result.orphaned_issues.clone_from(&route.blocked_dependents);
     }
 
-    for id in &route.final_delete_ids {
+    for id in &live_ids {
         if args.hard {
             result.labels_removed += storage_ctx.storage.get_labels(id)?.len();
             result.events_removed += storage_ctx.storage.count_issue_events(id)?;
@@ -780,6 +830,7 @@ fn render_routed_delete_preview(ctx: &OutputContext, preview: &DeletePreviewResu
 
 fn merge_delete_result(result: &mut DeleteResult, mut batch_result: DeleteResult) {
     result.deleted.append(&mut batch_result.deleted);
+    result.skipped.append(&mut batch_result.skipped);
     result.dependencies_removed += batch_result.dependencies_removed;
     result.labels_removed += batch_result.labels_removed;
     result.events_removed += batch_result.events_removed;
@@ -791,6 +842,7 @@ fn merge_delete_result(result: &mut DeleteResult, mut batch_result: DeleteResult
 
 fn finalize_delete_result(result: &mut DeleteResult) {
     result.deleted = sorted_unique_strings(std::mem::take(&mut result.deleted));
+    result.skipped = sorted_unique_strings(std::mem::take(&mut result.skipped));
     result.orphaned_issues = sorted_unique_strings(std::mem::take(&mut result.orphaned_issues));
     result.deleted_count = result.deleted.len();
 }
@@ -1156,6 +1208,7 @@ fn render_delete_result_rich(result: &DeleteResult, storage: &SqliteStorage, ctx
 mod tests {
     use super::*;
     use crate::model::{Issue, IssueType, Priority, Status};
+    use crate::storage::db::{self, SqlValue};
     use chrono::Utc;
     use std::io::Write;
     use tempfile::NamedTempFile;

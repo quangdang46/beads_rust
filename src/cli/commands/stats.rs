@@ -144,7 +144,13 @@ fn execute_inner(
     }
 
     let recent_activity = if should_collect_activity(args, early_ctx.mode()) {
-        compute_recent_activity(Some(storage), &jsonl_path, args.activity_hours)
+        let activity = compute_recent_activity(Some(storage), &jsonl_path, args.activity_hours);
+        if activity.is_none() {
+            eprintln!(
+                "[note] recent activity unavailable: issues.jsonl is missing or not inside a git repository"
+            );
+        }
+        activity
     } else {
         None
     };
@@ -172,7 +178,19 @@ fn execute_inner(
     // Output based on mode
     match output_format {
         OutputFormat::Json => {
-            ctx.json_pretty(&output);
+            // `StatsSummary.average_lead_time_hours` is `Option` and skipped
+            // when `None`, which made the key disappear on empty databases.
+            // Emit it explicitly as `null` so the JSON schema is stable.
+            let mut value = serde_json::to_value(&output).unwrap_or_default();
+            if let Some(summary) = value
+                .get_mut("summary")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                summary
+                    .entry("average_lead_time_hours".to_string())
+                    .or_insert(serde_json::Value::Null);
+            }
+            ctx.json_pretty(&value);
         }
         OutputFormat::Toon => {
             ctx.toon_with_stats(&output, args.stats);

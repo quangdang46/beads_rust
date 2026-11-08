@@ -554,6 +554,18 @@ pub fn execute_with_args(
     tracing::info!("Executing close command");
     let use_structured_output = use_json || ctx.is_json() || ctx.is_toon();
 
+    // Normalise the close reason once so `--reason ""` / whitespace-only
+    // values behave exactly like an omitted reason (default "done") for
+    // both the policy gates and the stored `close_reason`.
+    let mut normalized_args = args.clone();
+    normalized_args.reason = args
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .map(str::to_string);
+    let args = &normalized_args;
+
     // Up-front bypass argument-pair validation. Done before any storage IO so
     // a misuse of the bypass flag never silently slips past policy gates.
     validate_bypass_args(args)?;
@@ -708,6 +720,9 @@ fn execute_route(
     }
 
     let epic_counts = storage_ctx.storage.get_epic_counts()?;
+    // Open children per parent/epic (dep-row + dot-notation), used to let a
+    // parent close when every open child is itself in this close batch.
+    let open_epic_children = storage_ctx.storage.get_open_epic_children_map()?;
     let blocked_before: Vec<String> = if args.suggest_next {
         storage_ctx
             .storage
@@ -758,9 +773,26 @@ fn execute_route(
             continue;
         }
 
+        // Block only on open children that are NOT part of this close batch —
+        // `br close parent child` must be able to close both atomically.
+        let unrequested_open_children: Vec<&String> = if args.force {
+            Vec::new()
+        } else {
+            open_epic_children
+                .get(id)
+                .map(|children| {
+                    children
+                        .iter()
+                        .filter(|child| !requested_ids.contains(*child))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
         if !args.force
-            && let Some(&(total, closed)) = epic_counts.get(id)
-            && closed < total
+            && !unrequested_open_children.is_empty()
+            && epic_counts
+                .get(id)
+                .is_some_and(|&(total, closed)| closed < total)
         {
             let label = if issue.issue_type == IssueType::Epic {
                 "epic"
@@ -771,8 +803,8 @@ fn execute_route(
                 id: id.clone(),
                 reason: format!(
                     "{label} has {}/{} open children (use --force to close anyway)",
-                    total - closed,
-                    total
+                    unrequested_open_children.len(),
+                    epic_counts.get(id).map_or(0, |&(total, _)| total)
                 ),
             };
             ordered_outcomes.push(CloseOutcome::Skipped(skipped.clone()));

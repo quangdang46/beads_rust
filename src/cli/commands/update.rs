@@ -10,14 +10,12 @@ use crate::cli::UpdateArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::{format_status_label, format_type_label, sanitize_terminal_inline};
-use crate::model::{Issue, IssueType, Priority, Status};
+use crate::model::{CustomStatus, Issue, IssueType, Priority, Status};
 use crate::output::OutputContext;
 use crate::storage::{EventAttribution, IssueUpdate, SqliteStorage};
 use crate::util::id::{IdResolver, ResolverConfig};
 use crate::util::time::parse_flexible_timestamp;
-use crate::validation::{
-    LabelValidator, validate_custom_status_against_registry, validate_custom_type_against_registry,
-};
+use crate::validation::{LabelValidator, validate_custom_type_against_registry};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -42,6 +40,84 @@ impl From<&Issue> for UpdatedIssueOutput {
             priority: issue.priority.0,
             updated_at: issue.updated_at,
         }
+    }
+}
+
+/// Parse a CLI `--status` value: trims surrounding whitespace, rejects
+/// empty/whitespace-only input, and rejects embedded whitespace (status names
+/// are single tokens). Built-in names map to their `Status` variant; anything
+/// else becomes `Status::Custom` and must subsequently pass
+/// [`validate_cli_status`] against the custom-status registry.
+///
+/// # Errors
+///
+/// Returns a validation error when the value is empty or contains whitespace.
+pub(crate) fn parse_cli_status(raw: &str) -> Result<Status> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(BeadsError::validation("status", "cannot be empty"));
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err(BeadsError::validation(
+            "status",
+            format!("invalid status '{trimmed}': cannot contain whitespace"),
+        ));
+    }
+    trimmed.parse()
+}
+
+/// Parse a CLI `--type` value with the same token rules as
+/// [`parse_cli_status`]. Issue types are open-ended: unknown names become
+/// `IssueType::Custom` (optionally constrained by the custom-type registry
+/// via `validate_custom_type_against_registry`).
+///
+/// # Errors
+///
+/// Returns a validation error when the value is empty or contains whitespace.
+pub(crate) fn parse_cli_issue_type(raw: &str) -> Result<IssueType> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(BeadsError::validation("type", "cannot be empty"));
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err(BeadsError::validation(
+            "type",
+            format!("invalid type '{trimmed}': cannot contain whitespace"),
+        ));
+    }
+    trimmed.parse()
+}
+
+/// Strict CLI status check: built-in statuses always pass; `Status::Custom`
+/// must be registered via `br custom-status add`. Unlike
+/// `validate_custom_status_against_registry` (which passes everything through
+/// when the registry is empty, for JSONL-import tolerance), the CLI refuses
+/// unregistered custom statuses so typos like `--status bogus` fail loudly.
+///
+/// # Errors
+///
+/// Returns a validation error for empty or unregistered custom statuses.
+pub(crate) fn validate_cli_status(status: &Status, registered: &[CustomStatus]) -> Result<()> {
+    let Status::Custom(value) = status else {
+        return Ok(());
+    };
+    if value.trim().is_empty() {
+        return Err(BeadsError::validation("status", "cannot be empty"));
+    }
+    let known = registered
+        .iter()
+        .any(|cs| cs.name.trim().eq_ignore_ascii_case(value));
+    if known {
+        Ok(())
+    } else {
+        Err(BeadsError::validation(
+            "status",
+            format!(
+                "unknown status '{value}'. Built-in statuses: open, in_progress, \
+                 blocked, deferred, draft, pinned, hooked. To use a custom status, \
+                 register it first: `br custom-status add {value} --category <active|wip|done|frozen|unspecified>`"
+            ),
+        ))
     }
 }
 
@@ -167,6 +243,18 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
     // close-policy / delete pipelines are applied (see beads_rust#301).
     reject_terminal_status_transition(args.status.as_deref())?;
 
+    // Warn (not reject) on past defer dates, consistent with `br defer`.
+    if let Some(raw) = args.defer.as_deref()
+        && !raw.trim().is_empty()
+        && let Ok(until) = parse_flexible_timestamp(raw.trim(), "defer")
+        && until < Utc::now()
+    {
+        ctx.warning(&format!(
+            "defer date {} is in the past; the issue becomes ready immediately",
+            until.to_rfc3339()
+        ));
+    }
+
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let mut target_inputs = args.ids.clone();
     if target_inputs.is_empty() {
@@ -176,6 +264,12 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 "ids",
                 "no issue IDs provided and no last-touched issue",
             ));
+        }
+        // The last-touched fallback mutates an issue the caller never named.
+        // Only honour it after an explicit interactive confirmation; scripts
+        // (pipes, --json/--quiet) must pass an ID.
+        if !confirm_last_touched_update(ctx, &last_touched)? {
+            return Ok(());
         }
         target_inputs.push(last_touched);
     }
@@ -353,13 +447,39 @@ fn prepare_single_route(
 
     // Validate custom status/type against registry (if configured).
     // Applies only when the update explicitly sets a new status or type.
+    // Status uses the strict CLI check: built-ins pass, customs must be
+    // registered via `br custom-status add` (typos like `--status bogus`
+    // are rejected even when the registry is empty).
     if let Some(ref new_status) = update.status {
         let custom_statuses = storage_ctx.storage.list_custom_statuses()?;
-        validate_custom_status_against_registry(new_status, &custom_statuses)?;
+        validate_cli_status(new_status, &custom_statuses)?;
     }
     if let Some(ref new_type) = update.issue_type {
         let custom_types = storage_ctx.storage.list_custom_types()?;
         validate_custom_type_against_registry(new_type, &custom_types)?;
+    }
+
+    // A `--status` change on a closed issue would silently reopen it,
+    // bypassing `br reopen`'s audit trail (status event + optional reason
+    // comment). Refuse and direct the caller at the dedicated command.
+    // Field-only updates on closed issues remain allowed.
+    if update.status.is_some() {
+        for id in &resolved_ids {
+            if storage_ctx
+                .storage
+                .get_issue(id)?
+                .is_some_and(|issue| issue.status == Status::Closed)
+            {
+                return Err(BeadsError::validation(
+                    "status",
+                    format!(
+                        "issue {id} is closed; use `br reopen {id}` to reopen it \
+                         before changing its status (or `br update {id}` without \
+                         --status for field edits)"
+                    ),
+                ));
+            }
+        }
     }
 
     // Strict status-workflow enforcement (issue #311) + transition rules
@@ -508,6 +628,29 @@ fn execute_prepared_route(
                     format!("{existing_notes}\n---\n[{timestamp}] {push_content}")
                 };
                 issue_update.notes = Some(Some(new_notes));
+            }
+            // Record the status being left behind when transitioning INTO
+            // `deferred` via `--status deferred`, so `br undefer` can restore
+            // it (e.g. `in_progress`) instead of always reopening as `open`.
+            if issue_update.status == Some(Status::Deferred)
+                && issue_before
+                    .as_ref()
+                    .is_some_and(|i| i.status != Status::Deferred)
+                && let Some(before) = issue_before.as_ref()
+                && let Some(metadata) = super::defer::metadata_with_pre_defer_status(before)
+            {
+                issue_update.metadata = Some(Some(metadata));
+            }
+            // Conversely, leaving `deferred` for any other status drops the
+            // recorded pre-defer status so a later defer records fresh.
+            if !matches!(issue_update.status, None | Some(Status::Deferred))
+                && issue_before
+                    .as_ref()
+                    .is_some_and(|i| i.status == Status::Deferred)
+                && let Some(before) = issue_before.as_ref()
+                && let Some(metadata) = super::defer::metadata_without_pre_defer_status(before)
+            {
+                issue_update.metadata = Some(Some(metadata));
             }
             issue_update.skip_cache_rebuild = defer_blocked_cache_rebuild;
             // Stage Tier 1 attribution (issue #312, Layer 3 capture-only) so the
@@ -860,7 +1003,7 @@ fn validate_transition_to_in_progress(
         || args
             .status
             .as_ref()
-            .is_some_and(|status| status.eq_ignore_ascii_case("in_progress"));
+            .is_some_and(|status| status.trim().eq_ignore_ascii_case("in_progress"));
 
     if !transitioning_to_in_progress || args.force {
         return Ok(());
@@ -1015,6 +1158,41 @@ fn build_resolver(config_layer: &config::ConfigLayer, _storage: &SqliteStorage) 
     IdResolver::new(ResolverConfig::with_prefix(id_config.prefix))
 }
 
+/// Interactive guard for the no-IDs last-touched fallback. Returns `Ok(true)`
+/// only when the user explicitly confirms on a TTY; non-interactive contexts
+/// (piped stdin/stdout, `--json`, `--toon`, `--quiet`) get a validation error
+/// because they cannot answer the prompt.
+fn confirm_last_touched_update(ctx: &OutputContext, last_touched: &str) -> Result<bool> {
+    use std::io::{IsTerminal, Write};
+
+    if ctx.is_json()
+        || ctx.is_toon()
+        || ctx.is_quiet()
+        || !std::io::stdin().is_terminal()
+        || !std::io::stdout().is_terminal()
+    {
+        return Err(BeadsError::validation(
+            "ids",
+            "no issue IDs provided; `br update` requires an explicit ID \
+             (the last-touched fallback is interactive-only)",
+        ));
+    }
+    eprint!("No issue IDs provided — update last-touched issue {last_touched}? [y/N] ");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return Ok(false);
+    }
+    let answer = line.trim();
+    if answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") {
+        eprintln!();
+        Ok(true)
+    } else {
+        eprintln!("Aborted.");
+        Ok(false)
+    }
+}
+
 fn resolve_target_ids(
     args: &UpdateArgs,
     beads_dir: &std::path::Path,
@@ -1082,7 +1260,7 @@ fn reject_terminal_status_transition(raw_status: Option<&str>) -> Result<()> {
     let Some(raw) = raw_status else {
         return Ok(());
     };
-    let parsed: Status = raw.parse()?;
+    let parsed: Status = raw.trim().parse()?;
     match parsed {
         Status::Closed => Err(BeadsError::validation(
             "status",
@@ -1107,12 +1285,16 @@ fn build_update(args: &UpdateArgs, actor: &str, claim_exclusive: bool) -> Result
     let status = if args.claim {
         Some(Status::InProgress)
     } else {
-        args.status.as_ref().map(|s| s.parse()).transpose()?
+        args.status.as_deref().map(parse_cli_status).transpose()?
     };
 
     let priority = args.priority.as_ref().map(|p| p.parse()).transpose()?;
 
-    let issue_type = args.type_.as_ref().map(|t| t.parse()).transpose()?;
+    let issue_type = args
+        .type_
+        .as_deref()
+        .map(parse_cli_issue_type)
+        .transpose()?;
 
     let assignee = if args.claim {
         Some(Some(actor.to_string()))
@@ -1275,10 +1457,12 @@ fn agent_context_update_from_arg(value: Option<&str>) -> Result<Option<Option<St
 fn optional_date_field(value: Option<&str>) -> Result<Option<Option<DateTime<Utc>>>> {
     value
         .map(|v| {
-            if v.is_empty() {
+            // Trim so `--defer " "` clears the date just like `--defer ""`,
+            // matching `br defer --until ""` (indefinite) semantics.
+            if v.trim().is_empty() {
                 Ok(None)
             } else {
-                parse_date(v).map(Some)
+                parse_date(v.trim()).map(Some)
             }
         })
         .transpose()
@@ -1440,6 +1624,50 @@ mod tests {
         let result = optional_date_field(Some("not-a-date"));
         assert!(result.is_err());
         info!("test_optional_date_field_invalid_format: assertions passed");
+    }
+
+    #[test]
+    fn test_parse_cli_status_trims_and_maps_builtins() {
+        init_test_logging();
+        assert_eq!(
+            parse_cli_status("  in_progress  ").unwrap(),
+            Status::InProgress
+        );
+        assert_eq!(parse_cli_status("OPEN").unwrap(), Status::Open);
+    }
+
+    #[test]
+    fn test_parse_cli_status_rejects_empty_and_whitespace() {
+        init_test_logging();
+        assert!(parse_cli_status("").is_err());
+        assert!(parse_cli_status("   ").is_err());
+        assert!(parse_cli_status("in progress").is_err());
+    }
+
+    #[test]
+    fn test_validate_cli_status_rejects_unregistered_custom() {
+        init_test_logging();
+        // Empty registry: any custom status is rejected (typo protection).
+        let bogus = Status::Custom("bogus".to_string());
+        assert!(validate_cli_status(&bogus, &[]).is_err());
+        // Registered custom status passes (case-insensitive).
+        let registered = vec![CustomStatus {
+            name: "Review".to_string(),
+            category: "wip".to_string(),
+        }];
+        let custom = Status::Custom("review".to_string());
+        assert!(validate_cli_status(&custom, &registered).is_ok());
+        // Built-ins always pass.
+        assert!(validate_cli_status(&Status::Open, &[]).is_ok());
+        assert!(validate_cli_status(&Status::Deferred, &[]).is_ok());
+    }
+
+    #[test]
+    fn test_parse_cli_issue_type_rejects_empty() {
+        init_test_logging();
+        assert!(parse_cli_issue_type("").is_err());
+        assert!(parse_cli_issue_type("two words").is_err());
+        assert_eq!(parse_cli_issue_type(" Bug ").unwrap(), IssueType::Bug);
     }
 
     #[test]

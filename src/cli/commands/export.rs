@@ -76,32 +76,59 @@ pub fn execute_with_storage(
 fn execute_inner(
     args: &ExportArgs,
     _cli: &config::CliOverrides,
-    _outer_ctx: &OutputContext,
+    outer_ctx: &OutputContext,
     storage_ctx: &config::OpenStorageResult,
 ) -> Result<()> {
     let storage = &storage_ctx.storage;
 
-    // Parse the export format
-    let export_format = ExportFormat::from_str(&args.format).map_err(|_| {
+    // Parse the export format. The global `--json` flag requests JSON output;
+    // for the default `jsonl` format that means a JSON array (same as
+    // `-f json`) rather than silently ignoring the flag. Explicit non-jsonl
+    // formats (`-f csv`, `-f obsidian`) are left alone.
+    let mut export_format = ExportFormat::from_str(&args.format).map_err(|_| {
         BeadsError::Config(format!(
             "Unknown export format: '{}'. Must be one of: jsonl, json, csv, obsidian",
             args.format
         ))
     })?;
+    if outer_ctx.is_json() && matches!(export_format, ExportFormat::Jsonl) {
+        export_format = ExportFormat::Json;
+    }
+
+    // Validate `--fields` up front: `csv::parse_fields` silently drops
+    // unknown names, which used to produce an empty header and an empty file
+    // with no error.
+    validate_export_field_names(args.filters.fields.as_deref())?;
 
     // Validate selection filters before building the storage query.
     // Convert to ListArgs so we reuse list's filter validation/builder.
     let list_args = args.filters.to_list_args();
     validate_list_args(&list_args)?;
 
-    // Build list filters from the export selection flags.
-    // Use limit=0 (unlimited) for export so we get all matching issues.
-    let (mut filters, _predicate) = build_filters(&list_args)?;
-    filters.limit = Some(0);
-    filters.offset = Some(0);
+    // Build list filters from the export selection flags. `--limit`/`--offset`
+    // are honored: `None`/`0` means unlimited, matching `br list` semantics.
+    let (mut filters, predicate) = build_filters(&list_args)?;
+    filters.limit = list_args.limit;
+    filters.offset = list_args.offset;
 
     // Query issues
-    let issues = storage.list_issues(&filters)?;
+    let mut issues = storage.list_issues(&filters)?;
+
+    // Apply the client-side predicate from `--filter` (query DSL), which
+    // `list_issues` cannot evaluate in SQL.
+    if let Some(predicate) = predicate {
+        issues.retain(|issue| predicate(issue));
+    }
+
+    // Ephemeral issues and `-wisp-` IDs are session-local scratch state and
+    // are never part of a JSONL export (the sync export path excludes them
+    // via `export_issue_ids`).
+    issues.retain(|issue| !issue.ephemeral && !issue.id.contains("-wisp-"));
+
+    // Hydrate labels, dependencies, and comments so JSON/JSONL exports carry
+    // the same embedded relations the canonical `.beads/issues.jsonl`
+    // contains — `list_issues` returns bare issue rows.
+    hydrate_export_relations(storage, &mut issues)?;
 
     // Resolve CSV fields if needed
     let csv_fields = if matches!(export_format, ExportFormat::Csv) {
@@ -186,6 +213,79 @@ fn execute_inner(
         }
     }
 
+    Ok(())
+}
+
+/// Reject unknown `--fields` names instead of letting `csv::parse_fields`
+/// silently drop them (which produced an empty header / empty file).
+fn validate_export_field_names(fields_arg: Option<&str>) -> Result<()> {
+    let Some(fields_arg) = fields_arg else {
+        return Ok(());
+    };
+    let unknown: Vec<&str> = fields_arg
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .filter(|name| !csv::ALL_FIELDS.contains(name))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    Err(BeadsError::Validation {
+        field: "fields".to_string(),
+        reason: format!(
+            "Unknown CSV field(s): {}. Available: {}",
+            unknown.join(", "),
+            csv::ALL_FIELDS.join(", ")
+        ),
+    })
+}
+
+/// Populate `labels`, `dependencies`, and `comments` on issues returned by
+/// `list_issues`, and normalize their order the same way the sync JSONL
+/// exporter does so subset/stdout/JSON exports are byte-comparable with the
+/// canonical `.beads/issues.jsonl`.
+fn hydrate_export_relations(
+    storage: &crate::storage::SqliteStorage,
+    issues: &mut [Issue],
+) -> Result<()> {
+    if issues.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<String> = issues.iter().map(|issue| issue.id.clone()).collect();
+    let deps_map = storage.get_dependencies_full_for_issues(&ids)?;
+    let labels_map = storage.get_labels_for_issues(&ids)?;
+    let comments_map = storage.get_comments_for_issues(&ids)?;
+
+    for issue in issues {
+        if let Some(deps) = deps_map.get(&issue.id) {
+            issue.dependencies.clone_from(deps);
+        }
+        if let Some(labels) = labels_map.get(&issue.id) {
+            issue.labels.clone_from(labels);
+        }
+        if let Some(comments) = comments_map.get(&issue.id) {
+            issue.comments.clone_from(comments);
+        }
+
+        issue.labels.sort_unstable();
+        issue.labels.dedup();
+        issue.dependencies.sort_by(|left, right| {
+            left.issue_id
+                .cmp(&right.issue_id)
+                .then_with(|| left.depends_on_id.cmp(&right.depends_on_id))
+                .then_with(|| left.dep_type.as_str().cmp(right.dep_type.as_str()))
+                .then_with(|| left.created_at.cmp(&right.created_at))
+        });
+        issue.comments.sort_by(|left, right| {
+            left.issue_id
+                .cmp(&right.issue_id)
+                .then_with(|| left.created_at.cmp(&right.created_at))
+                .then_with(|| left.author.cmp(&right.author))
+                .then_with(|| left.body.cmp(&right.body))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+    }
     Ok(())
 }
 
@@ -378,6 +478,23 @@ mod tests {
         assert!(!list.pretty);
         assert!(!list.wrap);
         assert!(!list.stats);
+    }
+
+    #[test]
+    fn validate_export_field_names_rejects_unknown_fields() {
+        assert!(validate_export_field_names(None).is_ok());
+        assert!(validate_export_field_names(Some("id,title,status")).is_ok());
+        assert!(validate_export_field_names(Some(" id , title ")).is_ok());
+
+        let err = validate_export_field_names(Some("id,bogus,title")).unwrap_err();
+        assert!(matches!(err, BeadsError::Validation { .. }));
+        if let BeadsError::Validation { reason, .. } = err {
+            assert!(reason.contains("bogus"), "reason: {reason}");
+        }
+
+        // Every bogus name errors — previously these were silently dropped,
+        // producing an empty CSV header and an empty file.
+        assert!(validate_export_field_names(Some("nope,alsonope")).is_err());
     }
 
     #[test]

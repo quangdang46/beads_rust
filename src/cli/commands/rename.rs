@@ -5,8 +5,9 @@
 
 use crate::cli::RenameArgs;
 use crate::config;
-use crate::error::Result;
+use crate::error::{BeadsError, Result};
 use crate::output::{OutputContext, OutputMode};
+use crate::util::id::{IdResolver, ResolverConfig};
 use rich_rust::prelude::*;
 use serde::Serialize;
 use tracing::info;
@@ -63,15 +64,38 @@ pub fn execute(args: &RenameArgs, cli: &config::CliOverrides, ctx: &OutputContex
     let actor = config::resolve_actor(&config_layer);
     let storage = &mut storage_ctx.storage;
 
-    info!(old = %old_id, new = %new_id, "Renaming issue ID");
+    // Validate the new ID up front: prefix-suffix format. The prefix charset
+    // mirrors `util::id::normalize_prefix` (lowercase alnum plus `_ - . : #`,
+    // with at least one alphanumeric) so digit/underscore prefixes produced
+    // by `init --prefix` or directory-derived names remain renamable.
+    let new_id_format =
+        regex::Regex::new(r"^[a-z0-9_.:#-]*[a-z0-9][a-z0-9_.:#-]*-[a-zA-Z0-9._-]+$")
+            .expect("static regex is valid");
+    if !new_id_format.is_match(new_id) {
+        return Err(BeadsError::validation(
+            "new_id",
+            format!(
+                "'{new_id}' must be prefix-suffix format with a lowercase prefix (e.g., acme-dolt)"
+            ),
+        ));
+    }
 
-    let renamed = storage.update_issue_id(old_id, new_id, &actor)?;
+    // Resolve the old ID (exact, prefix-short, or content hash). Unresolvable
+    // or ambiguous input fails here with a clear error instead of a raw
+    // not-found deep in storage.
+    let id_config = config::id_config_from_layer(&config_layer);
+    let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+    let resolved_old_id = super::resolve_issue_id(storage, &resolver, old_id)?;
+
+    info!(old = %resolved_old_id, new = %new_id, "Renaming issue ID");
+
+    let renamed = storage.update_issue_id(&resolved_old_id, new_id, &actor)?;
 
     storage_ctx.flush_no_db_if_dirty()?;
 
     if ctx.is_json() {
         let result = RenameResult {
-            old_id: old_id.clone(),
+            old_id: resolved_old_id.clone(),
             new_id: new_id.clone(),
             title: renamed.title,
             updated_at: renamed.updated_at.to_rfc3339(),
@@ -79,7 +103,7 @@ pub fn execute(args: &RenameArgs, cli: &config::CliOverrides, ctx: &OutputContex
         ctx.json_pretty(&result);
     } else if ctx.is_toon() {
         let result = RenameResult {
-            old_id: old_id.clone(),
+            old_id: resolved_old_id.clone(),
             new_id: new_id.clone(),
             title: renamed.title,
             updated_at: renamed.updated_at.to_rfc3339(),
@@ -92,12 +116,12 @@ pub fn execute(args: &RenameArgs, cli: &config::CliOverrides, ctx: &OutputContex
         let theme = ctx.theme();
         let mut text = Text::new("");
         text.append_styled("\u{2713} Renamed: ", theme.success.clone());
-        text.append_styled(old_id, theme.issue_id.clone());
+        text.append_styled(&resolved_old_id, theme.issue_id.clone());
         text.append(" → ");
         text.append_styled(new_id, theme.accent.clone());
         console.print_renderable(&text);
     } else {
-        println!("Renamed: {} → {}", old_id, new_id);
+        println!("Renamed: {} → {}", resolved_old_id, new_id);
     }
 
     Ok(())

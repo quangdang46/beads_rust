@@ -1497,6 +1497,21 @@ fn execute_flush(
             }
         }
 
+        // --flush-only only writes DB -> JSONL; it cannot reconcile JSONL
+        // content changed externally (same IDs, different bytes). When the
+        // stored content hash no longer matches the file on disk, the
+        // divergent JSONL would otherwise be left silently stale, so warn.
+        if let Ok(Some(stored_hash)) = storage.get_metadata(METADATA_JSONL_CONTENT_HASH)
+            && compute_jsonl_hash(jsonl_path).is_ok_and(|current| current != stored_hash)
+        {
+            eprintln!(
+                "Warning: {} content differs from the last recorded sync hash. \
+                 --flush-only does not reconcile external JSONL changes; \
+                 run `br sync --merge` (or `br sync --import-only`) to reconcile.",
+                jsonl_path.display()
+            );
+        }
+
         if use_json {
             let result = FlushResult {
                 exported_issues: 0,
@@ -2085,12 +2100,28 @@ fn jsonl_contains_duplicate_external_refs(jsonl_path: &Path) -> Result<bool> {
     Ok(false)
 }
 
+/// Count non-tombstone issues. `--rebuild` re-imports every JSONL row,
+/// including tombstone records, so `created_count`/`count_all_issues`
+/// over-reports "Created" by the number of tombstones; user-facing "Created"
+/// numbers should only count live issues.
+fn count_non_tombstone_issues(storage: &crate::storage::SqliteStorage) -> Result<usize> {
+    let rows = storage.execute_raw_query(
+        "SELECT count(*) FROM issues WHERE status IS NULL OR status != 'tombstone'",
+    )?;
+    Ok(rows
+        .first()
+        .and_then(|row| row.first())
+        .and_then(crate::storage::db::SqlValue::as_integer)
+        .and_then(|count| usize::try_from(count).ok())
+        .unwrap_or(0))
+}
+
 fn emit_auto_rebuild_import_result(
     storage: &crate::storage::SqliteStorage,
     use_json: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let created = storage.count_all_issues()?;
+    let created = count_non_tombstone_issues(storage)?;
     let result = ImportResultOutput {
         created,
         updated: 0,
@@ -2564,9 +2595,16 @@ fn execute_import(
         }
     }
 
-    // Output result
+    // Output result. For --rebuild the DB mirrors the JSONL exactly, so the
+    // live (non-tombstone) row count is the honest "created" number; raw
+    // created_count includes tombstone records imported from the JSONL.
+    let created = if args.rebuild {
+        count_non_tombstone_issues(storage)?
+    } else {
+        import_result.created_count
+    };
     let result = ImportResultOutput {
-        created: import_result.created_count,
+        created,
         updated: import_result.updated_count,
         skipped: import_result.skipped_count,
         tombstone_skipped: import_result.tombstone_skipped,
@@ -2735,8 +2773,24 @@ fn execute_merge(
     debug!(left_count = left.len(), "Loaded local state (DB)");
 
     // 3. Load Right State (external JSONL)
+    //
+    // A missing JSONL must NOT be treated as "everything was deleted
+    // externally": with an empty `right` map the 3-way merge resolves every
+    // base+local issue as delete-in-right and tombstones the entire database
+    // while still exiting 0. `--import-only` already treats a missing JSONL
+    // as a no-op; merge has no safe no-op (its whole job is reconciling the
+    // two sides), so fail loudly instead.
+    if !jsonl_path.exists() {
+        return Err(BeadsError::Config(format!(
+            "Cannot merge: JSONL file not found at {}.\n\
+             A missing JSONL would be misread as 'all issues deleted externally' \
+             and tombstone the local database. Restore the file or run \
+             `br sync --flush-only` first if the DB is the source of truth.",
+            jsonl_path.display()
+        )));
+    }
     let mut right = HashMap::new();
-    if jsonl_path.exists() {
+    {
         // `read_issues_from_jsonl` parses JSON line-by-line, which yields a
         // generic "Invalid JSON at line 1" error when the JSONL still
         // contains unresolved merge-conflict markers from a botched

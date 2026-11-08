@@ -274,6 +274,55 @@ fn assert_no_integrity_failure_signals(role: &str, results: &[BrResult]) {
     );
 }
 
+/// A `br reopen` that exits non-zero only because every target was skipped
+/// (already open, tombstone, not found) is an expected no-op under the
+/// NOTHING_TO_DO contract: the JSON payload is still emitted on stdout before
+/// the structured error. Such results are neither successes nor contention.
+fn is_expected_noop_reopen(result: &BrResult) -> bool {
+    if result.success {
+        return false;
+    }
+    let payload = extract_json_payload(&result.stdout);
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&payload) else {
+        return false;
+    };
+    json.get("reopened")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(Vec::is_empty)
+        && json
+            .get("skipped")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|skipped| !skipped.is_empty())
+}
+
+/// Reopen variant of [`assert_only_success_or_contention`]: all-skipped
+/// reopens are expected no-ops (NOTHING_TO_DO), not failures.
+fn assert_reopen_results(results: &[BrResult]) -> usize {
+    let mut success_count = 0;
+    let mut unexpected_failures = Vec::new();
+
+    for (index, result) in results.iter().enumerate() {
+        if result.success {
+            success_count += 1;
+        } else if is_expected_noop_reopen(result) || is_expected_contention_failure(result) {
+            // Expected: idempotent reopen skip or lock contention.
+        } else {
+            unexpected_failures.push(format!(
+                "reopen[{index}] stdout={} stderr={}",
+                result.stdout, result.stderr
+            ));
+        }
+    }
+
+    assert!(
+        unexpected_failures.is_empty(),
+        "unexpected reopen failures: {}",
+        unexpected_failures.join(" | ")
+    );
+
+    success_count
+}
+
 fn assert_only_success_or_contention(role: &str, results: &[BrResult]) -> usize {
     let mut success_count = 0;
     let mut unexpected_failures = Vec::new();
@@ -2641,7 +2690,7 @@ fn e2e_close_update_reopen_preserve_blocked_cache_integrity() {
 
     let close_successes = assert_only_success_or_contention("close", &close_results);
     let update_successes = assert_only_success_or_contention("update", &update_results);
-    let reopen_successes = assert_only_success_or_contention("reopen", &reopen_results);
+    let reopen_successes = assert_reopen_results(&reopen_results);
     let reader_successes = assert_only_success_or_contention("reader", &reader_results);
 
     assert!(

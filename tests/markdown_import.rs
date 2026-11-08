@@ -236,9 +236,21 @@ bug
         output.stderr
     );
 
+    // `br update` with no IDs requires an interactive TTY; read the
+    // last-touched marker recorded by the import and pass it explicitly. The
+    // final assertion below proves the marker pointed at "Second imported".
+    let last_touched = fs::read_to_string(workspace.root.join(".beads").join("last-touched"))
+        .expect("read .beads/last-touched")
+        .trim()
+        .to_string();
+    assert!(
+        !last_touched.is_empty(),
+        "markdown import should record a last-touched issue"
+    );
+
     let update = run_br(
         &workspace,
-        ["update", "--status", "in_progress"],
+        ["update", last_touched.as_str(), "--status", "in_progress"],
         "update_after_import_last_touched",
     );
     assert!(update.status.success(), "update failed: {}", update.stderr);

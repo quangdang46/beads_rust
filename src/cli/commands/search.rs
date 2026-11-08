@@ -1,9 +1,11 @@
 //! Search command implementation.
 //!
-//! Classic bd-style LIKE search across title/description/id with list-like filters.
+//! Case-insensitive substring search across issue content (title,
+//! description, design, acceptance criteria, notes, labels, created_by, id)
+//! with list-like filters.
 
 use crate::cli::{
-    DEFAULT_LIST_OFFSET, DEFAULT_SEARCH_LIMIT, ListArgs, OutputFormat, SearchArgs,
+    DEFAULT_LIST_LIMIT, DEFAULT_LIST_OFFSET, ListArgs, OutputFormat, SearchArgs,
     resolve_output_format_with_outer_mode,
 };
 use crate::config;
@@ -19,6 +21,12 @@ use regex::{Regex, RegexBuilder};
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::str::FromStr;
+
+// `DEFAULT_SEARCH_LIMIT` (50) was the historical `br search` result cap.
+// Search is now unlimited by default to match the `--limit` help text and
+// `br list`/`br ready` semantics; the constant remains in `cli` for API
+// stability and is referenced here to keep it live.
+const _: usize = crate::cli::DEFAULT_SEARCH_LIMIT;
 
 /// Execute the search command.
 ///
@@ -57,7 +65,7 @@ pub fn execute_with_storage_ctx(
         outer_ctx.inherited_output_mode(),
         false,
     );
-    let issues = collect_search_results_for_output(storage, query, &args.filters, output_format)?;
+    let issues = collect_search_results_for_output(storage, query, &args.filters)?;
     render_search_results(
         storage,
         issues,
@@ -79,78 +87,230 @@ fn collect_search_results(
     query: &str,
     list_args: &ListArgs,
 ) -> Result<Vec<Issue>> {
-    collect_search_results_with_projection(storage, query, list_args, false)
+    collect_search_results_with_projection(storage, query, list_args)
 }
 
 fn collect_search_results_for_output(
     storage: &SqliteStorage,
     query: &str,
     list_args: &ListArgs,
-    output_format: OutputFormat,
 ) -> Result<Vec<Issue>> {
-    collect_search_results_with_projection(
-        storage,
-        query,
-        list_args,
-        matches!(output_format, OutputFormat::Text),
-    )
+    collect_search_results_with_projection(storage, query, list_args)
+}
+
+/// Maximum length of the query string echoed in human-readable output.
+/// Longer queries are truncated with an ellipsis so a pasted blob cannot
+/// flood the terminal.
+const DISPLAY_QUERY_MAX_CHARS: usize = 80;
+
+/// Truncate a query for display purposes only (matching still uses the
+/// full string).
+fn display_query(query: &str) -> String {
+    let trimmed = query.trim();
+    if trimmed.chars().count() <= DISPLAY_QUERY_MAX_CHARS {
+        return trimmed.to_string();
+    }
+    let mut out: String = trimmed.chars().take(DISPLAY_QUERY_MAX_CHARS).collect();
+    out.push('…');
+    out
 }
 
 fn collect_search_results_with_projection(
     storage: &SqliteStorage,
     query: &str,
     list_args: &ListArgs,
-    use_text_projection: bool,
 ) -> Result<Vec<Issue>> {
+    validate_search_enum_filters(storage, list_args)?;
     let mut filters = build_filters(list_args)?;
     let client_filters = needs_client_filters(list_args);
-    let needs_post_query_ordering = requires_post_query_ordering(list_args, client_filters);
-    let (offset, limit) = if needs_post_query_ordering {
-        (filters.offset.take(), filters.limit.take())
-    } else {
-        (None, None)
-    };
-    if needs_post_query_ordering {
-        filters.sort = None;
-        filters.reverse = false;
+    let query = query.trim();
+
+    // When the search query is empty but filters (like --title-contains or
+    // --label) are provided, use list_issues instead of text search.
+    if query.is_empty() {
+        let needs_post_query_ordering = requires_post_query_ordering(list_args, client_filters);
+        let (offset, limit) = if needs_post_query_ordering {
+            (filters.offset.take(), filters.limit.take())
+        } else {
+            (None, None)
+        };
+        if needs_post_query_ordering {
+            filters.sort = None;
+            filters.reverse = false;
+        }
+
+        let mut issues = storage.list_issues(&filters)?;
+        if client_filters {
+            issues = apply_client_filters(issues, list_args)?;
+        }
+        if needs_post_query_ordering {
+            apply_issue_sort(&mut issues, list_args.sort.as_deref(), list_args.reverse)?;
+            apply_offset_limit(&mut issues, offset, limit);
+        }
+        return Ok(issues);
     }
 
-    // When the search query is empty but filters (like --title-contains or --label)
-    // are provided, use list_issues instead of text search.
-    let use_list = query.is_empty();
-    let issues = if use_list {
-        storage.list_issues(&filters)?
-    } else if use_text_projection && !client_filters {
-        storage.search_issues_for_command_output(query, &filters)?
-    } else {
-        storage.search_issues(query, &filters)?
-    };
-    let mut issues = if client_filters {
-        apply_client_filters(issues, list_args)?
-    } else {
-        issues
-    };
+    // Text search: the SQL `search_issues` path only covers
+    // title/description/id. To cover labels, notes, and created_by
+    // consistently we scan all filter-matching issues and match client-side,
+    // then apply sort/offset/limit in Rust (same ordering the SQL path used:
+    // priority ASC, created_at DESC, id ASC unless overridden).
+    filters.limit = None;
+    filters.offset = None;
+    filters.sort = None;
+    filters.reverse = false;
 
-    if needs_post_query_ordering {
-        apply_issue_sort(&mut issues, list_args.sort.as_deref(), list_args.reverse)?;
-        if let Some(offset) = offset
-            && offset > 0
-        {
-            if offset >= issues.len() {
-                issues.clear();
-            } else {
-                issues = issues.split_off(offset);
+    let mut issues = storage.list_issues(&filters)?;
+    if client_filters {
+        issues = apply_client_filters(issues, list_args)?;
+    }
+
+    // Labels live in a separate table; hydrate them so they participate in
+    // free-text matching (and so downstream output sees them, matching the
+    // previous relation-metadata backfill).
+    let issue_ids: Vec<String> = issues.iter().map(|issue| issue.id.clone()).collect();
+    let labels_by_id = storage.get_labels_for_issues(&issue_ids)?;
+    for issue in &mut issues {
+        if let Some(labels) = labels_by_id.get(&issue.id) {
+            issue.labels = labels.clone();
+        }
+    }
+
+    issues.retain(|issue| issue_matches_search_query(issue, query));
+
+    apply_issue_sort(&mut issues, list_args.sort.as_deref(), list_args.reverse)?;
+    apply_offset_limit(
+        &mut issues,
+        list_args.offset,
+        list_args.limit.filter(|limit| *limit > 0),
+    );
+    Ok(issues)
+}
+
+/// Apply offset then limit to an already-sorted issue list.
+fn apply_offset_limit(issues: &mut Vec<Issue>, offset: Option<usize>, limit: Option<usize>) {
+    if let Some(offset) = offset
+        && offset > 0
+    {
+        if offset >= issues.len() {
+            issues.clear();
+        } else {
+            *issues = issues.split_off(offset);
+        }
+    }
+    if let Some(limit) = limit
+        && limit > 0
+        && issues.len() > limit
+    {
+        issues.truncate(limit);
+    }
+}
+
+/// Free-text match for `br search <QUERY>`.
+///
+/// Coverage is deliberately limited to user-visible content and identity
+/// fields: title, description, design, acceptance criteria, notes, labels,
+/// created_by, and id. Structured metadata (status, type, priority,
+/// assignee, owner, dates, source_repo, external_ref, metadata) is excluded —
+/// those have dedicated filter flags, and fields like `source_repo` are
+/// populated on nearly every issue so matching them would return everything.
+fn issue_matches_search_query(issue: &Issue, query: &str) -> bool {
+    let needle = query.to_lowercase();
+    if needle.is_empty() {
+        return true;
+    }
+    if issue.id.to_lowercase().contains(&needle)
+        || issue.title.to_lowercase().contains(&needle)
+        || issue
+            .description
+            .as_deref()
+            .is_some_and(|v| v.to_lowercase().contains(&needle))
+        || issue
+            .design
+            .as_deref()
+            .is_some_and(|v| v.to_lowercase().contains(&needle))
+        || issue
+            .acceptance_criteria
+            .as_deref()
+            .is_some_and(|v| v.to_lowercase().contains(&needle))
+        || issue
+            .notes
+            .as_deref()
+            .is_some_and(|v| v.to_lowercase().contains(&needle))
+        || issue
+            .created_by
+            .as_deref()
+            .is_some_and(|v| v.to_lowercase().contains(&needle))
+    {
+        return true;
+    }
+    issue
+        .labels
+        .iter()
+        .any(|label| label.to_lowercase().contains(&needle))
+}
+
+/// Validate `--status`/`--type` filter values for search.
+///
+/// `Status`/`IssueType` parse any string into a `Custom` variant, so a typo
+/// like `--status bogus` would otherwise silently match nothing. Built-in
+/// values always pass; custom values pass when registered in the custom-status
+/// registry or when at least one issue actually carries them (custom values
+/// can enter via JSONL import without registration).
+fn validate_search_enum_filters(storage: &SqliteStorage, args: &ListArgs) -> Result<()> {
+    if !args.status.is_empty() {
+        let registered = storage.list_custom_statuses()?;
+        for raw in &args.status {
+            let status = Status::from_str(raw)?;
+            if !matches!(status, Status::Custom(_)) {
+                continue;
+            }
+            if registered.iter().any(|c| c.name.eq_ignore_ascii_case(raw)) {
+                continue;
+            }
+            let probe = ListFilters {
+                statuses: Some(vec![status]),
+                include_closed: true,
+                include_deferred: true,
+                include_templates: true,
+                limit: Some(1),
+                ..Default::default()
+            };
+            if storage.list_issues(&probe)?.is_empty() {
+                return Err(BeadsError::InvalidStatus {
+                    status: raw.clone(),
+                });
             }
         }
-        if let Some(limit) = limit
-            && limit > 0
-            && issues.len() > limit
-        {
-            issues.truncate(limit);
+    }
+
+    if !args.type_.is_empty() {
+        let registered = storage.list_custom_types()?;
+        for raw in &args.type_ {
+            let issue_type = IssueType::from_str(raw)?;
+            if !matches!(issue_type, IssueType::Custom(_)) {
+                continue;
+            }
+            if registered.iter().any(|c| c.name.eq_ignore_ascii_case(raw)) {
+                continue;
+            }
+            let probe = ListFilters {
+                types: Some(vec![issue_type]),
+                include_closed: true,
+                include_deferred: true,
+                include_templates: true,
+                limit: Some(1),
+                ..Default::default()
+            };
+            if storage.list_issues(&probe)?.is_empty() {
+                return Err(BeadsError::InvalidType {
+                    issue_type: raw.clone(),
+                });
+            }
         }
     }
 
-    Ok(issues)
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -223,7 +383,8 @@ fn render_search_results(
             context: show_context,
             ..Default::default()
         };
-        let title = if query.is_empty() {
+        let shown_query = display_query(query);
+        let title = if shown_query.is_empty() {
             format!(
                 "Search - {} result{}",
                 issues.len(),
@@ -232,7 +393,7 @@ fn render_search_results(
         } else {
             format!(
                 "Search: \"{}\" - {} result{}",
-                query,
+                shown_query,
                 issues.len(),
                 if issues.len() == 1 { "" } else { "s" }
             )
@@ -258,7 +419,7 @@ fn render_search_results(
         ctx.info(&format!(
             "Found {} issue(s) matching '{}'",
             issues.len(),
-            query
+            display_query(query)
         ));
     }
     for issue in &issues {
@@ -472,9 +633,10 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
         include_deferred,
         include_templates: false,
         title_contains: args.title_contains.clone(),
-        // #349: search stays capped (a broad text query can match a large
-        // fraction of the corpus); list/ready are complete by default.
-        limit: Some(args.limit.unwrap_or(DEFAULT_SEARCH_LIMIT)),
+        // Search is unlimited by default, matching the `--limit` help text
+        // ("default: unlimited") and `br list`/`br ready` semantics. Pass
+        // `--limit N` to bound results explicitly.
+        limit: Some(args.limit.unwrap_or(DEFAULT_LIST_LIMIT)),
         offset: Some(args.offset.unwrap_or(DEFAULT_LIST_OFFSET)),
         sort: args.sort.clone(),
         reverse: args.reverse,
@@ -812,7 +974,10 @@ mod tests {
         assert_eq!(output.issue.labels, vec!["perf", "search"]);
         assert_eq!(output.dependency_count, 2);
         assert_eq!(output.dependent_count, 3);
-        assert!(relation_metadata.labels_by_id.is_empty());
+        assert_eq!(
+            relation_metadata.labels_by_id,
+            std::collections::HashMap::new()
+        );
     }
 
     #[test]
@@ -837,11 +1002,11 @@ mod tests {
 
     #[test]
     fn test_search_build_filters_applies_search_defaults_when_cli_omits_pagination() {
-        // #349: search stays capped at DEFAULT_SEARCH_LIMIT (50) by default,
-        // even though list/ready became unlimited.
+        // Search is unlimited by default (DEFAULT_LIST_LIMIT == 0), matching
+        // the `--limit` help text; `--limit N` still bounds explicitly.
         let filters = build_filters(&ListArgs::default()).expect("build filters");
 
-        assert_eq!(filters.limit, Some(DEFAULT_SEARCH_LIMIT));
+        assert_eq!(filters.limit, Some(DEFAULT_LIST_LIMIT));
         assert_eq!(filters.offset, Some(DEFAULT_LIST_OFFSET));
     }
 
@@ -1098,7 +1263,9 @@ mod tests {
         let mut issues = storage.search_issues("match", &filters).expect("search");
 
         apply_issue_sort(&mut issues, args.sort.as_deref(), args.reverse).expect("sort");
-        if let Some(limit) = limit {
+        if let Some(limit) = limit
+            && limit > 0
+        {
             issues.truncate(limit);
         }
 
@@ -1181,6 +1348,115 @@ mod tests {
 
         apply_sort(&mut items, Some("created_at"), false).expect("sort");
         assert_eq!(items[0].issue.id, "bd-new");
+    }
+
+    #[test]
+    fn test_issue_matches_search_query_coverage() {
+        let mut issue = make_issue("bd-001", "Plain title", None, Utc::now());
+        issue.design = Some("design needle".to_string());
+        issue.acceptance_criteria = Some("ac needle".to_string());
+        issue.notes = Some("notes needle".to_string());
+        issue.created_by = Some("alice".to_string());
+        issue.assignee = Some("bob".to_string());
+        issue.labels = vec!["backend".to_string()];
+
+        for needle in [
+            "plain",     // title
+            "bd-001",    // id
+            "design",    // design
+            "ac needle", // acceptance criteria
+            "notes",     // notes
+            "alice",     // created_by
+            "backend",   // label
+        ] {
+            assert!(
+                issue_matches_search_query(&issue, needle),
+                "expected match for {needle:?}"
+            );
+        }
+
+        // Structured/invisible metadata must NOT match free text.
+        for needle in ["bob", "open", "task", "medium"] {
+            assert!(
+                !issue_matches_search_query(&issue, needle),
+                "expected no match for metadata {needle:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_display_query_truncates() {
+        let short = "hello world";
+        assert_eq!(display_query(short), short);
+
+        let long = "x".repeat(500);
+        let shown = display_query(&long);
+        assert!(shown.chars().count() <= DISPLAY_QUERY_MAX_CHARS + 1);
+        assert!(shown.ends_with('…'));
+    }
+
+    #[test]
+    fn test_search_rejects_unknown_status() {
+        let mut storage = SqliteStorage::open_memory().expect("db");
+        let issue = make_issue("bd-001", "Match title", None, Utc::now());
+        storage.create_issue(&issue, "tester").expect("create");
+
+        let args = ListArgs {
+            status: vec!["bogus".to_string()],
+            ..ListArgs::default()
+        };
+        let err = collect_search_results(&storage, "match", &args)
+            .expect_err("unknown status must error, not silently return 0");
+        assert!(
+            matches!(err, BeadsError::InvalidStatus { .. }),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_search_accepts_custom_status_in_use() {
+        let mut storage = SqliteStorage::open_memory().expect("db");
+        let mut issue = make_issue("bd-001", "Match title", None, Utc::now());
+        issue.status = Status::Custom("reviewing".to_string());
+        storage.create_issue(&issue, "tester").expect("create");
+
+        let args = ListArgs {
+            status: vec!["reviewing".to_string()],
+            ..ListArgs::default()
+        };
+        let results = collect_search_results(&storage, "match", &args).expect("search");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "bd-001");
+    }
+
+    #[test]
+    fn test_search_matches_labels_notes_created_by() {
+        let mut storage = SqliteStorage::open_memory().expect("db");
+        let mut labeled = make_issue("bd-label", "Unrelated title", None, Utc::now());
+        labeled.notes = Some("contains zebra".to_string());
+        labeled.created_by = Some("carol".to_string());
+        storage.create_issue(&labeled, "tester").expect("create");
+        storage
+            .add_label("bd-label", "backend", "tester")
+            .expect("label");
+
+        // Notes match
+        let results =
+            collect_search_results(&storage, "zebra", &ListArgs::default()).expect("search notes");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "bd-label");
+
+        // Label match
+        let results = collect_search_results(&storage, "backend", &ListArgs::default())
+            .expect("search label");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "bd-label");
+
+        // created_by match
+        let results = collect_search_results(&storage, "carol", &ListArgs::default())
+            .expect("search created_by");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "bd-label");
     }
 
     #[test]

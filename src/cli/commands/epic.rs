@@ -4,7 +4,7 @@ use crate::cli::{EpicCloseEligibleArgs, EpicCommands, EpicStatusArgs};
 use crate::config;
 use crate::error::Result;
 use crate::format::sanitize_terminal_inline;
-use crate::model::{EpicStatus, EventType, IssueType};
+use crate::model::{EpicStatus, EventType, IssueType, Status};
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::db::{self, SqlValue};
 use crate::storage::{ListFilters, SqliteStorage};
@@ -250,7 +250,12 @@ fn load_epic_statuses(storage: &SqliteStorage) -> Result<Vec<EpicStatus>> {
     let mut statuses = Vec::new();
     for epic in epics {
         let (total_children, closed_children) = counts.get(&epic.id).copied().unwrap_or((0, 0));
-        let eligible_for_close = total_children > 0 && closed_children == total_children;
+        // Deferred epics are listed for visibility but must never be
+        // auto-closed by `epic close-eligible` — deferral is an explicit
+        // "not now" state, and there is no --include-deferred opt-in flag.
+        let eligible_for_close = epic.status != Status::Deferred
+            && total_children > 0
+            && closed_children == total_children;
 
         statuses.push(EpicStatus {
             epic,
@@ -647,6 +652,51 @@ mod tests {
         assert_eq!(epic_status.total_children, 0);
         assert_eq!(epic_status.closed_children, 0);
         assert!(!epic_status.eligible_for_close);
+    }
+
+    #[test]
+    fn epic_status_deferred_epic_never_eligible_for_close() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        let epic = base_issue(
+            "bd-epic-def-closed",
+            "Deferred epic done",
+            IssueType::Epic,
+            Status::Deferred,
+        );
+        let task = base_issue("bd-task-def", "Task", IssueType::Task, Status::Open);
+
+        storage.create_issue(&epic, "tester").unwrap();
+        storage.create_issue(&task, "tester").unwrap();
+        storage
+            .add_dependency(
+                "bd-task-def",
+                "bd-epic-def-closed",
+                "parent-child",
+                "tester",
+            )
+            .unwrap();
+        storage
+            .update_issue(
+                "bd-task-def",
+                &IssueUpdate {
+                    status: Some(Status::Closed),
+                    closed_at: Some(Some(Utc::now())),
+                    close_reason: Some(Some("Done".to_string())),
+                    ..Default::default()
+                },
+                "tester",
+            )
+            .unwrap();
+
+        let epics = load_epic_statuses(&storage).unwrap();
+        let epic_status = find_epic(&epics, "bd-epic-def-closed").expect("epic not found");
+        assert_eq!(epic_status.total_children, 1);
+        assert_eq!(epic_status.closed_children, 1);
+        assert!(
+            !epic_status.eligible_for_close,
+            "deferred epics must not be auto-closed even when all children are closed"
+        );
     }
 
     #[test]

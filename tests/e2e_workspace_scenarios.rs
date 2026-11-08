@@ -124,8 +124,8 @@ fn scenario_init_json_output() {
     if !payload.is_empty() && (payload.starts_with('{') || payload.starts_with('[')) {
         let json: Value = serde_json::from_str(&payload).expect("parse init json");
         assert!(
-            json.get("path").is_some() || json.get("workspace").is_some(),
-            "init JSON should contain path or workspace field"
+            json.get("beads_dir").is_some(),
+            "init JSON should contain beads_dir field"
         );
     }
 

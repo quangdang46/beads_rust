@@ -53,5 +53,5 @@ pub mod theme;
 
 pub use components::*;
 pub(crate) use context::JsonArrayPageMeta;
-pub use context::{OutputContext, OutputMode, take_output_serialization_failure};
+pub use context::{OutputContext, OutputMode, take_output_serialization_failure, terminal_is_dumb};
 pub use theme::Theme;

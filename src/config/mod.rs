@@ -14,7 +14,7 @@ pub mod routing;
 use crate::error::{BeadsError, Result, ResultExt};
 use crate::model::{IssueType, Priority};
 use crate::storage::SqliteStorage;
-use crate::storage::db::{self, SqlValue};
+use crate::storage::db::SqlValue;
 use crate::sync::path::validate_sync_path_with_external;
 use crate::sync::{
     ExportConfig, ImportConfig, ImportResult, JsonlTombstoneFilter, PreservedTombstone, auto_flush,
@@ -30,15 +30,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::time::Duration;
 use std::time::UNIX_EPOCH;
 use tempfile::tempdir;
 use tracing::warn;
@@ -276,13 +272,39 @@ fn discover_beads_dir_candidate_with_env(
     };
 
     loop {
+        // Use `symlink_metadata` so a dangling `.beads`/`_beads` symlink is
+        // detected instead of silently skipped (which would make commands
+        // operate on a parent workspace's database). A symlink that resolves
+        // to a directory is still accepted.
         let candidate = current.join(".beads");
-        if candidate.is_dir() {
-            return Ok(candidate);
+        match fs::symlink_metadata(&candidate) {
+            Ok(metadata) => {
+                if metadata.is_dir() || (metadata.file_type().is_symlink() && candidate.is_dir()) {
+                    return Ok(candidate);
+                }
+                return Err(BeadsError::Config(format!(
+                    "{} exists but is not a directory",
+                    candidate.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
         let candidate_underscore = current.join("_beads");
-        if candidate_underscore.is_dir() {
-            return Ok(candidate_underscore);
+        match fs::symlink_metadata(&candidate_underscore) {
+            Ok(metadata) => {
+                if metadata.is_dir()
+                    || (metadata.file_type().is_symlink() && candidate_underscore.is_dir())
+                {
+                    return Ok(candidate_underscore);
+                }
+                return Err(BeadsError::Config(format!(
+                    "{} exists but is not a directory",
+                    candidate_underscore.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
 
         if !current.pop() {
@@ -3330,6 +3352,16 @@ pub(crate) fn resolved_jsonl_path_is_external(beads_dir: &Path, jsonl_path: &Pat
     !path_is_within_beads_dir(jsonl_path, beads_dir)
 }
 
+/// Return whether the resolved database path lives outside `.beads/`.
+///
+/// Used by `main` to warn when an explicit `--db` points at a database
+/// outside the discovered workspace, where auto-import/auto-flush would
+/// silently operate on foreign files.
+#[must_use]
+pub fn resolved_db_path_is_external(beads_dir: &Path, db_path: &Path) -> bool {
+    !path_is_within_beads_dir(db_path, beads_dir)
+}
+
 /// Return whether an external JSONL path can be trusted implicitly without
 /// a command-level `--allow-external-jsonl` opt-in.
 ///
@@ -4551,13 +4583,13 @@ pub fn claim_exclusive_from_layer(layer: &ConfigLayer) -> bool {
 pub fn is_startup_key(key: &str) -> bool {
     let normalized = normalize_key(key);
 
-    if normalized.starts_with("git.")
-        || normalized.starts_with("routing.")
-        || normalized.starts_with("validation.")
-        || normalized.starts_with("directory.")
-        || normalized.starts_with("sync.")
-        || normalized.starts_with("display.")
-        || normalized.starts_with("external-projects.")
+    if normalized.starts_with("git-")
+        || normalized.starts_with("routing-")
+        || normalized.starts_with("validation-")
+        || normalized.starts_with("directory-")
+        || normalized.starts_with("sync-")
+        || normalized.starts_with("display-")
+        || normalized.starts_with("external-projects-")
     {
         return true;
     }
@@ -4579,9 +4611,8 @@ pub fn is_startup_key(key: &str) -> bool {
             | "no-git-ops"
             | "no-push"
             | "sync-branch"
-            | "sync.branch"
             | "external-projects"
-            | "hierarchy.max-depth"
+            | "hierarchy-max-depth"
     )
 }
 
@@ -4596,17 +4627,25 @@ fn insert_key_value(layer: &mut ConfigLayer, key: &str, value: String) {
     }
 }
 
+/// Normalize a config key for comparison.
+///
+/// All separator spellings (`_`, `-`, `.`) collapse to `-` so that
+/// `issue_prefix`, `issue-prefix`, and `issue.prefix` are the same key.
+/// This is what allows a single canonical env-var mapping to satisfy every
+/// lookup spelling.
 fn normalize_key(key: &str) -> String {
-    key.trim().to_lowercase().replace('_', "-")
+    key.trim().to_lowercase().replace(['_', '.'], "-")
 }
 
+/// Map a `BD_*` environment variable suffix to its single canonical config
+/// key.
+///
+/// Previously this emitted three variants (underscore, dotted, hyphenated)
+/// per variable, which stored phantom duplicate keys. Since [`normalize_key`]
+/// unifies all separator spellings, one canonical underscore form is enough
+/// for every lookup.
 fn env_key_variants(raw: &str) -> Vec<String> {
-    let mut variants = Vec::new();
-    let raw_lower = raw.to_lowercase();
-    variants.push(raw_lower.clone());
-    variants.push(raw_lower.replace('_', "."));
-    variants.push(raw_lower.replace('_', "-"));
-    variants
+    vec![raw.to_lowercase()]
 }
 
 fn parse_bool(value: &str) -> Option<bool> {
@@ -5589,11 +5628,11 @@ labels:
     }
 
     #[test]
-    fn env_key_variants_generates_all_forms() {
+    fn env_key_variants_generates_single_canonical_form() {
+        // One env var must map to exactly one config key — emitting
+        // underscore/dotted/hyphenated variants stored phantom duplicates.
         let variants = env_key_variants("no_auto_flush");
-        assert!(variants.contains(&"no_auto_flush".to_string()));
-        assert!(variants.contains(&"no.auto.flush".to_string()));
-        assert!(variants.contains(&"no-auto-flush".to_string()));
+        assert_eq!(variants, vec!["no_auto_flush".to_string()]);
     }
 
     #[test]
@@ -5601,6 +5640,8 @@ labels:
         assert_eq!(normalize_key("ISSUE_PREFIX"), "issue-prefix");
         assert_eq!(normalize_key("issue-prefix"), "issue-prefix");
         assert_eq!(normalize_key("issue_prefix"), "issue-prefix");
+        assert_eq!(normalize_key("issue.prefix"), "issue-prefix");
+        assert_eq!(normalize_key("sync.auto_flush"), "sync-auto-flush");
         assert_eq!(normalize_key("  ISSUE_PREFIX  "), "issue-prefix");
     }
 
@@ -7880,8 +7921,10 @@ routing:
 
         let prefix = with_database_family_snapshot(&db_path, |snapshot_db_path| {
             let conn = Connection::open(&snapshot_db_path)?;
-            let row =
-                db::query_row_all(&conn, "SELECT value FROM config WHERE key = 'issue_prefix'")?;
+            let row = crate::storage::db::query_row_all(
+                &conn,
+                "SELECT value FROM config WHERE key = 'issue_prefix'",
+            )?;
             Ok(row
                 .as_ref()
                 .and_then(|r| r.first())

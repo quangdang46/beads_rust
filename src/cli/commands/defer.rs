@@ -14,6 +14,7 @@ use crate::output::{OutputContext, OutputMode};
 use crate::storage::IssueUpdate;
 use crate::util::id::{IdResolver, ResolverConfig};
 use crate::util::time::parse_flexible_timestamp;
+use chrono::Utc;
 use rich_rust::prelude::*;
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
@@ -61,11 +62,58 @@ enum DeferredOutcome {
     Skipped(SkippedIssue),
 }
 
+/// Metadata key recording the status an issue held before being deferred.
+/// Stored inside the issue's JSON `metadata` blob so `br undefer` can restore
+/// e.g. `in_progress` instead of always reopening as `open`.
+const PRE_DEFER_STATUS_KEY: &str = "pre_defer_status";
+
+/// Read the recorded pre-defer status from an issue's metadata blob.
+pub(crate) fn pre_defer_status(issue: &Issue) -> Option<Status> {
+    let metadata = issue.metadata.as_deref()?;
+    let value: serde_json::Value = serde_json::from_str(metadata).ok()?;
+    value.get(PRE_DEFER_STATUS_KEY)?.as_str()?.parse().ok()
+}
+
+/// Merge `pre_defer_status` into the issue's metadata blob, preserving any
+/// existing keys. Returns `Some(json)` to write, or `None` when the existing
+/// blob is not a JSON object and must be left untouched.
+pub(crate) fn metadata_with_pre_defer_status(issue: &Issue) -> Option<String> {
+    let mut value: serde_json::Value = match issue.metadata.as_deref() {
+        Some(raw) => serde_json::from_str(raw).ok()?,
+        None => serde_json::json!({}),
+    };
+    let object = value.as_object_mut()?;
+    if object.contains_key(PRE_DEFER_STATUS_KEY) {
+        return None;
+    }
+    object.insert(
+        PRE_DEFER_STATUS_KEY.to_string(),
+        serde_json::Value::String(issue.status.as_str().to_string()),
+    );
+    serde_json::to_string(&value).ok()
+}
+
+/// Remove `pre_defer_status` from the metadata blob after undefer. Returns
+/// `Some(json)` to write, or `None` when the blob is not a JSON object.
+pub(crate) fn metadata_without_pre_defer_status(issue: &Issue) -> Option<String> {
+    let raw = issue.metadata.as_deref()?;
+    let mut value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let object = value.as_object_mut()?;
+    if object.remove(PRE_DEFER_STATUS_KEY).is_none() {
+        return None;
+    }
+    serde_json::to_string(&value).ok()
+}
+
 fn restored_status_after_undefer(issue: &Issue) -> Status {
-    if issue.status == Status::Deferred {
-        Status::Open
-    } else {
-        issue.status.clone()
+    if issue.status != Status::Deferred {
+        return issue.status.clone();
+    }
+    // Prefer the status recorded at defer time (e.g. `in_progress`); fall
+    // back to `open` for issues deferred before this was tracked.
+    match pre_defer_status(issue) {
+        Some(status) if !status.is_terminal() && status != Status::Deferred => status,
+        _ => Status::Open,
     }
 }
 
@@ -220,11 +268,23 @@ fn execute_defer_route(
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
 
+    // `--until ""` (or whitespace) means "indefinitely", matching
+    // `br update --defer ""` which clears the defer date.
     let defer_until = args
         .until
-        .as_ref()
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
         .map(|s| parse_flexible_timestamp(s, "defer_until"))
         .transpose()?;
+    if let Some(until) = defer_until
+        && until < Utc::now()
+    {
+        ctx.warning(&format!(
+            "defer date {} is in the past; the issue becomes ready immediately",
+            until.to_rfc3339()
+        ));
+    }
 
     let resolved_ids = resolve_issue_ids(&storage_ctx.storage, &resolver, &args.ids)?;
 
@@ -275,12 +335,19 @@ fn execute_defer_route(
             continue;
         }
 
-        let update = IssueUpdate {
+        let mut update = IssueUpdate {
             status: Some(Status::Deferred),
             defer_until: Some(defer_until),
             skip_cache_rebuild: true,
             ..Default::default()
         };
+        // Record the status being left behind so `br undefer` can restore it
+        // (e.g. `in_progress`) instead of always reopening as `open`.
+        if issue.status != Status::Deferred
+            && let Some(metadata) = metadata_with_pre_defer_status(&issue)
+        {
+            update.metadata = Some(Some(metadata));
+        }
 
         // Stage Tier 1 attribution (issue #312, Layer 3 capture-only) for the
         // defer status-change audit event. Recorded only — never gated.
@@ -533,17 +600,22 @@ fn execute_undefer_route(
 
         let restored_status = restored_status_after_undefer(&issue);
         let status_update = if issue.status == Status::Deferred {
-            Some(Status::Open)
+            Some(restored_status.clone())
         } else {
             None
         };
 
-        let update = IssueUpdate {
+        let mut update = IssueUpdate {
             status: status_update,
             defer_until: Some(None),
             skip_cache_rebuild: true,
             ..Default::default()
         };
+        if issue.status == Status::Deferred
+            && let Some(metadata) = metadata_without_pre_defer_status(&issue)
+        {
+            update.metadata = Some(Some(metadata));
+        }
 
         // Stage Tier 1 attribution (issue #312, Layer 3 capture-only) for the
         // undefer status-change audit event. Recorded only — never gated.
@@ -838,6 +910,43 @@ mod tests {
             status: "deferred".to_string(),
             defer_until: None,
         }
+    }
+
+    #[test]
+    fn pre_defer_status_roundtrip() {
+        let mut issue = make_issue("bd-1", "t");
+        issue.status = Status::InProgress;
+        issue.metadata = Some(r#"{"other": 1}"#.to_string());
+
+        let metadata = metadata_with_pre_defer_status(&issue).expect("metadata");
+        let value: serde_json::Value = serde_json::from_str(&metadata).unwrap();
+        assert_eq!(value["other"], 1);
+        assert_eq!(value[PRE_DEFER_STATUS_KEY], "in_progress");
+
+        issue.status = Status::Deferred;
+        issue.metadata = Some(metadata);
+        assert_eq!(pre_defer_status(&issue), Some(Status::InProgress));
+
+        let cleared = metadata_without_pre_defer_status(&issue).expect("cleared");
+        let value: serde_json::Value = serde_json::from_str(&cleared).unwrap();
+        assert!(value.get(PRE_DEFER_STATUS_KEY).is_none());
+        assert_eq!(value["other"], 1);
+    }
+
+    #[test]
+    fn restored_status_prefers_recorded_pre_defer_status() {
+        let mut issue = make_issue("bd-1", "t");
+        issue.status = Status::Deferred;
+        issue.metadata = Some(r#"{"pre_defer_status":"in_progress"}"#.to_string());
+        assert_eq!(restored_status_after_undefer(&issue), Status::InProgress);
+
+        // No recorded status → open (legacy behaviour).
+        issue.metadata = None;
+        assert_eq!(restored_status_after_undefer(&issue), Status::Open);
+
+        // Terminal recorded status is never restored.
+        issue.metadata = Some(r#"{"pre_defer_status":"closed"}"#.to_string());
+        assert_eq!(restored_status_after_undefer(&issue), Status::Open);
     }
 
     #[test]

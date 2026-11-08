@@ -12,7 +12,7 @@ use super::{
 use crate::cli::GraphArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
-use crate::format::{IssueWithDependencyMetadata, format_status_label, sanitize_terminal_inline};
+use crate::format::{format_status_label, sanitize_terminal_inline};
 use crate::model::{Issue, Priority, Status};
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::{ListFilters, SqliteStorage};
@@ -24,7 +24,34 @@ use std::str::FromStr;
 use tracing::debug;
 use unicode_width::UnicodeWidthStr;
 
-const GRAPH_DEPENDENTS_BATCH_SIZE: usize = 400;
+/// A dependency edge in graph output: (dependent, dependency, dep_type).
+///
+/// Serializes as a 3-element array so `edges[i][0]`/`edges[i][1]` keep their
+/// historical meaning while `edges[i][2]` carries the dependency type label.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+struct GraphEdge(String, String, String);
+
+impl GraphEdge {
+    fn new(dependent: &str, dependency: &str, dep_type: &str) -> Self {
+        Self(
+            dependent.to_string(),
+            dependency.to_string(),
+            dep_type.to_string(),
+        )
+    }
+
+    fn dependent(&self) -> &str {
+        &self.0
+    }
+
+    fn dependency(&self) -> &str {
+        &self.1
+    }
+
+    fn dep_type(&self) -> &str {
+        &self.2
+    }
+}
 
 /// JSON output for a single node in the graph.
 #[derive(Debug, Clone, Serialize)]
@@ -41,7 +68,7 @@ struct GraphNode {
 struct SingleGraphOutput {
     root: String,
     nodes: Vec<GraphNode>,
-    edges: Vec<(String, String)>,
+    edges: Vec<GraphEdge>,
     count: usize,
 }
 
@@ -49,7 +76,7 @@ struct SingleGraphOutput {
 #[derive(Debug, Serialize)]
 struct ConnectedComponent {
     nodes: Vec<GraphNode>,
-    edges: Vec<(String, String)>,
+    edges: Vec<GraphEdge>,
     roots: Vec<String>,
 }
 
@@ -65,7 +92,7 @@ struct AllGraphOutput {
 struct SingleGraphTraversal {
     traversal_order: Vec<String>,
     issues_by_id: HashMap<String, Issue>,
-    edges: Vec<(String, String)>,
+    edges: Vec<GraphEdge>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,6 +199,12 @@ fn execute_graph_with_storage_ctx(
     let config_layer = storage_ctx.load_config(cli)?;
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+    if args.all && args.issue.is_some() {
+        return Err(BeadsError::validation(
+            "issue",
+            "--all cannot be combined with an issue ID; pass one or the other",
+        ));
+    }
     if args.all {
         graph_all(&storage_ctx.storage, args.compact, ctx)
     } else {
@@ -298,9 +331,12 @@ fn graph_all(storage: &SqliteStorage, compact: bool, ctx: &OutputContext) -> Res
     let issue_map: HashMap<String, &crate::model::Issue> =
         issues.iter().map(|i| (i.id.clone(), i)).collect();
 
-    // Build adjacency list (both directions for connected components)
+    // Build adjacency list (both directions for connected components).
+    // ALL dependency types participate — parent-child, related,
+    // discovered-from, etc. — so components reflect the real relation graph;
+    // each edge keeps its type label for display.
     let mut adj: HashMap<String, Vec<String>> = HashMap::new();
-    let mut blocking_edges: Vec<(String, String)> = Vec::new();
+    let mut component_edges: Vec<GraphEdge> = Vec::new();
 
     // Optimize: fetch all dependencies once
     let all_dependencies = storage.get_all_dependency_records()?;
@@ -311,9 +347,6 @@ fn graph_all(storage: &SqliteStorage, compact: bool, ctx: &OutputContext) -> Res
         // Get dependencies from bulk map
         if let Some(deps) = all_dependencies.get(&issue.id) {
             for dependency in deps {
-                if !dependency.dep_type.affects_ready_work() {
-                    continue;
-                }
                 let dep_id = &dependency.depends_on_id;
                 // Only include edges within our issue set
                 if issue_set.contains(dep_id) {
@@ -323,7 +356,11 @@ fn graph_all(storage: &SqliteStorage, compact: bool, ctx: &OutputContext) -> Res
                     adj.entry(dep_id.clone())
                         .or_default()
                         .push(issue.id.clone());
-                    blocking_edges.push((issue.id.clone(), dep_id.clone()));
+                    component_edges.push(GraphEdge::new(
+                        &issue.id,
+                        dep_id,
+                        dependency.dep_type.as_str(),
+                    ));
                 }
             }
         }
@@ -360,7 +397,7 @@ fn graph_all(storage: &SqliteStorage, compact: bool, ctx: &OutputContext) -> Res
 
         // Calculate depths using longest path from roots
         // Roots are issues with no unsatisfied dependencies within the component
-        let component_set: HashSet<&String> = component_nodes.iter().collect();
+        let component_set: HashSet<&str> = component_nodes.iter().map(String::as_str).collect();
         let (mut depths, mut roots) =
             calculate_depths(&all_dependencies, &component_nodes, &component_set);
 
@@ -390,15 +427,18 @@ fn graph_all(storage: &SqliteStorage, compact: bool, ctx: &OutputContext) -> Res
         roots.sort();
 
         // Filter edges to this component
-        let component_edges: Vec<(String, String)> = blocking_edges
+        let edges: Vec<GraphEdge> = component_edges
             .iter()
-            .filter(|(from, to)| component_set.contains(from) && component_set.contains(to))
+            .filter(|edge| {
+                component_set.contains(edge.dependent())
+                    && component_set.contains(edge.dependency())
+            })
             .cloned()
             .collect();
 
         components.push(ConnectedComponent {
             nodes,
-            edges: component_edges,
+            edges,
             roots,
         });
     }
@@ -495,7 +535,7 @@ fn graph_all(storage: &SqliteStorage, compact: bool, ctx: &OutputContext) -> Res
 fn calculate_depths(
     all_dependencies: &HashMap<String, Vec<crate::model::Dependency>>,
     nodes: &[String],
-    component_set: &HashSet<&String>,
+    component_set: &HashSet<&str>,
 ) -> (HashMap<String, usize>, Vec<String>) {
     let dependency_edges = dependency_edges_for_component(all_dependencies, nodes, component_set);
     let dependency_map = build_dependency_map(nodes, &dependency_edges);
@@ -511,19 +551,19 @@ fn calculate_depths(
 fn dependency_edges_for_component(
     all_dependencies: &HashMap<String, Vec<crate::model::Dependency>>,
     nodes: &[String],
-    component_set: &HashSet<&String>,
-) -> Vec<(String, String)> {
+    component_set: &HashSet<&str>,
+) -> Vec<GraphEdge> {
     let mut dependency_edges = Vec::new();
 
     for node_id in nodes {
         if let Some(deps) = all_dependencies.get(node_id) {
             for dependency in deps {
-                if !dependency.dep_type.affects_ready_work() {
-                    continue;
-                }
-
-                if component_set.contains(&dependency.depends_on_id) {
-                    dependency_edges.push((node_id.clone(), dependency.depends_on_id.clone()));
+                if component_set.contains(dependency.depends_on_id.as_str()) {
+                    dependency_edges.push(GraphEdge::new(
+                        node_id,
+                        &dependency.depends_on_id,
+                        dependency.dep_type.as_str(),
+                    ));
                 }
             }
         }
@@ -543,14 +583,13 @@ fn collect_single_graph(
     // path Vec unnecessary.
     let mut traversal_order: Vec<String> = Vec::new();
     let mut issues_by_id: HashMap<String, Issue> = HashMap::new();
-    let mut edges: Vec<(String, String)> = Vec::new();
-    let mut seen_edges: HashSet<(String, String)> = HashSet::new();
+    let mut edges: Vec<GraphEdge> = Vec::new();
+    let mut seen_edges: HashSet<GraphEdge> = HashSet::new();
     let mut ordered_nodes: HashSet<String> = HashSet::new();
     let mut expanded_nodes: HashSet<String> = HashSet::new();
     let mut queued_nodes: HashSet<String> = HashSet::new();
 
     let metadata_cache = storage.get_active_issues_metadata()?;
-    let mut dependents_cache: HashMap<String, Vec<IssueWithDependencyMetadata>> = HashMap::new();
 
     let mut stack: Vec<String> = vec![root_id.to_string()];
     queued_nodes.insert(root_id.to_string());
@@ -568,19 +607,15 @@ fn collect_single_graph(
             continue;
         }
 
-        let mut frontier_batch = Vec::with_capacity(stack.len().saturating_add(1));
-        frontier_batch.push(current_id.clone());
-        frontier_batch.extend(stack.iter().rev().cloned());
-        cache_graph_dependents(storage, &mut dependents_cache, &frontier_batch)?;
-
-        let mut dependents: Vec<_> = dependents_cache
-            .get(&current_id)
-            .cloned()
-            .unwrap_or_default();
+        // All dependency types are traversed (blocks, parent-child, related,
+        // discovered-from, ...); `dep.dep_type` labels each edge. There is no
+        // batched all-types dependents query in storage yet, so this is a
+        // per-node lookup — the same shape `dep tree` already uses.
+        let mut dependents = storage.get_dependents_with_metadata(&current_id)?;
         dependents.sort_by(|a, b| a.priority.0.cmp(&b.priority.0).then(a.id.cmp(&b.id)));
 
         for dep in dependents.into_iter().rev() {
-            let edge = (dep.id.clone(), current_id.clone());
+            let edge = GraphEdge::new(&dep.id, &current_id, dep.dep_type.as_str());
             if seen_edges.insert(edge.clone()) {
                 edges.push(edge);
             }
@@ -623,38 +658,6 @@ fn collect_single_graph(
     })
 }
 
-fn cache_graph_dependents(
-    storage: &SqliteStorage,
-    dependents_cache: &mut HashMap<String, Vec<IssueWithDependencyMetadata>>,
-    issue_ids: &[String],
-) -> Result<()> {
-    let mut missing_ids = Vec::new();
-    let mut seen_ids = HashSet::new();
-    for issue_id in issue_ids {
-        if dependents_cache.contains_key(issue_id.as_str()) || !seen_ids.insert(issue_id.as_str()) {
-            continue;
-        }
-        missing_ids.push(issue_id.clone());
-        if missing_ids.len() == GRAPH_DEPENDENTS_BATCH_SIZE {
-            break;
-        }
-    }
-
-    if missing_ids.is_empty() {
-        return Ok(());
-    }
-
-    let fetched = storage.get_blocking_dependents_for_issue_ids(&missing_ids)?;
-    for issue_id in &missing_ids {
-        dependents_cache.insert(
-            issue_id.clone(),
-            fetched.get(issue_id).cloned().unwrap_or_default(),
-        );
-    }
-
-    Ok(())
-}
-
 fn build_graph_nodes(
     traversal_order: &[String],
     issues_by_id: &HashMap<String, Issue>,
@@ -688,7 +691,7 @@ fn sort_single_graph_nodes(nodes: &mut [GraphNode], root_id: &str) {
 
 fn calculate_depths_from_dependency_edges(
     nodes: &[String],
-    dependency_edges: &[(String, String)],
+    dependency_edges: &[GraphEdge],
     root_nodes: &[String],
 ) -> HashMap<String, usize> {
     let dependency_map = build_dependency_map(nodes, dependency_edges);
@@ -706,11 +709,11 @@ fn calculate_depths_from_dependency_edges(
     let mut component_children: HashMap<usize, HashSet<usize>> = HashMap::new();
     let mut component_indegree = vec![0usize; component_count];
 
-    for (dependent, dependency) in dependency_edges {
-        let Some(&dependent_component) = node_to_component.get(dependent) else {
+    for edge in dependency_edges {
+        let Some(&dependent_component) = node_to_component.get(edge.dependent()) else {
             continue;
         };
-        let Some(&dependency_component) = node_to_component.get(dependency) else {
+        let Some(&dependency_component) = node_to_component.get(edge.dependency()) else {
             continue;
         };
 
@@ -775,7 +778,7 @@ fn calculate_depths_from_dependency_edges(
 
 fn build_dependency_map(
     nodes: &[String],
-    dependency_edges: &[(String, String)],
+    dependency_edges: &[GraphEdge],
 ) -> HashMap<String, Vec<String>> {
     let mut dependency_map: HashMap<String, Vec<String>> = nodes
         .iter()
@@ -783,11 +786,11 @@ fn build_dependency_map(
         .map(|node_id| (node_id, Vec::new()))
         .collect();
 
-    for (dependent, dependency) in dependency_edges {
+    for edge in dependency_edges {
         dependency_map
-            .entry(dependent.clone())
+            .entry(edge.dependent().to_string())
             .or_default()
-            .push(dependency.clone());
+            .push(edge.dependency().to_string());
     }
 
     for dependencies in dependency_map.values_mut() {
@@ -899,14 +902,15 @@ fn dfs_finish_order(
     }
 }
 
-fn build_parent_map(edges: &[(String, String)]) -> HashMap<String, Vec<String>> {
-    let mut parent_map: HashMap<String, Vec<String>> = HashMap::new();
+/// Map each dependent to its (dependency, dep_type) pairs.
+fn build_parent_map(edges: &[GraphEdge]) -> HashMap<String, Vec<(String, String)>> {
+    let mut parent_map: HashMap<String, Vec<(String, String)>> = HashMap::new();
 
-    for (dependent, dependency) in edges {
+    for edge in edges {
         parent_map
-            .entry(dependent.clone())
+            .entry(edge.dependent().to_string())
             .or_default()
-            .push(dependency.clone());
+            .push((edge.dependency().to_string(), edge.dep_type().to_string()));
     }
 
     for parents in parent_map.values_mut() {
@@ -936,26 +940,43 @@ fn format_id_list(ids: &[String]) -> String {
     format_id_iter(ids.iter().map(String::as_str))
 }
 
-fn format_parent_list(parents: Option<&[String]>) -> String {
+/// Render one parent entry, labeling non-default dependency types so
+/// parent-child / related / discovered-from edges are distinguishable from
+/// plain `blocks` edges.
+fn format_parent_entry(dependency: &str, dep_type: &str) -> String {
+    let id = graph_display_text(dependency);
+    if dep_type == "blocks" || dep_type.is_empty() {
+        id
+    } else {
+        format!("{id} ({})", sanitize_terminal_inline(dep_type))
+    }
+}
+
+fn format_parent_list(parents: Option<&[(String, String)]>) -> String {
     match parents {
         Some(parents) if !parents.is_empty() => {
-            format!(" depends on: {}", format_id_list(parents))
+            let rendered = parents
+                .iter()
+                .map(|(id, dep_type)| format_parent_entry(id, dep_type))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(" depends on: {rendered}")
         }
         _ => String::new(),
     }
 }
 
-fn format_compact_dependency_edges(root_id: &str, edges: &[(String, String)]) -> String {
+fn format_compact_dependency_edges(root_id: &str, edges: &[GraphEdge]) -> String {
     if edges.is_empty() {
         return graph_display_text(root_id);
     }
 
     let mut grouped_dependents: HashMap<String, Vec<String>> = HashMap::new();
-    for (dependent, dependency) in edges {
+    for edge in edges {
         grouped_dependents
-            .entry(dependency.clone())
+            .entry(edge.dependency().to_string())
             .or_default()
-            .push(dependent.clone());
+            .push(edge.dependent().to_string());
     }
 
     let mut dependencies: Vec<String> = grouped_dependents.keys().cloned().collect();
@@ -1006,7 +1027,7 @@ const fn human_graph_render_mode(mode: OutputMode, compact: bool) -> HumanGraphR
     }
 }
 
-fn render_single_graph_plain(nodes: &[GraphNode], edges: &[(String, String)], root_issue: &Issue) {
+fn render_single_graph_plain(nodes: &[GraphNode], edges: &[GraphEdge], root_issue: &Issue) {
     let parent_map = build_parent_map(edges);
     println!(
         "Dependents of {} by depth ({} total):",
@@ -1044,7 +1065,7 @@ fn render_single_graph_plain(nodes: &[GraphNode], edges: &[(String, String)], ro
 /// Render single graph with rich formatting.
 fn render_single_graph_rich(
     nodes: &[GraphNode],
-    edges: &[(String, String)],
+    edges: &[GraphEdge],
     root_issue: &Issue,
     ctx: &OutputContext,
 ) {
@@ -1330,7 +1351,7 @@ mod tests {
                     depth: 1,
                 },
             ],
-            edges: vec![("bd-002".to_string(), "bd-001".to_string())],
+            edges: vec![GraphEdge::new("bd-002", "bd-001", "blocks")],
         };
 
         let json = serde_json::to_string(&output).unwrap();
@@ -1347,10 +1368,14 @@ mod tests {
         ];
 
         let rendered_ids = format_id_list(&ids);
-        let rendered_parents = format_parent_list(Some(&ids));
+        let parent_pairs: Vec<(String, String)> = ids
+            .iter()
+            .map(|id| (id.clone(), "blocks".to_string()))
+            .collect();
+        let rendered_parents = format_parent_list(Some(&parent_pairs));
         let rendered_compact = format_compact_dependency_edges(
             "bd-root\x1b[2J",
-            &[("bd-child\x07".to_string(), "bd-root\x1b[2J".to_string())],
+            &[GraphEdge::new("bd-child\x07", "bd-root\x1b[2J", "blocks")],
         );
 
         for rendered in [rendered_ids, rendered_parents, rendered_compact] {
@@ -1402,7 +1427,7 @@ mod tests {
                         depth: 1,
                     },
                 ],
-                edges: vec![("bd-002".to_string(), "bd-001".to_string())],
+                edges: vec![GraphEdge::new("bd-002", "bd-001", "blocks")],
                 roots: vec!["bd-001".to_string()],
             }],
             total_nodes: 2,
@@ -1493,8 +1518,8 @@ mod tests {
                 },
             ],
             edges: vec![
-                ("bd-003".to_string(), "bd-001".to_string()),
-                ("bd-003".to_string(), "bd-002".to_string()),
+                GraphEdge::new("bd-003", "bd-001", "blocks"),
+                GraphEdge::new("bd-003", "bd-002", "blocks"),
             ],
             roots: vec!["bd-001".to_string(), "bd-002".to_string()],
         };
@@ -1561,10 +1586,10 @@ mod tests {
                 },
             ],
             edges: vec![
-                ("bd-a".to_string(), "bd-root".to_string()),
-                ("bd-b".to_string(), "bd-root".to_string()),
-                ("bd-c".to_string(), "bd-a".to_string()),
-                ("bd-c".to_string(), "bd-b".to_string()),
+                GraphEdge::new("bd-a", "bd-root", "blocks"),
+                GraphEdge::new("bd-b", "bd-root", "blocks"),
+                GraphEdge::new("bd-c", "bd-a", "blocks"),
+                GraphEdge::new("bd-c", "bd-b", "blocks"),
             ],
         };
 
@@ -1633,7 +1658,7 @@ mod tests {
                             depth: 1,
                         },
                     ],
-                    edges: vec![("comp2-b".to_string(), "comp2-a".to_string())],
+                    edges: vec![GraphEdge::new("comp2-b", "comp2-a", "blocks")],
                     roots: vec!["comp2-a".to_string()],
                 },
             ],
@@ -1714,7 +1739,7 @@ mod tests {
 
         let all_dependencies = storage.get_all_dependency_records().unwrap();
         let nodes = vec!["bd-a".to_string(), "bd-b".to_string()];
-        let component_set: HashSet<&String> = nodes.iter().collect();
+        let component_set: HashSet<&str> = nodes.iter().map(String::as_str).collect();
 
         let (depths, roots) = calculate_depths(&all_dependencies, &nodes, &component_set);
         assert!(roots.is_empty());
@@ -1825,7 +1850,7 @@ mod tests {
         assert!(
             traversal
                 .edges
-                .contains(&(String::from("bd-missing"), String::from("bd-root"))),
+                .contains(&GraphEdge::new("bd-missing", "bd-root", "blocks")),
             "graph should retain the dangling edge"
         );
     }
@@ -1885,7 +1910,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_graph_dependents_batches_frontier_roots() {
+    fn test_collect_single_graph_includes_all_dependency_types() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = chrono::Utc::now();
 
@@ -1914,35 +1939,33 @@ mod tests {
                 "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
                  VALUES ('bd-a', 'bd-root', 'blocks', '{created_at}', 'test');
                  INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
-                 VALUES ('bd-b', 'bd-root', 'blocks', '{created_at}', 'test');
+                 VALUES ('bd-b', 'bd-root', 'related', '{created_at}', 'test');
                  INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
-                 VALUES ('bd-c', 'bd-a', 'blocks', '{created_at}', 'test');"
+                 VALUES ('bd-c', 'bd-a', 'discovered-from', '{created_at}', 'test');"
             ))
             .unwrap();
 
-        let mut cache = HashMap::new();
-        cache_graph_dependents(
-            &storage,
-            &mut cache,
-            &["bd-root".to_string(), "bd-a".to_string()],
-        )
-        .unwrap();
+        let root = storage
+            .get_issue("bd-root")
+            .unwrap()
+            .expect("root issue should exist");
+        let traversal =
+            collect_single_graph(&storage, "bd-root", &root).expect("graph traversal should work");
 
-        let root_dependents: Vec<_> = cache.get("bd-root").map_or_else(Vec::new, |dependents| {
-            dependents
-                .iter()
-                .map(|dependent| dependent.id.as_str())
-                .collect()
-        });
-        assert_eq!(root_dependents, vec!["bd-a", "bd-b"]);
-
-        let a_dependents: Vec<_> = cache.get("bd-a").map_or_else(Vec::new, |dependents| {
-            dependents
-                .iter()
-                .map(|dependent| dependent.id.as_str())
-                .collect()
-        });
-        assert_eq!(a_dependents, vec!["bd-c"]);
+        // Non-blocking edge types must be traversed and labeled.
+        for expected in [
+            GraphEdge::new("bd-a", "bd-root", "blocks"),
+            GraphEdge::new("bd-b", "bd-root", "related"),
+            GraphEdge::new("bd-c", "bd-a", "discovered-from"),
+        ] {
+            assert!(
+                traversal.edges.contains(&expected),
+                "missing edge {expected:?} in {:?}",
+                traversal.edges
+            );
+        }
+        assert!(traversal.issues_by_id.contains_key("bd-b"));
+        assert!(traversal.issues_by_id.contains_key("bd-c"));
     }
 
     #[test]
@@ -1955,11 +1978,11 @@ mod tests {
             "bd-d".to_string(),
         ];
         let dependency_edges = vec![
-            ("bd-a".to_string(), "root".to_string()),
-            ("bd-b".to_string(), "root".to_string()),
-            ("bd-c".to_string(), "bd-b".to_string()),
-            ("bd-d".to_string(), "bd-a".to_string()),
-            ("bd-d".to_string(), "bd-c".to_string()),
+            GraphEdge::new("bd-a", "root", "blocks"),
+            GraphEdge::new("bd-b", "root", "blocks"),
+            GraphEdge::new("bd-c", "bd-b", "blocks"),
+            GraphEdge::new("bd-d", "bd-a", "blocks"),
+            GraphEdge::new("bd-d", "bd-c", "blocks"),
         ];
         let root_nodes = ["root".to_string()];
 
@@ -1976,9 +1999,9 @@ mod tests {
     fn test_calculate_depths_from_dependency_edges_collapses_reachable_cycle() {
         let nodes = vec!["root".to_string(), "bd-a".to_string(), "bd-b".to_string()];
         let dependency_edges = vec![
-            ("bd-a".to_string(), "root".to_string()),
-            ("bd-b".to_string(), "bd-a".to_string()),
-            ("bd-a".to_string(), "bd-b".to_string()),
+            GraphEdge::new("bd-a", "root", "blocks"),
+            GraphEdge::new("bd-b", "bd-a", "blocks"),
+            GraphEdge::new("bd-a", "bd-b", "blocks"),
         ];
         let root_nodes = ["root".to_string()];
 
@@ -1993,9 +2016,9 @@ mod tests {
     fn test_calculate_depths_from_dependency_edges_tolerates_external_edge_endpoint() {
         let nodes = vec!["root".to_string(), "bd-a".to_string()];
         let dependency_edges = vec![
-            ("bd-a".to_string(), "root".to_string()),
-            ("bd-a".to_string(), "bd-missing".to_string()),
-            ("bd-unknown".to_string(), "root".to_string()),
+            GraphEdge::new("bd-a", "root", "blocks"),
+            GraphEdge::new("bd-a", "bd-missing", "blocks"),
+            GraphEdge::new("bd-unknown", "root", "blocks"),
         ];
         let root_nodes = ["root".to_string()];
 
@@ -2010,10 +2033,10 @@ mod tests {
     #[test]
     fn test_format_compact_dependency_edges_preserves_branching() {
         let edges = vec![
-            ("bd-a".to_string(), "root".to_string()),
-            ("bd-b".to_string(), "root".to_string()),
-            ("bd-c".to_string(), "bd-a".to_string()),
-            ("bd-c".to_string(), "bd-b".to_string()),
+            GraphEdge::new("bd-a", "root", "blocks"),
+            GraphEdge::new("bd-b", "root", "blocks"),
+            GraphEdge::new("bd-c", "bd-a", "blocks"),
+            GraphEdge::new("bd-c", "bd-b", "blocks"),
         ];
 
         let compact = format_compact_dependency_edges("root", &edges);

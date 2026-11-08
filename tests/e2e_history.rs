@@ -669,10 +669,11 @@ fn e2e_history_prune_removes_oldest_backups() {
     // Save the most recent backup names (sorted, last ones are newest)
     let expected_kept: Vec<_> = backups_before.iter().rev().take(2).cloned().collect();
 
-    // Prune to keep only 2 (with older_than=0 to force deletion of old ones)
+    // Prune to keep only 2 newest backups. (`--older-than 0` is rejected: it
+    // would delete every backup; `--keep` alone already drops the excess.)
     let prune = run_br(
         &workspace,
-        ["history", "prune", "--keep", "2", "--older-than", "0"],
+        ["history", "prune", "--keep", "2"],
         "history_prune_oldest",
     );
     assert!(prune.status.success(), "prune failed: {}", prune.stderr);

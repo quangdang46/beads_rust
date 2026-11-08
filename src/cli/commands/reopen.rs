@@ -136,6 +136,11 @@ pub fn execute(
         crate::util::set_last_touched_id(&beads_dir, &last_reopened.id);
     }
 
+    // Match `br close` idempotence: when every target was skipped (e.g. an
+    // already-open issue), report NothingToDo (exit 3) instead of success.
+    let reopened_count = reopened_issues.len();
+    let skipped_count = skipped_issues.len();
+
     if use_structured_output {
         let result = ReopenResult {
             reopened: reopened_issues,
@@ -183,6 +188,13 @@ pub fn execute(
             println!("No issues to reopen.");
         }
     }
+
+    if reopened_count == 0 && skipped_count > 0 {
+        return Err(BeadsError::NothingToDo {
+            reason: format!("all {skipped_count} issue(s) skipped"),
+        });
+    }
+
     Ok(())
 }
 
@@ -591,7 +603,9 @@ mod tests {
             db: Some(db_path.clone()),
             ..CliOverrides::default()
         };
-        execute(&args, false, &overrides, &ctx).expect("reopen");
+        // Reopening a tombstone is a skip; like `br close` on an
+        // already-terminal issue this surfaces as NothingToDo (exit 3).
+        assert!(execute(&args, false, &overrides, &ctx).is_err());
 
         let storage = SqliteStorage::open(&db_path).expect("reopen storage");
         let issue = storage

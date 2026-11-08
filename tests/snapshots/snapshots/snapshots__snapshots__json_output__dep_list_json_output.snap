@@ -9,6 +9,7 @@ expression: normalize_json(&json)
     "type": "blocks",
     "title": "Parent issue",
     "status": "open",
-    "priority": 2
+    "priority": 2,
+    "metadata": "{}"
   }
 ]

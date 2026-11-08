@@ -40,8 +40,11 @@ struct LintSuggestion {
 
 #[derive(Debug, Serialize)]
 struct LintOutput {
-    total: usize,
-    issues: usize,
+    /// Number of issues examined.
+    checked: usize,
+    /// Total missing-section warnings across all flagged issues.
+    warnings: usize,
+    /// Per-issue findings (only issues that produced warnings).
     results: Vec<LintResult>,
 }
 
@@ -53,14 +56,14 @@ struct LintSummary {
 }
 
 impl LintSummary {
-    /// Exit code for human-mode output.
+    /// Exit code for all output modes.
     ///
-    /// Default: exit 1 when warnings are present (bd parity). Pass
-    /// `allow_warnings = true` (via `--allow-warnings`) to treat findings
-    /// as advisory. Structured modes (JSON/TOON) always exit 0 so agents
-    /// can parse the payload regardless of findings.
-    const fn exit_code(&self, structured: bool, allow_warnings: bool) -> i32 {
-        if structured || self.warnings == 0 || allow_warnings {
+    /// Exit 1 when warnings are present (bd parity), unless
+    /// `--allow-warnings` treats findings as advisory. Structured modes
+    /// (JSON/TOON) emit the payload first, then exit with the same code so
+    /// scripts can both parse the report and detect findings.
+    const fn exit_code(&self, allow_warnings: bool) -> i32 {
+        if self.warnings == 0 || allow_warnings {
             0
         } else {
             1
@@ -173,30 +176,32 @@ fn lint_issues_with_storage(args: &LintArgs, storage: &SqliteStorage) -> Result<
 
 fn render_lint_output(summary: LintSummary, ctx: &OutputContext, allow_warnings: bool) {
     if ctx.is_toon() {
+        let exit_code = summary.exit_code(allow_warnings);
         let output = LintOutput {
-            total: summary.warnings,
-            issues: summary.results.len(),
+            checked: summary.checked,
+            warnings: summary.warnings,
             results: summary.results,
         };
         ctx.toon(&output);
-        return;
+        std::process::exit(exit_code);
     }
 
     if ctx.is_json() {
+        let exit_code = summary.exit_code(allow_warnings);
         let output = LintOutput {
-            total: summary.warnings,
-            issues: summary.results.len(),
+            checked: summary.checked,
+            warnings: summary.warnings,
             results: summary.results,
         };
         ctx.json_pretty(&output);
-        return;
+        std::process::exit(exit_code);
     }
 
     if ctx.is_quiet() {
         if summary.results.is_empty() {
             return;
         }
-        std::process::exit(summary.exit_code(false, allow_warnings));
+        std::process::exit(summary.exit_code(allow_warnings));
     }
 
     if ctx.is_rich() {
@@ -229,7 +234,7 @@ fn render_lint_output(summary: LintSummary, ctx: &OutputContext, allow_warnings:
         }
     }
 
-    std::process::exit(summary.exit_code(false, allow_warnings));
+    std::process::exit(summary.exit_code(allow_warnings));
 }
 
 fn render_lint_rich(summary: &LintSummary, ctx: &OutputContext) {
@@ -344,7 +349,11 @@ fn build_filters(args: &LintArgs) -> Result<ListFilters> {
         filters.types = Some(vec![issue_type]);
     }
 
-    let status_filter = args.status.as_deref().unwrap_or("open").trim();
+    // Default (no --status): lint the whole active set — open, in_progress,
+    // blocked, deferred, draft, pinned, hooked, and custom statuses — aligned
+    // with `br count`/`br stats` active-set semantics. `--status all` adds
+    // closed issues; an explicit status narrows to that status only.
+    let status_filter = args.status.as_deref().unwrap_or("").trim();
     if !status_filter.is_empty() && !status_filter.eq_ignore_ascii_case("all") {
         let status: Status = status_filter.parse()?;
         if status.is_terminal() {
@@ -356,6 +365,8 @@ fn build_filters(args: &LintArgs) -> Result<ListFilters> {
         filters.statuses = Some(vec![status]);
     } else if status_filter.eq_ignore_ascii_case("all") {
         filters.include_closed = true;
+        filters.include_deferred = true;
+    } else {
         filters.include_deferred = true;
     }
 
@@ -698,12 +709,10 @@ mod tests {
     fn test_exit_code_behavior() {
         let issue = make_issue(IssueType::Task, Some("No criteria"));
         let summary = lint_issues(&[issue]);
-        // Structured output always exits 0.
-        assert_eq!(summary.exit_code(true, false), 0);
-        assert_eq!(summary.exit_code(true, true), 0);
-        // Human mode exits 1 on warnings by default (bd parity).
-        assert_eq!(summary.exit_code(false, false), 1);
+        // Warnings exit 1 in every output mode (JSON/TOON emit the payload
+        // first, then exit with the same code).
+        assert_eq!(summary.exit_code(false), 1);
         // --allow-warnings makes findings advisory.
-        assert_eq!(summary.exit_code(false, true), 0);
+        assert_eq!(summary.exit_code(true), 0);
     }
 }

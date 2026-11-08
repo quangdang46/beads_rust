@@ -2035,7 +2035,7 @@ fn e2e_formula_text_output_has_line_breaks() {
         expand.stdout
     );
     assert!(
-        expand.stdout.contains("Step one for {{component}}"),
+        expand.stdout.contains("Step one for core"),
         "unexpected preview: {}",
         expand.stdout
     );

@@ -114,9 +114,21 @@ struct RenameResult {
 
 /// Validate a label name.
 ///
-/// Labels may contain ASCII alphanumeric characters, hyphens, underscores, and colons.
+/// Labels are ASCII-only (the storage layer's `LabelValidator` enforces the
+/// same alphabet, so Unicode labels like `café` are rejected downstream
+/// regardless) and may contain ASCII alphanumerics, hyphens, underscores,
+/// and colons. At least one alphanumeric character is required, so
+/// punctuation-only names like `---`, `:::` or `_` are rejected.
 fn validate_label(label: &str) -> Result<()> {
-    LabelValidator::validate(label).map_err(|error| BeadsError::validation("label", error.message))
+    LabelValidator::validate(label)
+        .map_err(|error| BeadsError::validation("label", error.message))?;
+    if !label.chars().any(|c| c.is_ascii_alphanumeric()) {
+        return Err(BeadsError::validation(
+            "label",
+            "must contain at least one alphanumeric character",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_rename_labels(args: &LabelRenameArgs) -> Result<()> {
@@ -133,12 +145,15 @@ fn format_label_action_plain_line(result: &LabelActionResult, action: &str) -> O
     let issue_id = label_display_text(&result.issue_id);
     match (action, result.status.as_str()) {
         ("add", "added") => Some(format!("\u{2713} Added label {label} to {issue_id}")),
+        // A duplicate add is a no-op, not a success: use the dimmed bullet
+        // (matching rich mode) rather than the ✓ "Added" checkmark so the
+        // output does not read as both "added" and "already exists".
         ("add", _) => Some(format!(
-            "\u{2713} Label {label} already exists on {issue_id}"
+            "\u{2022} Label {label} already exists on {issue_id}"
         )),
         ("remove", "removed") => Some(format!("\u{2713} Removed label {label} from {issue_id}")),
         ("remove", _) => Some(format!(
-            "\u{2713} Label {label} not found on {issue_id} (no-op)"
+            "\u{2022} Label {label} not found on {issue_id} (no-op)"
         )),
         _ => None,
     }
@@ -147,13 +162,6 @@ fn format_label_action_plain_line(result: &LabelActionResult, action: &str) -> O
 fn format_rename_noop_plain_line(label: &str) -> String {
     format!(
         "Label '{}' already has that name; no changes made.",
-        label_display_text(label)
-    )
-}
-
-fn format_rename_not_found_plain_line(label: &str) -> String {
-    format!(
-        "Label '{}' not found on any issues.",
         label_display_text(label)
     )
 }
@@ -590,30 +598,14 @@ fn label_rename(
 
     let count = storage.rename_label(&args.old_name, &args.new_name, actor)?;
 
+    // Renaming a label that no issue carries is a not-found condition:
+    // exit 3 (NOT_FOUND) in every output mode, consistent with other
+    // missing-entity lookups such as `label list <missing-issue>`.
     if count == 0 {
-        if ctx.is_json() {
-            let result = RenameResult {
-                old_name: args.old_name.clone(),
-                new_name: args.new_name.clone(),
-                affected_issues: 0,
-            };
-            ctx.json_pretty(&result);
-        } else if ctx.is_toon() {
-            let result = RenameResult {
-                old_name: args.old_name.clone(),
-                new_name: args.new_name.clone(),
-                affected_issues: 0,
-            };
-            ctx.toon(&result);
-        } else if ctx.is_quiet() {
-            return Ok(());
-        } else if matches!(ctx.mode(), OutputMode::Rich) {
-            render_rename_not_found_rich(&args.old_name, ctx);
-        } else {
-            let line = format_rename_not_found_plain_line(&args.old_name);
-            println!("{line}");
-        }
-        return Ok(());
+        return Err(BeadsError::NotFound {
+            kind: "label".to_string(),
+            id: args.old_name.clone(),
+        });
     }
 
     storage_ctx.flush_no_db_if_dirty()?;
@@ -883,23 +875,6 @@ fn render_label_counts_rich(label_counts: &[LabelCount], ctx: &OutputContext) {
     console.print_renderable(&panel);
 }
 
-/// Render rename not found message in rich mode.
-fn render_rename_not_found_rich(old_name: &str, ctx: &OutputContext) {
-    let console = Console::default();
-    let theme = ctx.theme();
-
-    let mut text = Text::new("");
-    text.append_styled("\u{26a0} ", theme.warning.clone());
-    text.append("Label ");
-    text.append_styled(
-        sanitize_terminal_inline(old_name).as_ref(),
-        Style::new().color(label_color(old_name)),
-    );
-    text.append_styled(" not found on any issues.", theme.dimmed.clone());
-
-    console.print_renderable(&text);
-}
-
 /// Render rename no-op message in rich mode.
 fn render_rename_noop_rich(label: &str, ctx: &OutputContext) {
     let console = Console::default();
@@ -973,7 +948,6 @@ mod tests {
         let lines = [
             format_label_action_plain_line(&result, "add").expect("add line"),
             format_rename_noop_plain_line("old\x1b[2J"),
-            format_rename_not_found_plain_line("missing\rlabel"),
             format_rename_result_plain_line("old\x08", "new\nlabel", 2),
         ];
 
@@ -1000,6 +974,28 @@ mod tests {
         assert!(validate_label("special@char").is_err());
         assert!(validate_label("dot.not.allowed").is_err());
         assert!(validate_label(&"a".repeat(51)).is_err());
+    }
+
+    #[test]
+    fn test_validate_label_rejects_punctuation_only() {
+        // Punctuation-only names carry no meaning and are rejected even
+        // though every character is in the allowed alphabet.
+        for label in ["---", ":::", "_", "-_:", "--::__"] {
+            assert!(
+                validate_label(label).is_err(),
+                "punctuation-only label {label:?} must be rejected"
+            );
+        }
+        // Mixed alphanumeric + punctuation remains valid.
+        assert!(validate_label("a-b_c:d").is_ok());
+    }
+
+    #[test]
+    fn test_validate_label_ascii_only() {
+        // The storage layer's LabelValidator is ASCII-only, so non-ASCII
+        // alphanumerics are rejected here for a consistent early error.
+        assert!(validate_label("café").is_err());
+        assert!(validate_label("naïve").is_err());
     }
 
     #[test]

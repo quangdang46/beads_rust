@@ -29,11 +29,11 @@ pub enum QueryError {
 impl std::fmt::Display for QueryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            QueryError::ComplexQuery(msg) => write!(f, "complex query: {msg}"),
-            QueryError::UnknownField(msg) => write!(f, "unknown field: {msg}"),
-            QueryError::InvalidValue(msg) => write!(f, "invalid value: {msg}"),
-            QueryError::InvalidOperator(msg) => write!(f, "invalid operator: {msg}"),
-            QueryError::ParseError(msg) => write!(f, "parse error: {msg}"),
+            Self::ComplexQuery(msg) => write!(f, "complex query: {msg}"),
+            Self::UnknownField(msg) => write!(f, "unknown field: {msg}"),
+            Self::InvalidValue(msg) => write!(f, "invalid value: {msg}"),
+            Self::InvalidOperator(msg) => write!(f, "invalid operator: {msg}"),
+            Self::ParseError(msg) => write!(f, "parse error: {msg}"),
         }
     }
 }
@@ -42,9 +42,13 @@ impl std::error::Error for QueryError {}
 
 impl From<crate::query::parser::ParseError> for QueryError {
     fn from(e: crate::query::parser::ParseError) -> Self {
-        QueryError::ParseError(e.to_string())
+        Self::ParseError(e.to_string())
     }
 }
+
+/// In-memory predicate over an issue, used when a query cannot be fully
+/// expressed as storage-layer filters.
+pub type IssuePredicate = Box<dyn Fn(&crate::model::Issue) -> bool + Send>;
 
 /// Result of evaluating a query.
 pub struct QueryResult {
@@ -54,7 +58,7 @@ pub struct QueryResult {
     /// Whether in-memory predicate filtering is needed.
     pub requires_predicate: bool,
     /// Predicate function for in-memory filtering (None when not needed).
-    pub predicate: Option<Box<dyn Fn(&crate::model::Issue) -> bool + Send>>,
+    pub predicate: Option<IssuePredicate>,
 }
 
 impl std::fmt::Debug for QueryResult {
@@ -94,9 +98,7 @@ fn parse_duration_shorthand(s: &str) -> Result<Duration, QueryError> {
 /// - Relative offsets: "+1d" = one day from now, "-3d" = three days ago
 fn parse_timestamp_value(s: &str) -> Result<DateTime<Utc>, QueryError> {
     // First try duration shorthand (old behavior: "7d" = 7 days ago)
-    if s.ends_with(|c| c == 'd' || c == 'h' || c == 'm' || c == 's')
-        && s.starts_with(|c: char| c.is_ascii_digit())
-    {
+    if s.ends_with(['d', 'h', 'm', 's']) && s.starts_with(|c: char| c.is_ascii_digit()) {
         let dur = parse_duration_shorthand(s)?;
         return Ok(Utc::now() - dur);
     }
@@ -197,6 +199,12 @@ fn apply_comparison(
                 .map_err(|_| QueryError::InvalidValue(format!("invalid status: {value}")))?;
             if op == ComparisonOp::Eq {
                 filters.statuses.get_or_insert(Vec::new()).push(status);
+            } else {
+                // `!=` cannot be expressed as an IN-list (multiple status
+                // comparisons are OR-ed); fall back to predicate filtering.
+                return Err(QueryError::ComplexQuery(
+                    "status != requires predicate filtering".into(),
+                ));
             }
             Ok(())
         }
@@ -215,7 +223,7 @@ fn apply_comparison(
             filters.priorities.get_or_insert(Vec::new()).push(priority);
             Ok(())
         }
-        "type" => {
+        "type" | "issue_type" | "issue-type" => {
             if op != ComparisonOp::Eq && op != ComparisonOp::NotEq {
                 return Err(QueryError::InvalidOperator(
                     "type only supports = and !=".into(),
@@ -225,6 +233,11 @@ fn apply_comparison(
                 .map_err(|_| QueryError::InvalidValue(format!("invalid type: {value}")))?;
             if op == ComparisonOp::Eq {
                 filters.types.get_or_insert(Vec::new()).push(issue_type);
+            } else {
+                // Same OR-semantics problem as status !=; use the predicate.
+                return Err(QueryError::ComplexQuery(
+                    "type != requires predicate filtering".into(),
+                ));
             }
             Ok(())
         }
@@ -284,7 +297,7 @@ fn apply_comparison(
                 ComparisonOp::Less | ComparisonOp::LessEq => {
                     filters.created_before = Some(ts);
                 }
-                _ => {
+                ComparisonOp::NotEq => {
                     return Err(QueryError::InvalidOperator(
                         "invalid operator for timestamp field".into(),
                     ));
@@ -305,7 +318,7 @@ fn apply_comparison(
                 ComparisonOp::Less | ComparisonOp::LessEq => {
                     filters.updated_before = Some(ts);
                 }
-                _ => {
+                ComparisonOp::NotEq => {
                     return Err(QueryError::InvalidOperator(
                         "invalid operator for timestamp field".into(),
                     ));
@@ -314,6 +327,16 @@ fn apply_comparison(
             Ok(())
         }
         "id" => {
+            if op != ComparisonOp::Eq && op != ComparisonOp::NotEq {
+                return Err(QueryError::InvalidOperator(
+                    "id only supports = and !=".into(),
+                ));
+            }
+            if op == ComparisonOp::NotEq {
+                return Err(QueryError::ComplexQuery(
+                    "id != requires predicate filtering".into(),
+                ));
+            }
             if value.contains('*') {
                 filters
                     .ids
@@ -328,6 +351,11 @@ fn apply_comparison(
             Ok(())
         }
         "pinned" => {
+            if op != ComparisonOp::Eq {
+                return Err(QueryError::ComplexQuery(
+                    "pinned != requires predicate filtering".into(),
+                ));
+            }
             let b = value.eq_ignore_ascii_case("true") || value == "1";
             filters.pinned = Some(b);
             Ok(())
@@ -374,31 +402,31 @@ fn apply_comparison(
         }
         "closed" | "closed_at" => {
             // SQL filtering for closed_at not yet implemented; use predicate path
-            return Err(QueryError::ComplexQuery(
+            Err(QueryError::ComplexQuery(
                 "closed_at filtering requires predicate (no SQL-side filter)".into(),
-            ));
+            ))
         }
         "started" | "started_at" => {
             // SQL filtering for started_at not yet implemented; use predicate path
-            return Err(QueryError::ComplexQuery(
+            Err(QueryError::ComplexQuery(
                 "started_at filtering requires predicate (no SQL-side filter)".into(),
-            ));
+            ))
         }
         "spec" | "spec_id" => {
             if op != ComparisonOp::Eq {
                 return Err(QueryError::InvalidOperator("spec only supports =".into()));
             }
-            return Err(QueryError::ComplexQuery(
+            Err(QueryError::ComplexQuery(
                 "spec filtering requires predicate (no SQL-side filter)".into(),
-            ));
+            ))
         }
         "parent" => {
             if op != ComparisonOp::Eq {
                 return Err(QueryError::InvalidOperator("parent only supports =".into()));
             }
-            return Err(QueryError::ComplexQuery(
+            Err(QueryError::ComplexQuery(
                 "parent filtering requires predicate (no SQL-side filter)".into(),
-            ));
+            ))
         }
         "ephemeral" => {
             if op != ComparisonOp::Eq {
@@ -426,9 +454,9 @@ fn apply_comparison(
                     "has_metadata_key only supports =".into(),
                 ));
             }
-            return Err(QueryError::ComplexQuery(
+            Err(QueryError::ComplexQuery(
                 "has_metadata_key filtering requires predicate (no SQL-side filter)".into(),
-            ));
+            ))
         }
         f if f.starts_with("metadata.") => {
             let key = &f["metadata.".len()..];
@@ -451,7 +479,7 @@ fn apply_comparison(
 ///
 /// This is used for complex queries (OR, NOT) that can't be expressed
 /// as SQL WHERE conditions alone.
-fn build_predicate(node: &QueryNode) -> Box<dyn Fn(&crate::model::Issue) -> bool + Send> {
+fn build_predicate(node: &QueryNode) -> IssuePredicate {
     match node {
         QueryNode::Comparison { field, op, value } => {
             let field = field.clone();
@@ -477,6 +505,7 @@ fn build_predicate(node: &QueryNode) -> Box<dyn Fn(&crate::model::Issue) -> bool
 }
 
 /// Evaluate a single comparison against an Issue's in-memory fields.
+#[allow(clippy::too_many_lines)]
 fn evaluate_predicate_on_issue(
     issue: &crate::model::Issue,
     field: &str,
@@ -495,7 +524,7 @@ fn evaluate_predicate_on_issue(
 
     match field {
         "status" => apply_str_op(&issue.status.to_string(), value),
-        "type" => apply_str_op(&issue.issue_type.to_string(), value),
+        "type" | "issue_type" | "issue-type" => apply_str_op(&issue.issue_type.to_string(), value),
         "priority" => {
             let issue_p = issue.priority.0;
             let v: i32 = Priority::from_str(value).map(|p| p.0).unwrap_or(-1);
@@ -544,9 +573,13 @@ fn evaluate_predicate_on_issue(
         }
         "id" => {
             let id = &issue.id;
-            if value.ends_with('*') {
-                let prefix = &value[..value.len() - 1];
-                id.starts_with(prefix)
+            if let Some(prefix) = value.strip_suffix('*') {
+                let matched = id.starts_with(prefix);
+                match op {
+                    ComparisonOp::Eq => matched,
+                    ComparisonOp::NotEq => !matched,
+                    _ => false,
+                }
             } else {
                 apply_str_op(id, value)
             }
@@ -592,7 +625,6 @@ fn evaluate_predicate_on_issue(
                 ComparisonOp::LessEq => issue_ts <= ts,
                 ComparisonOp::Greater => issue_ts > ts,
                 ComparisonOp::GreaterEq => issue_ts >= ts,
-                _ => false,
             }
         }
         "started" | "started_at" => {
@@ -611,7 +643,6 @@ fn evaluate_predicate_on_issue(
                 ComparisonOp::LessEq => issue_ts <= ts,
                 ComparisonOp::Greater => issue_ts > ts,
                 ComparisonOp::GreaterEq => issue_ts >= ts,
-                _ => false,
             }
         }
         "spec" | "spec_id" => {
@@ -643,7 +674,7 @@ fn evaluate_predicate_on_issue(
                 .metadata
                 .as_deref()
                 .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
-                .map_or(false, |v| v.get(key).is_some())
+                .is_some_and(|v| v.get(key).is_some())
         }
         _ if field.starts_with("metadata.") => {
             let key = &field["metadata.".len()..];
@@ -659,6 +690,39 @@ fn evaluate_predicate_on_issue(
             // Unknown field — treat as no match
             false
         }
+    }
+}
+
+/// Determine whether a predicate-path query can match closed (terminal)
+/// issues. The storage layer excludes closed/tombstone rows unless
+/// `include_closed` is set, so queries that negate `status` or explicitly
+/// name a terminal status inside an `OR`/`NOT` tree must opt in — otherwise
+/// matching rows are filtered out before the predicate ever sees them.
+///
+/// This is deliberately conservative: returning `true` only widens the SQL
+/// candidate set (the predicate remains authoritative), while `false` is
+/// only returned when no status comparison can admit a terminal status.
+fn query_needs_closed(node: &QueryNode) -> bool {
+    match node {
+        QueryNode::Comparison { field, op, value } => {
+            if field != "status" {
+                return false;
+            }
+            match op {
+                // `status!=x` admits every status except x — including closed
+                // whenever x is not itself the excluded terminal status. Even
+                // for `!=closed` this is safe: the predicate re-filters.
+                ComparisonOp::NotEq => true,
+                ComparisonOp::Eq => crate::model::Status::from_str(value)
+                    .map(|s| s.is_terminal())
+                    .unwrap_or(false),
+                _ => false,
+            }
+        }
+        QueryNode::And(left, right) | QueryNode::Or(left, right) => {
+            query_needs_closed(left) || query_needs_closed(right)
+        }
+        QueryNode::Not(inner) => query_needs_closed(inner),
     }
 }
 
@@ -686,6 +750,9 @@ pub fn evaluate(node: &QueryNode) -> Result<QueryResult, QueryError> {
 
     // Complex query: build base filters (best-effort), build predicate
     let _ = build_filters(node, &mut filters);
+    if query_needs_closed(node) {
+        filters.include_closed = true;
+    }
     let predicate = build_predicate(node);
     Ok(QueryResult {
         filters,
@@ -1020,11 +1087,77 @@ mod tests {
         assert!(pred_fn(&issue));
     }
 
+    #[test]
+    fn test_status_not_eq_uses_predicate() {
+        let result = parse_and_evaluate("status!=open").unwrap();
+        assert!(result.requires_predicate);
+        assert!(result.filters.include_closed);
+        let pred = result.predicate.unwrap();
+        let mut issue = make_eval_test_issue(); // Open
+        assert!(!pred(&issue));
+        issue.status = crate::model::Status::Closed;
+        assert!(pred(&issue)); // closed != open
+        issue.status = crate::model::Status::InProgress;
+        assert!(pred(&issue));
+    }
+
+    #[test]
+    fn test_type_not_eq_uses_predicate() {
+        let result = parse_and_evaluate("type!=feature").unwrap();
+        assert!(result.requires_predicate);
+        let pred = result.predicate.unwrap();
+        let issue = make_eval_test_issue(); // Task
+        assert!(pred(&issue));
+        let mut feature = make_eval_test_issue();
+        feature.issue_type = crate::model::IssueType::Feature;
+        assert!(!pred(&feature));
+    }
+
+    #[test]
+    fn test_issue_type_alias() {
+        let result = parse_and_evaluate("issue_type=bug").unwrap();
+        assert!(!result.requires_predicate);
+        assert_eq!(
+            result.filters.types,
+            Some(vec![crate::model::IssueType::Bug])
+        );
+        let result2 = parse_and_evaluate("issue-type=bug").unwrap();
+        assert_eq!(
+            result2.filters.types,
+            Some(vec![crate::model::IssueType::Bug])
+        );
+    }
+
+    #[test]
+    fn test_status_eq_closed_marks_filter_for_closed() {
+        // Filter-only path: statuses carries Closed; the caller (list) is
+        // responsible for include_closed — the evaluator leaves it false so
+        // `status=closed` doesn't widen unrelated queries.
+        let result = parse_and_evaluate("status=closed").unwrap();
+        assert!(!result.requires_predicate);
+        assert_eq!(
+            result.filters.statuses,
+            Some(vec![crate::model::Status::Closed])
+        );
+    }
+
+    #[test]
+    fn test_or_with_closed_status_needs_closed() {
+        let result = parse_and_evaluate("status=open OR status=closed").unwrap();
+        assert!(result.requires_predicate);
+        assert!(result.filters.include_closed);
+    }
+
+    #[test]
+    fn test_predicate_without_status_does_not_include_closed() {
+        let result = parse_and_evaluate("priority>1").unwrap();
+        assert!(result.requires_predicate);
+        assert!(!result.filters.include_closed);
+    }
+
     /// Helper: parse a query string and return the predicate function.
     /// Panics on parse/eval errors.
-    fn build_predicate_for_test(
-        query: &str,
-    ) -> Option<Box<dyn Fn(&crate::model::Issue) -> bool + Send>> {
+    fn build_predicate_for_test(query: &str) -> Option<IssuePredicate> {
         let result = parse_and_evaluate(query).unwrap();
         result.predicate
     }

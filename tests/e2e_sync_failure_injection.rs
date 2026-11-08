@@ -585,7 +585,11 @@ fn import_failure_missing_file_no_db_changes() {
     artifacts.save();
 }
 
-/// Test: Import with malformed JSON fails early, DB unchanged.
+/// Test: Import with malformed JSON fails early under `strict`, DB unchanged.
+///
+/// The default policy is warn-and-skip; `strict: true` (the `--strict` flag
+/// on `br import`) restores abort-on-first-malformed-line semantics, which is
+/// what this failure-atomicity test exercises.
 #[test]
 fn import_failure_malformed_json_no_db_changes() {
     let _log = common::test_log("import_failure_malformed_json_no_db_changes");
@@ -608,15 +612,19 @@ fn import_failure_malformed_json_no_db_changes() {
 
     artifacts.log("malformed_content", "not valid json");
 
-    // Attempt import
+    // Attempt import in strict mode (default policy is warn-and-skip)
     let config = ImportConfig {
         beads_dir: Some(beads_dir),
+        strict: true,
         ..Default::default()
     };
     let result = import_from_jsonl(&mut storage, &jsonl_path, &config, Some("test-"));
 
     // Should fail
-    assert!(result.is_err(), "Import should fail on malformed JSON");
+    assert!(
+        result.is_err(),
+        "Strict import should fail on malformed JSON"
+    );
     let err_msg = result.unwrap_err().to_string();
     artifacts.log("error", &err_msg);
     assert!(
@@ -798,7 +806,9 @@ fn cli_export_readonly_preserves_state() {
     }
 }
 
-/// Test: CLI import with malformed JSONL fails without DB corruption.
+/// Test: CLI import with malformed JSONL warns, skips the bad line, and
+/// preserves the DB (`br sync` has no --strict flag; the default policy is
+/// warn-and-skip).
 #[test]
 fn cli_import_malformed_preserves_db() {
     let _log = common::test_log("cli_import_malformed_preserves_db");
@@ -838,18 +848,28 @@ fn cli_import_malformed_preserves_db() {
     let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
     fs::write(&jsonl_path, "totally not json {{{\n").unwrap();
 
-    // Attempt import
-    let import_run = run_br(&workspace, ["sync", "--import-only"], "import_fail");
+    // Attempt import. Default policy is warn-and-skip: the malformed line is
+    // skipped with a stderr warning and the import succeeds.
+    let import_run = run_br(&workspace, ["sync", "--import-only"], "import_warn_skip");
     artifacts.log("import_stdout", &import_run.stdout);
     artifacts.log("import_stderr", &import_run.stderr);
 
     // Save artifacts before assertions for debugging
     artifacts.save();
 
-    // Verify import failed
+    // Import should succeed while warning about the skipped line
     assert!(
-        !import_run.status.success(),
-        "Import should fail on malformed JSON"
+        import_run.status.success(),
+        "Import should warn-and-skip malformed JSON by default: {}",
+        import_run.stderr
+    );
+    assert!(
+        import_run.stderr.contains("skipping")
+            || import_run.stderr.contains("Warning")
+            || import_run.stdout.contains("skipped"),
+        "expected a skip warning, got stdout={} stderr={}",
+        import_run.stdout,
+        import_run.stderr
     );
 
     // List after - DB should still have original issue (use --no-auto-import --allow-stale to ignore corrupt/newer JSONL)

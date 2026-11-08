@@ -9,10 +9,7 @@ use crate::storage::{EventAttribution, SqliteStorage};
 use crate::util::id::{IdGenerationInput, IdGenerator, IdResolver, ResolverConfig, child_id};
 use crate::util::markdown_import::{parse_dependency, parse_markdown_file};
 use crate::util::time::parse_flexible_timestamp;
-use crate::validation::{
-    IssueValidator, LabelValidator, validate_custom_status_against_registry,
-    validate_custom_type_against_registry,
-};
+use crate::validation::{IssueValidator, LabelValidator, validate_custom_type_against_registry};
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -159,7 +156,16 @@ pub fn execute_with_storage(
     // Strict status-workflow enforcement (issue #311). Reject an out-of-set
     // `--status` before any write when the project configures
     // `workflow.strict: true`. No-op when the workflow section is absent.
-    enforce_workflow_status(&storage_ctx.paths.beads_dir, args.status.as_deref())?;
+    // `--defer` without `--status` creates the issue as `deferred`, so the
+    // policy check must see that effective status, not the `open` default.
+    let effective_status = args.status.as_deref().or_else(|| {
+        args.defer
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|_| "deferred")
+    });
+    enforce_workflow_status(&storage_ctx.paths.beads_dir, effective_status)?;
 
     let config = CreateConfig {
         id_config: config::id_config_from_layer(&layer),
@@ -286,7 +292,7 @@ fn enforce_workflow_status(beads_dir: &Path, raw_status: Option<&str>) -> Result
     // canonical name (`In_Progress` vs `in_progress`) compare equal. When
     // `--status` is omitted the effective status is the create default, `Open`.
     let parsed: Status = match raw_status {
-        Some(raw) => raw.parse()?,
+        Some(raw) => raw.trim().parse()?,
         None => Status::Open,
     };
     // Status-set enforcement (issue #311).
@@ -369,7 +375,7 @@ pub fn create_issue_impl(
     };
 
     let issue_type = if let Some(t) = &args.type_ {
-        IssueType::from_str(t)?
+        crate::cli::commands::update::parse_cli_issue_type(t)?
     } else {
         config.default_issue_type.clone()
     };
@@ -383,9 +389,13 @@ pub fn create_issue_impl(
         .map(|parent| resolve_issue_id(storage, &id_resolver, parent))
         .transpose()?;
 
-    // Parse status (default to Open if not provided)
+    // Parse status (default to Open if not provided). A `--defer` date with
+    // no explicit `--status` creates the issue as `deferred`, matching
+    // `br defer`'s status behaviour.
     let status = if let Some(s) = &args.status {
-        Status::from_str(s)?
+        crate::cli::commands::update::parse_cli_status(s)?
+    } else if defer_until.is_some() {
+        Status::Deferred
     } else {
         Status::Open
     };
@@ -502,9 +512,11 @@ pub fn create_issue_impl(
         // 5. Validate Issue
         IssueValidator::validate(&issue).map_err(BeadsError::from_validation_errors)?;
 
-        // 5a. Validate custom status/type against registry (if configured)
+        // 5a. Validate custom status/type against registry. Status uses the
+        // strict CLI check: built-ins pass, customs must be registered via
+        // `br custom-status add` (typos like `-s bogus` fail loudly).
         let custom_statuses = storage.list_custom_statuses()?;
-        validate_custom_status_against_registry(&issue.status, &custom_statuses)?;
+        crate::cli::commands::update::validate_cli_status(&issue.status, &custom_statuses)?;
         let custom_types = storage.list_custom_types()?;
         validate_custom_type_against_registry(&issue.issue_type, &custom_types)?;
 
@@ -827,7 +839,15 @@ fn execute_import(
     let layer = storage_ctx.load_config(cli)?;
 
     // Strict status-workflow enforcement (issue #311); see `execute`.
-    enforce_workflow_status(&storage_ctx.paths.beads_dir, args.status.as_deref())?;
+    // `--defer` without `--status` creates issues as `deferred`.
+    let effective_status = args.status.as_deref().or_else(|| {
+        args.defer
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|_| "deferred")
+    });
+    enforce_workflow_status(&storage_ctx.paths.beads_dir, effective_status)?;
 
     let id_config = config::id_config_from_layer(&layer);
     let default_priority = config::default_priority_from_layer(&layer)?;
@@ -840,9 +860,12 @@ fn execute_import(
     let due_at = parse_optional_date(args.due.as_deref())?;
     let defer_until = parse_optional_date(args.defer.as_deref())?;
 
-    // Parse status (default to Open if not provided)
+    // Parse status (default to Open if not provided); same token rules as
+    // single create (`--defer` implies `deferred` unless `--status` given).
     let import_status = if let Some(s) = &args.status {
-        Status::from_str(s)?
+        crate::cli::commands::update::parse_cli_status(s)?
+    } else if defer_until.is_some() {
+        Status::Deferred
     } else {
         Status::Open
     };
@@ -861,6 +884,12 @@ fn execute_import(
     };
 
     let storage = &mut storage_ctx.storage;
+
+    // Strict status check for import too: built-ins pass, customs must be
+    // registered via `br custom-status add`.
+    let custom_statuses = storage.list_custom_statuses()?;
+    crate::cli::commands::update::validate_cli_status(&import_status, &custom_statuses)?;
+
     let mut count = storage.count_issues()?;
     let mut last_created_id: Option<String> = None;
 
@@ -1076,7 +1105,6 @@ fn execute_import(
                 eprintln!("✗ Failed to create {}: {err}", create_display_text(&title));
                 break;
             }
-
             // Populate Labels (with validation)
             let mut labels = parsed.labels.clone();
             labels.extend(args.labels.clone());
@@ -1461,7 +1489,7 @@ fn is_marker_only_dependency(dep_id: &str) -> bool {
 
 fn parse_optional_date(s: Option<&str>) -> Result<Option<DateTime<Utc>>> {
     match s {
-        Some(s) if !s.trim().is_empty() => parse_flexible_timestamp(s, "date").map(Some),
+        Some(s) if !s.trim().is_empty() => parse_flexible_timestamp(s.trim(), "date").map(Some),
         _ => Ok(None),
     }
 }

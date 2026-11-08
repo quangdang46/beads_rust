@@ -1148,6 +1148,18 @@ fn ready_default_group_is_open_only_e2e() {
     let init = run_br(&workspace, ["init"], "init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
 
+    // Custom statuses must be registered before they can be assigned.
+    let register = run_br(
+        &workspace,
+        ["custom-status", "add", "rework", "--category", "wip"],
+        "register_rework_status",
+    );
+    assert!(
+        register.status.success(),
+        "register rework status failed: {}",
+        register.stderr
+    );
+
     let open = run_br(&workspace, ["create", "Open work", "-t", "task"], "c_open");
     let open_id = parse_created_id(&open.stdout);
     let rework = run_br(
@@ -1189,6 +1201,18 @@ fn ready_configured_group_surfaces_rework_e2e() {
     let init = run_br(&workspace, ["init"], "init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
 
+    // Custom statuses must be registered before they can be assigned.
+    let register = run_br(
+        &workspace,
+        ["custom-status", "add", "rework", "--category", "wip"],
+        "register_rework_status",
+    );
+    assert!(
+        register.status.success(),
+        "register rework status failed: {}",
+        register.stderr
+    );
+
     let open = run_br(&workspace, ["create", "Open work", "-t", "task"], "c_open");
     let open_id = parse_created_id(&open.stdout);
     let rework = run_br(
@@ -1197,10 +1221,15 @@ fn ready_configured_group_surfaces_rework_e2e() {
         "c_rework",
     );
     let rework_id = parse_created_id(&rework.stdout);
-    run_br(
+    let set = run_br(
         &workspace,
         ["update", &rework_id, "--status", "rework"],
         "to_rework",
+    );
+    assert!(
+        set.status.success(),
+        "update to rework failed: {}",
+        set.stderr
     );
 
     write_policy(

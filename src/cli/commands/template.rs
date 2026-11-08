@@ -15,7 +15,7 @@ use crate::error::{BeadsError, Result};
 use crate::format::sanitize_terminal_inline;
 use crate::model::Issue;
 use crate::output::OutputContext;
-use crate::storage::{ListFilters, SqliteStorage};
+use crate::storage::ListFilters;
 use crate::util::id::{IdResolver, ResolverConfig};
 use chrono::Utc;
 
@@ -98,7 +98,19 @@ fn execute_create(
         description: args.description.clone(),
         type_: args.type_.clone(),
         priority: args.priority.clone(),
-        labels: args.labels.clone(),
+        // `br create` accepts comma-separated labels in a single --labels
+        // value; mirror that here so `template create --labels a,b` works.
+        labels: args
+            .labels
+            .iter()
+            .flat_map(|l| {
+                l.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .collect(),
         assignee: args.assignee.clone(),
         owner: args.owner.clone(),
         status: None,
@@ -176,16 +188,17 @@ fn execute_list(args: &TemplateListArgs, cli: &CliOverrides, ctx: &OutputContext
 
 fn execute_list_with_storage(
     args: &TemplateListArgs,
-    cli: &CliOverrides,
+    _cli: &CliOverrides,
     ctx: &OutputContext,
     storage_ctx: &OpenStorageResult,
 ) -> Result<()> {
     let storage = &storage_ctx.storage;
 
-    let mut filters = ListFilters {
+    // NB: limit/offset are applied AFTER the is_template filter below —
+    // pushing them into SQL would count non-template issues and return
+    // wrong/empty pages.
+    let filters = ListFilters {
         include_templates: true,
-        limit: args.limit,
-        offset: args.offset,
         sort: Some("title".to_string()),
         reverse: false,
         ..Default::default()
@@ -194,7 +207,24 @@ fn execute_list_with_storage(
     let issues = storage.list_issues(&filters)?;
 
     // Filter to only templates (is_template=true)
-    let templates: Vec<&Issue> = issues.iter().filter(|i| i.is_template).collect();
+    let mut templates: Vec<Issue> = issues.into_iter().filter(|i| i.is_template).collect();
+
+    // Hydrate labels — list_issues does not populate the labels relation.
+    let template_ids: Vec<String> = templates.iter().map(|t| t.id.clone()).collect();
+    if !template_ids.is_empty() {
+        let labels_map = storage.get_labels_for_issues(&template_ids)?;
+        for t in &mut templates {
+            if let Some(labels) = labels_map.get(&t.id) {
+                t.labels = labels.clone();
+            }
+        }
+    }
+
+    // Apply offset/limit in Rust, after filtering and hydration.
+    let offset = args.offset.unwrap_or(0);
+    let limit = args.limit.unwrap_or(usize::MAX);
+    let templates: Vec<Issue> = templates.into_iter().skip(offset).take(limit).collect();
+    let templates: Vec<&Issue> = templates.iter().collect();
 
     if args.json || ctx.is_json() {
         let json_list: Vec<serde_json::Value> = templates
@@ -267,7 +297,7 @@ fn execute_show_with_storage(
     )?;
     let resolved_id = resolution.id;
 
-    let issue = storage
+    let mut issue = storage
         .get_issue(&resolved_id)?
         .ok_or_else(|| BeadsError::IssueNotFound {
             id: resolved_id.clone(),
@@ -279,6 +309,10 @@ fn execute_show_with_storage(
             format!("issue {resolved_id} is not a template"),
         ));
     }
+
+    // get_issue does not hydrate the labels relation — fetch them so
+    // `template show` displays stored labels.
+    issue.labels = storage.get_labels(&resolved_id)?;
 
     if ctx.is_json() {
         ctx.json_pretty(&issue);
@@ -423,7 +457,7 @@ fn execute_spawn_with_storage(
     )?;
     let resolved_id = resolution.id;
 
-    let template = storage_ctx
+    let mut template = storage_ctx
         .storage
         .get_issue(&resolved_id)?
         .ok_or_else(|| BeadsError::IssueNotFound {
@@ -443,6 +477,9 @@ fn execute_spawn_with_storage(
             format!("template {resolved_id} is already deleted"),
         ));
     }
+
+    // Hydrate labels so spawned issues inherit the template's labels.
+    template.labels = storage_ctx.storage.get_labels(&resolved_id)?;
 
     // Build the spawned issue from template fields
     let now = Utc::now();

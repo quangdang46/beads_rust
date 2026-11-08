@@ -12,7 +12,7 @@ use crate::format::{
     format_status_label, format_type_label, sanitize_terminal_inline, sanitize_terminal_text,
 };
 use crate::model::{Dependency, Issue, Priority, Status};
-use crate::output::{IssuePanel, OutputContext, OutputMode};
+use crate::output::{IssuePanel, OutputContext, OutputMode, terminal_is_dumb};
 use crate::storage::SqliteStorage;
 use crate::sync::{path as sync_path, read_issues_from_jsonl};
 use crate::util::id::{IdResolver, ResolverConfig, normalize_id};
@@ -22,6 +22,7 @@ use std::fmt::Write as FmtWrite;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Execute the show command.
 ///
@@ -205,12 +206,19 @@ fn execute_routed(
             println!();
         }
 
+        // `--oneline` only applies to human text output; the JSON/TOON
+        // routed path above already returned.
+        if args.oneline {
+            println!("{}: {}", details.issue.id, details.issue.title);
+            continue;
+        }
+
         let ctx = OutputContext::from_output_format(output_format, quiet, !*use_color);
         if matches!(ctx.mode(), OutputMode::Rich) {
             let panel = IssuePanel::from_details(details, ctx.theme());
             panel.print(&ctx, args.wrap);
         } else {
-            print_issue_details(details, *use_color);
+            print_issue_details(details, *use_color, args.wrap.then(|| ctx.width()));
         }
     }
 
@@ -255,16 +263,25 @@ fn execute_inner(
     let quiet = cli.quiet.unwrap_or(false);
     let ctx = OutputContext::from_output_format(output_format, quiet, !use_color);
 
-    // Handle --oneline flag: print `{id}: {title}` for each issue
-    if args.oneline {
+    if matches!(ctx.mode(), OutputMode::Quiet) {
+        return Ok(());
+    }
+
+    // Handle --oneline flag: print `{id}: {title}` for each issue.
+    // Machine-readable formats win over --oneline: `--json`/`--toon`
+    // (including formats inherited from the global output mode or
+    // BR_OUTPUT_FORMAT) must still emit their structured document, just
+    // like `--format toon --json` resolves to JSON.
+    if args.oneline
+        && !matches!(
+            output_format,
+            crate::cli::OutputFormat::Json | crate::cli::OutputFormat::Toon
+        )
+    {
         for details in &details_list {
             let issue = &details.issue;
             println!("{}: {}", issue.id, issue.title);
         }
-        return Ok(());
-    }
-
-    if matches!(ctx.mode(), OutputMode::Quiet) {
         return Ok(());
     }
     match output_format {
@@ -322,7 +339,7 @@ fn execute_inner(
                     let panel = IssuePanel::from_details(details, ctx.theme());
                     panel.print(&ctx, args.wrap);
                 } else {
-                    print_issue_details(details, use_color);
+                    print_issue_details(details, use_color, args.wrap.then(|| ctx.width()));
                 }
             }
         }
@@ -403,7 +420,9 @@ fn load_issue_details_for_route(
 
     if let Some(storage_ctx) = preloaded_storage_ctx {
         let config_layer = storage_ctx.load_config(cli)?;
-        let use_color = config::should_use_color(&config_layer);
+        // `TERM=dumb`/`unknown` cannot render ANSI — force plain styling
+        // even when config would otherwise enable color.
+        let use_color = config::should_use_color(&config_layer) && !terminal_is_dumb();
         let id_config = config::id_config_from_layer(&config_layer);
         let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
         let external_db_paths = external_project_db_paths_after_auto_import_if_needed(
@@ -438,7 +457,7 @@ fn load_issue_details_for_route(
     } else {
         config::load_config(beads_dir, preloaded_storage, cli)?
     };
-    let use_color = config::should_use_color(&config_layer);
+    let use_color = config::should_use_color(&config_layer) && !terminal_is_dumb();
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
     let details_list = if no_db {
@@ -1047,9 +1066,81 @@ fn parse_external_dep_id(dep_id: &str) -> Option<(String, String)> {
     Some((project, capability))
 }
 
-fn print_issue_details(details: &IssueDetails, use_color: bool) {
+fn print_issue_details(details: &IssueDetails, use_color: bool, wrap_width: Option<usize>) {
     let output = format_issue_details(details, use_color);
-    print!("{output}");
+    match wrap_width {
+        Some(width) => print!("{}", wrap_plain_text(&output, width)),
+        None => print!("{output}"),
+    }
+}
+
+/// Soft-wrap rendered plain text so `--wrap` has a visible effect outside
+/// rich mode. Lines are folded at the last whitespace that fits `width`
+/// cells (display width, not bytes); a word longer than `width` is
+/// hard-split. Content is never dropped.
+fn wrap_plain_text(text: &str, width: usize) -> String {
+    if width == 0 {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    for (index, segment) in text.split('\n').enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        wrap_plain_line(segment, width, &mut out);
+    }
+    out
+}
+
+fn wrap_plain_line(line: &str, width: usize, out: &mut String) {
+    let mut remaining = line;
+    loop {
+        if UnicodeWidthStr::width(remaining) <= width {
+            out.push_str(remaining);
+            return;
+        }
+
+        // Prefer breaking after the last whitespace that still fits.
+        let mut break_at = None;
+        let mut column = 0usize;
+        for (byte_index, ch) in remaining.char_indices() {
+            let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if column + char_width > width {
+                break;
+            }
+            column += char_width;
+            if ch.is_whitespace() {
+                break_at = Some(byte_index + ch.len_utf8());
+            }
+        }
+
+        let split_at = match break_at {
+            Some(position) if position > 0 => position,
+            _ => {
+                // No whitespace fits: hard-split at the width boundary.
+                let mut end = 0usize;
+                let mut column = 0usize;
+                for (byte_index, ch) in remaining.char_indices() {
+                    let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+                    if column + char_width > width {
+                        break;
+                    }
+                    column += char_width;
+                    end = byte_index + ch.len_utf8();
+                }
+                if end == 0 {
+                    out.push_str(remaining);
+                    return;
+                }
+                end
+            }
+        };
+
+        out.push_str(&remaining[..split_at]);
+        out.push('\n');
+        remaining =
+            remaining[split_at..].trim_start_matches(|ch: char| ch.is_whitespace() && ch != '\n');
+    }
 }
 
 #[allow(clippy::too_many_lines)]

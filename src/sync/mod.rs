@@ -2703,12 +2703,19 @@ fn compute_jsonl_newer_impl(storage: &SqliteStorage, jsonl_path: &Path) -> Resul
         observed.mtime > sync_sys_time
     });
 
-    let jsonl_newer = if mtime_newer {
-        stored_hash.as_ref().is_none_or(|stored_hash| {
+    // JSONL is newer when its *content* differs from the hash recorded at the
+    // last successful sync. `br sync --import-only` decides "hash unchanged"
+    // purely by comparing `compute_jsonl_hash` against this same stored hash,
+    // so gating the verdict on mtime here produced contradictory output
+    // ("JSONL is newer" from --status while import reported "hash unchanged",
+    // or vice versa when a file was replaced preserving its mtime). When no
+    // stored hash exists there is nothing to compare content against, so fall
+    // back to the mtime-vs-last-sync heuristic as a safe default.
+    let jsonl_newer = match &stored_hash {
+        Some(stored_hash) => {
             compute_jsonl_hash(jsonl_path).map_or(true, |current_hash| &current_hash != stored_hash)
-        })
-    } else {
-        false
+        }
+        None => mtime_newer,
     };
 
     if !jsonl_newer && stored_hash.is_some() {
@@ -4045,6 +4052,9 @@ struct PrefixRenameSeed {
 #[derive(Debug, Default)]
 struct ImportValidationPlan {
     record_count: usize,
+    /// Lines skipped because they were not parseable issue records (non-strict
+    /// mode only). Counted once here and folded into `ImportResult::skipped_count`.
+    skipped_lines: usize,
     prefix_mismatches: Vec<PrefixRenameSeed>,
     occupied_ids: HashSet<String>,
 }
@@ -4063,24 +4073,87 @@ struct BdJsonlWrapper {
     payload: Option<serde_json::Value>,
 }
 
-fn parse_normalized_import_issue(trimmed: &str, line_num: usize) -> Result<Option<Issue>> {
-    // First, try the current flat Issue format (backward compatible).
-    if let Ok(mut issue) = serde_json::from_str::<Issue>(trimmed) {
-        normalize_issue(&mut issue);
+/// How `for_each_jsonl_import_issue` handles a line that fails to parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InvalidJsonlLinePolicy {
+    /// Abort the import on the first malformed line (`--strict`).
+    Strict,
+    /// Skip the line with a stderr warning (default, matches CSV/markdown
+    /// import behavior of skipping bad rows).
+    WarnAndSkip,
+    /// Skip the line silently. Used by the second and third import passes,
+    /// which re-parse the same file deterministically after the first pass
+    /// already warned about each bad line.
+    SkipSilently,
+}
 
-        if let Err(errors) = IssueValidator::validate(&issue) {
-            let details = errors
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(BeadsError::Config(format!(
-                "Validation failed for issue {} at line {}: {}",
-                issue.id, line_num, details
-            )));
+/// Inject `created_at`/`updated_at` defaults into a JSON object so records
+/// that omit the timestamps still deserialize as [`Issue`]. Returns `None`
+/// when `value` is not a JSON object.
+fn issue_value_with_timestamp_defaults(mut value: serde_json::Value) -> Option<serde_json::Value> {
+    let object = value.as_object_mut()?;
+    if object.get("created_at").is_none() {
+        object.insert(
+            "created_at".to_string(),
+            serde_json::Value::String(Utc::now().to_rfc3339()),
+        );
+    }
+    if object.get("updated_at").is_none() {
+        object.insert(
+            "updated_at".to_string(),
+            serde_json::Value::String(Utc::now().to_rfc3339()),
+        );
+    }
+    Some(value)
+}
+
+/// Deserialize an [`Issue`] from a JSON line, tolerating missing
+/// `created_at`/`updated_at` timestamps (which `Issue` requires but which
+/// some exporters omit).
+fn parse_issue_lenient(value: serde_json::Value) -> Option<Issue> {
+    if let Ok(issue) = serde_json::from_value::<Issue>(value.clone()) {
+        return Some(issue);
+    }
+    let patched = issue_value_with_timestamp_defaults(value)?;
+    serde_json::from_value::<Issue>(patched).ok()
+}
+
+/// Validate a parsed issue, returning the validation error details on failure.
+fn validate_import_issue(issue: &Issue, line_num: usize) -> Result<()> {
+    if let Err(errors) = IssueValidator::validate(issue) {
+        let details = errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(BeadsError::Config(format!(
+            "Validation failed for issue {} at line {}: {}",
+            issue.id, line_num, details
+        )));
+    }
+    Ok(())
+}
+
+fn parse_normalized_import_issue(
+    trimmed: &str,
+    line_num: usize,
+    invalid_policy: InvalidJsonlLinePolicy,
+) -> Result<Option<Issue>> {
+    // First, try the current flat Issue format (backward compatible). A flat
+    // record that only fails because it omits created_at/updated_at is
+    // retried with timestamp defaults before falling through to the wrapper
+    // probe — otherwise it was misreported as an "unknown _type" skip.
+    let flat_value = serde_json::from_str::<serde_json::Value>(trimmed).ok();
+    let flat_issue = flat_value.and_then(|value| {
+        if value.get("_type").is_some() {
+            // bd-style wrapper records are handled below, not as flat issues.
+            return None;
         }
-
-        return Ok(Some(issue));
+        parse_issue_lenient(value)
+    });
+    if let Some(mut issue) = flat_issue {
+        normalize_issue(&mut issue);
+        return validate_import_issue(&issue, line_num).map(|()| Some(issue));
     }
 
     // Flat Issue parse failed; try bd wrapper format.
@@ -4094,65 +4167,121 @@ fn parse_normalized_import_issue(trimmed: &str, line_num: usize) -> Result<Optio
                         line_num
                     ))
                 })?;
-                let mut issue: Issue = serde_json::from_value(payload).map_err(|e| {
-                    BeadsError::Config(format!("Invalid payload JSON at line {}: {}", line_num, e))
+                let mut issue = parse_issue_lenient(payload).ok_or_else(|| {
+                    BeadsError::Config(format!(
+                        "Invalid payload JSON at line {}: expected an issue object",
+                        line_num
+                    ))
                 })?;
                 normalize_issue(&mut issue);
-
-                if let Err(errors) = IssueValidator::validate(&issue) {
-                    let details = errors
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    return Err(BeadsError::Config(format!(
-                        "Validation failed for issue {} at line {}: {}",
-                        issue.id, line_num, details
-                    )));
-                }
-
+                validate_import_issue(&issue, line_num)?;
                 Ok(Some(issue))
             }
             _ => {
-                // Unknown wrapper type -- skip with a warning.
-                eprintln!(
-                    "Warning: skipping JSONL line {} with unknown _type '{}'",
-                    line_num, type_
-                );
-                Ok(None)
+                // Unknown wrapper type -- skip with a warning (or abort/error
+                // under strict / silent-skip policies).
+                match invalid_policy {
+                    InvalidJsonlLinePolicy::Strict => Err(BeadsError::Config(format!(
+                        "Unsupported JSONL record at line {}: unknown _type '{}'",
+                        line_num, type_
+                    ))),
+                    InvalidJsonlLinePolicy::WarnAndSkip => {
+                        eprintln!(
+                            "Warning: skipping JSONL line {} with unknown _type '{}'",
+                            line_num, type_
+                        );
+                        Ok(None)
+                    }
+                    InvalidJsonlLinePolicy::SkipSilently => Ok(None),
+                }
             }
         }
     } else {
-        // Neither flat Issue nor bd wrapper -- report the original error.
-        Err(BeadsError::Config(format!(
-            "Invalid JSON at line {}: expected a flat Issue or a bd JSONL wrapper",
-            line_num
-        )))
+        // Neither flat Issue nor bd wrapper.
+        match invalid_policy {
+            InvalidJsonlLinePolicy::Strict => Err(BeadsError::Config(format!(
+                "Invalid JSON at line {}: expected a flat Issue or a bd JSONL wrapper",
+                line_num
+            ))),
+            InvalidJsonlLinePolicy::WarnAndSkip => {
+                eprintln!(
+                    "Warning: skipping malformed JSONL line {} (not a valid issue record)",
+                    line_num
+                );
+                Ok(None)
+            }
+            InvalidJsonlLinePolicy::SkipSilently => Ok(None),
+        }
     }
 }
 
+/// Outcome of scanning one JSONL line: an issue to process, or `None` when
+/// the line was skipped under a non-strict invalid-line policy.
 fn for_each_jsonl_import_issue(
     input_path: &Path,
+    invalid_policy: InvalidJsonlLinePolicy,
     mut handle_issue: impl FnMut(usize, Issue) -> Result<()>,
-) -> Result<()> {
+) -> Result<usize> {
     let file = File::open(input_path)?;
     path::validate_jsonl_fd_metadata(&file, input_path)?;
     let mut reader = BufReader::with_capacity(2 * 1024 * 1024, file);
     let mut line = String::new();
     let mut line_num = 0usize;
+    let mut skipped_lines = 0usize;
 
     while reader.read_line(&mut line)? > 0 {
         line_num += 1;
         let trimmed = line.trim();
         if !trimmed.is_empty() {
-            if let Some(issue) = parse_normalized_import_issue(trimmed, line_num)? {
-                handle_issue(line_num, issue)?;
+            // Under non-strict policies, parse failures are skips, not aborts.
+            // `parse_normalized_import_issue` still returns Err for semantic
+            // failures (duplicate-free validation errors are hard errors in
+            // every mode); only unparseable records are skippable. Distinguish
+            // by retrying: a parse-level failure yields None-skip, while a
+            // successfully parsed but invalid issue still errors.
+            match parse_normalized_import_issue(trimmed, line_num, invalid_policy) {
+                Ok(Some(issue)) => handle_issue(line_num, issue)?,
+                Ok(None) => skipped_lines += 1,
+                Err(err) => {
+                    // Validation errors on successfully parsed records are
+                    // hard errors in every mode; malformed JSON is skippable
+                    // unless strict. `parse_normalized_import_issue` already
+                    // applied the policy to malformed input, so any Err here
+                    // is a semantic (validation/payload) failure.
+                    if invalid_policy == InvalidJsonlLinePolicy::Strict {
+                        return Err(err);
+                    }
+                    // Non-strict: malformed-line errors that slipped through
+                    // (e.g. a wrapper with a missing payload) are skipped with
+                    // a warning to stay consistent with CSV/markdown import.
+                    if is_skippable_record_error(&err) {
+                        if invalid_policy == InvalidJsonlLinePolicy::WarnAndSkip {
+                            eprintln!("Warning: skipping malformed JSONL line {}: {err}", line_num);
+                        }
+                        skipped_lines += 1;
+                    } else {
+                        return Err(err);
+                    }
+                }
             }
         }
         line.clear();
     }
 
-    Ok(())
+    Ok(skipped_lines)
+}
+
+/// True when an import parse error describes an unparseable/malformed record
+/// (skippable) rather than a semantic validation failure (always fatal).
+fn is_skippable_record_error(err: &BeadsError) -> bool {
+    let BeadsError::Config(message) = err else {
+        return false;
+    };
+    message.contains("Invalid JSON")
+        || message.contains("expected an issue object")
+        || message.contains("no payload field")
+        || message.contains("unknown _type")
+        || message.contains("not a valid issue record")
 }
 
 fn collect_import_validation_plan(
@@ -4162,47 +4291,53 @@ fn collect_import_validation_plan(
 ) -> Result<ImportValidationPlan> {
     let mut plan = ImportValidationPlan::default();
     let mut seen_ids = HashSet::new();
+    let invalid_policy = if config.strict {
+        InvalidJsonlLinePolicy::Strict
+    } else {
+        InvalidJsonlLinePolicy::WarnAndSkip
+    };
 
-    for_each_jsonl_import_issue(input_path, |line_num, issue| {
-        let prefix_mismatch = !config.skip_prefix_validation
-            && expected_prefix.is_some_and(|prefix| {
-                !id_matches_expected_prefix(&issue.id, prefix)
-                    && issue.status != crate::model::Status::Tombstone
-            });
+    plan.skipped_lines =
+        for_each_jsonl_import_issue(input_path, invalid_policy, |line_num, issue| {
+            let prefix_mismatch = !config.skip_prefix_validation
+                && expected_prefix.is_some_and(|prefix| {
+                    !id_matches_expected_prefix(&issue.id, prefix)
+                        && issue.status != crate::model::Status::Tombstone
+                });
 
-        if prefix_mismatch && !config.rename_on_import {
-            return Err(BeadsError::Config(format!(
-                "Prefix mismatch at line {}: expected '{}', found issue '{}'",
-                line_num,
-                expected_prefix.unwrap_or_default(),
-                issue.id
-            )));
-        }
+            if prefix_mismatch && !config.rename_on_import {
+                return Err(BeadsError::Config(format!(
+                    "Prefix mismatch at line {}: expected '{}', found issue '{}'",
+                    line_num,
+                    expected_prefix.unwrap_or_default(),
+                    issue.id
+                )));
+            }
 
-        if !seen_ids.insert(issue.id.clone()) {
-            return Err(BeadsError::Config(format!(
-                "Duplicate issue id '{}' in {} at line {}",
-                issue.id,
-                input_path.display(),
-                line_num
-            )));
-        }
+            if !seen_ids.insert(issue.id.clone()) {
+                return Err(BeadsError::Config(format!(
+                    "Duplicate issue id '{}' in {} at line {}",
+                    issue.id,
+                    input_path.display(),
+                    line_num
+                )));
+            }
 
-        if prefix_mismatch {
-            plan.prefix_mismatches.push(PrefixRenameSeed {
-                old_id: issue.id,
-                title: issue.title,
-                description: issue.description,
-                created_by: issue.created_by,
-                created_at: issue.created_at,
-            });
-        } else {
-            plan.occupied_ids.insert(issue.id);
-        }
-        plan.record_count += 1;
+            if prefix_mismatch {
+                plan.prefix_mismatches.push(PrefixRenameSeed {
+                    old_id: issue.id,
+                    title: issue.title,
+                    description: issue.description,
+                    created_by: issue.created_by,
+                    created_at: issue.created_at,
+                });
+            } else {
+                plan.occupied_ids.insert(issue.id);
+            }
+            plan.record_count += 1;
 
-        Ok(())
-    })?;
+            Ok(())
+        })?;
 
     Ok(plan)
 }
@@ -4339,7 +4474,14 @@ fn scan_import_collision_renames(
     let progress =
         create_progress_bar(record_count as u64, "Scanning issues", config.show_progress);
 
-    for_each_jsonl_import_issue(input_path, |_line_num, mut issue| {
+    let invalid_policy = if config.strict {
+        InvalidJsonlLinePolicy::Strict
+    } else {
+        // The validation pass already warned about each malformed line;
+        // later passes skip the same lines silently.
+        InvalidJsonlLinePolicy::SkipSilently
+    };
+    for_each_jsonl_import_issue(input_path, invalid_policy, |_line_num, mut issue| {
         apply_prefix_renames(&mut issue, prefix_renames);
 
         if issue.ephemeral {
@@ -4489,7 +4631,12 @@ fn stream_import_actions_in_tx(
     progress.set_position(0);
     storage.clear_all_export_hashes_in_tx()?;
 
-    for_each_jsonl_import_issue(input_path, |_line_num, mut issue| {
+    let invalid_policy = if config.strict {
+        InvalidJsonlLinePolicy::Strict
+    } else {
+        InvalidJsonlLinePolicy::SkipSilently
+    };
+    for_each_jsonl_import_issue(input_path, invalid_policy, |_line_num, mut issue| {
         apply_prefix_renames(&mut issue, prefix_renames);
 
         if issue.ephemeral {
@@ -4619,7 +4766,12 @@ pub fn import_from_jsonl(
     let validation_plan = collect_import_validation_plan(input_path, config, expected_prefix)?;
     spinner.finish_with_message("Parsed and validated issues");
 
-    let mut result = ImportResult::default();
+    let mut result = ImportResult {
+        // Malformed lines skipped under non-strict mode count toward the
+        // skipped total so the summary does not underreport them.
+        skipped_count: validation_plan.skipped_lines,
+        ..ImportResult::default()
+    };
 
     // Step 5: Handle renames if requested
     let prefix_renames = if config.rename_on_import {
@@ -5200,12 +5352,51 @@ pub fn three_way_merge(
                 right.is_some_and(|issue| issue.status != crate::model::Status::Tombstone);
 
             if local_tombstone && external_non_tombstone {
-                // Import paths never allow JSONL to resurrect a local tombstone.
-                // Merge winner flags must preserve that invariant too.
-                if let Some(issue) = left {
-                    report.kept.push(issue.clone());
+                // Local deleted (tombstoned) while external modified: this is a
+                // delete-vs-modify conflict. Previously this was silently
+                // resolved as "delete wins" for every strategy, discarding the
+                // external edit with conflicts=0. Honor the merge strategy:
+                // Manual reports a conflict (execute_merge then requires a
+                // force flag), PreferExternal resurrects the external version,
+                // PreferNewer keeps whichever side has the newer updated_at,
+                // and PreferLocal keeps the tombstone.
+                // local_tombstone/external_non_tombstone guarantee both sides
+                // are present; the fallback arm is unreachable but keeps this
+                // panic-free.
+                let (Some(local_issue), Some(external_issue)) = (left, right) else {
+                    continue;
+                };
+                match strategy {
+                    ConflictResolution::Manual => {
+                        report
+                            .conflicts
+                            .push((id.clone(), ConflictType::DeleteVsModify));
+                    }
+                    ConflictResolution::PreferExternal => {
+                        report.kept.push(external_issue.clone());
+                        report.notes.push((
+                            id.clone(),
+                            "Local deleted, external modified - kept external".to_string(),
+                        ));
+                    }
+                    ConflictResolution::PreferNewer => {
+                        if external_issue.updated_at > local_issue.updated_at {
+                            report.kept.push(external_issue.clone());
+                            report.notes.push((
+                                id.clone(),
+                                "Local deleted, external modified - kept external (newer)"
+                                    .to_string(),
+                            ));
+                        } else {
+                            report.kept.push(local_issue.clone());
+                            report.tombstone_protected.push(id.clone());
+                        }
+                    }
+                    ConflictResolution::PreferLocal => {
+                        report.kept.push(local_issue.clone());
+                        report.tombstone_protected.push(id.clone());
+                    }
                 }
-                report.tombstone_protected.push(id.clone());
                 continue;
             }
 
@@ -9379,7 +9570,10 @@ mod tests {
     }
 
     #[test]
-    fn test_three_way_merge_tombstone_protection_blocks_external_winner() {
+    fn test_three_way_merge_tombstone_vs_external_modify_prefer_external_resurrects() {
+        // Delete-vs-modify with an explicit external winner (`--force-jsonl`
+        // maps to PreferExternal): the external version must be kept,
+        // otherwise the conflict could never be resolved toward JSONL.
         let base = make_issue_with_hash("bd-tomb", "Base", fixed_time_merge(100), Some("base"));
         let mut local_tombstone =
             make_issue_with_hash("bd-tomb", "Deleted", fixed_time_merge(200), Some("deleted"));
@@ -9408,10 +9602,10 @@ mod tests {
         );
 
         assert!(report.conflicts.is_empty());
-        assert_eq!(report.tombstone_protected, vec!["bd-tomb".to_string()]);
+        assert!(report.tombstone_protected.is_empty());
         assert_eq!(report.kept.len(), 1);
-        assert_eq!(report.kept[0].status, crate::model::Status::Tombstone);
-        assert_eq!(report.kept[0].title, "Deleted");
+        assert_eq!(report.kept[0].title, "Resurrection attempt");
+        assert!(report.notes.iter().any(|(id, _)| id == "bd-tomb"));
     }
 
     #[test]
@@ -9596,5 +9790,145 @@ mod tests {
             hash1, hash2,
             "Hashes should be identical regardless of empty lines or whitespace"
         );
+    }
+
+    fn merge_id_map(entries: &[(&str, Issue)]) -> std::collections::HashMap<String, Issue> {
+        entries
+            .iter()
+            .map(|(id, issue)| ((*id).to_string(), issue.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn test_three_way_merge_tombstone_vs_external_modify_manual_conflicts() {
+        // Local tombstoned the issue while external modified it: this is a
+        // delete-vs-modify conflict and must surface under Manual instead of
+        // silently resolving as delete (regression: conflicts=0 with the
+        // remote edit discarded).
+        let base = make_test_issue("br-1", "base");
+        let mut tombstone = make_test_issue("br-1", "base");
+        tombstone.status = Status::Tombstone;
+        tombstone.updated_at = fixed_time_merge(100);
+        let mut external = make_test_issue("br-1", "edited externally");
+        external.updated_at = fixed_time_merge(200);
+
+        let tombstones: HashSet<String, RandomState> = ["br-1".to_string()].into_iter().collect();
+        let context = MergeContext::new(
+            merge_id_map(&[("br-1", base)]),
+            merge_id_map(&[("br-1", tombstone)]),
+            merge_id_map(&[("br-1", external)]),
+        );
+        let report = three_way_merge(&context, ConflictResolution::Manual, Some(&tombstones));
+
+        assert!(
+            report.has_conflicts(),
+            "expected a delete-vs-modify conflict"
+        );
+        assert!(
+            report
+                .conflicts
+                .iter()
+                .any(|(id, kind)| id == "br-1" && *kind == ConflictType::DeleteVsModify),
+            "conflicts: {:?}",
+            report.conflicts
+        );
+        assert!(report.kept.is_empty());
+    }
+
+    #[test]
+    fn test_three_way_merge_tombstone_vs_external_modify_strategies() {
+        let base = make_test_issue("br-1", "base");
+        let mut tombstone = make_test_issue("br-1", "base");
+        tombstone.status = Status::Tombstone;
+        tombstone.updated_at = fixed_time_merge(300);
+        let mut external = make_test_issue("br-1", "edited externally");
+        external.updated_at = fixed_time_merge(200);
+        let tombstones: HashSet<String, RandomState> = ["br-1".to_string()].into_iter().collect();
+
+        let build = || {
+            MergeContext::new(
+                merge_id_map(&[("br-1", base.clone())]),
+                merge_id_map(&[("br-1", tombstone.clone())]),
+                merge_id_map(&[("br-1", external.clone())]),
+            )
+        };
+
+        // PreferLocal keeps the tombstone and marks it protected.
+        let report = three_way_merge(&build(), ConflictResolution::PreferLocal, Some(&tombstones));
+        assert!(!report.has_conflicts());
+        assert_eq!(report.kept.len(), 1);
+        assert_eq!(report.kept[0].status, Status::Tombstone);
+        assert_eq!(report.tombstone_protected, vec!["br-1".to_string()]);
+
+        // PreferNewer with the tombstone newer also keeps the tombstone.
+        let report = three_way_merge(&build(), ConflictResolution::PreferNewer, Some(&tombstones));
+        assert_eq!(report.kept[0].status, Status::Tombstone);
+        assert_eq!(report.tombstone_protected, vec!["br-1".to_string()]);
+
+        // PreferExternal resurrects the external edit.
+        let report = three_way_merge(
+            &build(),
+            ConflictResolution::PreferExternal,
+            Some(&tombstones),
+        );
+        assert_eq!(report.kept.len(), 1);
+        assert_eq!(report.kept[0].title, "edited externally");
+        assert!(report.notes.iter().any(|(id, _)| id == "br-1"));
+    }
+
+    #[test]
+    fn test_parse_normalized_import_issue_lenient_timestamps() {
+        // Flat issue missing created_at/updated_at must still import (and not
+        // be misreported as an unknown _type skip).
+        let issue = make_test_issue("br-x1", "no timestamps");
+        let mut value = serde_json::to_value(&issue).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("created_at");
+        object.remove("updated_at");
+        let line = value.to_string();
+
+        let parsed = parse_normalized_import_issue(&line, 1, InvalidJsonlLinePolicy::Strict)
+            .unwrap()
+            .expect("flat issue without timestamps should parse");
+        assert_eq!(parsed.id, "br-x1");
+
+        // bd wrapper payload missing updated_at must also import.
+        let mut payload = serde_json::to_value(&issue).unwrap();
+        payload.as_object_mut().unwrap().remove("updated_at");
+        let wrapped = serde_json::json!({ "_type": "issue", "payload": payload }).to_string();
+        let parsed = parse_normalized_import_issue(&wrapped, 2, InvalidJsonlLinePolicy::Strict)
+            .unwrap()
+            .expect("wrapper payload without updated_at should parse");
+        assert_eq!(parsed.id, "br-x1");
+    }
+
+    #[test]
+    fn test_for_each_jsonl_import_issue_skips_malformed_unless_strict() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("issues.jsonl");
+        let good1 = serde_json::to_string(&make_test_issue("br-a", "one")).unwrap();
+        let good2 = serde_json::to_string(&make_test_issue("br-b", "two")).unwrap();
+        fs::write(&path, format!("{good1}\nnot-json-at-all\n{good2}\n")).unwrap();
+
+        // Non-strict: the malformed line is skipped and counted.
+        let mut seen = Vec::new();
+        let skipped = for_each_jsonl_import_issue(
+            &path,
+            InvalidJsonlLinePolicy::WarnAndSkip,
+            |_line, issue| {
+                seen.push(issue.id);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(seen, vec!["br-a".to_string(), "br-b".to_string()]);
+        assert_eq!(skipped, 1);
+
+        // Strict: the same file aborts on the malformed line.
+        let result =
+            for_each_jsonl_import_issue(&path, InvalidJsonlLinePolicy::Strict, |_line, _issue| {
+                Ok(())
+            });
+        assert!(result.is_err(), "strict mode must abort on malformed lines");
     }
 }

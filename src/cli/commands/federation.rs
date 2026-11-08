@@ -263,6 +263,39 @@ pub fn run(command: &FederationCommand, ctx: &OutputContext) -> Result<()> {
 
 /// Add a new peer.
 fn cmd_add(conn: &Connection, args: &FederationAddArgs, ctx: &OutputContext) -> Result<()> {
+    // Sovereignty must be one of the defined tiers T1–T4.
+    let sovereignty = args.sovereignty.trim().to_ascii_uppercase();
+    if !matches!(sovereignty.as_str(), "T1" | "T2" | "T3" | "T4") {
+        return Err(BeadsError::validation(
+            "sovereignty",
+            format!("must be one of T1, T2, T3, T4 (got '{}')", args.sovereignty),
+        ));
+    }
+
+    // Reject duplicates by name or remote URL — INSERT OR REPLACE would
+    // silently overwrite an existing peer's credentials/settings.
+    if let Some(existing) = federation_peers_get(conn, args.name.trim())? {
+        return Err(BeadsError::validation(
+            "name",
+            format!(
+                "peer '{}' already exists ({}); remove it first or pick another name",
+                existing.name, existing.remote_url
+            ),
+        ));
+    }
+    let url_taken = federation_peers_list(conn)?
+        .iter()
+        .any(|p| p.remote_url == args.remote_url);
+    if url_taken {
+        return Err(BeadsError::validation(
+            "remote_url",
+            format!(
+                "a peer with remote_url '{}' is already configured",
+                args.remote_url
+            ),
+        ));
+    }
+
     let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
     // Encrypt password if provided
@@ -283,7 +316,7 @@ fn cmd_add(conn: &Connection, args: &FederationAddArgs, ctx: &OutputContext) -> 
         name: args.name.clone(),
         remote_url: args.remote_url.clone(),
         username: args.username.clone().unwrap_or_default(),
-        sovereignty: args.sovereignty.clone(),
+        sovereignty,
         last_sync: String::new(),
         created_at: now.clone(),
         updated_at: now,

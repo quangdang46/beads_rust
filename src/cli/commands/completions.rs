@@ -34,14 +34,22 @@ pub fn execute(args: &CompletionsArgs, _ctx: &OutputContext) -> Result<()> {
     let cmd = Cli::command();
 
     if let Some(output_path) = &args.output {
-        // Generate to file
-        let mut file = std::fs::File::create(output_path)?;
+        // `-o` accepts either a file path or an existing directory. When a
+        // directory is given, the script is written inside it under the
+        // conventional per-shell filename (matching the install
+        // instructions printed by `print_install_instructions`).
+        let target_path = if output_path.is_dir() {
+            output_path.join(shell_file_name(args.shell))
+        } else {
+            output_path.clone()
+        };
+        let mut file = std::fs::File::create(&target_path)?;
         write_dynamic_completions(args.shell, &cmd, &mut file)?;
-        info!(path = %output_path.display(), "Wrote completion script");
+        info!(path = %target_path.display(), "Wrote completion script");
         eprintln!(
             "Generated {} completions to {}",
             shell_name(args.shell),
-            output_path.display()
+            target_path.display()
         );
     } else {
         // Generate to stdout
@@ -67,6 +75,18 @@ fn write_dynamic_completions(
     let bin = cmd.get_bin_name().unwrap_or_else(|| cmd.get_name());
     env_shell.write_registration("COMPLETE", cmd.get_name(), bin, bin, out)?;
     Ok(())
+}
+
+/// Conventional on-disk filename for a shell's completion script when `-o`
+/// names a directory (see `print_install_instructions`).
+const fn shell_file_name(shell: ShellType) -> &'static str {
+    match shell {
+        ShellType::Bash => "br",
+        ShellType::Zsh => "_br",
+        ShellType::Fish => "br.fish",
+        ShellType::PowerShell => "br.ps1",
+        ShellType::Elvish => "br.elv",
+    }
 }
 
 /// Get human-readable shell name.

@@ -155,14 +155,37 @@ fn export_sorts_comments_canonically_after_loading_relations() {
 }
 
 #[test]
-fn import_rejects_malformed_json() {
+fn import_malformed_json_warns_and_skips_by_default() {
+    // Default policy is WarnAndSkip: malformed lines are skipped, counted in
+    // `skipped_count`, and the import still succeeds.
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("issues.jsonl");
+    let issue = issue_with_id("test-ok", "Valid issue");
+    let json = serde_json::to_string(&issue).unwrap();
+    fs::write(&path, format!("not json\n{json}\n")).unwrap();
+
+    let mut storage = SqliteStorage::open_memory().unwrap();
+    let result = import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("test-"))
+        .expect("default warn-and-skip policy should not fail on malformed lines");
+    assert_eq!(result.skipped_count, 1);
+    assert_eq!(result.imported_count, 1);
+    assert!(storage.get_issue("test-ok").unwrap().is_some());
+}
+
+#[test]
+fn import_strict_rejects_malformed_json() {
+    // `strict: true` (the `--strict` flag on `br import`) aborts on the first
+    // malformed line.
     let temp = TempDir::new().unwrap();
     let path = temp.path().join("issues.jsonl");
     fs::write(&path, "not json\n").unwrap();
 
     let mut storage = SqliteStorage::open_memory().unwrap();
-    let err = import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("test-"))
-        .unwrap_err();
+    let config = ImportConfig {
+        strict: true,
+        ..Default::default()
+    };
+    let err = import_from_jsonl(&mut storage, &path, &config, Some("test-")).unwrap_err();
     assert!(err.to_string().contains("Invalid JSON"));
 }
 

@@ -39,6 +39,10 @@ fn create_issue_with_description(
 
 fn run_lint_json(workspace: &BrWorkspace, mut args: Vec<String>, label: &str) -> Value {
     args.push("--json".to_string());
+    // `br lint` exits 1 when template warnings are found (bd parity, all
+    // output modes); --allow-warnings keeps the run successful so callers
+    // can assert on the payload.
+    args.push("--allow-warnings".to_string());
     let lint = run_br(workspace, args, label);
     assert!(lint.status.success(), "lint json failed: {}", lint.stderr);
     let payload = extract_json_payload(&lint.stdout);
@@ -439,8 +443,8 @@ fn e2e_dependency_errors() {
 }
 
 #[test]
-fn e2e_dep_add_blocks_ignores_non_blocking_cycle_edges() {
-    let _log = common::test_log("e2e_dep_add_blocks_ignores_non_blocking_cycle_edges");
+fn e2e_dep_add_cycle_check_covers_non_blocking_edge_types() {
+    let _log = common::test_log("e2e_dep_add_cycle_check_covers_non_blocking_edge_types");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -473,15 +477,37 @@ fn e2e_dep_add_blocks_ignores_non_blocking_cycle_edges() {
         related.stderr
     );
 
+    // Cycle detection probes the unified edge graph (`dep cycles` scope), so a
+    // blocking edge that would close a cycle through a `related` edge is now
+    // rejected: a -> b (related) plus b -> a (blocks) is a cycle.
     let blocks = run_br(
         &workspace,
         ["dep", "add", &id_b, &id_a, "--type", "blocks"],
         "dep_blocks",
     );
     assert!(
-        blocks.status.success(),
-        "blocking dep should ignore non-blocking related edge: {}",
+        !blocks.status.success(),
+        "blocking dep closing a cycle through a related edge should fail: {}",
         blocks.stderr
+    );
+    let combined = format!("{}{}", blocks.stdout, blocks.stderr).to_lowercase();
+    assert!(
+        combined.contains("cycle"),
+        "expected a cycle error, got: {combined}"
+    );
+
+    // Associative types still bypass the cycle gate: `dep add` only probes
+    // ordering/ancestry types, so a reverse `related` edge is allowed even
+    // though it forms an associative cycle that `dep cycles` will report.
+    let related_back = run_br(
+        &workspace,
+        ["dep", "add", &id_b, &id_a, "--type", "related"],
+        "dep_related_back",
+    );
+    assert!(
+        related_back.status.success(),
+        "associative related edge should bypass cycle checks: {}",
+        related_back.stderr
     );
 }
 
@@ -1378,7 +1404,12 @@ fn e2e_sync_rename_prefix_failed_import_restores_original_corrupt_db_family() {
     );
 
     let issues_path = workspace.root.join(".beads").join("issues.jsonl");
-    fs::write(&issues_path, "{\"id\":\"broken\"\n").expect("write malformed jsonl");
+    // Duplicate issue IDs stay fatal under the default warn-and-skip
+    // malformed-line policy (only unparseable lines are skippable), so the
+    // deferred recovery failure/restore path is still exercised. (`br sync`
+    // has no --strict flag; strict aborts are covered by `br import --strict`.)
+    let dup_issue = "{\"id\":\"dup-1\",\"title\":\"Dup\",\"status\":\"open\",\"priority\":2,\"issue_type\":\"task\",\"created_at\":\"2026-01-01T00:00:00Z\",\"updated_at\":\"2026-01-01T00:00:00Z\"}";
+    fs::write(&issues_path, format!("{dup_issue}\n{dup_issue}\n")).expect("write invalid jsonl");
 
     let alt_db = workspace
         .root
@@ -1403,13 +1434,13 @@ fn e2e_sync_rename_prefix_failed_import_restores_original_corrupt_db_family() {
     );
     assert!(
         !result.status.success(),
-        "malformed JSONL should fail explicit import after deferred recovery"
+        "duplicate-id JSONL should fail explicit import after deferred recovery"
     );
     // `--json` writes the structured error to stdout; stderr holds only logs.
     let json = parse_error_json(&result.stdout).expect("structured error json");
     let message = json["error"]["message"].as_str().unwrap_or_default();
     assert!(
-        message.contains("Invalid JSON"),
+        message.contains("Duplicate issue id"),
         "unexpected error message: {message} (stderr={})",
         result.stderr
     );
@@ -1594,7 +1625,12 @@ fn e2e_sync_rename_prefix_import_failure_does_not_leave_missing_db_created() {
     );
 
     let issues_path = workspace.root.join(".beads").join("issues.jsonl");
-    fs::write(&issues_path, "{\"id\":\"broken\"\n").expect("write malformed jsonl");
+    // Duplicate issue IDs stay fatal under the default warn-and-skip
+    // malformed-line policy (only unparseable lines are skippable), so the
+    // deferred recovery failure/restore path is still exercised. (`br sync`
+    // has no --strict flag; strict aborts are covered by `br import --strict`.)
+    let dup_issue = "{\"id\":\"dup-1\",\"title\":\"Dup\",\"status\":\"open\",\"priority\":2,\"issue_type\":\"task\",\"created_at\":\"2026-01-01T00:00:00Z\",\"updated_at\":\"2026-01-01T00:00:00Z\"}";
+    fs::write(&issues_path, format!("{dup_issue}\n{dup_issue}\n")).expect("write invalid jsonl");
 
     let alt_db = workspace
         .root
@@ -1621,13 +1657,13 @@ fn e2e_sync_rename_prefix_import_failure_does_not_leave_missing_db_created() {
     );
     assert!(
         !result.status.success(),
-        "malformed JSONL should fail explicit import after deferred recovery"
+        "duplicate-id JSONL should fail explicit import after deferred recovery"
     );
     // `--json` writes the structured error to stdout; stderr holds only logs.
     let json = parse_error_json(&result.stdout).expect("structured error json");
     let message = json["error"]["message"].as_str().unwrap_or_default();
     assert!(
-        message.contains("Invalid JSON"),
+        message.contains("Duplicate issue id"),
         "unexpected error message: {message} (stderr={})",
         result.stderr
     );
@@ -1803,8 +1839,11 @@ fn e2e_lint_bug_missing_sections_json() {
     );
 
     let json = run_lint_json(&workspace, vec!["lint".to_string()], "lint_bug_json");
-    assert_eq!(json["total"].as_u64(), Some(2));
-    assert_eq!(json["issues"].as_u64(), Some(1));
+    // Schema: `checked` = issues examined, `warnings` = total warnings,
+    // `results` = only the issues that produced warnings.
+    assert_eq!(json["checked"].as_u64(), Some(1));
+    assert_eq!(json["warnings"].as_u64(), Some(2));
+    assert_eq!(json["results"].as_array().map(Vec::len), Some(1));
     let missing = json["results"][0]["missing"]
         .as_array()
         .expect("missing array");
@@ -1839,8 +1878,9 @@ fn e2e_lint_multiple_issues_aggregate_warnings() {
     );
 
     let json = run_lint_json(&workspace, vec!["lint".to_string()], "lint_multi_json");
-    assert_eq!(json["issues"].as_u64(), Some(2));
-    assert_eq!(json["total"].as_u64(), Some(3));
+    assert_eq!(json["checked"].as_u64(), Some(2));
+    assert_eq!(json["results"].as_array().map(Vec::len), Some(2));
+    assert_eq!(json["warnings"].as_u64(), Some(3));
 }
 
 #[test]
@@ -1894,7 +1934,7 @@ fn e2e_lint_status_all_includes_closed() {
         ],
         "lint_closed_json",
     );
-    assert_eq!(json["issues"].as_u64(), Some(1));
+    assert_eq!(json["results"].as_array().map(Vec::len), Some(1));
 }
 
 #[test]
@@ -1924,7 +1964,7 @@ fn e2e_lint_type_filter_limits_results() {
         vec!["lint".to_string(), "--type".to_string(), "bug".to_string()],
         "lint_type_json",
     );
-    assert_eq!(json["issues"].as_u64(), Some(1));
+    assert_eq!(json["results"].as_array().map(Vec::len), Some(1));
     assert_eq!(json["results"][0]["type"].as_str(), Some("bug"));
 }
 
@@ -1955,7 +1995,7 @@ fn e2e_lint_ids_only_lints_selected() {
         vec!["lint".to_string(), bug_id.clone()],
         "lint_ids_json",
     );
-    assert_eq!(json["issues"].as_u64(), Some(1));
+    assert_eq!(json["results"].as_array().map(Vec::len), Some(1));
     assert_eq!(json["results"][0]["id"].as_str(), Some(bug_id.as_str()));
 }
 
@@ -1975,8 +2015,8 @@ fn e2e_lint_skips_types_without_required_sections() {
     );
 
     let json = run_lint_json(&workspace, vec!["lint".to_string()], "lint_skip_json");
-    assert_eq!(json["issues"].as_u64(), Some(0));
-    assert_eq!(json["total"].as_u64(), Some(0));
+    assert_eq!(json["warnings"].as_u64(), Some(0));
+    assert_eq!(json["results"].as_array().map(Vec::len), Some(0));
 }
 
 // === Structured JSON Error Output Tests ===
@@ -2192,14 +2232,16 @@ fn e2e_structured_error_ambiguous_id() {
 }
 
 #[test]
-fn e2e_structured_error_jsonl_parse() {
-    let _log = common::test_log("e2e_structured_error_jsonl_parse");
+fn e2e_structured_output_jsonl_parse_warn_and_skip() {
+    let _log = common::test_log("e2e_structured_output_jsonl_parse_warn_and_skip");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
     assert!(init.status.success());
 
-    // Create malformed JSONL
+    // Create malformed JSONL. The default import policy is warn-and-skip:
+    // the line is skipped, counted, and the import still succeeds. (`br sync`
+    // has no --strict flag; strict aborts are covered by `br import --strict`.)
     let beads_dir = workspace.root.join(".beads");
     let issues_path = beads_dir.join("issues.jsonl");
     fs::write(&issues_path, "{ not valid json\n").expect("write bad jsonl");
@@ -2209,20 +2251,26 @@ fn e2e_structured_error_jsonl_parse() {
         ["sync", "--import-only", "--json"],
         "import_bad_json",
     );
-    assert!(!result.status.success());
-    // JSONL parse errors should be exit code 6 (sync errors) or 7 (config)
-    let exit_code = result.status.code().unwrap_or(0);
     assert!(
-        exit_code == 6 || exit_code == 7,
-        "unexpected exit code: {exit_code}"
+        result.status.success(),
+        "warn-and-skip import should succeed: {}",
+        result.stderr
     );
 
-    // The error output should be valid JSON
-    let json = parse_error_json(&result.stdout);
-    if let Some(json) = json {
-        assert!(verify_error_structure(&json), "missing required fields");
-    }
-    // Note: Some errors may not produce structured JSON yet - that's OK
+    // A warning about the skipped line goes to stderr.
+    assert!(
+        result.stderr.to_lowercase().contains("skipping"),
+        "expected a skip warning on stderr, got: {}",
+        result.stderr
+    );
+
+    // The JSON result on stdout is structured and reports the skipped line.
+    let payload = extract_json_payload(&result.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("parse import json");
+    assert!(
+        json["skipped"].as_u64().unwrap_or(0) >= 1,
+        "malformed line should be counted as skipped: {json}"
+    );
 }
 
 #[test]

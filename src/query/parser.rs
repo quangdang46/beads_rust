@@ -29,7 +29,6 @@ impl std::error::Error for ParseError {}
 struct Parser<'a> {
     lexer: Lexer<'a>,
     current: Token,
-    peeked: Option<Token>,
 }
 
 impl<'a> Parser<'a> {
@@ -41,33 +40,16 @@ impl<'a> Parser<'a> {
                 value: String::new(),
                 pos: 0,
             },
-            peeked: None,
         }
     }
 
     fn advance(&mut self) -> Result<(), ParseError> {
-        if let Some(tok) = self.peeked.take() {
-            self.current = tok;
-            Ok(())
-        } else {
-            let tok = self.lexer.next_token().map_err(|msg| ParseError {
-                message: msg,
-                pos: self.current.pos,
-            })?;
-            self.current = tok;
-            Ok(())
-        }
-    }
-
-    fn peek(&mut self) -> Result<&Token, ParseError> {
-        if self.peeked.is_none() {
-            let tok = self.lexer.next_token().map_err(|msg| ParseError {
-                message: msg,
-                pos: self.current.pos,
-            })?;
-            self.peeked = Some(tok);
-        }
-        Ok(self.peeked.as_ref().unwrap())
+        let tok = self.lexer.next_token().map_err(|msg| ParseError {
+            message: msg,
+            pos: self.current.pos,
+        })?;
+        self.current = tok;
+        Ok(())
     }
 
     fn parse(&mut self) -> Result<QueryNode, ParseError> {

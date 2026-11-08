@@ -199,6 +199,15 @@ fn execute_inner(
         OutputFormat::Text | OutputFormat::Csv => print_scheduler_text(&output),
     }
 
+    // `--stats` is documented as stderr-only; for non-TOON formats emit a
+    // compact stats line there so stdout stays machine-clean.
+    if args.stats && !matches!(output_format, OutputFormat::Toon) {
+        eprintln!(
+            "[stats] candidates: {}, recommendations: {}",
+            output.candidate_count, output.returned_count
+        );
+    }
+
     Ok(())
 }
 
@@ -426,7 +435,10 @@ fn score_candidate(
 
     let issue_id = issue.id.clone();
     let issue_title = issue.title.clone();
-    let ready_issue = ReadyIssue::from(issue);
+    let mut ready_issue = ReadyIssue::from(issue);
+    // Ready queries don't hydrate the labels relation — populate from the
+    // labels map so `--json` output carries labels like `br ready`/`br list`.
+    ready_issue.labels = labels.clone();
     let evidence = SchedulerEvidence {
         priority: PriorityEvidence {
             value: ready_issue.priority.0,

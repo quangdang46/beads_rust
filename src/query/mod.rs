@@ -19,7 +19,7 @@ mod lexer;
 mod parser;
 
 pub use ast::{ComparisonOp, QueryNode};
-pub use evaluator::{QueryError, QueryResult, evaluate};
+pub use evaluator::{IssuePredicate, QueryError, QueryResult, evaluate};
 pub use parser::parse;
 
 /// Parse a query string and evaluate it into a `QueryResult`.
