@@ -1296,10 +1296,9 @@ fn e2e_update_honors_toon_env_mode() {
 
     let decoded = try_decode(update.stdout.trim(), None).expect("valid update TOON");
     let json = Value::from(decoded);
-    let results = toon_array_items(&json);
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0]["id"].as_str(), Some(issue_id.as_str()));
-    assert_eq!(results[0]["status"].as_str(), Some("in_progress"));
+    // Single-issue `br update --toon` emits a bare object, not an array.
+    assert_eq!(json["id"].as_str(), Some(issue_id.as_str()));
+    assert_eq!(json["status"].as_str(), Some("in_progress"));
 }
 
 #[test]

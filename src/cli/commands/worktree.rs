@@ -2,11 +2,39 @@
 //!
 //! Delegates to [`crate::worktree`] for all core logic.
 
+use crate::error::BeadsError;
 use crate::output::OutputContext;
 use crate::worktree::{self, BeadsState};
 use anyhow::Result;
 use serde_json::json;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+/// Ensure the current directory is inside a git repository.
+///
+/// Every `br worktree` operation shells out to git; outside a repository
+/// (or without git installed) each call fails and surfaces as an internal
+/// "git command failed" error. Fail fast with a clean typed error instead —
+/// the anyhow→BeadsError downcast in the dispatcher preserves it.
+fn require_git_repository() -> Result<()> {
+    // `--is-inside-work-tree` prints "false" (exit 0) inside bare repos, so
+    // check the output, not just the exit status.
+    let inside = Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map(|output| {
+            output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true"
+        })
+        .unwrap_or(false);
+    if inside {
+        return Ok(());
+    }
+    Err(anyhow::Error::new(BeadsError::Config(
+        "not inside a git repository (or git is not installed)".to_string(),
+    )))
+}
 
 /// Dispatch a [`crate::cli::WorktreeCommand`].
 pub fn execute(command: &crate::cli::WorktreeCommand, ctx: &OutputContext) -> Result<()> {
@@ -19,6 +47,7 @@ pub fn execute(command: &crate::cli::WorktreeCommand, ctx: &OutputContext) -> Re
 }
 
 fn cmd_list(ctx: &OutputContext) -> Result<()> {
+    require_git_repository()?;
     let worktrees = worktree::list_worktrees(None)?;
 
     if ctx.is_json() {
@@ -64,6 +93,7 @@ fn cmd_list(ctx: &OutputContext) -> Result<()> {
 }
 
 fn cmd_info(ctx: &OutputContext) -> Result<()> {
+    require_git_repository()?;
     // Determine beads dir from cwd
     let beads_dir = find_beads_dir().map(PathBuf::from);
     let info = worktree::current_worktree_info(beads_dir.as_deref())?;
@@ -99,6 +129,7 @@ fn cmd_info(ctx: &OutputContext) -> Result<()> {
 }
 
 fn cmd_create(args: &crate::cli::WorktreeCreateArgs, ctx: &OutputContext) -> Result<()> {
+    require_git_repository()?;
     let path = Path::new(&args.path);
     let branch = args.branch.as_deref();
 
@@ -115,6 +146,7 @@ fn cmd_create(args: &crate::cli::WorktreeCreateArgs, ctx: &OutputContext) -> Res
 }
 
 fn cmd_remove(args: &crate::cli::WorktreeRemoveArgs, ctx: &OutputContext) -> Result<()> {
+    require_git_repository()?;
     let removed = worktree::remove_worktree(&args.name, None, args.force)?;
 
     if ctx.is_json() {

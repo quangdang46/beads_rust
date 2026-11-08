@@ -4,17 +4,14 @@
 //! description, design, acceptance criteria, notes, labels, created_by, id)
 //! with list-like filters.
 
-use crate::cli::commands::list::{parse_metadata_filters, parse_time_filter};
-use crate::cli::{
-    DEFAULT_LIST_LIMIT, DEFAULT_LIST_OFFSET, ListArgs, OutputFormat, SearchArgs,
-    resolve_output_format_with_outer_mode,
-};
+use crate::cli::commands::list;
+use crate::cli::{ListArgs, OutputFormat, SearchArgs, resolve_output_format_with_outer_mode};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::{
     IssueWithCounts, TextFormatOptions, csv, format_issue_line_with, terminal_width,
 };
-use crate::model::{Issue, IssueType, MolType, Priority, Status};
+use crate::model::{Issue, IssueType, Status};
 use crate::output::{IssueTable, IssueTableColumns, OutputContext, OutputMode};
 use crate::storage::{ListFilters, SqliteStorage};
 use chrono::Utc;
@@ -122,7 +119,7 @@ fn collect_search_results_with_projection(
     list_args: &ListArgs,
 ) -> Result<Vec<Issue>> {
     validate_search_enum_filters(storage, list_args)?;
-    let mut filters = build_filters(list_args)?;
+    let (mut filters, predicate) = build_filters(list_args)?;
     let client_filters = needs_client_filters(list_args);
     let query = query.trim();
 
@@ -141,6 +138,11 @@ fn collect_search_results_with_projection(
         }
 
         let mut issues = storage.list_issues(&filters)?;
+        // Apply in-memory predicate for complex query DSL expressions
+        // (OR/NOT), mirroring `br list`.
+        if let Some(ref pred) = predicate {
+            issues.retain(|issue| pred(issue));
+        }
         if client_filters {
             issues = apply_client_filters(issues, list_args)?;
         }
@@ -162,6 +164,11 @@ fn collect_search_results_with_projection(
     filters.reverse = false;
 
     let mut issues = storage.list_issues(&filters)?;
+    // Apply in-memory predicate for complex query DSL expressions
+    // (OR/NOT), mirroring `br list`.
+    if let Some(ref pred) = predicate {
+        issues.retain(|issue| pred(issue));
+    }
     if client_filters {
         issues = apply_client_filters(issues, list_args)?;
     }
@@ -576,107 +583,19 @@ fn normalize_whitespace(input: &str) -> String {
     input.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn build_filters(args: &ListArgs) -> Result<ListFilters> {
+/// Build [`ListFilters`] for search by delegating to `list`'s builder so
+/// `--filter` DSL expressions, `--deferred` status pinning, and merged
+/// status visibility stay aligned with `br list`/`br count`. The returned
+/// predicate covers DSL constructs that cannot be pushed into SQL (OR/NOT)
+/// and is applied in-memory by the caller.
+///
+/// Search resolves `--id` client-side (it supports `*` globs), so the SQL
+/// `ids` filter produced by the shared builder is cleared here.
+fn build_filters(args: &ListArgs) -> Result<(ListFilters, Option<crate::query::IssuePredicate>)> {
     validate_sort_key(args.sort.as_deref())?;
-
-    let statuses = if args.status.is_empty() {
-        None
-    } else {
-        Some(
-            args.status
-                .iter()
-                .map(|s| s.parse())
-                .collect::<Result<Vec<Status>>>()?,
-        )
-    };
-
-    let types = if args.type_.is_empty() {
-        None
-    } else {
-        Some(
-            args.type_
-                .iter()
-                .map(|t| t.parse())
-                .collect::<Result<Vec<IssueType>>>()?,
-        )
-    };
-
-    let priorities = if args.priority.is_empty() {
-        None
-    } else {
-        let mut parsed = Vec::new();
-        for p in &args.priority {
-            parsed.push(Priority::from_str(p)?);
-        }
-        Some(parsed)
-    };
-
-    let include_closed = args.all
-        || statuses
-            .as_ref()
-            .is_some_and(|parsed| parsed.iter().any(Status::is_terminal));
-
-    // Deferred issues are included by default (consistent with "open" status semantics).
-    let include_deferred = args.deferred
-        || args.all
-        || statuses.is_none()
-        || statuses
-            .as_ref()
-            .is_some_and(|parsed| parsed.contains(&Status::Deferred));
-
-    Ok(ListFilters {
-        statuses,
-        types,
-        priorities,
-        assignee: args.assignee.clone(),
-        unassigned: args.unassigned,
-        include_closed,
-        include_deferred,
-        include_templates: false,
-        title_contains: args.title_contains.clone(),
-        // Search is unlimited by default, matching the `--limit` help text
-        // ("default: unlimited") and `br list`/`br ready` semantics. Pass
-        // `--limit N` to bound results explicitly.
-        limit: Some(args.limit.unwrap_or(DEFAULT_LIST_LIMIT)),
-        offset: Some(args.offset.unwrap_or(DEFAULT_LIST_OFFSET)),
-        sort: args.sort.clone(),
-        reverse: args.reverse,
-        labels: if args.label.is_empty() {
-            None
-        } else {
-            Some(args.label.clone())
-        },
-        labels_or: if args.label_any.is_empty() {
-            None
-        } else {
-            Some(args.label_any.clone())
-        },
-        updated_before: parse_time_filter(args.updated_before.as_deref())?,
-        updated_after: parse_time_filter(args.updated_after.as_deref())?,
-        ids: None,
-        created_after: parse_time_filter(args.created_after.as_deref())?,
-        created_before: parse_time_filter(args.created_before.as_deref())?,
-        metadata_filters: {
-            let parsed = parse_metadata_filters(&args.metadata)?;
-            if parsed.is_empty() {
-                None
-            } else {
-                Some(
-                    parsed
-                        .into_iter()
-                        .map(|(k, v)| format!("{k}={v}"))
-                        .collect(),
-                )
-            }
-        },
-        owner: args.owner.clone(),
-        pinned: args.pinned.then_some(true),
-        mol_type: args
-            .mol_type
-            .as_ref()
-            .and_then(|m| MolType::from_str(m).ok()),
-        external_ref: args.external_ref.clone(),
-    })
+    let (mut filters, predicate) = list::build_filters(args)?;
+    filters.ids = None;
+    Ok((filters, predicate))
 }
 
 fn needs_client_filters(args: &ListArgs) -> bool {
@@ -907,6 +826,7 @@ fn apply_issue_sort(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::{DEFAULT_LIST_LIMIT, DEFAULT_LIST_OFFSET};
     use crate::model::{Issue, IssueType, Priority, Status};
     use chrono::{DateTime, TimeZone, Utc};
 
@@ -1020,7 +940,7 @@ mod tests {
     fn test_search_build_filters_applies_search_defaults_when_cli_omits_pagination() {
         // Search is unlimited by default (DEFAULT_LIST_LIMIT == 0), matching
         // the `--limit` help text; `--limit N` still bounds explicitly.
-        let filters = build_filters(&ListArgs::default()).expect("build filters");
+        let (filters, _) = build_filters(&ListArgs::default()).expect("build filters");
 
         assert_eq!(filters.limit, Some(DEFAULT_LIST_LIMIT));
         assert_eq!(filters.offset, Some(DEFAULT_LIST_OFFSET));
@@ -1188,6 +1108,8 @@ mod tests {
         let overdue_only_ids: Vec<_> = overdue_only.iter().map(|issue| issue.id.as_str()).collect();
         assert_eq!(overdue_only_ids, vec!["bd-open"]);
 
+        // `--deferred` is restrictive (matches `br list --deferred`): it pins
+        // the status set to `deferred`, so the open overdue issue is excluded.
         let overdue_with_deferred = collect_search_results(
             &storage,
             "match",
@@ -1202,7 +1124,7 @@ mod tests {
             .iter()
             .map(|issue| issue.id.as_str())
             .collect();
-        assert_eq!(overdue_with_deferred_ids, vec!["bd-deferred", "bd-open"]);
+        assert_eq!(overdue_with_deferred_ids, vec!["bd-deferred"]);
 
         let overdue_with_all = collect_search_results(
             &storage,
@@ -1271,7 +1193,7 @@ mod tests {
             reverse: true,
             ..Default::default()
         };
-        let mut filters = build_filters(&args).expect("filters");
+        let (mut filters, _) = build_filters(&args).expect("filters");
         let limit = filters.limit.take();
         filters.sort = None;
         filters.reverse = false;
@@ -1500,5 +1422,81 @@ mod tests {
         let hydrated = attach_counts(&storage, vec![stored_issue]).expect("attach counts");
         assert_eq!(hydrated.len(), 1);
         assert_eq!(hydrated[0].issue.labels, vec!["backend".to_string()]);
+    }
+
+    #[test]
+    fn test_search_deferred_restricts_to_deferred_issues() {
+        let mut storage = SqliteStorage::open_memory().expect("db");
+        let created_at = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+
+        let open_issue = make_issue("bd-open", "match open", None, created_at);
+        let mut deferred_issue = make_issue("bd-deferred", "match deferred", None, created_at);
+        deferred_issue.status = Status::Deferred;
+
+        storage.create_issue(&open_issue, "tester").expect("create");
+        storage
+            .create_issue(&deferred_issue, "tester")
+            .expect("create");
+
+        // Without --deferred both issues match (deferred is included by default).
+        let all =
+            collect_search_results(&storage, "match", &ListArgs::default()).expect("search all");
+        assert_eq!(all.len(), 2);
+
+        // With --deferred only the deferred issue is returned.
+        let deferred_only = collect_search_results(
+            &storage,
+            "match",
+            &ListArgs {
+                deferred: true,
+                ..Default::default()
+            },
+        )
+        .expect("search deferred");
+        assert_eq!(deferred_only.len(), 1);
+        assert_eq!(deferred_only[0].id, "bd-deferred");
+    }
+
+    #[test]
+    fn test_search_deferred_conflicts_with_excluding_status() {
+        let mut storage = SqliteStorage::open_memory().expect("db");
+        let issue = make_issue("bd-001", "match title", None, Utc::now());
+        storage.create_issue(&issue, "tester").expect("create");
+
+        let args = ListArgs {
+            deferred: true,
+            status: vec!["open".to_string()],
+            ..ListArgs::default()
+        };
+        let err = collect_search_results(&storage, "match", &args)
+            .expect_err("--deferred + --status open must error");
+        assert!(
+            matches!(
+                err,
+                BeadsError::Validation { ref field, ref reason }
+                    if field == "status" && reason.contains("deferred")
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_search_deferred_with_deferred_status_is_allowed() {
+        let mut storage = SqliteStorage::open_memory().expect("db");
+        let created_at = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let mut deferred_issue = make_issue("bd-deferred", "match deferred", None, created_at);
+        deferred_issue.status = Status::Deferred;
+        storage
+            .create_issue(&deferred_issue, "tester")
+            .expect("create");
+
+        let args = ListArgs {
+            deferred: true,
+            status: vec!["deferred".to_string()],
+            ..ListArgs::default()
+        };
+        let results = collect_search_results(&storage, "match", &args).expect("search");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "bd-deferred");
     }
 }

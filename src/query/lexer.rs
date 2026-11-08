@@ -181,6 +181,7 @@ impl<'a> Lexer<'a> {
                         || ch == '-'
                         || ch == '.'
                         || ch == '*'
+                        || ch == '@'
                     {
                         self.next();
                     } else {
@@ -269,7 +270,17 @@ impl<'a> Lexer<'a> {
 
     fn read_ident_or_keyword(&mut self, start: usize) -> Token {
         while let Some(&ch) = self.peek() {
-            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '.' || ch == '*' {
+            // `@` is allowed inside identifiers so unquoted email-like values
+            // (e.g. `owner=alice@example.com`) lex as a single token instead
+            // of failing on the `@`. It is intentionally NOT an ident start
+            // character, so `foo@bar` still cannot begin a field name.
+            if ch.is_ascii_alphanumeric()
+                || ch == '_'
+                || ch == '-'
+                || ch == '.'
+                || ch == '*'
+                || ch == '@'
+            {
                 self.next();
             } else {
                 break;

@@ -3606,6 +3606,13 @@ impl ConfigLayer {
             if let Some(stripped) = key.strip_prefix("BD_") {
                 let normalized = stripped.to_lowercase();
                 for variant in env_key_variants(&normalized) {
+                    if !is_known_env_config_key(&variant) {
+                        tracing::debug!(
+                            env_var = %key,
+                            "Ignoring BD_* environment variable: not a known config key"
+                        );
+                        continue;
+                    }
                     insert_key_value(&mut layer, &variant, value.clone());
                 }
             }
@@ -4654,6 +4661,58 @@ fn env_key_variants(raw: &str) -> Vec<String> {
     vec![raw.to_lowercase()]
 }
 
+/// Config keys (in [`normalize_key`] form, i.e. `-` separators) that `BD_*`
+/// environment variables are allowed to set.
+///
+/// Derived from the keys actually read by the `*_from_layer` config
+/// consumers (`get_value`/`get_startup_value` call sites) plus the exact
+/// startup keys declared by [`is_startup_key`]. Anything else — typos,
+/// unrelated shell variables, or keys no consumer reads — is ignored so it
+/// cannot pollute `br config list` or the merged config with phantom
+/// entries (e.g. `BD_FOO=bar` used to produce `foo: bar`).
+const KNOWN_ENV_CONFIG_KEYS: &[&str] = &[
+    // Runtime keys read via `get_value`.
+    "issue-prefix",
+    "prefix",
+    "default-priority",
+    "default-type",
+    "display-color",
+    "min-hash-length",
+    "max-hash-length",
+    "max-collision-prob",
+    // Startup keys read via `get_startup_value`.
+    "no-db",
+    "no-auto-flush",
+    "no-history",
+    "no-auto-import",
+    "sync-auto-flush",
+    "sync-auto-import",
+    "sync-history-enabled",
+    "actor",
+    "claim-exclusive",
+    "db",
+    "database",
+    "lock-timeout",
+    // Remaining exact startup keys declared by `is_startup_key`.
+    "no-daemon",
+    "json",
+    "identity",
+    "flush-debounce",
+    "remote-sync-interval",
+    "no-git-ops",
+    "no-push",
+    "sync-branch",
+    "external-projects",
+    "hierarchy-max-depth",
+];
+
+/// Whether a `BD_*` env-var suffix maps to a config key that any consumer
+/// actually reads. `raw` is the lowercased env suffix (e.g. `issue_prefix`).
+fn is_known_env_config_key(raw: &str) -> bool {
+    let normalized = normalize_key(raw);
+    KNOWN_ENV_CONFIG_KEYS.contains(&normalized.as_str())
+}
+
 fn parse_bool(value: &str) -> Option<bool> {
     match value.trim().to_lowercase().as_str() {
         "1" | "true" | "yes" | "y" | "on" => Some(true),
@@ -5639,6 +5698,64 @@ labels:
         // underscore/dotted/hyphenated variants stored phantom duplicates.
         let variants = env_key_variants("no_auto_flush");
         assert_eq!(variants, vec!["no_auto_flush".to_string()]);
+    }
+
+    #[test]
+    fn is_known_env_config_key_accepts_consumed_keys() {
+        // Keys read by `*_from_layer` consumers and declared startup keys.
+        for key in [
+            "issue_prefix",
+            "prefix",
+            "default_priority",
+            "default_type",
+            "display_color",
+            "min_hash_length",
+            "max_hash_length",
+            "max_collision_prob",
+            "no_db",
+            "no_auto_flush",
+            "no_history",
+            "no_auto_import",
+            "sync_auto_flush",
+            "sync_auto_import",
+            "sync_history_enabled",
+            "actor",
+            "db",
+            "database",
+            "lock_timeout",
+            "no_daemon",
+            "json",
+            "identity",
+            "flush_debounce",
+            "remote_sync_interval",
+            "no_git_ops",
+            "no_push",
+            "sync_branch",
+            "external_projects",
+            "hierarchy_max_depth",
+        ] {
+            assert!(
+                is_known_env_config_key(key),
+                "expected {key} to be a known env config key"
+            );
+        }
+    }
+
+    #[test]
+    fn is_known_env_config_key_rejects_unknown_keys() {
+        // Arbitrary BD_* vars must not create phantom config keys.
+        for key in [
+            "foo",
+            "bogus",
+            "no_autoflush",    // typo of no_auto_flush — not a real key
+            "git_auto_commit", // git.* family has no env consumer
+            "sync_unknown_toggle",
+        ] {
+            assert!(
+                !is_known_env_config_key(key),
+                "expected {key} to be rejected as an env config key"
+            );
+        }
     }
 
     #[test]

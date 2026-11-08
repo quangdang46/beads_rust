@@ -14,6 +14,32 @@
 use crate::Result;
 use crate::error::BeadsError;
 use crate::output::OutputContext;
+use std::process::{Command, Stdio};
+
+/// Ensure the current directory is inside a git repository.
+///
+/// `br hooks` operates on `.git/hooks/`; outside a repository (or without
+/// git installed) `find_git_info` fails with an internal error. Fail fast
+/// with a clean typed error instead.
+fn require_git_repository() -> Result<()> {
+    // `--is-inside-work-tree` prints "false" (exit 0) inside bare repos, so
+    // check the output, not just the exit status.
+    let inside = Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map(|output| {
+            output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true"
+        })
+        .unwrap_or(false);
+    if inside {
+        return Ok(());
+    }
+    Err(BeadsError::Config(
+        "not inside a git repository (or git is not installed)".to_string(),
+    ))
+}
 
 /// Execute the `hooks` subcommand.
 ///
@@ -31,6 +57,7 @@ pub fn execute(command: &crate::cli::HooksCommand, ctx: &OutputContext) -> Resul
 
 /// Install managed git hooks.
 fn cmd_install(args: &crate::cli::HooksInstallArgs, ctx: &OutputContext) -> Result<()> {
+    require_git_repository()?;
     let git_info = crate::hooks::find_git_info()?;
     let all_hooks = args.all;
 
@@ -84,6 +111,7 @@ fn cmd_install(args: &crate::cli::HooksInstallArgs, ctx: &OutputContext) -> Resu
 
 /// Uninstall managed git hooks.
 fn cmd_uninstall(args: &crate::cli::HooksUninstallArgs, ctx: &OutputContext) -> Result<()> {
+    require_git_repository()?;
     let git_info = crate::hooks::find_git_info()?;
 
     if let Some(name) = &args.hook {
@@ -142,6 +170,7 @@ fn cmd_uninstall(args: &crate::cli::HooksUninstallArgs, ctx: &OutputContext) -> 
 
 /// List the status of all managed hooks.
 fn cmd_list(ctx: &OutputContext) -> Result<()> {
+    require_git_repository()?;
     let statuses = crate::hooks::check_hooks_status()?;
 
     if ctx.is_json() || ctx.is_toon() {

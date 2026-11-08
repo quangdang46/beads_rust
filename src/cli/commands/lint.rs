@@ -6,7 +6,7 @@ use super::{
     acquire_routed_workspace_write_lock, auto_import_storage_ctx_if_stale,
     cli_for_routed_workspace, resolve_issue_id,
 };
-use crate::cli::LintArgs;
+use crate::cli::{LintArgs, resolve_output_format_basic_with_outer_mode};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::sanitize_terminal_inline;
@@ -136,6 +136,8 @@ pub fn execute(
     ctx: &OutputContext,
 ) -> Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
+    let format_ctx = lint_format_context(args, cli, ctx);
+    let ctx = format_ctx.as_ref().unwrap_or(ctx);
 
     let issues = if args.ids.is_empty() {
         let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
@@ -164,9 +166,51 @@ pub fn execute_with_storage_ctx(
         return Ok(false);
     }
 
+    // `execute_with_storage_ctx` has no `CliOverrides`; rebuild the context
+    // only from the command-level `--format` flag and the inherited mode.
+    let format_ctx = lint_format_context_without_cli(args, ctx);
+    let ctx = format_ctx.as_ref().unwrap_or(ctx);
+
     let issues = lint_issues_with_storage(args, &storage_ctx.storage)?;
     render_lint_output(lint_issues(&issues), ctx, args.allow_warnings);
     Ok(true)
+}
+
+/// Build an [`OutputContext`] honoring the command-level `--format` flag.
+///
+/// Returns `None` when no explicit format was requested so callers keep the
+/// inherited outer context (global `--json`/`--quiet`/TTY detection).
+fn lint_format_context(
+    args: &LintArgs,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+) -> Option<OutputContext> {
+    lint_format_context_inner(
+        args,
+        ctx,
+        cli.quiet.unwrap_or(false),
+        cli.display_color == Some(false),
+    )
+}
+
+fn lint_format_context_without_cli(args: &LintArgs, ctx: &OutputContext) -> Option<OutputContext> {
+    lint_format_context_inner(args, ctx, ctx.is_quiet(), false)
+}
+
+fn lint_format_context_inner(
+    args: &LintArgs,
+    ctx: &OutputContext,
+    quiet: bool,
+    no_color: bool,
+) -> Option<OutputContext> {
+    args.format.map(|format| {
+        let resolved = resolve_output_format_basic_with_outer_mode(
+            Some(format),
+            ctx.inherited_output_mode(),
+            false,
+        );
+        OutputContext::from_output_format(resolved, quiet || ctx.is_quiet(), no_color)
+    })
 }
 
 fn lint_issues_with_storage(args: &LintArgs, storage: &SqliteStorage) -> Result<Vec<Issue>> {

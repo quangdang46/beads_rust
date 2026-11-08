@@ -2106,12 +2106,12 @@ pub struct ListArgs {
     #[arg(long, add = ArgValueCompleter::new(issue_id_completer))]
     pub id: Vec<String>,
 
-    /// Filter by label (AND logic, can be repeated)
-    #[arg(long, short = 'l', add = ArgValueCompleter::new(label_completer))]
+    /// Filter by label (AND logic, repeatable or comma-separated)
+    #[arg(long, short = 'l', value_delimiter = ',', add = ArgValueCompleter::new(label_completer_delimited))]
     pub label: Vec<String>,
 
-    /// Filter by label (OR logic, can be repeated)
-    #[arg(long, add = ArgValueCompleter::new(label_completer))]
+    /// Filter by label (OR logic, repeatable or comma-separated)
+    #[arg(long, value_delimiter = ',', add = ArgValueCompleter::new(label_completer_delimited))]
     pub label_any: Vec<String>,
 
     /// Filter by priority (can be repeated)
@@ -3024,6 +3024,10 @@ pub struct LintArgs {
     /// template sections as advisory rather than blocking.
     #[arg(long)]
     pub allow_warnings: bool,
+
+    /// Output format (text, json, toon). Env: BR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT.
+    #[arg(long, value_enum)]
+    pub format: Option<OutputFormatBasic>,
 }
 
 /// Arguments for the defer command.

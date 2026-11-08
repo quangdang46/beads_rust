@@ -1129,9 +1129,11 @@ fn e2e_dotted_ids_survive_no_db_import_update_dep_and_flush() {
         "dotted_no_db_update",
     );
     assert_br_success(&no_db_update, "no-db update failed for dotted id");
-    let updated = parse_json_array(&no_db_update.stdout, "update json");
-    assert_eq!(updated[0]["id"].as_str(), Some("bd-rchk0.5.6"));
-    assert_eq!(updated[0]["priority"].as_i64(), Some(1));
+    // `br update --json` emits a bare object for a single updated issue
+    // (single-entity convention, matching `br show --json`).
+    let updated = parse_json_value(&no_db_update.stdout);
+    assert_eq!(updated["id"].as_str(), Some("bd-rchk0.5.6"));
+    assert_eq!(updated["priority"].as_i64(), Some(1));
 
     let imported = run_br(
         &workspace,
@@ -1172,9 +1174,10 @@ fn e2e_dotted_ids_survive_no_db_import_update_dep_and_flush() {
         "dotted_db_update",
     );
     assert_br_success(&db_update, "db update failed for dotted id");
-    let db_update_json = parse_json_array(&db_update.stdout, "db update json");
-    assert_eq!(db_update_json[0]["id"].as_str(), Some("bd-rchk0.5.6"));
-    assert_eq!(db_update_json[0]["priority"].as_i64(), Some(0));
+    // Single-issue `br update --json` emits a bare object, not an array.
+    let db_update_json = parse_json_value(&db_update.stdout);
+    assert_eq!(db_update_json["id"].as_str(), Some("bd-rchk0.5.6"));
+    assert_eq!(db_update_json["priority"].as_i64(), Some(0));
 
     let dep_add = run_br(
         &workspace,

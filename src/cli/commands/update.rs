@@ -365,10 +365,21 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
         crate::util::set_last_touched_id(&beads_dir, last_id);
     }
 
+    // Single-entity convention (matches `br create --json`/`br show --json`):
+    // `br update` accepts multiple IDs, so emit a bare object when exactly
+    // one issue was updated and keep the array shape for batch updates.
     if ctx.is_toon() {
-        ctx.toon(&updated_issues);
+        if let [issue] = updated_issues.as_slice() {
+            ctx.toon(issue);
+        } else {
+            ctx.toon(&updated_issues);
+        }
     } else if ctx.is_json() {
-        ctx.json_pretty(&updated_issues);
+        if let [issue] = updated_issues.as_slice() {
+            ctx.json_pretty(issue);
+        } else {
+            ctx.json_pretty(&updated_issues);
+        }
     } else if !ctx.is_quiet() {
         print_render_items(&render_items);
         // beads_rust#297: emit inherited governing context for any

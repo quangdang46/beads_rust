@@ -626,6 +626,9 @@ pub struct ImportResult {
     pub orphans_removed: usize,
     /// Number of orphaned FK rows cleaned after deferred-FK import.
     pub orphan_cleaned_count: usize,
+    /// Number of dependency rows dropped because an endpoint referenced a
+    /// missing issue (beads_rust-xgxmi). `external:` endpoints are exempt.
+    pub orphan_deps_skipped: usize,
     /// Number of label rows imported from JSONL for applied issue records.
     pub labels_imported: usize,
     /// Number of dependency rows imported from JSONL for applied issue records.
@@ -2073,6 +2076,62 @@ fn increment_progress(progress: Option<&ProgressBar>) {
     }
 }
 
+/// Best-effort JSONL analysis for the export overwrite safety check.
+///
+/// Unlike [`analyze_jsonl`], lines that fail to parse and duplicate issue
+/// IDs are skipped instead of failing the whole scan: the caller uses this
+/// to decide whether overwriting an existing file could lose issues, and
+/// partial information beats none when the file is corrupt.
+///
+/// Returns `(content_lines, issue_ids, unparseable_lines)` where
+/// `content_lines` counts every non-blank line (parseable or not),
+/// `issue_ids` holds the IDs recovered from parseable lines, and
+/// `unparseable_lines` counts non-blank lines that were not valid JSON
+/// objects with an `id`.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be opened or read.
+fn analyze_jsonl_lenient(path: &Path) -> Result<(usize, HashSet<String>, usize)> {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((0, HashSet::new(), 0));
+        }
+        Err(e) => return Err(BeadsError::Io(e)),
+    };
+    path::validate_jsonl_fd_metadata(&file, path)?;
+
+    let mut reader = BufReader::new(file);
+    let mut line_buf = String::new();
+    let mut content_lines = 0usize;
+    let mut unparseable_lines = 0usize;
+    let mut ids = HashSet::new();
+
+    loop {
+        line_buf.clear();
+        let bytes = reader.read_line(&mut line_buf)?;
+        if bytes == 0 {
+            break;
+        }
+
+        let trimmed = line_buf.trim_end_matches(['\n', '\r']);
+        if trimmed.trim().is_empty() {
+            continue;
+        }
+        content_lines += 1;
+
+        match serde_json::from_str::<PartialId>(trimmed) {
+            Ok(partial) => {
+                ids.insert(partial.id);
+            }
+            Err(_) => unparseable_lines += 1,
+        }
+    }
+
+    Ok((content_lines, ids, unparseable_lines))
+}
+
 /// Export issues from `SQLite` to JSONL format.
 ///
 /// This implements the classic beads export semantics:
@@ -2146,7 +2205,33 @@ pub fn export_to_jsonl_with_policy(
 
     // Safety checks
     if !config.force && output_path.exists() {
-        let (jsonl_count, jsonl_ids) = analyze_jsonl(output_path)?;
+        // The checks below compare the database against the OLD file at
+        // `output_path`. That file may be corrupt or partially written;
+        // `export -o` is an explicit request to replace it and the write
+        // itself is already atomic (temp file + rename), so an unreadable
+        // target must not fail the export with a config error. Fall back
+        // to a lenient scan that recovers whatever issue IDs still parse.
+        let (jsonl_count, jsonl_ids, unparseable_lines) = match analyze_jsonl(output_path) {
+            Ok((count, ids)) => (count, ids, 0usize),
+            Err(err) => {
+                tracing::warn!(
+                    path = %output_path.display(),
+                    error = %err,
+                    "Existing JSONL could not be fully parsed; \
+                     using lenient scan for export safety checks"
+                );
+                let (content_lines, ids, bad_lines) = analyze_jsonl_lenient(output_path)?;
+                (content_lines, ids, bad_lines)
+            }
+        };
+        if unparseable_lines > 0 {
+            tracing::warn!(
+                path = %output_path.display(),
+                unparseable_lines,
+                "Existing JSONL has unparseable line(s); \
+                 the stale-export safety check only covers parseable issue IDs"
+            );
+        }
 
         // Check 1: prevent exporting empty database over non-empty JSONL
         if export_ids.is_empty() && jsonl_count > 0 {
@@ -4544,7 +4629,15 @@ fn apply_collision_renames(issue: &mut Issue, renames: &HashMap<String, String>)
     }
 }
 
-fn cleanup_import_orphans_in_tx(storage: &SqliteStorage) -> Result<usize> {
+/// Outcome of the post-import orphan sweep: total rows removed plus the
+/// subset removed from `dependencies` (the only table whose drops are
+/// user-visible data loss — a dep edge silently vanishing, beads_rust-xgxmi).
+struct ImportOrphanCleanup {
+    total: usize,
+    dependency_rows: usize,
+}
+
+fn cleanup_import_orphans_in_tx(storage: &SqliteStorage) -> Result<ImportOrphanCleanup> {
     let orphan_tables = &[
         ("dependencies", "issue_id"),
         ("dependencies", "depends_on_id"),
@@ -4556,6 +4649,7 @@ fn cleanup_import_orphans_in_tx(storage: &SqliteStorage) -> Result<usize> {
         ("child_counters", "parent_id"),
     ];
     let mut orphans_cleaned = 0usize;
+    let mut dependency_orphans = 0usize;
 
     for (table, col) in orphan_tables {
         let external_dependency_filter = match (*table, *col) {
@@ -4566,10 +4660,17 @@ fn cleanup_import_orphans_in_tx(storage: &SqliteStorage) -> Result<usize> {
         let sql = format!(
             "DELETE FROM {table} WHERE {col} NOT IN (SELECT id FROM issues){external_dependency_filter}"
         );
-        orphans_cleaned += storage.execute_raw_count(&sql)?;
+        let removed = storage.execute_raw_count(&sql)?;
+        orphans_cleaned += removed;
+        if *table == "dependencies" {
+            dependency_orphans += removed;
+        }
     }
 
-    Ok(orphans_cleaned)
+    Ok(ImportOrphanCleanup {
+        total: orphans_cleaned,
+        dependency_rows: dependency_orphans,
+    })
 }
 
 fn skipped_import_matches_stored_issue(
@@ -4701,13 +4802,37 @@ fn stream_import_actions_in_tx(
         storage.set_metadata_in_tx("needs_flush", "true")?;
     }
 
-    let orphans_cleaned = cleanup_import_orphans_in_tx(storage)?;
-    if orphans_cleaned > 0 {
+    let orphan_cleanup = cleanup_import_orphans_in_tx(storage)?;
+    if orphan_cleanup.total > 0 {
         tracing::info!(
-            count = orphans_cleaned,
+            count = orphan_cleanup.total,
             "Cleaned orphaned FK rows after import"
         );
-        tx_result.orphan_cleaned_count = orphans_cleaned;
+        tx_result.orphan_cleaned_count = orphan_cleanup.total;
+    }
+    if orphan_cleanup.dependency_rows > 0 {
+        // Orphan dependency edges are silently dropped by the sweep above;
+        // surface the count so `br import` is not silently lossy
+        // (beads_rust-xgxmi). Strict mode treats them like any other invalid
+        // entry and aborts the import.
+        if config.strict {
+            return Err(BeadsError::validation(
+                "jsonl import",
+                format!(
+                    "{} dependency row(s) reference missing issues and cannot be imported",
+                    orphan_cleanup.dependency_rows
+                ),
+            ));
+        }
+        tracing::warn!(
+            count = orphan_cleanup.dependency_rows,
+            "Skipped dependency rows referencing missing issues during import"
+        );
+        eprintln!(
+            "Warning: import dropped {} dependency row(s) referencing missing issues",
+            orphan_cleanup.dependency_rows
+        );
+        tx_result.orphan_deps_skipped = orphan_cleanup.dependency_rows;
     }
 
     tx_result.blocked_cache_entries = storage.rebuild_blocked_cache_in_tx()?;
@@ -6399,6 +6524,86 @@ mod tests {
     }
 
     #[test]
+    fn test_export_overwrites_corrupt_jsonl() {
+        // Regression: `br export -o` used to fail with a config error when
+        // the target JSONL existed but was corrupt, because the safety
+        // preflight could not parse the OLD file. The write is already
+        // atomic (temp file + rename), so a corrupt target must not block
+        // an explicit export.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let output_path = temp_dir.path().join("issues.jsonl");
+
+        let issue = make_test_issue("bd-001", "Real issue");
+        storage.create_issue(&issue, "test").unwrap();
+
+        fs::write(&output_path, "this is not json{{{\n").unwrap();
+
+        let config = ExportConfig::default();
+        let result = export_to_jsonl(&storage, &output_path, &config);
+        assert!(
+            result.is_ok(),
+            "export over corrupt JSONL should succeed: {:?}",
+            result.err()
+        );
+
+        // The rewritten file must be valid JSONL containing the DB issue.
+        let read_back = read_issues_from_jsonl(&output_path).unwrap();
+        assert_eq!(read_back.len(), 1);
+        assert_eq!(read_back[0].id, "bd-001");
+    }
+
+    #[test]
+    fn test_export_corrupt_jsonl_still_blocks_stale_db() {
+        // The lenient fallback must not weaken the stale-database guard:
+        // issue IDs recovered from the parseable lines of a corrupt file
+        // still count as "JSONL issues the DB is missing".
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let output_path = temp_dir.path().join("issues.jsonl");
+
+        let issue = make_test_issue("bd-001", "In DB");
+        storage.create_issue(&issue, "test").unwrap();
+
+        // One valid line whose ID is absent from the DB, plus garbage.
+        let missing = make_test_issue("bd-missing", "Only in JSONL");
+        fs::write(
+            &output_path,
+            format!(
+                "{}\nnot json at all\n",
+                serde_json::to_string(&missing).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let config = ExportConfig::default();
+        let result = export_to_jsonl(&storage, &output_path, &config);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("stale database") || err.contains("lose"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_export_empty_db_over_corrupt_jsonl_refuses() {
+        // An empty DB must still not overwrite a non-empty (even if
+        // corrupt) JSONL — the file may hold the only copy of issues.
+        let storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let output_path = temp_dir.path().join("issues.jsonl");
+
+        fs::write(&output_path, "garbage{{{\n").unwrap();
+
+        let config = ExportConfig::default();
+        let result = export_to_jsonl(&storage, &output_path, &config);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("empty database"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn test_count_issues_in_jsonl() {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("test.jsonl");
@@ -7595,7 +7800,14 @@ mod tests {
 
         let cleaned = cleanup_import_orphans_in_tx(&storage).unwrap();
 
-        assert_eq!(cleaned, 1, "only the real local orphan should be removed");
+        assert_eq!(
+            cleaned.total, 1,
+            "only the real local orphan should be removed"
+        );
+        assert_eq!(
+            cleaned.dependency_rows, 0,
+            "external dependency endpoints must not count as dropped deps"
+        );
         let external_rows = storage
             .execute_raw_query(
                 "SELECT issue_id, depends_on_id
@@ -7607,6 +7819,73 @@ mod tests {
             external_rows.len(),
             1,
             "external dependency endpoints must survive import cleanup"
+        );
+    }
+
+    fn make_issue_with_orphan_dep(id: &str, missing_target: &str) -> Issue {
+        let mut issue = make_test_issue(id, "Issue with dangling dep");
+        issue.dependencies.push(crate::model::Dependency {
+            issue_id: id.to_string(),
+            depends_on_id: missing_target.to_string(),
+            dep_type: crate::model::DependencyType::Blocks,
+            created_at: issue.created_at,
+            created_by: None,
+            metadata: None,
+            thread_id: None,
+        });
+        issue
+    }
+
+    #[test]
+    fn test_import_reports_orphan_dependency_rows() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("issues.jsonl");
+
+        let issue = make_issue_with_orphan_dep("bd-orphandep", "bd-does-not-exist");
+        let json = serde_json::to_string(&issue).unwrap();
+        fs::write(&path, format!("{json}\n")).unwrap();
+
+        let result =
+            import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd-")).unwrap();
+
+        assert_eq!(result.imported_count, 1);
+        assert_eq!(
+            result.orphan_deps_skipped, 1,
+            "dropped orphan dep must be counted on ImportResult"
+        );
+        assert!(
+            storage
+                .get_dependencies_full("bd-orphandep")
+                .unwrap()
+                .is_empty(),
+            "orphan dep row must still be dropped, not imported dangling"
+        );
+    }
+
+    #[test]
+    fn test_import_strict_rejects_orphan_dependency_rows() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("issues.jsonl");
+
+        let issue = make_issue_with_orphan_dep("bd-orphandep", "bd-does-not-exist");
+        let json = serde_json::to_string(&issue).unwrap();
+        fs::write(&path, format!("{json}\n")).unwrap();
+
+        let config = ImportConfig {
+            strict: true,
+            ..ImportConfig::default()
+        };
+        let err = import_from_jsonl(&mut storage, &path, &config, Some("bd-")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("dependency row(s) reference missing issues"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            storage.get_issue("bd-orphandep").unwrap().is_none(),
+            "strict import must roll back the issue insert too"
         );
     }
 

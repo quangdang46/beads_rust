@@ -742,10 +742,9 @@ fn e2e_routing_update_external_issue_via_main_workspace() {
     assert!(update.status.success(), "update failed: {}", update.stderr);
     let update_payload = extract_json_payload(&update.stdout);
     let updated: Value = serde_json::from_str(&update_payload).expect("update json");
-    let updated_array = updated.as_array().expect("update array");
-    assert_eq!(updated_array.len(), 1);
-    assert_eq!(updated_array[0]["id"].as_str(), Some(external_id.as_str()));
-    assert_eq!(updated_array[0]["status"].as_str(), Some("in_progress"));
+    // Single-issue `br update --json` emits a bare object, not an array.
+    assert_eq!(updated["id"].as_str(), Some(external_id.as_str()));
+    assert_eq!(updated["status"].as_str(), Some("in_progress"));
 
     let show_external = run_br(
         &external_workspace,
@@ -1427,9 +1426,8 @@ fn e2e_routing_label_add_sets_invoking_workspace_last_touched_for_follow_up_upda
     assert!(update.status.success(), "update failed: {}", update.stderr);
     let updated: Value =
         serde_json::from_str(&extract_json_payload(&update.stdout)).expect("update json");
-    let updated_array = updated.as_array().expect("update array");
-    assert_eq!(updated_array.len(), 1);
-    assert_eq!(updated_array[0]["id"].as_str(), Some(external_id.as_str()));
+    // Single-issue `br update --json` emits a bare object, not an array.
+    assert_eq!(updated["id"].as_str(), Some(external_id.as_str()));
 
     let show_external = run_br(
         &external_workspace,
@@ -1684,9 +1682,8 @@ fn e2e_routing_comments_add_sets_invoking_workspace_last_touched_for_follow_up_u
     assert!(update.status.success(), "update failed: {}", update.stderr);
     let updated: Value =
         serde_json::from_str(&extract_json_payload(&update.stdout)).expect("update json");
-    let updated_array = updated.as_array().expect("update array");
-    assert_eq!(updated_array.len(), 1);
-    assert_eq!(updated_array[0]["id"].as_str(), Some(external_id.as_str()));
+    // Single-issue `br update --json` emits a bare object, not an array.
+    assert_eq!(updated["id"].as_str(), Some(external_id.as_str()));
 
     let show_external = run_br(
         &external_workspace,
@@ -1877,9 +1874,8 @@ fn e2e_routing_dep_add_sets_invoking_workspace_last_touched_for_follow_up_update
     assert!(update.status.success(), "update failed: {}", update.stderr);
     let updated: Value =
         serde_json::from_str(&extract_json_payload(&update.stdout)).expect("update json");
-    let updated_array = updated.as_array().expect("update array");
-    assert_eq!(updated_array.len(), 1);
-    assert_eq!(updated_array[0]["id"].as_str(), Some(child_id.as_str()));
+    // Single-issue `br update --json` emits a bare object, not an array.
+    assert_eq!(updated["id"].as_str(), Some(child_id.as_str()));
 
     let shown = show_issue_json(
         &external_workspace,
@@ -2475,10 +2471,9 @@ fn e2e_routing_update_external_issue_uses_metadata_database_path() {
     assert!(update.status.success(), "update failed: {}", update.stderr);
     let update_payload = extract_json_payload(&update.stdout);
     let updated: Value = serde_json::from_str(&update_payload).expect("update json");
-    let updated_array = updated.as_array().expect("update array");
-    assert_eq!(updated_array.len(), 1);
-    assert_eq!(updated_array[0]["id"].as_str(), Some(external_id.as_str()));
-    assert_eq!(updated_array[0]["status"].as_str(), Some("in_progress"));
+    // Single-issue `br update --json` emits a bare object, not an array.
+    assert_eq!(updated["id"].as_str(), Some(external_id.as_str()));
+    assert_eq!(updated["status"].as_str(), Some("in_progress"));
 
     let show_external = run_br(
         &external_workspace,

@@ -898,6 +898,14 @@ mod tests {
     }
 
     #[test]
+    fn test_owner_filter_unquoted_email() {
+        // Regression: `owner=alice@example.com` used to fail tokenization on
+        // the `@` (or silently mismatch). `@` is now a valid ident character.
+        let result = parse_and_evaluate("owner=alice@example.com").unwrap();
+        assert_eq!(result.filters.owner, Some("alice@example.com".to_string()));
+    }
+
+    #[test]
     fn test_iso_date_created() {
         let result = parse_and_evaluate("created_at>2026-01-15").unwrap();
         assert!(!result.requires_predicate);

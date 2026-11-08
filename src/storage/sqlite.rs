@@ -3809,7 +3809,11 @@ impl SqliteStorage {
 
             let rows = db::query_rows_with(&self.conn(), &sql, &params)?;
             for row in &rows {
-                issues.push(Self::issue_from_row(row)?);
+                if let Some(issue) =
+                    Self::parse_row_lenient(row, "get_issues_by_ids", Self::issue_from_row)
+                {
+                    issues.push(issue);
+                }
             }
         }
 
@@ -4129,7 +4133,9 @@ impl SqliteStorage {
         let rows = db::query_rows_with(&self.conn(), &sql, &params)?;
         let mut issues = Vec::with_capacity(rows.len());
         for row in &rows {
-            issues.push(Self::issue_from_row(row)?);
+            if let Some(issue) = Self::parse_row_lenient(row, "list_issues", Self::issue_from_row) {
+                issues.push(issue);
+            }
         }
         if sort_default_in_rust {
             sort_list_default(&mut issues);
@@ -4174,7 +4180,13 @@ impl SqliteStorage {
             let rows =
                 db::query_rows_with(&self.conn(), &sql, &[SqlValue::from(i64::from(priority))])?;
             for row in &rows {
-                issues.push(Self::issue_from_row(row.as_slice())?);
+                if let Some(issue) = Self::parse_row_lenient(
+                    row.as_slice(),
+                    "list_default_visible_limited_page",
+                    Self::issue_from_row,
+                ) {
+                    issues.push(issue);
+                }
             }
         }
 
@@ -4268,7 +4280,13 @@ impl SqliteStorage {
         let rows = db::query_all(&self.conn(), &sql)?;
         let mut issues = Vec::with_capacity(rows.len());
         for row in &rows {
-            issues.push(Self::command_summary_issue_from_row(row)?);
+            if let Some(issue) = Self::parse_row_lenient(
+                row,
+                "command_summary_issue_from_row",
+                Self::command_summary_issue_from_row,
+            ) {
+                issues.push(issue);
+            }
         }
         Ok(issues)
     }
@@ -4320,7 +4338,13 @@ impl SqliteStorage {
                 if issues.len() == limit {
                     break;
                 }
-                issues.push(Self::command_summary_issue_from_row(row)?);
+                if let Some(issue) = Self::parse_row_lenient(
+                    row,
+                    "command_summary_issue_from_row",
+                    Self::command_summary_issue_from_row,
+                ) {
+                    issues.push(issue);
+                }
             }
             offset = 0;
         }
@@ -4420,7 +4444,13 @@ impl SqliteStorage {
         let rows = db::query_rows_with(&self.conn(), &sql, &params)?;
         let mut issues = Vec::with_capacity(rows.len());
         for row in &rows {
-            issues.push(Self::stale_command_issue_from_row(row)?);
+            if let Some(issue) = Self::parse_row_lenient(
+                row,
+                "stale_command_issue_from_row",
+                Self::stale_command_issue_from_row,
+            ) {
+                issues.push(issue);
+            }
         }
         Ok(issues)
     }
@@ -4504,7 +4534,13 @@ impl SqliteStorage {
         let rows = db::query_rows_with(&self.conn(), &sql, &params)?;
         let mut issues = Vec::with_capacity(rows.len());
         for row in &rows {
-            issues.push(Self::lint_command_issue_from_row(row)?);
+            if let Some(issue) = Self::parse_row_lenient(
+                row,
+                "lint_command_issue_from_row",
+                Self::lint_command_issue_from_row,
+            ) {
+                issues.push(issue);
+            }
         }
         Ok(issues)
     }
@@ -4569,7 +4605,13 @@ impl SqliteStorage {
         )?;
         let mut issues = Vec::with_capacity(rows.len());
         for row in &rows {
-            issues.push(Self::command_summary_issue_from_row(row)?);
+            if let Some(issue) = Self::parse_row_lenient(
+                row,
+                "command_summary_issue_from_row",
+                Self::command_summary_issue_from_row,
+            ) {
+                issues.push(issue);
+            }
         }
         Ok(issues)
     }
@@ -4632,7 +4674,13 @@ impl SqliteStorage {
         )?;
         let mut issues = Vec::with_capacity(rows.len());
         for row in &rows {
-            issues.push(Self::command_summary_issue_from_row(row)?);
+            if let Some(issue) = Self::parse_row_lenient(
+                row,
+                "command_summary_issue_from_row",
+                Self::command_summary_issue_from_row,
+            ) {
+                issues.push(issue);
+            }
         }
         Ok(issues)
     }
@@ -4651,7 +4699,11 @@ impl SqliteStorage {
         )?;
         let mut issues = Vec::with_capacity(rows.len());
         for row in &rows {
-            issues.push(Self::stats_issue_from_row(row)?);
+            if let Some(issue) =
+                Self::parse_row_lenient(row, "stats_issue_from_row", Self::stats_issue_from_row)
+            {
+                issues.push(issue);
+            }
         }
         Ok(issues)
     }
@@ -4670,7 +4722,13 @@ impl SqliteStorage {
         )?;
         let mut issues = Vec::with_capacity(rows.len());
         for row in &rows {
-            issues.push(Self::stats_summary_issue_from_row(row)?);
+            if let Some(issue) = Self::parse_row_lenient(
+                row,
+                "stats_summary_issue_from_row",
+                Self::stats_summary_issue_from_row,
+            ) {
+                issues.push(issue);
+            }
         }
         Ok(issues)
     }
@@ -4690,7 +4748,13 @@ impl SqliteStorage {
         )?;
         let mut issues = Vec::with_capacity(rows.len());
         for row in &rows {
-            issues.push(Self::changelog_issue_from_row(row)?);
+            if let Some(issue) = Self::parse_row_lenient(
+                row,
+                "changelog_issue_from_row",
+                Self::changelog_issue_from_row,
+            ) {
+                issues.push(issue);
+            }
         }
         issues.sort_unstable_by(|left, right| {
             left.priority
@@ -5483,7 +5547,11 @@ impl SqliteStorage {
         let rows = db::query_rows_with(&self.conn(), &sql, &params)?;
         let mut issues = Vec::with_capacity(rows.len());
         for row in &rows {
-            issues.push(projection.parse_issue(row)?);
+            if let Some(issue) =
+                Self::parse_row_lenient(row, "search_issues", |r| projection.parse_issue(r))
+            {
+                issues.push(issue);
+            }
         }
 
         Ok(issues)
@@ -5585,7 +5653,11 @@ impl SqliteStorage {
         )?;
         let mut issues = Vec::with_capacity(rows.len());
         for row in &rows {
-            issues.push(projection.parse_issue(row)?);
+            if let Some(issue) =
+                Self::parse_row_lenient(row, "search_issues", |r| projection.parse_issue(r))
+            {
+                issues.push(issue);
+            }
         }
         Ok(issues)
     }
@@ -5989,7 +6061,11 @@ impl SqliteStorage {
         let rows = db::query_rows_with(&self.conn(), &sql, &params)?;
         let mut issues = Vec::with_capacity(rows.len());
         for row in &rows {
-            issues.push(projection.parse_row(row)?);
+            if let Some(issue) = Self::parse_row_lenient(row, "query_ready_issue_candidates", |r| {
+                projection.parse_row(r)
+            }) {
+                issues.push(issue);
+            }
         }
         if sort_hybrid_in_rust {
             sort_ready_hybrid(&mut issues);
@@ -6076,8 +6152,11 @@ impl SqliteStorage {
                 chunk.iter().map(|id| SqlValue::from(id.as_str())).collect();
             let rows = db::query_rows_with(&self.conn(), &sql, &params)?;
             for row in &rows {
-                let issue = projection.parse_row(row)?;
-                by_id.insert(issue.id.clone(), issue);
+                if let Some(issue) = Self::parse_row_lenient(row, "get_ready_issues_by_ids", |r| {
+                    projection.parse_row(r)
+                }) {
+                    by_id.insert(issue.id.clone(), issue);
+                }
             }
         }
 
@@ -6803,7 +6882,11 @@ impl SqliteStorage {
 
         let mut blocked_issues = Vec::new();
         for row in &rows {
-            let issue = projection.parse_issue(row)?;
+            let Some(issue) = Self::parse_row_lenient(row, "load_blocked_issues_from_map", |r| {
+                projection.parse_issue(r)
+            }) else {
+                continue;
+            };
             if let Some(blockers) = blocked_issues_map.get(issue.id.as_str()) {
                 blocked_issues.push((issue, blockers.clone()));
             }
@@ -7364,7 +7447,11 @@ impl SqliteStorage {
 
         let mut blocked_issues = Vec::new();
         for row in &rows {
-            let issue = projection.parse_issue(row)?;
+            let Some(issue) =
+                Self::parse_row_lenient(row, "get_blocked_issues", |r| projection.parse_issue(r))
+            else {
+                continue;
+            };
             let blockers = match parse_blocked_by_json(
                 &issue.id,
                 row.get(projection.cached_blocked_by_index())
@@ -10220,7 +10307,11 @@ impl SqliteStorage {
         let rows = db::query_all(&self.conn(), sql)?;
         let mut issues = Vec::with_capacity(rows.len());
         for row in &rows {
-            issues.push(Self::issue_from_row(row)?);
+            if let Some(issue) =
+                Self::parse_row_lenient(row, "get_all_issues_for_export", Self::issue_from_row)
+            {
+                issues.push(issue);
+            }
         }
 
         Ok(issues)
@@ -10864,6 +10955,40 @@ impl SqliteStorage {
                 .and_then(SqlValue::as_text)
                 .map(String::from),
         })
+    }
+
+    /// Parse a row into `T`, returning `None` (with a warning) when the row is
+    /// malformed.
+    ///
+    /// Bulk read paths (list/search/ready/blocked/stats/export) use this so a
+    /// single corrupt row cannot fail an entire query — e.g. a row inserted
+    /// outside `br` with an unparseable datetime or bogus status must not take
+    /// down `br list`, `br list --json`, or `br export` for every other issue.
+    /// Single-issue lookups (`get_issue`, `get_issue_from_conn`,
+    /// `find_by_external_ref`, `find_by_content_hash`) keep strict parsing so
+    /// `br show <id>` reports a clear per-issue error, and import collision
+    /// detection keeps strictness via `get_all_issues_metadata`.
+    fn parse_row_lenient<T>(
+        row: &[SqlValue],
+        context: &'static str,
+        parse: impl FnOnce(&[SqlValue]) -> Result<T>,
+    ) -> Option<T> {
+        match parse(row) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                let row_id = row
+                    .first()
+                    .and_then(SqlValue::as_text)
+                    .unwrap_or("<unknown>");
+                tracing::warn!(
+                    row_id,
+                    error = %error,
+                    context,
+                    "Skipping malformed row during bulk read"
+                );
+                None
+            }
+        }
     }
 
     fn issue_from_row(row: &[SqlValue]) -> Result<Issue> {
@@ -25856,5 +25981,56 @@ mod tests {
             vec!["br-r1", "br-r2"],
             "expired deferred is ready; future/NULL deferred stays hidden"
         );
+    }
+
+    /// Insert a row that bypasses `Issue` validation: `due_at` holds a value
+    /// `parse_opt_datetime_value` cannot parse, reproducing beads_rust-yyjid.
+    fn insert_malformed_due_at_row(storage: &SqliteStorage, id: &str) {
+        storage
+            .execute_raw(&format!(
+                "INSERT INTO issues (id, title, status, priority, issue_type, created_at, \
+                 created_by, updated_at, due_at) \
+                 VALUES ('{id}', 'malformed row', 'open', 1, 'task', \
+                 '2026-01-01T00:00:00Z', 'tester', '2026-01-01T00:00:00Z', 'not-a-date')"
+            ))
+            .unwrap();
+    }
+
+    #[test]
+    fn test_bulk_reads_skip_malformed_issue_row() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        storage
+            .create_issue(
+                &make_issue("br-ok1", "Healthy issue", Status::Open, 1, None, now, None),
+                "tester",
+            )
+            .unwrap();
+        insert_malformed_due_at_row(&storage, "br-bad1");
+
+        // Bulk reads must skip the malformed row instead of failing DB-wide.
+        let listed = storage.list_issues(&ListFilters::default()).unwrap();
+        assert_eq!(issue_ids(listed), vec!["br-ok1".to_string()]);
+
+        let by_ids = storage
+            .get_issues_by_ids(&["br-ok1".to_string(), "br-bad1".to_string()])
+            .unwrap();
+        assert_eq!(issue_ids(by_ids), vec!["br-ok1".to_string()]);
+
+        let exported = storage.get_all_issues_for_export().unwrap();
+        assert_eq!(issue_ids(exported), vec!["br-ok1".to_string()]);
+
+        // The malformed row itself still exists and single-issue lookups
+        // keep strict parsing so `br show br-bad1` reports a clear error.
+        assert!(storage.get_issue("br-bad1").is_err());
+    }
+
+    #[test]
+    fn test_get_issue_strict_on_malformed_row() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        insert_malformed_due_at_row(&storage, "br-bad2");
+
+        // Single-issue lookup surfaces the parse error rather than hiding it.
+        assert!(storage.get_issue("br-bad2").is_err());
     }
 }

@@ -244,11 +244,19 @@ fn emit_structured(output_ctx: &OutputContext, value: &serde_json::Value, use_to
 }
 
 /// Parse the formula from file, validate, resolve extends, and return the
-/// resolved formula + steps.  Returns a `BeadsError::Config` on any failure.
+/// resolved formula + steps + `--var` keys that are not declared in
+/// `formula.vars`.  Returns a `BeadsError::Config` on any failure.
 fn parse_and_resolve(
     file: &PathBuf,
     var_overrides: &[String],
-) -> std::result::Result<(crate::formula::Formula, Vec<crate::formula::Step>), BeadsError> {
+) -> std::result::Result<
+    (
+        crate::formula::Formula,
+        Vec<crate::formula::Step>,
+        Vec<String>,
+    ),
+    BeadsError,
+> {
     let mut parser = Parser::new(vec![]);
 
     let formula = parser
@@ -272,14 +280,41 @@ fn parse_and_resolve(
             vars.insert(var.name.clone(), default.clone());
         }
     }
+    let mut provided_keys: Vec<String> = Vec::new();
     for kv in var_overrides {
         if let Some((key, value)) = kv.split_once('=') {
+            provided_keys.push(key.to_string());
             vars.insert(key.to_string(), value.to_string());
         } else {
             return Err(BeadsError::Config(format!(
                 "Invalid variable override {kv:?}: expected KEY=VALUE format"
             )));
         }
+    }
+
+    // Warn about `--var` keys the formula does not declare. They still
+    // participate in `{{var}}` substitution (formulas may intentionally
+    // pass extra context), so this is a warning, not an error.
+    let declared: std::collections::HashSet<&str> = formula
+        .vars
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|var| var.name.as_str())
+        .collect();
+    let mut unknown_vars: Vec<String> = provided_keys
+        .iter()
+        .filter(|key| !declared.contains(key.as_str()))
+        .cloned()
+        .collect();
+    unknown_vars.sort();
+    unknown_vars.dedup();
+    if !unknown_vars.is_empty() {
+        tracing::warn!(
+            unknown_vars = ?unknown_vars,
+            formula = %formula.formula,
+            "--var key(s) not declared in formula.vars; they still apply to {{var}} substitution"
+        );
     }
 
     // Enforce VarDef constraints: required vars must be present, provided
@@ -328,7 +363,23 @@ fn parse_and_resolve(
 
     validate_step_graph_acyclic(&steps)?;
 
-    Ok((formula, steps))
+    Ok((formula, steps, unknown_vars))
+}
+
+/// Surface `--var` keys that are not declared in `formula.vars`.
+///
+/// Machine-readable modes get the list inside the JSON payload
+/// (`unknown_vars`); human modes get a stderr/rich warning. Quiet and
+/// JSON/TOON modes suppress the human warning by design — the structured
+/// field and the `tracing::warn!` in [`parse_and_resolve`] still carry it.
+fn warn_unknown_vars(output_ctx: &OutputContext, unknown_vars: &[String]) {
+    if unknown_vars.is_empty() {
+        return;
+    }
+    output_ctx.warning(&format!(
+        "Unknown --var key(s) not declared in formula.vars: {}",
+        unknown_vars.join(", ")
+    ));
 }
 
 /// Reject step graphs whose `depends_on`/`needs` edges form a cycle.
@@ -441,7 +492,7 @@ fn substitute_str(s: &str, vars: &HashMap<String, String>) -> Result<String> {
 
 /// Validate a formula file.
 fn execute_validate(args: &FormulaValidateArgs, output_ctx: &OutputContext) -> crate::Result<()> {
-    let (_formula, steps) = parse_and_resolve(&args.file, &args.vars)?;
+    let (_formula, steps, unknown_vars) = parse_and_resolve(&args.file, &args.vars)?;
 
     let use_json = wants_json(args.format, args.json, args.robot, output_ctx);
     let use_toon = wants_toon(args.format, args.json, args.robot, output_ctx);
@@ -450,9 +501,11 @@ fn execute_validate(args: &FormulaValidateArgs, output_ctx: &OutputContext) -> c
         let output = serde_json::json!({
             "valid": true,
             "step_count": steps.len(),
+            "unknown_vars": unknown_vars,
         });
         emit_structured(output_ctx, &output, use_toon);
     } else {
+        warn_unknown_vars(output_ctx, &unknown_vars);
         output_ctx.print_line(&format!(
             "Formula is valid: {} step(s) would be created",
             steps.len()
@@ -468,7 +521,7 @@ fn execute_validate(args: &FormulaValidateArgs, output_ctx: &OutputContext) -> c
 
 /// Preview the steps that would be created from a formula.
 fn execute_expand(args: &FormulaExpandArgs, output_ctx: &OutputContext) -> crate::Result<()> {
-    let (resolved, steps) = parse_and_resolve(&args.file, &args.vars)?;
+    let (resolved, steps, unknown_vars) = parse_and_resolve(&args.file, &args.vars)?;
 
     let use_json = wants_json(args.format, args.json, args.robot, output_ctx);
     let use_toon = wants_toon(args.format, args.json, args.robot, output_ctx);
@@ -479,6 +532,7 @@ fn execute_expand(args: &FormulaExpandArgs, output_ctx: &OutputContext) -> crate
             "type": format!("{:?}", resolved.r#type),
             "description": resolved.description,
             "step_count": steps.len(),
+            "unknown_vars": unknown_vars,
             "steps": steps.iter().map(|s| {
                 let v = serde_json::to_value(s).unwrap_or_default();
                 v
@@ -487,6 +541,7 @@ fn execute_expand(args: &FormulaExpandArgs, output_ctx: &OutputContext) -> crate
         });
         emit_structured(output_ctx, &output, use_toon);
     } else {
+        warn_unknown_vars(output_ctx, &unknown_vars);
         output_ctx.print_line(&format!(
             "Formula: {} ({} steps)",
             resolved.formula,
@@ -527,11 +582,13 @@ fn execute_apply(
     overrides: &crate::config::CliOverrides,
     output_ctx: &OutputContext,
 ) -> crate::Result<()> {
-    let (resolved, steps) = parse_and_resolve(&args.file, &args.vars)?;
+    let (resolved, steps, unknown_vars) = parse_and_resolve(&args.file, &args.vars)?;
 
     let use_json = wants_json(args.format, args.json, args.robot, output_ctx);
     let use_toon = wants_toon(args.format, args.json, args.robot, output_ctx);
     let now = chrono::Utc::now();
+
+    warn_unknown_vars(output_ctx, &unknown_vars);
 
     // In dry-run mode, just preview what would be created.
     if args.dry_run {
@@ -541,6 +598,7 @@ fn execute_apply(
                 "formula": resolved.formula,
                 "description": resolved.description,
                 "step_count": steps.len(),
+                "unknown_vars": unknown_vars,
                 "steps": steps.iter().map(|s| {
                     let mut obj = serde_json::json!({
                         "id": s.id,
@@ -766,6 +824,7 @@ fn execute_apply(
             "dependencies_created": dep_count,
             "gated_issues": gate_count,
             "issue_ids": issue_ids,
+            "unknown_vars": unknown_vars,
         });
         emit_structured(output_ctx, &output, use_toon);
     } else {
