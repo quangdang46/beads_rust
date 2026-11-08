@@ -64,19 +64,14 @@ pub fn execute(args: &RenameArgs, cli: &config::CliOverrides, ctx: &OutputContex
     let actor = config::resolve_actor(&config_layer);
     let storage = &mut storage_ctx.storage;
 
-    // Validate the new ID up front: prefix-suffix format. The prefix charset
-    // mirrors `util::id::normalize_prefix` (lowercase alnum plus `_ - . : #`,
-    // with at least one alphanumeric) so digit/underscore prefixes produced
-    // by `init --prefix` or directory-derived names remain renamable.
-    let new_id_format =
-        regex::Regex::new(r"^[a-z0-9_.:#-]*[a-z0-9][a-z0-9_.:#-]*-[a-zA-Z0-9._-]+$")
-            .expect("static regex is valid");
-    if !new_id_format.is_match(new_id) {
+    // Validate the new ID up front with the canonical parser: anything
+    // `parse_id` rejects would produce an ID that import/export and
+    // dependency resolution cannot handle (e.g. `prefix-hash.child` with a
+    // non-numeric child segment).
+    if crate::util::id::parse_id(new_id).is_err() {
         return Err(BeadsError::validation(
             "new_id",
-            format!(
-                "'{new_id}' must be prefix-suffix format with a lowercase prefix (e.g., acme-dolt)"
-            ),
+            format!("'{new_id}' is not a valid issue ID (expected prefix-hash, e.g., acme-dolt)"),
         ));
     }
 

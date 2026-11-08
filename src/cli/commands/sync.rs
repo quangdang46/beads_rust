@@ -2727,6 +2727,32 @@ fn detect_prefix_from_jsonl(jsonl_path: &Path) -> Result<Option<String>> {
     Ok(None)
 }
 
+/// Returns true when the JSONL file contains at least one non-whitespace
+/// line. Reads line-by-line and stops at the first content byte, so the
+/// cost is O(1) for healthy files regardless of size.
+fn jsonl_has_content(jsonl_path: &Path) -> bool {
+    use std::io::{BufRead, BufReader};
+
+    let Ok(file) = std::fs::File::open(jsonl_path) else {
+        return false;
+    };
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => return false,
+            Ok(_) => {
+                if !line.trim().is_empty() {
+                    return true;
+                }
+            }
+            // Unreadable/invalid UTF-8: let the real parser report it.
+            Err(_) => return true,
+        }
+    }
+}
+
 /// Execute the --merge operation.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn execute_merge(
@@ -2784,6 +2810,19 @@ fn execute_merge(
         return Err(BeadsError::Config(format!(
             "Cannot merge: JSONL file not found at {}.\n\
              A missing JSONL would be misread as 'all issues deleted externally' \
+             and tombstone the local database. Restore the file or run \
+             `br sync --flush-only` first if the DB is the source of truth.",
+            jsonl_path.display()
+        )));
+    }
+    // An existing-but-empty JSONL is the same hazard: a legitimate
+    // delete-everything still leaves tombstone records, so zero parseable
+    // content can only mean truncation/corruption. Guard it whenever the
+    // local DB still holds issues; an empty DB makes the merge a no-op.
+    if !left.is_empty() && !jsonl_has_content(jsonl_path) {
+        return Err(BeadsError::Config(format!(
+            "Cannot merge: JSONL file at {} is empty.\n\
+             An empty JSONL would be misread as 'all issues deleted externally' \
              and tombstone the local database. Restore the file or run \
              `br sync --flush-only` first if the DB is the source of truth.",
             jsonl_path.display()

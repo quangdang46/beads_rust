@@ -117,6 +117,16 @@ pub fn execute(
     ctx: &OutputContext,
 ) -> Result<()> {
     let base_dir = root_dir.unwrap_or_else(|| Path::new("."));
+    // Validate an explicit prefix before touching the filesystem: a rejected
+    // `--prefix` must not leave a half-initialized `.beads/` behind.
+    if let Some(requested) = &prefix
+        && requested.trim().is_empty()
+    {
+        return Err(BeadsError::validation(
+            "prefix",
+            "issue prefix cannot be empty",
+        ));
+    }
     let beads_dir = resolve_init_beads_dir(base_dir);
 
     let mut created_dir = false;

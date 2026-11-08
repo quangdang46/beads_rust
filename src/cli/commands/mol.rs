@@ -865,6 +865,12 @@ fn execute_swarm_create(
             reason: format!("epic '{}' is not swarmable: {}", epic_id, err_msg),
         });
     }
+    if analysis.total_issues == 0 {
+        return Err(BeadsError::Validation {
+            field: "epic_id".to_string(),
+            reason: format!("epic '{}' has no child issues to swarm", epic_id),
+        });
+    }
 
     // Create the swarm molecule
     let swarm_title = format!("Swarm: {}", epic.title);

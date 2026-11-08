@@ -106,10 +106,12 @@ fn execute_inner(
     validate_list_args(&list_args)?;
 
     // Build list filters from the export selection flags. `--limit`/`--offset`
-    // are honored: `None`/`0` means unlimited, matching `br list` semantics.
+    // are deferred to after ephemeral/predicate filtering below: applying them
+    // in SQL would count ephemeral rows that are then dropped, producing
+    // short pages.
     let (mut filters, predicate) = build_filters(&list_args)?;
-    filters.limit = list_args.limit;
-    filters.offset = list_args.offset;
+    filters.limit = None;
+    filters.offset = None;
 
     // Query issues
     let mut issues = storage.list_issues(&filters)?;
@@ -124,6 +126,17 @@ fn execute_inner(
     // are never part of a JSONL export (the sync export path excludes them
     // via `export_issue_ids`).
     issues.retain(|issue| !issue.ephemeral && !issue.id.contains("-wisp-"));
+
+    // `None`/`0` limit means unlimited, matching `br list` semantics.
+    let offset = list_args.offset.unwrap_or(0);
+    if offset > 0 {
+        issues = issues.into_iter().skip(offset).collect();
+    }
+    if let Some(limit) = list_args.limit
+        && limit > 0
+    {
+        issues.truncate(limit);
+    }
 
     // Hydrate labels, dependencies, and comments so JSON/JSONL exports carry
     // the same embedded relations the canonical `.beads/issues.jsonl`

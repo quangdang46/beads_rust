@@ -4,6 +4,7 @@
 //! description, design, acceptance criteria, notes, labels, created_by, id)
 //! with list-like filters.
 
+use crate::cli::commands::list::{parse_metadata_filters, parse_time_filter};
 use crate::cli::{
     DEFAULT_LIST_LIMIT, DEFAULT_LIST_OFFSET, ListArgs, OutputFormat, SearchArgs,
     resolve_output_format_with_outer_mode,
@@ -13,7 +14,7 @@ use crate::error::{BeadsError, Result};
 use crate::format::{
     IssueWithCounts, TextFormatOptions, csv, format_issue_line_with, terminal_width,
 };
-use crate::model::{Issue, IssueType, Priority, Status};
+use crate::model::{Issue, IssueType, MolType, Priority, Status};
 use crate::output::{IssueTable, IssueTableColumns, OutputContext, OutputMode};
 use crate::storage::{ListFilters, SqliteStorage};
 use chrono::Utc;
@@ -650,16 +651,31 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
         } else {
             Some(args.label_any.clone())
         },
-        updated_before: None,
-        updated_after: None,
+        updated_before: parse_time_filter(args.updated_before.as_deref())?,
+        updated_after: parse_time_filter(args.updated_after.as_deref())?,
         ids: None,
-        created_after: None,
-        created_before: None,
-        metadata_filters: None,
-        owner: None,
-        pinned: None,
-        mol_type: None,
-        external_ref: None,
+        created_after: parse_time_filter(args.created_after.as_deref())?,
+        created_before: parse_time_filter(args.created_before.as_deref())?,
+        metadata_filters: {
+            let parsed = parse_metadata_filters(&args.metadata)?;
+            if parsed.is_empty() {
+                None
+            } else {
+                Some(
+                    parsed
+                        .into_iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect(),
+                )
+            }
+        },
+        owner: args.owner.clone(),
+        pinned: args.pinned.then_some(true),
+        mol_type: args
+            .mol_type
+            .as_ref()
+            .and_then(|m| MolType::from_str(m).ok()),
+        external_ref: args.external_ref.clone(),
     })
 }
 

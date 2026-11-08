@@ -1532,7 +1532,9 @@ fn validate_parent_updates(
             });
         }
 
-        if storage.would_create_cycle(issue_id, parent_id, true)? {
+        // Parent-child edges are traversed parent -> child, so the probe
+        // swaps endpoints — same convention as `dep add -t parent-child`.
+        if storage.would_create_cycle(parent_id, issue_id, false)? {
             return Err(BeadsError::DependencyCycle {
                 path: format!("Setting parent of {issue_id} to {parent_id} would create a cycle"),
             });

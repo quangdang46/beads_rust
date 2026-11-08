@@ -561,6 +561,7 @@ struct ImportIssueTimestampStrings {
     due_at: Option<String>,
     defer_until: Option<String>,
     deleted_at: Option<String>,
+    started_at: Option<String>,
 }
 
 impl ImportIssueTimestampStrings {
@@ -572,6 +573,7 @@ impl ImportIssueTimestampStrings {
             due_at: issue.due_at.map(|dt| dt.to_rfc3339()),
             defer_until: issue.defer_until.map(|dt| dt.to_rfc3339()),
             deleted_at: issue.deleted_at.map(|dt| dt.to_rfc3339()),
+            started_at: issue.started_at.map(|dt| dt.to_rfc3339()),
         }
     }
 }
@@ -3489,16 +3491,13 @@ impl SqliteStorage {
                 });
             }
 
-            // Validate new ID format: prefix-suffix (e.g. acme-dolt, gt-auth).
-            // Prefix charset mirrors `util::id::normalize_prefix` so prefixes
-            // containing digits or separators remain renamable.
-            if !regex::Regex::new(r"^[a-z0-9_.:#-]*[a-z0-9][a-z0-9_.:#-]*-[a-zA-Z0-9._-]+$")
-                .unwrap()
-                .is_match(new_id)
-            {
+            // Validate new ID format with the canonical parser so renamed
+            // IDs stay importable/exportable (e.g. `prefix-hash.1` numeric
+            // child segments only — `prefix-hash.child` is rejected).
+            if crate::util::id::parse_id(new_id).is_err() {
                 return Err(BeadsError::validation(
                     "new_id",
-                    "must be prefix-suffix format (e.g., acme-dolt, gt-auth)",
+                    "must be a valid issue ID (prefix-hash, e.g., acme-dolt)",
                 ));
             }
 
@@ -8529,7 +8528,10 @@ impl SqliteStorage {
                 Self::validate_parent_child_endpoints(issue_id, pid, "parent-child")?;
                 Self::ensure_dependency_target_exists_in_tx(conn, pid)?;
 
-                if Self::check_cycle(conn, issue_id, pid, true)? {
+                // `parent-child` edges are stored child -> parent but
+                // traversed parent -> child, so the probe swaps endpoints
+                // and uses the unified graph — same as `dep add`.
+                if Self::check_cycle(conn, pid, issue_id, false)? {
                     return Err(BeadsError::DependencyCycle {
                         path: format!("Setting parent of {issue_id} to {pid} would create a cycle"),
                     });
@@ -13635,6 +13637,23 @@ impl SqliteStorage {
                 .metadata
                 .as_deref()
                 .map_or_else(SqlValue::null, SqlValue::from),
+            // wisp/coordination fields — same set `create_issue` writes, so
+            // JSONL round-trips do not silently drop them.
+            SqlValue::from(i64::from(i32::from(issue.no_history))),
+            SqlValue::from(issue.wisp_type.as_str()),
+            SqlValue::from(issue.mol_type.as_str()),
+            SqlValue::from(issue.work_type.as_str()),
+            timestamps
+                .started_at
+                .as_deref()
+                .map_or_else(SqlValue::null, SqlValue::from),
+            issue
+                .spec_id
+                .as_deref()
+                .map_or_else(SqlValue::null, SqlValue::from),
+            issue
+                .points
+                .map_or_else(SqlValue::null, |v| SqlValue::from(i64::from(v))),
         ]
     }
 
@@ -13643,7 +13662,7 @@ impl SqliteStorage {
         issue: &Issue,
         timestamps: &ImportIssueTimestampStrings,
     ) -> Result<usize> {
-        let mut insert_params = Vec::with_capacity(34);
+        let mut insert_params = Vec::with_capacity(42);
         insert_params.push(SqlValue::from(issue.id.as_str()));
         insert_params.extend(Self::import_issue_field_values(issue, timestamps));
 
@@ -13656,9 +13675,10 @@ impl SqliteStorage {
                 due_at, defer_until, external_ref, source_system, source_repo, source_repo_path,
                 deleted_at, deleted_by, delete_reason, original_type,
                 sender, ephemeral,
-                pinned, is_template, agent_context, metadata
+                pinned, is_template, agent_context, metadata,
+                no_history, wisp_type, mol_type, work_type, started_at, spec_id, points
             ) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )",
             &insert_params,
         )?;
@@ -13685,7 +13705,9 @@ impl SqliteStorage {
                 deleted_at = ?, deleted_by = ?, delete_reason = ?, original_type = ?,
                 sender = ?,
                 ephemeral = ?, pinned = ?, is_template = ?, agent_context = ?,
-                metadata = ?
+                metadata = ?,
+                no_history = ?, wisp_type = ?, mol_type = ?, work_type = ?,
+                started_at = ?, spec_id = ?, points = ?
               WHERE id = ?",
             &params,
         )?;

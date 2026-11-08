@@ -456,7 +456,7 @@ fn issue_with_batched_relation_metadata(
 ///
 /// Returns `None` if the input is `None` or empty.
 /// Returns an error if the value can't be parsed.
-fn parse_time_filter(value: Option<&str>) -> Result<Option<DateTime<Utc>>> {
+pub(crate) fn parse_time_filter(value: Option<&str>) -> Result<Option<DateTime<Utc>>> {
     let Some(s) = value else {
         return Ok(None);
     };
@@ -511,8 +511,12 @@ pub(crate) fn parse_metadata_filters(filters: &[String]) -> Result<Vec<(String, 
 pub(crate) fn build_filters(
     args: &ListArgs,
 ) -> Result<(ListFilters, Option<crate::query::IssuePredicate>)> {
+    // `--status all` is a common convention for "no status filter"; without
+    // this it parses to `Status::Custom("all")` and silently matches nothing.
+    let status_all = args.status.iter().any(|s| s.eq_ignore_ascii_case("all"));
+
     // Parse status strings to Status enums
-    let statuses = if args.status.is_empty() {
+    let statuses = if args.status.is_empty() || status_all {
         None
     } else {
         Some(
@@ -548,6 +552,7 @@ pub(crate) fn build_filters(
     };
 
     let include_closed = args.all
+        || status_all
         || statuses
             .as_ref()
             .is_some_and(|parsed| parsed.iter().any(Status::is_terminal));

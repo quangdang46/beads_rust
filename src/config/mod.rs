@@ -4412,7 +4412,10 @@ pub fn default_issue_type_from_layer(layer: &ConfigLayer) -> Result<IssueType> {
 /// Accepts keys: `display.color`, `display-color`, `display_color`.
 #[must_use]
 pub fn display_color_from_layer(layer: &ConfigLayer) -> Option<bool> {
+    // `display.*` keys classify as startup keys, so the value can live in
+    // either map depending on which loader wrote it — check both.
     get_value(layer, &["display.color", "display-color", "display_color"])
+        .or_else(|| get_startup_value(layer, &["display.color", "display-color", "display_color"]))
         .and_then(|value| parse_bool(value))
 }
 
@@ -4428,6 +4431,9 @@ pub fn should_use_color(layer: &ConfigLayer) -> bool {
         return value;
     }
     if env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    if crate::output::context::terminal_is_dumb() {
         return false;
     }
     std::io::stdout().is_terminal()

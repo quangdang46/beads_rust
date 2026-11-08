@@ -326,7 +326,64 @@ fn parse_and_resolve(
         .map(|s| substitute_step(s, &vars))
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
+    validate_step_graph_acyclic(&steps)?;
+
     Ok((formula, steps))
+}
+
+/// Reject step graphs whose `depends_on`/`needs` edges form a cycle.
+///
+/// `apply` creates all issues first and wires dependencies afterwards, so
+/// a cyclic step graph would otherwise leave a partially-created formula
+/// behind when `add_dependency` rejects the closing edge.
+fn validate_step_graph_acyclic(steps: &[crate::formula::Step]) -> Result<()> {
+    use std::collections::{HashMap, HashSet};
+
+    let known: HashSet<&str> = steps.iter().map(|s| s.id.as_str()).collect();
+    let mut graph: HashMap<&str, Vec<&str>> = HashMap::new();
+    for step in steps {
+        let deps: Vec<&str> = step
+            .depends_on
+            .iter()
+            .chain(step.needs.iter())
+            .map(String::as_str)
+            .filter(|dep| *dep != step.id && known.contains(dep))
+            .collect();
+        graph.insert(step.id.as_str(), deps);
+    }
+
+    // Iterative DFS with color marks: 0=unvisited, 1=in-stack, 2=done.
+    let mut color: HashMap<&str, u8> = HashMap::new();
+    for start in graph.keys() {
+        if color.get(start).copied().unwrap_or(0) != 0 {
+            continue;
+        }
+        let mut stack: Vec<(&str, usize)> = vec![(start, 0)];
+        color.insert(start, 1);
+        while let Some((node, next_idx)) = stack.last_mut() {
+            let neighbors = graph.get(node).cloned().unwrap_or_default();
+            if *next_idx < neighbors.len() {
+                let dep = neighbors[*next_idx];
+                *next_idx += 1;
+                match color.get(dep).copied().unwrap_or(0) {
+                    1 => {
+                        return Err(BeadsError::Config(format!(
+                            "formula step graph contains a dependency cycle involving '{dep}'"
+                        )));
+                    }
+                    0 => {
+                        color.insert(dep, 1);
+                        stack.push((dep, 0));
+                    }
+                    _ => {}
+                }
+            } else {
+                color.insert(node, 2);
+                stack.pop();
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Perform `{{variable}}` substitution in a step's string fields.
@@ -341,11 +398,31 @@ fn substitute_step(
         }
     };
 
+    let sub_vec = |items: &[String]| -> Result<Vec<String>> {
+        items
+            .iter()
+            .map(|item| substitute_str(item, vars))
+            .collect()
+    };
+
     Ok(crate::formula::Step {
+        id: substitute_str(&step.id, vars)?,
         title: sub(step.title)?,
         description: sub(step.description)?,
         notes: sub(step.notes)?,
         assignee: sub(step.assignee)?,
+        labels: sub_vec(&step.labels)?,
+        depends_on: sub_vec(&step.depends_on)?,
+        needs: sub_vec(&step.needs)?,
+        children: step
+            .children
+            .map(|children| {
+                children
+                    .into_iter()
+                    .map(|child| substitute_step(child, vars))
+                    .collect::<std::result::Result<Vec<_>, _>>()
+            })
+            .transpose()?,
         ..step
     })
 }
