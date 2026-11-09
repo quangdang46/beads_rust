@@ -1,2 +1,2 @@
 [1]{id,title,status,priority,issue_type,created_at,created_by,updated_at,source_repo,source_repo_path,mol_type,work_type,wisp_type}:
-  bd-0vn,Two,open,0,bug,"2026-11-09T12:19:12.157315Z",unknown,"2026-11-09T12:19:12.157315Z",.tmpip3CVd,/private/var/folders/dd/qv4ltr9158116jk2739rp61c0000gn/T/.tmpip3CVd,"","",""
+  bd-w5b,Two,open,0,bug,"2026-11-09T12:52:07.943175Z",unknown,"2026-11-09T12:52:07.943175Z",.tmpaYjwXt,/private/var/folders/dd/qv4ltr9158116jk2739rp61c0000gn/T/.tmpaYjwXt,"","",""
