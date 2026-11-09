@@ -210,8 +210,11 @@ fn verify_checksums_fragment_accepts_spaces_and_leading_dashes() -> Result<(), S
 
     let result = run_bash_step(&script, fixture.root(), &[])?;
     require_success(&result)?;
-    require_contains(&result.stdout, "artifact with spaces.tar.gz: OK")?;
-    require_contains(&result.stdout, "--leading-artifact.tar.gz: OK")
+    // Newer coreutils shell-quote checksum filenames containing spaces in
+    // `sha256sum -c` output; strip quotes so the assertion holds on both.
+    let stdout = result.stdout.replace('\'', "");
+    require_contains(&stdout, "artifact with spaces.tar.gz: OK")?;
+    require_contains(&stdout, "--leading-artifact.tar.gz: OK")
 }
 
 #[test]

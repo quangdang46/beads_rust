@@ -54,4 +54,9 @@ jobs:
         continue-on-error: true
 
       - name: Check for yanked dependencies
-        run: cargo audit --deny yanked
+        # `--deny yanked` alone does not scope the gate: cargo-audit still
+        # applies its default deny level to vulnerabilities, unmaintained,
+        # unsound, and notice lints, so the step failed on every known
+        # advisory even though advisories are deliberately non-blocking.
+        # Allow those categories explicitly so only a yanked crate fails.
+        run: cargo audit --deny yanked --allow vulnerabilities --allow unmaintained --allow unsound --allow notice

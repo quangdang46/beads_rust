@@ -61,6 +61,7 @@ Commands:
   reflect        Agent instructions to sync beads with the current codebase (prime-style)
   template       Issue tracking template commands
   update         Update an issue
+  web            Start the embedded web UI server
   version        Show version information
   worktree       Manage git worktrees
   federation     Manage federation peers for P2P sync
