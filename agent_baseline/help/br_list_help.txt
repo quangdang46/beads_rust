@@ -28,10 +28,10 @@ Options:
           Filter by specific IDs (can be repeated)
 
   -l, --label <LABEL>
-          Filter by label (AND logic, can be repeated)
+          Filter by label (AND logic, repeatable or comma-separated)
 
       --label-any <LABEL_ANY>
-          Filter by label (OR logic, can be repeated)
+          Filter by label (OR logic, repeatable or comma-separated)
 
   -p, --priority <PRIORITY>
           Filter by priority (can be repeated)
