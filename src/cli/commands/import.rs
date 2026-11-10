@@ -116,12 +116,12 @@ fn execute_inner(
         ExportFormat::Json => {
             let content = std::fs::read_to_string(&input_path)?;
             let issues = parse_json_issues(&content, &input_path)?;
-            let (imported, skipped) = import_issues(storage, &issues, args.strict)?;
+            let (imported, skipped) = import_issues(storage, &issues, args.strict, args.force)?;
             report_count(imported, skipped, issues.len(), &input_path, ctx);
         }
         ExportFormat::Csv => {
             let issues = read_issues_from_csv(&input_path)?;
-            let (imported, skipped) = import_issues(storage, &issues, args.strict)?;
+            let (imported, skipped) = import_issues(storage, &issues, args.strict, args.force)?;
             report_count(imported, skipped, issues.len(), &input_path, ctx);
         }
         ExportFormat::Obsidian => {
@@ -132,7 +132,7 @@ fn execute_inner(
                 .filter(|p| !p.trim().is_empty())
                 .unwrap_or_else(|| "br".to_string());
             let issues = read_issues_from_markdown(&input_path, &prefix)?;
-            let (imported, skipped) = import_issues(storage, &issues, args.strict)?;
+            let (imported, skipped) = import_issues(storage, &issues, args.strict, args.force)?;
             report_count(imported, skipped, issues.len(), &input_path, ctx);
         }
     }
@@ -181,16 +181,35 @@ fn report_count(
 ///
 /// Returns `(imported, skipped)` counts.
 /// When `strict` is true, aborts on the first failure instead of skipping.
+/// When `force` is true, an ID collision upserts the incoming issue
+/// (same semantics as the JSONL path's `force_upsert`) instead of
+/// skipping it — previously `--force` was silently ignored on the
+/// json/csv/obsidian formats.
 fn import_issues(
     storage: &mut crate::storage::SqliteStorage,
     issues: &[Issue],
     strict: bool,
+    force: bool,
 ) -> Result<(usize, usize)> {
     let mut imported = 0usize;
     let mut skipped = 0usize;
     for issue in issues {
         match storage.create_issue(issue, "br-import") {
             Ok(()) => imported += 1,
+            Err(BeadsError::IdCollision { .. }) if force => {
+                // Mirror the JSONL import's force-upsert: validate, then
+                // update-in-place (preserving child rows) and mark the
+                // issue dirty so the JSONL flush exports the new state.
+                crate::validation::IssueValidator::validate(issue)
+                    .map_err(BeadsError::from_validation_errors)?;
+                storage.upsert_issue_for_import(issue)?;
+                // `upsert_issue_for_import` deliberately skips dirty
+                // tracking (it serves the JSONL import's own bookkeeping);
+                // mark the row so the post-command JSONL flush exports
+                // the updated state.
+                storage.replace_dirty_issue_marker(&issue.id, &chrono::Utc::now().to_rfc3339())?;
+                imported += 1;
+            }
             Err(e) => {
                 if strict {
                     return Err(BeadsError::Config(format!(
