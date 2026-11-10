@@ -37,7 +37,7 @@ use std::process::Command;
 use std::str::FromStr;
 use std::time::UNIX_EPOCH;
 use tempfile::tempdir;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::util::hex_encode;
 
@@ -1504,12 +1504,42 @@ pub(crate) fn repair_database_from_jsonl_with_import_config(
         "Rebuilding SQLite database from JSONL"
     );
 
-    let ((storage, import_result), backup_set) =
+    let ((mut storage, import_result), backup_set) =
         rebuild_database_family_with_backup(db_path, beads_dir, || {
             rebuild_database_family(db_path, lock_timeout, jsonl_path, &import_config, &prefix)
         })?;
     let recovery_dir = backup_set.recovery_dir.clone();
     let verified_backups = backup_set.verified_files.clone();
+
+    // beads_rust-i976: issues.jsonl carries no event records, so the
+    // rebuilt DB's `events` audit table comes back empty. Replay the
+    // quarantined original DB's events into the rebuilt one. Non-fatal:
+    // a missing audit log is bad, a failed rebuild is worse.
+    if let Some((_, backup)) = backup_set
+        .files
+        .iter()
+        .find(|(original, _)| original.as_path() == db_path)
+    {
+        match storage.rescue_events_from_database(backup) {
+            Ok(stats) if stats.total > 0 => {
+                info!(
+                    total = stats.total,
+                    rescued = stats.rescued,
+                    skipped_orphan = stats.skipped_orphan,
+                    skipped_no_issue_ref = stats.skipped_no_issue_ref,
+                    "Rescued events audit rows from quarantined database"
+                );
+            }
+            Ok(_) => {}
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    backup = %backup.display(),
+                    "Failed to rescue events audit rows from quarantined database"
+                );
+            }
+        }
+    }
 
     warn!(
         db_path = %db_path.display(),

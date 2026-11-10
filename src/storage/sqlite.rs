@@ -12737,6 +12737,20 @@ fn append_issue_text_match_filter(sql: &mut String, params: &mut Vec<SqlValue>, 
 // EXPORT/SYNC METHODS
 // ============================================================================
 
+/// Statistics returned by [`SqliteStorage::rescue_events_from_database`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct EventsRescueStats {
+    /// Event rows found in the source database.
+    pub total: usize,
+    /// Rows copied into this database.
+    pub rescued: usize,
+    /// Rows skipped because their `issue_id` is NULL or non-text.
+    pub skipped_no_issue_ref: usize,
+    /// Rows skipped because the referenced issue does not exist in
+    /// the rebuilt database (the JSONL never carried it).
+    pub skipped_orphan: usize,
+}
+
 impl SqliteStorage {
     /// Get issue with all relations populated for export.
     ///
@@ -14090,6 +14104,135 @@ impl SqliteStorage {
         Ok(import_labels_equal(&stored.labels, &issue.labels)
             && import_dependencies_equal(&stored.dependencies, &issue.dependencies)
             && import_comments_equal(&stored.comments, &issue.comments))
+    }
+
+    /// Copy `events` audit rows from a quarantined pre-rebuild database
+    /// into this freshly rebuilt one (beads_rust-i976).
+    ///
+    /// `issues.jsonl` carries no event records, so a JSONL rebuild
+    /// produces an empty `events` table and silently destroys the audit
+    /// log (closes, reopens, status transitions, Tier-1 actor
+    /// attribution). The corrupt DB family is quarantined intact under
+    /// `.beads/recovery/`; this method replays its `events` rows into
+    /// the rebuilt database, keeping only rows whose `issue_id` still
+    /// exists (events for issues absent from the JSONL would violate
+    /// the `events -> issues` foreign key).
+    ///
+    /// Column sets are intersected so older schemas (pre Tier-1
+    /// attribution columns) and newer ones both work; the `id` primary
+    /// key is preserved when present in both so event ordering and
+    /// identity stay stable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the source cannot be opened, its `events`
+    /// table cannot be read, or the inserts fail. Callers performing
+    /// recovery should treat failure as non-fatal (log + continue): a
+    /// missing audit log is bad, a failed rebuild is worse.
+    pub fn rescue_events_from_database(
+        &mut self,
+        source_db_path: &Path,
+    ) -> Result<EventsRescueStats> {
+        let source = Connection::open_with_flags(
+            source_db_path.to_string_lossy().as_ref(),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+
+        let table_names: Vec<String> = db::query_all(
+            &source,
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'events'",
+        )?
+        .iter()
+        .filter_map(|row| row.first().and_then(SqlValue::as_text).map(String::from))
+        .collect();
+        if table_names.is_empty() {
+            return Ok(EventsRescueStats::default());
+        }
+
+        let source_columns = Self::table_column_names(&source)?;
+        let target_columns = Self::table_column_names(&self.conn())?;
+        let shared: Vec<String> = target_columns
+            .iter()
+            .filter(|name| source_columns.iter().any(|c| c == *name))
+            .cloned()
+            .collect();
+        if shared.is_empty() {
+            return Ok(EventsRescueStats::default());
+        }
+
+        let cols_csv = shared
+            .iter()
+            .map(|c| format!("\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let select_sql = format!("SELECT {cols_csv} FROM events");
+        let mut stmt = source.prepare(&select_sql)?;
+        let column_count = shared.len();
+        let mut rows: Vec<Vec<rusqlite::types::Value>> = Vec::new();
+        {
+            let mut query = stmt.query([])?;
+            while let Some(row) = query.next()? {
+                let mut values = Vec::with_capacity(column_count);
+                for idx in 0..column_count {
+                    values.push(row.get::<_, rusqlite::types::Value>(idx)?);
+                }
+                rows.push(values);
+            }
+        }
+
+        let issue_id_pos = shared.iter().position(|c| c == "issue_id");
+        let mut stats = EventsRescueStats {
+            total: rows.len(),
+            ..EventsRescueStats::default()
+        };
+
+        // Existing issue IDs in the rebuilt DB decide which events can
+        // legally come back (FK target must exist).
+        let existing_ids: std::collections::HashSet<String> =
+            db::query_all(self.conn(), "SELECT id FROM issues")?
+                .iter()
+                .filter_map(|row| row.first().and_then(SqlValue::as_text).map(String::from))
+                .collect();
+
+        let placeholders = vec!["?"; shared.len()].join(", ");
+        let insert_sql = format!("INSERT INTO events({cols_csv}) VALUES ({placeholders})");
+
+        self.with_write_transaction(|storage| {
+            let conn = storage.conn();
+            let mut insert = conn.prepare(&insert_sql)?;
+            for values in &rows {
+                let issue_id = issue_id_pos
+                    .and_then(|pos| values.get(pos))
+                    .and_then(|value| match value {
+                        rusqlite::types::Value::Text(text) => Some(text.clone()),
+                        _ => None,
+                    });
+                let Some(issue_id) = issue_id else {
+                    stats.skipped_no_issue_ref += 1;
+                    continue;
+                };
+                if !existing_ids.contains(&issue_id) {
+                    stats.skipped_orphan += 1;
+                    continue;
+                }
+                insert.execute(rusqlite::params_from_iter(values.iter()))?;
+                stats.rescued += 1;
+            }
+            Ok(())
+        })?;
+
+        Ok(stats)
+    }
+
+    /// Column names of the `events` table in ordinal order.
+    fn table_column_names(conn: &Connection) -> Result<Vec<String>> {
+        let mut stmt = conn.prepare("PRAGMA table_info(\"events\")")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        let mut names = Vec::new();
+        for name in rows {
+            names.push(name?);
+        }
+        Ok(names)
     }
 
     /// Check whether relation rows already exist for an imported issue ID.
