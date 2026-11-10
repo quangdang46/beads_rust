@@ -5165,6 +5165,168 @@ pub fn compute_jsonl_hash(path: &Path) -> Result<String> {
     Ok(hex_encode(&hasher.finalize()))
 }
 
+/// Registry names that are built in (backfilled by schema migration) and
+/// therefore do not count as user-defined custom state for the
+/// non-JSONL-state report.
+const BUILTIN_CUSTOM_STATUS_NAMES: &[&str] = &[
+    "open",
+    "in_progress",
+    "closed",
+    "deferred",
+    "tombstone",
+    "blocked",
+    "draft",
+    "pinned",
+    "hooked",
+];
+
+/// Built-in issue types backfilled into `custom_types` by schema
+/// migration v14 (mirrors the INSERT list in `schema.rs`).
+const BUILTIN_CUSTOM_TYPE_NAMES: &[&str] = &[
+    "task",
+    "bug",
+    "feature",
+    "epic",
+    "question",
+    "docs",
+    "decision",
+    "message",
+    "molecule",
+    "gate",
+    "spike",
+    "story",
+    "milestone",
+    "event",
+];
+
+/// Counts of database state that the JSONL sync surface cannot carry.
+///
+/// `issues.jsonl` round-trips issues plus their embedded relations
+/// (dependencies, labels, comments). Everything below lives only in
+/// `beads.db`: gate results/waiters, user-registered custom
+/// statuses/types, federation peers, agent interaction logs, and the
+/// events audit log. A JSONL rebuild or a fresh-workspace `br import`
+/// of an exported file therefore loses all of it — this report lets
+/// export/sync surfaces warn instead of losing it silently.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NonJsonlStateReport {
+    pub gate_results: i64,
+    pub gate_waiters: i64,
+    pub custom_statuses: i64,
+    pub custom_types: i64,
+    pub federation_peers: i64,
+    pub interactions: i64,
+    pub events: i64,
+}
+
+impl NonJsonlStateReport {
+    /// Whether any *opt-in feature* state is present. The `events` audit
+    /// log is excluded: it is non-empty on essentially every workspace
+    /// and would make the warning fire universally. Events are still
+    /// reported in [`Self::describe`] for completeness.
+    #[must_use]
+    pub fn feature_state_present(&self) -> bool {
+        self.gate_results > 0
+            || self.gate_waiters > 0
+            || self.custom_statuses > 0
+            || self.custom_types > 0
+            || self.federation_peers > 0
+            || self.interactions > 0
+    }
+
+    /// Human-readable summary of the nonzero categories.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if self.gate_results > 0 {
+            parts.push(format!("{} gate result(s)", self.gate_results));
+        }
+        if self.gate_waiters > 0 {
+            parts.push(format!("{} gate waiter(s)", self.gate_waiters));
+        }
+        if self.custom_statuses > 0 {
+            parts.push(format!("{} custom status(es)", self.custom_statuses));
+        }
+        if self.custom_types > 0 {
+            parts.push(format!("{} custom type(s)", self.custom_types));
+        }
+        if self.federation_peers > 0 {
+            parts.push(format!("{} federation peer(s)", self.federation_peers));
+        }
+        if self.interactions > 0 {
+            parts.push(format!("{} interaction(s)", self.interactions));
+        }
+        if self.events > 0 {
+            parts.push(format!("{} audit event(s)", self.events));
+        }
+        parts.join(", ")
+    }
+}
+
+fn sql_count(storage: &SqliteStorage, sql: &str) -> Result<i64> {
+    let rows = storage.execute_raw_query(sql)?;
+    Ok(rows
+        .first()
+        .and_then(|row| row.first())
+        .and_then(SqlValue::as_integer)
+        .unwrap_or(0))
+}
+
+fn sql_literal_list(values: &[&str]) -> String {
+    values
+        .iter()
+        .map(|value| format!("'{}'", value.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Count database state that JSONL export/import does not carry.
+///
+/// # Errors
+///
+/// Returns an error if a count query fails (e.g. an older schema missing
+/// an optional table); missing tables count as zero.
+pub fn non_jsonl_state_report(storage: &SqliteStorage) -> Result<NonJsonlStateReport> {
+    let count_or_zero = |sql: &str| -> i64 { sql_count(storage, sql).unwrap_or(0) };
+
+    let builtin_statuses = sql_literal_list(BUILTIN_CUSTOM_STATUS_NAMES);
+    let builtin_types = sql_literal_list(BUILTIN_CUSTOM_TYPE_NAMES);
+
+    Ok(NonJsonlStateReport {
+        gate_results: count_or_zero("SELECT COUNT(*) FROM gate_results"),
+        gate_waiters: count_or_zero("SELECT COUNT(*) FROM gate_waiters"),
+        custom_statuses: count_or_zero(&format!(
+            "SELECT COUNT(*) FROM custom_statuses WHERE lower(name) NOT IN ({builtin_statuses})"
+        )),
+        custom_types: count_or_zero(&format!(
+            "SELECT COUNT(*) FROM custom_types WHERE lower(name) NOT IN ({builtin_types})"
+        )),
+        federation_peers: count_or_zero("SELECT COUNT(*) FROM federation_peers"),
+        interactions: count_or_zero("SELECT COUNT(*) FROM interactions"),
+        events: count_or_zero("SELECT COUNT(*) FROM events"),
+    })
+}
+
+/// Emit a one-line stderr warning when the database holds state that the
+/// JSONL sync surface cannot carry. Stderr keeps `--json` stdout a single
+/// parseable document.
+pub fn warn_if_non_jsonl_state(storage: &SqliteStorage) {
+    match non_jsonl_state_report(storage) {
+        Ok(report) if report.feature_state_present() => {
+            eprintln!(
+                "warning: database holds state that issues.jsonl does not carry \
+                 ({}) — it survives in beads.db only and is lost on a \
+                 JSONL rebuild or fresh-workspace import",
+                report.describe()
+            );
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::debug!(error = %err, "non-JSONL state probe failed; skipping warning");
+        }
+    }
+}
+
 // ============================================================================
 // 3-Way Merge Types and Functions
 // ============================================================================

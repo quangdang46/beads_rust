@@ -1581,6 +1581,11 @@ fn execute_flush(
     }
     info!("Export complete, cleared dirty flags");
 
+    // Guard (beads_rust-jsonl-export-loses-nonissue-state-j3umr): warn
+    // when the DB holds state issues.jsonl cannot carry so the sync
+    // fidelity loss is never silent.
+    crate::sync::warn_if_non_jsonl_state(storage);
+
     // Write manifest if requested (atomic: temp + fsync + durable_rename)
     let manifest_path = if args.manifest {
         let manifest = serde_json::json!({

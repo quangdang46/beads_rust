@@ -167,6 +167,12 @@ fn execute_inner(
 
     match export_format {
         ExportFormat::Jsonl => {
+            // Guard (beads_rust-jsonl-export-loses-nonissue-state-j3umr):
+            // issues.jsonl carries issues + embedded relations only.
+            // Gate results/waiters, custom types/statuses, federation
+            // peers, interactions, and the events audit log stay in
+            // beads.db — warn so the loss is never silent.
+            crate::sync::warn_if_non_jsonl_state(storage);
             if let Some(ref output_path) = args.output {
                 if args.filters.selects_everything() {
                     // No selection, so this is a full export: a sync, and it
