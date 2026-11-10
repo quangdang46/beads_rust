@@ -102,6 +102,9 @@ pub struct TypeAddArgs {
 pub struct TypeRemoveArgs {
     /// Type name to remove.
     pub name: String,
+    /// Remove even when issues still use this type.
+    #[arg(long)]
+    pub force: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -317,6 +320,31 @@ pub fn execute_type(
                 return Err(BeadsError::validation(
                     "name",
                     format!("custom type '{name}' does not exist"),
+                ));
+            }
+            // Parity with `custom-status remove`: block removal while
+            // issues still reference the type; `--force` overrides (the
+            // issues keep their type string but it is no longer a
+            // registered custom type).
+            let in_use = store.list_issues(&ListFilters {
+                types: Some(vec![IssueType::Custom(name.clone())]),
+                include_closed: true,
+                include_deferred: true,
+                limit: Some(1),
+                ..Default::default()
+            })?;
+            if !in_use.is_empty() && !args.force {
+                return Err(BeadsError::validation(
+                    "name",
+                    format!(
+                        "custom type '{name}' is still used by at least one issue; \
+                         reassign those issues first or pass --force to remove anyway"
+                    ),
+                ));
+            }
+            if !in_use.is_empty() {
+                ctx.warning(&format!(
+                    "custom type '{name}' is still used by at least one issue"
                 ));
             }
             if !store.remove_custom_type(&name)? {
