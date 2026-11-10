@@ -125,7 +125,14 @@ mod tests {
     #[test]
     fn default_filter_varies_with_verbosity() {
         assert_eq!(default_filter(1, false), "beads_rust=debug");
-        assert_eq!(default_filter(0, false), "beads_rust=debug");
+        // Verbosity 0 is `debug` in dev builds but `error` in release
+        // builds, matching `cfg!(debug_assertions)` in `default_filter`.
+        let expected_v0 = if cfg!(debug_assertions) {
+            "beads_rust=debug"
+        } else {
+            "error"
+        };
+        assert_eq!(default_filter(0, false), expected_v0);
         assert_eq!(default_filter(2, false), "beads_rust=debug");
         assert_eq!(default_filter(3, false), "beads_rust=trace");
     }
