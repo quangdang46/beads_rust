@@ -3789,8 +3789,11 @@ pub enum DoctorSubcommand {
 #[derive(Args, Debug, Clone, Default)]
 pub struct DoctorCapabilitiesArgs {
     /// Output format: `json` (default for machine readers) or `text`.
-    #[arg(long, value_enum, default_value_t = OutputFormatBasic::Text)]
-    pub format: OutputFormatBasic,
+    /// When omitted, the global output mode applies — `br doctor
+    /// capabilities --json` (or `BR_OUTPUT_FORMAT=json`) emits the JSON
+    /// envelope instead of the text document.
+    #[arg(long, value_enum)]
+    pub format: Option<OutputFormatBasic>,
 
     /// Optional fixer/detector id filter — reserved for future
     /// extension; currently a passthrough. Stable surface so agents can

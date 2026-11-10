@@ -129,7 +129,7 @@ pub struct CapabilitiesEnvelope<'a> {
 ///
 /// Returns [`BeadsError`] if JSON serialization fails (effectively
 /// never with the data shapes used here).
-pub fn execute_capabilities(args: &DoctorCapabilitiesArgs, _ctx: &OutputContext) -> Result<()> {
+pub fn execute_capabilities(args: &DoctorCapabilitiesArgs, ctx: &OutputContext) -> Result<()> {
     let caps = DoctorCapabilities::build();
     let envelope = CapabilitiesEnvelope {
         schema_version: CAPABILITIES_SCHEMA,
@@ -142,7 +142,16 @@ pub fn execute_capabilities(args: &DoctorCapabilitiesArgs, _ctx: &OutputContext)
     // avoid breaking pinned agent invocations later.
     let _filter = args.command.as_deref();
 
-    match args.format {
+    // `--format` wins when given; otherwise honor the global output mode
+    // so `br doctor capabilities --json` (and `BR_OUTPUT_FORMAT=json`)
+    // emit the machine envelope instead of the text document.
+    let format = args.format.unwrap_or(match ctx.mode() {
+        crate::output::OutputMode::Json => OutputFormatBasic::Json,
+        crate::output::OutputMode::Toon => OutputFormatBasic::Toon,
+        _ => OutputFormatBasic::Text,
+    });
+
+    match format {
         OutputFormatBasic::Json | OutputFormatBasic::Toon => {
             // The capabilities subcommand is a pure machine-readable
             // surface — emit pretty JSON to stdout regardless of the
