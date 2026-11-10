@@ -1394,7 +1394,12 @@ mod tests {
             robot: true,
             ..Default::default()
         };
-        execute_undefer(&undefer_args, true, &cli, &ctx)?;
+        // beads_rust-exit-code-inconsistencies-xnwkq: an all-skipped
+        // undefer is a no-op and must surface NothingToDo (exit 3),
+        // matching other no-op commands — while leaving state untouched.
+        let err = execute_undefer(&undefer_args, true, &cli, &ctx)
+            .expect_err("all-skipped undefer must return NothingToDo");
+        assert!(matches!(err, BeadsError::NothingToDo { .. }), "got {err:?}");
 
         let updated = storage
             .get_issue(&issue_id)?
