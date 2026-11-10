@@ -2707,15 +2707,24 @@ fn e2e_dependency_idempotent_duplicate() {
     let dep_add = run_br(&workspace, ["dep", "add", &id_a, &id_b], "dep_add_first");
     assert!(dep_add.status.success());
 
-    // Add same dependency again - should succeed (idempotent) with status "exists"
+    // Add same dependency again - idempotent: the "exists" result JSON is
+    // emitted on stdout, then the no-op exits 3 with a NOTHING_TO_DO
+    // envelope on stderr (aligned with close/reopen/undefer).
     let result = run_br(
         &workspace,
         ["dep", "add", &id_a, &id_b, "--json"],
         "dep_add_duplicate_json",
     );
+    assert_eq!(
+        result.status.code(),
+        Some(3),
+        "duplicate dependency should report NOTHING_TO_DO, stderr: {}",
+        result.stderr
+    );
     assert!(
-        result.status.success(),
-        "duplicate dependency should be idempotent"
+        result.stderr.contains("NOTHING_TO_DO"),
+        "expected NOTHING_TO_DO envelope on stderr: {}",
+        result.stderr
     );
 
     // Parse output as success JSON (not error)

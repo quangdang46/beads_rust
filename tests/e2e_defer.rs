@@ -536,7 +536,20 @@ fn undefer_already_open_skips() {
     let (workspace, id) = setup_workspace_with_issue();
 
     let undefer = run_br(&workspace, ["undefer", &id, "--json"], "undefer_open");
-    assert!(undefer.status.success());
+    // All-skipped undefer is a no-op: the result JSON is still emitted on
+    // stdout, then the command exits 3 with a NOTHING_TO_DO envelope on
+    // stderr (same contract as `reopen`/`close`).
+    assert_eq!(
+        undefer.status.code(),
+        Some(3),
+        "all-skipped undefer should exit NOTHING_TO_DO: {}",
+        undefer.stderr
+    );
+    assert!(
+        undefer.stderr.contains("NOTHING_TO_DO"),
+        "expected NOTHING_TO_DO envelope on stderr: {}",
+        undefer.stderr
+    );
 
     let payload = extract_json_payload(&undefer.stdout);
     let result: Value = serde_json::from_str(&payload).expect("valid json");

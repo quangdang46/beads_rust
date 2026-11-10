@@ -122,15 +122,41 @@ fn test_create_rejects_positional_and_title_flag_together() {
         .output()
         .expect("create with conflicting title inputs");
 
-    assert!(
-        !output.status.success(),
-        "create should reject conflicting title inputs: {output:?}"
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "clap usage errors exit with code 2: {output:?}"
     );
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    // With --json the parse failure is reported as a USAGE_ERROR envelope on
+    // stdout (keeping the stream parseable); clap's message is preserved
+    // inside the envelope.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let envelope: serde_json::Value =
+        serde_json::from_str(&stdout).expect("usage error should be a JSON envelope");
+    let error = &envelope["error"];
+    assert_eq!(error["code"], "USAGE_ERROR");
+    let message = error["message"].as_str().unwrap_or_default();
     assert!(
-        stderr.contains("cannot be used with") && stderr.contains("--title"),
-        "expected clap conflict for --title, got: {stderr}"
+        message.contains("cannot be used with") && message.contains("--title"),
+        "expected clap conflict for --title in envelope, got: {message}"
+    );
+
+    // Without machine output the same conflict keeps clap's plain-text
+    // rendering on stderr.
+    let human = Command::new(bin.as_os_str())
+        .current_dir(path)
+        .arg("create")
+        .arg("Positional Title")
+        .arg("--title")
+        .arg("Flag Title")
+        .output()
+        .expect("create with conflicting title inputs (human output)");
+    assert_eq!(human.status.code(), Some(2));
+    let human_stderr = String::from_utf8_lossy(&human.stderr);
+    assert!(
+        human_stderr.contains("cannot be used with") && human_stderr.contains("--title"),
+        "expected clap conflict for --title on stderr, got: {human_stderr}"
     );
 
     let list_output = Command::new(bin.as_os_str())
