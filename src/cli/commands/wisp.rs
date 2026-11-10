@@ -352,7 +352,29 @@ fn execute_close(
 ) -> Result<()> {
     let now = Utc::now();
     let mut closed = Vec::new();
+    let mut skipped: Vec<(String, String)> = Vec::new();
     for id in &args.ids {
+        // Align with `br close`: a wisp that is already closed (or gone)
+        // is skipped, not re-closed — and when every target is skipped the
+        // command reports NothingToDo (exit 3) instead of exit 0.
+        match store.get_issue(id) {
+            Ok(Some(issue)) if issue.status == Status::Closed => {
+                skipped.push((id.clone(), "already closed".to_string()));
+                if !ctx.is_json() {
+                    println!("Skipped wisp {id}: already closed");
+                }
+                continue;
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                skipped.push((id.clone(), "issue not found".to_string()));
+                if !ctx.is_json() {
+                    println!("Skipped wisp {id}: issue not found");
+                }
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        }
         let updates = crate::storage::IssueUpdate {
             status: Some(Status::Closed),
             close_reason: Some(Some(args.reason.clone())),
@@ -368,7 +390,19 @@ fn execute_close(
     }
 
     if ctx.is_json() {
-        ctx.json_pretty(&serde_json::json!({ "closed": closed }));
+        ctx.json_pretty(&serde_json::json!({
+            "closed": closed,
+            "skipped": skipped
+                .iter()
+                .map(|(id, reason)| serde_json::json!({ "id": id, "reason": reason }))
+                .collect::<Vec<_>>(),
+        }));
+    }
+
+    if closed.is_empty() && !skipped.is_empty() {
+        return Err(BeadsError::NothingToDo {
+            reason: format!("all {} issue(s) skipped", skipped.len()),
+        });
     }
     Ok(())
 }

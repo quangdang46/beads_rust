@@ -488,7 +488,8 @@ fn dep_add(
             ctx.json_pretty(&result);
         }
     } else if matches!(ctx.mode(), OutputMode::Quiet) {
-        return Ok(());
+        // Quiet suppresses the notice but must not bypass the
+        // NothingToDo exit code below — fall through to it.
     } else if added {
         let issue_id_display = dep_display_text(&issue_id);
         let depends_on_id_display = dep_display_text(&depends_on_id);
@@ -528,6 +529,17 @@ fn dep_add(
         ctx.info(&format!(
             "Dependency already exists: {issue_id_display} → {depends_on_id_display}"
         ));
+    }
+
+    // Align with `br close`/`br reopen`/`br undefer`: a no-op mutation
+    // reports NothingToDo (exit 3) so agents can distinguish "edge added"
+    // from "edge already present". The structured/text notice above is
+    // still emitted first, matching how `close` reports skipped issues
+    // before exiting non-zero.
+    if !added {
+        return Err(BeadsError::NothingToDo {
+            reason: format!("dependency {issue_id} -> {depends_on_id} already exists"),
+        });
     }
 
     Ok(())

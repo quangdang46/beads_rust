@@ -486,6 +486,16 @@ pub fn execute_undefer(
     }
 
     render_undefer_output(&undeferred_issues, &skipped_issues, json, args, ctx)?;
+
+    // Align with `br close`/`br reopen`: when every requested issue was
+    // skipped (e.g. `undefer` on an issue that is not deferred), report
+    // NothingToDo (exit 3) instead of a silent success so agents can
+    // distinguish "did something" from "no-op".
+    if undeferred_issues.is_empty() && !skipped_issues.is_empty() {
+        return Err(BeadsError::NothingToDo {
+            reason: format!("all {} issue(s) skipped", skipped_issues.len()),
+        });
+    }
     Ok(())
 }
 
