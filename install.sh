@@ -1179,6 +1179,22 @@ find_binary_candidate() {
     return 1
 }
 
+# Run `cargo build --release` inside $1 with target dir $2 and optional extra
+# cargo args ($3...). Returns non-zero on build failure.
+cargo_build_release() {
+    local build_dir="$1"
+    local target_dir="$2"
+    shift 2
+    local extra_args=("$@")
+
+    if [[ "$GUM_AVAILABLE" == "true" && "$QUIET" -eq 0 ]]; then
+        gum spin --spinner dot --title "Compiling br (release mode)..." -- \
+            bash -c "cd '$build_dir' && CARGO_TARGET_DIR='$target_dir' cargo build --release ${extra_args[*]}"
+    else
+        (cd "$build_dir" && CARGO_TARGET_DIR="$target_dir" cargo build --release "${extra_args[@]}")
+    fi
+}
+
 # ============================================================================
 # Build from source
 # ============================================================================
@@ -1202,15 +1218,17 @@ build_from_source() {
 
     log_step "Building with Cargo (this may take a few minutes)..."
 
-    # Build with explicit target dir to avoid conflicts
+    # Build with explicit target dir to avoid conflicts.
+    # Fall back to --no-default-features (drops the embedded web UI) if the
+    # default-feature build fails, so a source install still succeeds on
+    # machines where the web dependency tree cannot compile.
     local target_dir="$TMP/target"
-    if [[ "$GUM_AVAILABLE" == "true" && "$QUIET" -eq 0 ]]; then
-        if ! gum spin --spinner dot --title "Compiling br (release mode)..." -- \
-            bash -c "cd '$build_dir' && CARGO_TARGET_DIR='$target_dir' cargo build --release"; then
+    if ! cargo_build_release "$build_dir" "$target_dir"; then
+        log_warn "Default-feature build failed; retrying without default features (no embedded web UI)..."
+        if ! cargo_build_release "$build_dir" "$target_dir" --no-default-features; then
             die "Build failed"
         fi
-    else
-        (cd "$build_dir" && CARGO_TARGET_DIR="$target_dir" cargo build --release) || die "Build failed"
+        log_warn "Installed without the embedded web UI; run 'br web' is unavailable in this build"
     fi
 
     # Find the binary
