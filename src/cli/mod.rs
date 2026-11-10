@@ -33,13 +33,10 @@ pub use commands::formula::FormulaCommands;
 pub(crate) const DEFAULT_LIST_LIMIT: usize = 0;
 pub(crate) const DEFAULT_LIST_OFFSET: usize = 0;
 
-/// Default cap for full-text SEARCH results (`br search`).
-///
-/// #349: unlike list/ready (which are complete by default), search results
-/// stay capped — a broad text query can match a huge fraction of the corpus,
-/// and a bounded, relevance-ordered result set is the right default. Callers
-/// can pass `--limit 0` for an unbounded search.
-pub(crate) const DEFAULT_SEARCH_LIMIT: usize = 50;
+// `br search` has no result cap by default (unlimited, matching `--limit`
+// help text and `br list`/`br ready` semantics); callers bound results
+// explicitly with `--limit N`. The historical `DEFAULT_SEARCH_LIMIT` (50)
+// cap was removed — see `commands::search`.
 
 #[derive(Clone, Copy)]
 enum IssueCompletionFilter {

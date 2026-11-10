@@ -177,7 +177,7 @@ pub enum Op {
     Rename { to: PathBuf },
     /// Set the mode of `path`.
     Chmod { mode: u32 },
-    /// Execute `sql` against the project's `fsqlite` DB inside a
+    /// Execute `sql` against the project's SQLite DB inside a
     /// `BEGIN IMMEDIATE` transaction. Before the SQL fires, every row
     /// of every table named in `affected_tables` is snapshotted as
     /// JSON under `<run-dir>/backups/db/`; on any error the
@@ -731,7 +731,7 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
 ///    before any SQL runs.
 ///    For `DbMigrate`: snapshot the entire DB file verbatim to
 ///    `<run-dir>/backups/db/beads.db.pre-migrate`.
-/// 3. Open a writable `fsqlite::Connection`, run the work inside
+/// 3. Open a writable `rusqlite::Connection`, run the work inside
 ///    the migration hook. On any error, restore from the pre-migrate
 ///    snapshot and return without writing an `actions.jsonl` line.
 /// 4. Compute `after_hash` from the post-COMMIT DB file SHA-256.
@@ -904,7 +904,7 @@ fn sha256_file_hex_prefixed(path: &Path) -> std::io::Result<String> {
 ///
 /// ## Single-connection contract (round-2 fresh-eyes fix)
 ///
-/// The snapshot SELECTs run on the **same** `fsqlite::Connection` and
+/// The snapshot SELECTs run on the **same** `rusqlite::Connection` and
 /// **inside** the same `BEGIN IMMEDIATE` transaction as the mutating
 /// SQL. This closes the dual-connection race window that existed when
 /// snapshotting used a separate connection: an external writer could
@@ -1197,7 +1197,7 @@ fn sql_value_to_json(val: &crate::storage::db::SqlValue) -> serde_json::Value {
 /// Drive an [`Op::DbMigrate`] end-to-end. Order of operations:
 ///
 /// 1. Snapshot the DB file verbatim to `backups/db/beads.db.pre-migrate`
-///    BEFORE opening any connection (fsqlite can dirty header counters
+///    BEFORE opening any connection (SQLite can dirty header counters
 ///    even on read-only PRAGMAs).
 /// 2. Verify `PRAGMA user_version == from` and refuse with an internal
 ///    error otherwise.
@@ -1223,7 +1223,7 @@ fn run_db_migrate(
     }
 
     // (1) Snapshot the DB file *before* we open any connection. Opening
-    //     a fsqlite connection can dirty header counters even on a
+    //     a SQLite connection can dirty header counters even on a
     //     read-only PRAGMA query; snapshotting first keeps the
     //     pre-migrate file byte-identical to the on-disk state callers
     //     observed before invoking the chokepoint.
@@ -1406,7 +1406,7 @@ fn execute_atomic(
 ///
 /// Some `repair_*` paths (notably `VACUUM`, `REINDEX`, and the blocked-
 /// cache rebuild through `reset_blocked_cache_table`) call into
-/// fsqlite/config helpers that perform their own in-place file or DB
+/// SQLite/config helpers that perform their own in-place file or DB
 /// mutations and cannot be reformulated as a planned [`Op`] without a
 /// larger refactor. Until that lands, this helper gives those callers
 /// the same observability + recoverability the chokepoint provides:
@@ -2058,7 +2058,7 @@ mod tests {
 
         // Behavioral check: the rolled-back transaction left the table
         // exactly one row (the seed). We do not compare DB file bytes
-        // because fsqlite touches header counters even on a rolled-back
+        // because SQLite touches header counters even on a rolled-back
         // transaction; the row-level invariant is what matters.
         let conn = Connection::open(db).unwrap();
         let count: i64 = conn

@@ -1,8 +1,8 @@
 //! REST API handlers for the embedded web UI server.
 //!
 //! Each handler opens a fresh storage connection inside
-//! `tokio::task::spawn_blocking` because `SqliteStorage` is `!Send`
-//! (fsqlite uses `Rc` internally). Results are returned as JSON.
+//! `tokio::task::spawn_blocking` because `SqliteStorage` is `!Sync`
+//! and cannot be shared across the async runtime. Results are returned as JSON.
 
 use crate::config;
 use crate::error::BeadsError;

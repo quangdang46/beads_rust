@@ -321,7 +321,6 @@ dependencies = [
  "indicatif",
  "insta",
  "mimalloc",
- "once_cell",
  "predicates",
  "proptest",
  "rand 0.10.2",

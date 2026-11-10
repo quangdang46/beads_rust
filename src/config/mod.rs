@@ -965,7 +965,7 @@ fn quarantine_non_file_journal_sidecar(db_path: &Path, beads_dir: &Path) {
 
 /// Issue #228: proactively quarantine truncated WAL sidecar files before
 /// opening. A WAL file that exists but is shorter than 32 bytes (the WAL
-/// header size) cannot be valid and will cause frankensqlite to return
+/// header size) cannot be valid and will cause the SQLite engine to return
 /// `WalCorrupt` during rebuild. Moving the sidecars out of the live
 /// database family lets SQLite recreate them on the next write while
 /// preserving the original bytes for operator inspection.

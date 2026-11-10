@@ -22,7 +22,7 @@ use std::sync::Arc;
 /// Shared application state available to all route handlers.
 ///
 /// Storage is NOT shared — each handler opens its own connection in a
-/// blocking task (SqliteStorage is !Send due to fsqlite's Rc internals).
+/// blocking task (SqliteStorage is !Sync, so it cannot be shared across the async runtime).
 pub struct AppState {
     /// Discovered beads directory path.
     pub beads_dir: PathBuf,
