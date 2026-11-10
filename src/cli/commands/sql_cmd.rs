@@ -3,7 +3,7 @@
 //! The query is wrapped in a `BEGIN`/`ROLLBACK` transaction so that any
 //! accidental data modifications are never committed.
 
-use crate::cli::{OutputFormatBasic, SqlArgs};
+use crate::cli::{OutputFormat, SqlArgs, resolve_output_format_basic_with_outer_mode};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::output::OutputContext;
@@ -63,16 +63,35 @@ fn execute_inner(args: &SqlArgs, ctx: &OutputContext, storage: &SqliteStorage) -
     ensure_read_only_query(&args.query)?;
     let (column_names, rows) = storage.execute_read_only_query(&args.query)?;
 
-    match args.format {
-        OutputFormatBasic::Json => {
+    // `br sql --format` is command-local, but output must still flow through
+    // an OutputContext so machine modes mark output as emitted (a later
+    // error can't append a second JSON document to the stream) and TOON
+    // requests get real TOON instead of the ASCII table. The local format
+    // resolves against the inherited outer mode (global --json/--quiet,
+    // BR_OUTPUT_FORMAT / TOON_DEFAULT_FORMAT) exactly like `dep`/`blocked`.
+    //
+    // Limitation: `--format` carries a clap default of `json`, so it always
+    // counts as an explicit request and wins over an outer TOON mode; use
+    // `br sql --format toon` (or unset formats via the env vars on commands
+    // without a local --format) for TOON.
+    let output_format = resolve_output_format_basic_with_outer_mode(
+        Some(args.format),
+        ctx.inherited_output_mode(),
+        false,
+    );
+    let sql_ctx = OutputContext::from_output_format(output_format, ctx.is_quiet(), true);
+
+    match output_format {
+        OutputFormat::Json => {
             let json = rows_to_json(&column_names, &rows);
-            let output = serde_json::to_string_pretty(&json).unwrap_or_else(|_| "[]".to_string());
-            if !ctx.is_quiet() {
-                println!("{output}");
-            }
+            sql_ctx.json(&json);
         }
-        OutputFormatBasic::Text | OutputFormatBasic::Toon => {
-            if !ctx.is_quiet() {
+        OutputFormat::Toon => {
+            let json = rows_to_json(&column_names, &rows);
+            sql_ctx.toon(&json);
+        }
+        OutputFormat::Text | OutputFormat::Csv => {
+            if !sql_ctx.is_quiet() {
                 print_table(&column_names, &rows);
             }
         }
@@ -288,6 +307,17 @@ fn ensure_read_only_query(query: &str) -> Result<()> {
                     ),
                 ));
             }
+            // Some allow-listed pragmas are dual-purpose: `PRAGMA
+            // schema_version` reads the schema cookie, but `PRAGMA
+            // schema_version = N` writes the database header. Reject any
+            // assignment form so the read-only contract holds regardless of
+            // which side of the pragma name the `=` appears on.
+            if words.iter().any(|word| word.contains('=')) {
+                return Err(BeadsError::validation(
+                    "query",
+                    format!("PRAGMA {name} assignments are not allowed: br sql is read-only"),
+                ));
+            }
             continue;
         }
 
@@ -442,6 +472,54 @@ fn value_to_string(val: &SqlValue) -> String {
             let preview: String = bytes.iter().take(8).map(|b| format!("{b:02x}")).collect();
             let suffix = if bytes.len() > 8 { "..." } else { "" };
             format!("[blob {} bytes: {preview}{suffix}]", bytes.len())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_read_only_query;
+
+    #[test]
+    fn read_only_pragma_forms_are_allowed() {
+        assert!(ensure_read_only_query("PRAGMA schema_version").is_ok());
+        assert!(ensure_read_only_query("PRAGMA table_info(issues)").is_ok());
+        assert!(ensure_read_only_query("SELECT * FROM issues").is_ok());
+    }
+
+    #[test]
+    fn pragma_assignments_are_rejected() {
+        // `PRAGMA schema_version = N` writes the database header; it must
+        // not pass the read-only guard even though `schema_version` is on
+        // the read-only allow-list.
+        for query in [
+            "PRAGMA schema_version = 99",
+            "PRAGMA schema_version=99",
+            "pragma schema_version = 99",
+            "PRAGMA main.schema_version = 99",
+        ] {
+            let err =
+                ensure_read_only_query(query).expect_err(&format!("expected rejection: {query}"));
+            assert!(
+                err.to_string().contains("read-only"),
+                "unexpected error for {query}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn mutating_and_transaction_statements_are_rejected() {
+        for query in [
+            "DELETE FROM issues",
+            "PRAGMA writable_schema = 1",
+            "PRAGMA journal_mode = WAL",
+            "VACUUM",
+            "BEGIN",
+        ] {
+            assert!(
+                ensure_read_only_query(query).is_err(),
+                "expected rejection: {query}"
+            );
         }
     }
 }
