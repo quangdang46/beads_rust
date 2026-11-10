@@ -20,8 +20,33 @@ static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[cfg(not(test))]
 const DISABLE_READ_ONLY_FAST_OPEN_ENV: &str = "BR_DISABLE_READ_ONLY_FAST_OPEN";
 
+/// beads_rust-epipe-sigabrt-plain-output-6d7g5: `println!`/`eprintln!`
+/// panic with "failed printing to stdout/stderr: Broken pipe" when the
+/// reader closes the pipe early (`br list | head -1`), and the release
+/// profile builds with `panic = "abort"`, so the panic becomes SIGABRT
+/// instead of a clean exit. The panic hook runs before the abort, so we
+/// convert BrokenPipe print panics into `exit(0)`. Every other panic
+/// keeps the default hook behavior.
+fn install_epipe_exit_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let message = if let Some(message) = info.payload().downcast_ref::<&str>() {
+            (*message).to_string()
+        } else if let Some(message) = info.payload().downcast_ref::<String>() {
+            message.clone()
+        } else {
+            String::new()
+        };
+        if message.contains("failed printing to") && message.contains("Broken pipe") {
+            std::process::exit(0);
+        }
+        default_hook(info);
+    }));
+}
+
 #[allow(clippy::too_many_lines)]
 fn main() {
+    install_epipe_exit_hook();
     CompleteEnv::with_factory(Cli::command).complete();
 
     // Install SIGINT/SIGTERM/SIGHUP handlers before any storage opens so

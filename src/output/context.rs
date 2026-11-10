@@ -1378,7 +1378,18 @@ impl OutputContext {
                 text.append("\n");
                 self.console().print_renderable(&text);
             }
-            OutputMode::Plain => println!("{content}"),
+            OutputMode::Plain => {
+                // beads_rust-epipe-sigabrt-plain-output-6d7g5: write through
+                // a checked writer instead of println! so a closed pipe
+                // (reader exited early) stops output quietly rather than
+                // panicking — release builds use panic="abort", which would
+                // turn that panic into SIGABRT.
+                let mut stdout = io::stdout().lock();
+                if writeln!(stdout, "{content}").is_err() {
+                    return;
+                }
+                let _ = stdout.flush();
+            }
             OutputMode::Quiet | OutputMode::Json | OutputMode::Toon => {}
         }
     }
