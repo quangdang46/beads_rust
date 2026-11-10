@@ -198,6 +198,29 @@ fn execute_inner(
     let quiet = cli.quiet.unwrap_or(false);
     let early_ctx = OutputContext::from_output_format(output_format, quiet, true);
 
+    // Rows dropped by lenient bulk-read parsing must not vanish silently:
+    // machine consumers get a hard error (incomplete JSON is worse than no
+    // JSON), human consumers get a stderr warning.
+    let skipped_rows = storage.take_skipped_rows();
+    if !skipped_rows.is_empty() {
+        if is_json_output {
+            let first = skipped_rows.records.first();
+            return Err(BeadsError::Config(format!(
+                "{} malformed row(s) skipped while reading issues; refusing to emit incomplete machine output (e.g. {} in {}: {})",
+                skipped_rows.total,
+                first.map_or("<unknown>", |r| r.row_id.as_str()),
+                first.map_or("<unknown>", |r| r.context),
+                first.map_or("<unknown>", |r| r.error.as_str()),
+            )));
+        }
+        if !quiet {
+            eprintln!(
+                "[warning] skipped {} malformed row(s) while reading issues",
+                skipped_rows.total
+            );
+        }
+    }
+
     // Warn on stderr when results were truncated (skip for structured output)
     if truncated && !quiet && !matches!(output_format, OutputFormat::Json | OutputFormat::Toon) {
         if client_filters {

@@ -370,7 +370,6 @@ const BLOCKED_CACHE_DELETE_CHUNK_SIZE: usize = 400;
 const DIRTY_ISSUE_CHUNK_SIZE: usize = 900;
 const BLOCKS_DEP_EDGE_FILTER_LIMIT: usize = 400;
 const IMPORT_DEPENDENCY_CHUNK_SIZE: usize = 140;
-const DEPENDENCY_TRAVERSAL_MAX_DEPTH: usize = 500;
 const BLOCKED_CACHE_STATE_KEY: &str = "blocked_cache_state";
 const BLOCKED_CACHE_STATE_STALE: &str = "stale";
 /// Annotation suffix appended to a blocker ref when an epic is "blocked" purely
@@ -434,7 +433,50 @@ pub struct SqliteStorage {
     /// committing (e.g. an empty-`updates` no-op). It therefore never leaks into
     /// an unrelated subsequent operation. Capture-only — never used for gating.
     pending_event_attribution: Option<EventAttribution>,
+    /// Rows dropped by lenient bulk-read parsing (`parse_row_lenient`),
+    /// drained by [`SqliteStorage::take_skipped_rows`] so command output can
+    /// surface them instead of silently losing issues.
+    skipped_rows: std::cell::RefCell<SkippedRowLog>,
 }
+
+/// A single row skipped by lenient bulk-read parsing.
+#[derive(Debug, Clone)]
+pub struct SkippedRowRecord {
+    /// Which read path dropped the row (e.g. `list_issues`, `search_issues`).
+    pub context: &'static str,
+    /// Best-effort row identifier (usually the issue id column).
+    pub row_id: String,
+    /// Parse error that caused the skip.
+    pub error: String,
+}
+
+/// Aggregate of rows skipped by lenient parsing since the last drain.
+#[derive(Debug, Default)]
+pub struct SkippedRows {
+    /// Total number of skipped rows (may exceed `records.len()` when the
+    /// record buffer was capped).
+    pub total: usize,
+    /// Detail records, capped to bound memory on severely corrupt tables.
+    pub records: Vec<SkippedRowRecord>,
+}
+
+impl SkippedRows {
+    /// Whether any rows were skipped.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.total == 0
+    }
+}
+
+/// Internal log behind [`SqliteStorage::skipped_rows`].
+#[derive(Debug, Default)]
+struct SkippedRowLog {
+    records: Vec<SkippedRowRecord>,
+    total: usize,
+}
+
+/// Cap on retained per-row skip details; `total` still counts every skip.
+const SKIPPED_ROW_RECORD_CAP: usize = 256;
 
 /// Context for a mutation operation, tracking side effects.
 /// Tier 1 attribution captured on status-mutating commands (issue #312,
@@ -1206,6 +1248,7 @@ impl SqliteStorage {
             mutation_count: 0,
             temp_db_path: None,
             pending_event_attribution: None,
+            skipped_rows: std::cell::RefCell::new(SkippedRowLog::default()),
         })
     }
 
@@ -1223,6 +1266,7 @@ impl SqliteStorage {
             mutation_count: 0,
             temp_db_path: None,
             pending_event_attribution: None,
+            skipped_rows: std::cell::RefCell::new(SkippedRowLog::default()),
         }))
     }
 
@@ -1272,6 +1316,7 @@ impl SqliteStorage {
             mutation_count: 0,
             temp_db_path: Some(path.to_path_buf()),
             pending_event_attribution: None,
+            skipped_rows: std::cell::RefCell::new(SkippedRowLog::default()),
         })
     }
 
@@ -2774,7 +2819,9 @@ impl SqliteStorage {
     /// 2. Parent-child edges reversed (`depends_on_id -> issue_id`), since a
     ///    parent finishing requires its children to finish first.
     ///
-    /// A depth cap prevents pathological traversal on corrupted graphs.
+    /// Traversal is bounded by the `visited` set (one visit per node), not
+    /// by depth: capping depth previously let cycles deeper than the cap
+    /// slip through this guard while `detect_cycles` still reported them.
     fn check_cycle(
         conn: &Connection,
         issue_id: &str,
@@ -2804,16 +2851,15 @@ impl SqliteStorage {
         let mut stmt = conn.prepare(&neighbor_sql)?;
 
         let mut visited = HashSet::new();
-        // Level-synchronous BFS: process all nodes at one depth before moving
-        // to the next, so we can enforce a depth cap cleanly.
+        // Level-synchronous BFS. The `visited` set bounds the walk to one
+        // visit per node, so it always terminates; there is deliberately no
+        // depth cap — a cap silently reported "no cycle" for cycles deeper
+        // than the cap, letting `dep add` accept edges that `dep cycles`
+        // (uncapped SCC) then reported (beads_rust-dep-cycle-depth-cap).
         let mut frontier: Vec<String> = vec![depends_on_id.to_string()];
         visited.insert(depends_on_id.to_string());
 
-        for _depth in 0..DEPENDENCY_TRAVERSAL_MAX_DEPTH {
-            if frontier.is_empty() {
-                break;
-            }
-
+        while !frontier.is_empty() {
             let mut next_frontier = Vec::new();
 
             for node in &frontier {
@@ -3810,7 +3856,7 @@ impl SqliteStorage {
             let rows = db::query_rows_with(&self.conn(), &sql, &params)?;
             for row in &rows {
                 if let Some(issue) =
-                    Self::parse_row_lenient(row, "get_issues_by_ids", Self::issue_from_row)
+                    self.parse_row_lenient(row, "get_issues_by_ids", Self::issue_from_row)
                 {
                     issues.push(issue);
                 }
@@ -3921,7 +3967,44 @@ impl SqliteStorage {
     /// Returns an error if the database query fails.
     #[allow(clippy::too_many_lines)]
     pub fn list_issues(&self, filters: &ListFilters) -> Result<Vec<Issue>> {
-        if let Some(limit) = default_visible_limited_page_limit(filters) {
+        self.list_issues_inner(filters, None)
+    }
+
+    /// List issues matching `filters` AND a free-text substring predicate.
+    ///
+    /// The text predicate covers the same fields `br search` matches
+    /// client-side (id, title, description, design, acceptance criteria,
+    /// notes, created_by, and labels) and is a *superset* of the exact
+    /// Rust-side matcher: SQLite `lower()`/`instr()` only fold ASCII, so any
+    /// row containing non-ASCII in a searchable field is kept as a candidate
+    /// for the caller to re-check. Callers that need exact `br search`
+    /// semantics must still apply the client-side matcher to the returned
+    /// rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn list_issues_matching_text(
+        &self,
+        text_query: &str,
+        filters: &ListFilters,
+    ) -> Result<Vec<Issue>> {
+        let trimmed = text_query.trim();
+        if trimmed.is_empty() {
+            return self.list_issues(filters);
+        }
+        self.list_issues_inner(filters, Some(trimmed))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn list_issues_inner(
+        &self,
+        filters: &ListFilters,
+        text_query: Option<&str>,
+    ) -> Result<Vec<Issue>> {
+        if text_query.is_none()
+            && let Some(limit) = default_visible_limited_page_limit(filters)
+        {
             return self.list_default_visible_limited_page(filters.include_deferred, limit);
         }
 
@@ -3954,7 +4037,7 @@ impl SqliteStorage {
         )? {
             let mut filters_without_redundant_label = filters.clone();
             filters_without_redundant_label.labels = None;
-            return self.list_issues(&filters_without_redundant_label);
+            return self.list_issues_inner(&filters_without_redundant_label, text_query);
         }
         sql.push_str(" FROM issues WHERE 1=1");
         if let Some(ref issue_ids) = label_candidate_ids {
@@ -4077,6 +4160,10 @@ impl SqliteStorage {
             params.push(SqlValue::from(ts.to_rfc3339()));
         }
 
+        if let Some(text_query) = text_query {
+            append_issue_text_match_filter(&mut sql, &mut params, text_query);
+        }
+
         if !sort_default_in_rust {
             // Apply custom sort if provided
             if let Some(ref sort_field) = filters.sort {
@@ -4133,7 +4220,7 @@ impl SqliteStorage {
         let rows = db::query_rows_with(&self.conn(), &sql, &params)?;
         let mut issues = Vec::with_capacity(rows.len());
         for row in &rows {
-            if let Some(issue) = Self::parse_row_lenient(row, "list_issues", Self::issue_from_row) {
+            if let Some(issue) = self.parse_row_lenient(row, "list_issues", Self::issue_from_row) {
                 issues.push(issue);
             }
         }
@@ -4180,7 +4267,7 @@ impl SqliteStorage {
             let rows =
                 db::query_rows_with(&self.conn(), &sql, &[SqlValue::from(i64::from(priority))])?;
             for row in &rows {
-                if let Some(issue) = Self::parse_row_lenient(
+                if let Some(issue) = self.parse_row_lenient(
                     row.as_slice(),
                     "list_default_visible_limited_page",
                     Self::issue_from_row,
@@ -4280,7 +4367,7 @@ impl SqliteStorage {
         let rows = db::query_all(&self.conn(), &sql)?;
         let mut issues = Vec::with_capacity(rows.len());
         for row in &rows {
-            if let Some(issue) = Self::parse_row_lenient(
+            if let Some(issue) = self.parse_row_lenient(
                 row,
                 "command_summary_issue_from_row",
                 Self::command_summary_issue_from_row,
@@ -4338,7 +4425,7 @@ impl SqliteStorage {
                 if issues.len() == limit {
                     break;
                 }
-                if let Some(issue) = Self::parse_row_lenient(
+                if let Some(issue) = self.parse_row_lenient(
                     row,
                     "command_summary_issue_from_row",
                     Self::command_summary_issue_from_row,
@@ -4444,7 +4531,7 @@ impl SqliteStorage {
         let rows = db::query_rows_with(&self.conn(), &sql, &params)?;
         let mut issues = Vec::with_capacity(rows.len());
         for row in &rows {
-            if let Some(issue) = Self::parse_row_lenient(
+            if let Some(issue) = self.parse_row_lenient(
                 row,
                 "stale_command_issue_from_row",
                 Self::stale_command_issue_from_row,
@@ -4534,7 +4621,7 @@ impl SqliteStorage {
         let rows = db::query_rows_with(&self.conn(), &sql, &params)?;
         let mut issues = Vec::with_capacity(rows.len());
         for row in &rows {
-            if let Some(issue) = Self::parse_row_lenient(
+            if let Some(issue) = self.parse_row_lenient(
                 row,
                 "lint_command_issue_from_row",
                 Self::lint_command_issue_from_row,
@@ -4605,7 +4692,7 @@ impl SqliteStorage {
         )?;
         let mut issues = Vec::with_capacity(rows.len());
         for row in &rows {
-            if let Some(issue) = Self::parse_row_lenient(
+            if let Some(issue) = self.parse_row_lenient(
                 row,
                 "command_summary_issue_from_row",
                 Self::command_summary_issue_from_row,
@@ -4674,7 +4761,7 @@ impl SqliteStorage {
         )?;
         let mut issues = Vec::with_capacity(rows.len());
         for row in &rows {
-            if let Some(issue) = Self::parse_row_lenient(
+            if let Some(issue) = self.parse_row_lenient(
                 row,
                 "command_summary_issue_from_row",
                 Self::command_summary_issue_from_row,
@@ -4700,7 +4787,7 @@ impl SqliteStorage {
         let mut issues = Vec::with_capacity(rows.len());
         for row in &rows {
             if let Some(issue) =
-                Self::parse_row_lenient(row, "stats_issue_from_row", Self::stats_issue_from_row)
+                self.parse_row_lenient(row, "stats_issue_from_row", Self::stats_issue_from_row)
             {
                 issues.push(issue);
             }
@@ -4722,7 +4809,7 @@ impl SqliteStorage {
         )?;
         let mut issues = Vec::with_capacity(rows.len());
         for row in &rows {
-            if let Some(issue) = Self::parse_row_lenient(
+            if let Some(issue) = self.parse_row_lenient(
                 row,
                 "stats_summary_issue_from_row",
                 Self::stats_summary_issue_from_row,
@@ -4748,7 +4835,7 @@ impl SqliteStorage {
         )?;
         let mut issues = Vec::with_capacity(rows.len());
         for row in &rows {
-            if let Some(issue) = Self::parse_row_lenient(
+            if let Some(issue) = self.parse_row_lenient(
                 row,
                 "changelog_issue_from_row",
                 Self::changelog_issue_from_row,
@@ -5548,7 +5635,7 @@ impl SqliteStorage {
         let mut issues = Vec::with_capacity(rows.len());
         for row in &rows {
             if let Some(issue) =
-                Self::parse_row_lenient(row, "search_issues", |r| projection.parse_issue(r))
+                self.parse_row_lenient(row, "search_issues", |r| projection.parse_issue(r))
             {
                 issues.push(issue);
             }
@@ -5654,7 +5741,7 @@ impl SqliteStorage {
         let mut issues = Vec::with_capacity(rows.len());
         for row in &rows {
             if let Some(issue) =
-                Self::parse_row_lenient(row, "search_issues", |r| projection.parse_issue(r))
+                self.parse_row_lenient(row, "search_issues", |r| projection.parse_issue(r))
             {
                 issues.push(issue);
             }
@@ -6061,7 +6148,7 @@ impl SqliteStorage {
         let rows = db::query_rows_with(&self.conn(), &sql, &params)?;
         let mut issues = Vec::with_capacity(rows.len());
         for row in &rows {
-            if let Some(issue) = Self::parse_row_lenient(row, "query_ready_issue_candidates", |r| {
+            if let Some(issue) = self.parse_row_lenient(row, "query_ready_issue_candidates", |r| {
                 projection.parse_row(r)
             }) {
                 issues.push(issue);
@@ -6152,9 +6239,9 @@ impl SqliteStorage {
                 chunk.iter().map(|id| SqlValue::from(id.as_str())).collect();
             let rows = db::query_rows_with(&self.conn(), &sql, &params)?;
             for row in &rows {
-                if let Some(issue) = Self::parse_row_lenient(row, "get_ready_issues_by_ids", |r| {
-                    projection.parse_row(r)
-                }) {
+                if let Some(issue) = self
+                    .parse_row_lenient(row, "get_ready_issues_by_ids", |r| projection.parse_row(r))
+                {
                     by_id.insert(issue.id.clone(), issue);
                 }
             }
@@ -6882,7 +6969,7 @@ impl SqliteStorage {
 
         let mut blocked_issues = Vec::new();
         for row in &rows {
-            let Some(issue) = Self::parse_row_lenient(row, "load_blocked_issues_from_map", |r| {
+            let Some(issue) = self.parse_row_lenient(row, "load_blocked_issues_from_map", |r| {
                 projection.parse_issue(r)
             }) else {
                 continue;
@@ -7448,7 +7535,7 @@ impl SqliteStorage {
         let mut blocked_issues = Vec::new();
         for row in &rows {
             let Some(issue) =
-                Self::parse_row_lenient(row, "get_blocked_issues", |r| projection.parse_issue(r))
+                self.parse_row_lenient(row, "get_blocked_issues", |r| projection.parse_issue(r))
             else {
                 continue;
             };
@@ -10308,7 +10395,7 @@ impl SqliteStorage {
         let mut issues = Vec::with_capacity(rows.len());
         for row in &rows {
             if let Some(issue) =
-                Self::parse_row_lenient(row, "get_all_issues_for_export", Self::issue_from_row)
+                self.parse_row_lenient(row, "get_all_issues_for_export", Self::issue_from_row)
             {
                 issues.push(issue);
             }
@@ -10969,6 +11056,7 @@ impl SqliteStorage {
     /// `br show <id>` reports a clear per-issue error, and import collision
     /// detection keeps strictness via `get_all_issues_metadata`.
     fn parse_row_lenient<T>(
+        &self,
         row: &[SqlValue],
         context: &'static str,
         parse: impl FnOnce(&[SqlValue]) -> Result<T>,
@@ -10986,8 +11074,32 @@ impl SqliteStorage {
                     context,
                     "Skipping malformed row during bulk read"
                 );
+                // Record the skip so command output can surface it — in
+                // machine modes a silently dropped row means incomplete
+                // agent-visible data with no signal.
+                let mut log = self.skipped_rows.borrow_mut();
+                log.total += 1;
+                if log.records.len() < SKIPPED_ROW_RECORD_CAP {
+                    log.records.push(SkippedRowRecord {
+                        context,
+                        row_id: row_id.to_string(),
+                        error: error.to_string(),
+                    });
+                }
                 None
             }
+        }
+    }
+
+    /// Drain and return the rows skipped by lenient bulk-read parsing since
+    /// the previous call. Command output uses this to warn (human modes) or
+    /// fail (machine modes) instead of silently emitting incomplete results.
+    #[must_use]
+    pub fn take_skipped_rows(&self) -> SkippedRows {
+        let mut log = self.skipped_rows.borrow_mut();
+        SkippedRows {
+            total: std::mem::take(&mut log.total),
+            records: std::mem::take(&mut log.records),
         }
     }
 
@@ -12568,6 +12680,57 @@ fn escape_like_pattern(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_")
+}
+
+/// Columns the `br search` free-text matcher covers on the `issues` row.
+/// Must stay in sync with `issue_matches_search_query` in
+/// `cli/commands/search.rs`.
+const SEARCH_TEXT_COLUMNS: &[&str] = &[
+    "id",
+    "title",
+    "description",
+    "design",
+    "acceptance_criteria",
+    "notes",
+    "created_by",
+];
+
+/// Append the `br search` free-text predicate to a `list_issues`-style
+/// WHERE clause.
+///
+/// The predicate is a *superset* of the client-side matcher: SQLite
+/// `lower()` only folds ASCII while Rust's `to_lowercase()` is
+/// Unicode-aware, so any row containing non-ASCII text in a searchable
+/// field is kept as a candidate (detected via UTF-8 byte length vs
+/// character length) for the caller to re-check exactly. For pure-ASCII
+/// content `instr(lower(col), needle)` is identical to
+/// `col.to_lowercase().contains(needle)`.
+fn append_issue_text_match_filter(sql: &mut String, params: &mut Vec<SqlValue>, query: &str) {
+    let needle = query.to_lowercase();
+    sql.push_str(" AND (");
+    for (index, column) in SEARCH_TEXT_COLUMNS.iter().enumerate() {
+        if index > 0 {
+            sql.push_str(" OR ");
+        }
+        // Column names are compile-time constants — no injection surface.
+        // `IFNULL` keeps NULL columns on the FALSE branch of the OR instead
+        // of propagating SQL NULL through the whole predicate.
+        let _ = write!(
+            sql,
+            "instr(lower(IFNULL({column}, '')), ?) > 0 \
+             OR length(CAST(IFNULL({column}, '') AS BLOB)) != length(IFNULL({column}, ''))"
+        );
+        params.push(SqlValue::from(needle.as_str()));
+    }
+    // Labels live in a separate table; an EXISTS keeps this a semi-join
+    // instead of fanning out duplicate issue rows.
+    sql.push_str(
+        " OR EXISTS (SELECT 1 FROM labels WHERE labels.issue_id = issues.id \
+         AND (instr(lower(labels.label), ?) > 0 \
+         OR length(CAST(labels.label AS BLOB)) != length(labels.label)))",
+    );
+    params.push(SqlValue::from(needle.as_str()));
+    sql.push(')');
 }
 
 // ============================================================================
@@ -23291,6 +23454,7 @@ mod tests {
             mutation_count: 0,
             temp_db_path: None,
             pending_event_attribution: None,
+            skipped_rows: std::cell::RefCell::new(SkippedRowLog::default()),
         };
         let timestamp = Utc.with_ymd_and_hms(2026, 3, 11, 0, 0, 0).unwrap();
         let stamp = timestamp.to_rfc3339();

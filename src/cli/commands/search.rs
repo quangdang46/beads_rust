@@ -20,11 +20,8 @@ use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::str::FromStr;
 
-// `DEFAULT_SEARCH_LIMIT` (50) was the historical `br search` result cap.
-// Search is now unlimited by default to match the `--limit` help text and
-// `br list`/`br ready` semantics; the constant remains in `cli` for API
-// stability and is referenced here to keep it live.
-const _: usize = crate::cli::DEFAULT_SEARCH_LIMIT;
+// Search is unlimited by default (matching the `--limit` help text and
+// `br list`/`br ready` semantics); `--limit N` bounds results explicitly.
 
 /// Execute the search command.
 ///
@@ -64,6 +61,30 @@ pub fn execute_with_storage_ctx(
         false,
     );
     let issues = collect_search_results_for_output(storage, query, &args.filters)?;
+
+    // Rows dropped by lenient bulk-read parsing must not vanish silently:
+    // machine consumers get a hard error (incomplete JSON is worse than no
+    // JSON), human consumers get a stderr warning.
+    let skipped_rows = storage.take_skipped_rows();
+    if !skipped_rows.is_empty() {
+        if matches!(output_format, OutputFormat::Json | OutputFormat::Toon) {
+            let first = skipped_rows.records.first();
+            return Err(BeadsError::Config(format!(
+                "{} malformed row(s) skipped while reading issues; refusing to emit incomplete machine output (e.g. {} in {}: {})",
+                skipped_rows.total,
+                first.map_or("<unknown>", |r| r.row_id.as_str()),
+                first.map_or("<unknown>", |r| r.context),
+                first.map_or("<unknown>", |r| r.error.as_str()),
+            )));
+        }
+        if !cli.quiet.unwrap_or(false) {
+            eprintln!(
+                "[warning] skipped {} malformed row(s) while reading issues",
+                skipped_rows.total
+            );
+        }
+    }
+
     render_search_results(
         storage,
         issues,
@@ -153,17 +174,22 @@ fn collect_search_results_with_projection(
         return Ok(issues);
     }
 
-    // Text search: the SQL `search_issues` path only covers
-    // title/description/id. To cover labels, notes, and created_by
-    // consistently we scan all filter-matching issues and match client-side,
-    // then apply sort/offset/limit in Rust (same ordering the SQL path used:
-    // priority ASC, created_at DESC, id ASC unless overridden).
+    // Text search: push the substring predicate into SQL via
+    // `list_issues_matching_text` so only candidate rows are hydrated
+    // (previously every filter-matched issue was parsed — an O(n) memory
+    // cost on large databases). The SQL predicate is a superset of the
+    // exact matcher: it covers title/description/design/acceptance
+    // criteria/notes/created_by/id plus a labels EXISTS, and keeps any row
+    // containing non-ASCII searchable text as a candidate because SQLite
+    // `lower()` only folds ASCII. The client-side retain below still
+    // decides the exact match set (Unicode case folding, labels).
+    // Sort/offset/limit are applied in Rust afterwards, same as before.
     filters.limit = None;
     filters.offset = None;
     filters.sort = None;
     filters.reverse = false;
 
-    let mut issues = storage.list_issues(&filters)?;
+    let mut issues = storage.list_issues_matching_text(query, &filters)?;
     // Apply in-memory predicate for complex query DSL expressions
     // (OR/NOT), mirroring `br list`.
     if let Some(ref pred) = predicate {
@@ -173,9 +199,9 @@ fn collect_search_results_with_projection(
         issues = apply_client_filters(issues, list_args)?;
     }
 
-    // Labels live in a separate table; hydrate them so they participate in
-    // free-text matching (and so downstream output sees them, matching the
-    // previous relation-metadata backfill).
+    // Hydrate labels only for the surviving candidates so they participate
+    // in free-text matching (and so downstream output sees them, matching
+    // the previous relation-metadata backfill).
     let issue_ids: Vec<String> = issues.iter().map(|issue| issue.id.clone()).collect();
     let labels_by_id = storage.get_labels_for_issues(&issue_ids)?;
     for issue in &mut issues {
