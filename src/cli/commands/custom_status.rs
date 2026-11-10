@@ -211,8 +211,10 @@ pub fn execute_status(
                 ));
             }
             // Block removal while issues still use the status; `--force`
-            // overrides (the issues keep their status string but it is no
-            // longer a registered custom status).
+            // overrides. Warn loudly: those issues keep the status string
+            // but it is no longer a registered custom status, so it will
+            // not appear in `custom-status list` or behave per its old
+            // category until reassigned.
             let in_use = store.list_issues(&ListFilters {
                 statuses: Some(vec![Status::Custom(name.clone())]),
                 include_closed: true,
@@ -231,7 +233,8 @@ pub fn execute_status(
             }
             if !in_use.is_empty() {
                 ctx.warning(&format!(
-                    "custom status '{name}' is still used by at least one issue"
+                    "custom status '{name}' is still used by at least one issue; \
+                     those issues keep the unregistered status string until reassigned"
                 ));
             }
             if !store.remove_custom_status(&name)? {
@@ -344,7 +347,8 @@ pub fn execute_type(
             }
             if !in_use.is_empty() {
                 ctx.warning(&format!(
-                    "custom type '{name}' is still used by at least one issue"
+                    "custom type '{name}' is still used by at least one issue; \
+                     those issues keep the unregistered type string until reassigned"
                 ));
             }
             if !store.remove_custom_type(&name)? {

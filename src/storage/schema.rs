@@ -446,10 +446,10 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
     // Run pre-schema migrations first to fix any incompatible old tables
     // This must run BEFORE the SCHEMA_SQL batch because the batch includes CREATE INDEX
     // statements that will fail if old tables have missing columns
-    let issues_rebuilt = run_pre_schema_migrations(conn).map_err(|e| {
-        eprintln!("run_pre_schema_migrations failed: {:?}", e);
-        e
-    })?;
+    // The error is propagated to the caller, which either recovers (e.g.
+    // corrupt-DB auto-rebuild) or reports it — printing here would emit
+    // scary "failed" noise even when the open ultimately succeeds.
+    let issues_rebuilt = run_pre_schema_migrations(conn)?;
 
     // The local statement splitter and its `is_index && is_stale_schema` skip are
     // gone with `execute_batch`: the skip absorbed a frankensqlite defect, where the
@@ -468,35 +468,23 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
             conn,
             &format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"),
         )
-        .map_err(|e| {
-            eprintln!("PRAGMA user_version failed: {:?}", e);
-            db_err(e)
-        })?;
+        .map_err(db_err)?;
     } else {
         // Existing database: run migrations for schema upgrades.
         // If the issues table was rebuilt from scratch, skip migration checks
         // that reference newly-added columns because fsqlite's in-memory schema
         // cache may not have been updated yet.
-        run_migrations(conn, issues_rebuilt).map_err(|e| {
-            eprintln!("run_migrations failed: {:?}", e);
-            e
-        })?;
+        run_migrations(conn, issues_rebuilt)?;
 
         // Mark schema as applied so future opens can skip DDL/migration work.
         set_pragma(
             conn,
             &format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"),
         )
-        .map_err(|e| {
-            eprintln!("PRAGMA user_version failed: {:?}", e);
-            db_err(e)
-        })?;
+        .map_err(db_err)?;
     }
 
-    apply_runtime_pragmas(conn).map_err(|e| {
-        eprintln!("apply_runtime_pragmas failed: {:?}", e);
-        e
-    })?;
+    apply_runtime_pragmas(conn)?;
 
     // On a truly fresh bootstrap, run a defensive `wal_checkpoint(TRUNCATE)`
     // to reclaim any transient pages frankensqlite allocated while

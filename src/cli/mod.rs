@@ -3619,6 +3619,10 @@ pub enum HistoryCommands {
     Diff {
         /// Backup filename (e.g. issues.2025-01-01T12-00-00.jsonl)
         file: String,
+        /// Field-level diff: parse both JSONL files and report which
+        /// fields changed per issue instead of a raw line diff
+        #[arg(long)]
+        fields: bool,
     },
     /// Restore from backup
     Restore {

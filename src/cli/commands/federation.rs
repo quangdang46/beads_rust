@@ -40,7 +40,7 @@ pub enum FederationCommand {
 pub struct FederationAddArgs {
     /// Peer name (used as primary key)
     pub name: String,
-    /// Remote URL (e.g., https://beads.example.com)
+    /// Remote URL or path (file:// URL or bare filesystem path; e.g., file:///srv/beads/issues.jsonl)
     pub remote_url: String,
     /// Optional username for authentication
     #[arg(long)]
@@ -272,6 +272,21 @@ fn cmd_add(conn: &Connection, args: &FederationAddArgs, ctx: &OutputContext) -> 
         ));
     }
 
+    // Validate remote_url up front using the same rules `federation sync`
+    // applies when resolving the peer to a JSONL path: only `file://` URLs
+    // and bare filesystem paths are supported. Accepting `https://` here
+    // would store a peer that can never sync.
+    let remote_url = args.remote_url.trim();
+    if remote_url.contains("://") && !remote_url.starts_with("file://") {
+        return Err(BeadsError::validation(
+            "remote_url",
+            format!(
+                "unsupported protocol in remote_url: '{remote_url}'; \
+                 use file:// or a bare path"
+            ),
+        ));
+    }
+
     // Reject duplicates by name or remote URL — INSERT OR REPLACE would
     // silently overwrite an existing peer's credentials/settings.
     if let Some(existing) = federation_peers_get(conn, args.name.trim())? {
@@ -285,13 +300,13 @@ fn cmd_add(conn: &Connection, args: &FederationAddArgs, ctx: &OutputContext) -> 
     }
     let url_taken = federation_peers_list(conn)?
         .iter()
-        .any(|p| p.remote_url == args.remote_url);
+        .any(|p| p.remote_url == remote_url);
     if url_taken {
         return Err(BeadsError::validation(
             "remote_url",
             format!(
                 "a peer with remote_url '{}' is already configured",
-                args.remote_url
+                remote_url
             ),
         ));
     }
@@ -314,7 +329,7 @@ fn cmd_add(conn: &Connection, args: &FederationAddArgs, ctx: &OutputContext) -> 
 
     let peer = FederationPeer {
         name: args.name.clone(),
-        remote_url: args.remote_url.clone(),
+        remote_url: remote_url.to_string(),
         username: args.username.clone().unwrap_or_default(),
         sovereignty,
         last_sync: String::new(),

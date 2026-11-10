@@ -129,7 +129,10 @@ fn execute_list(
         ..Default::default()
     })?;
 
-    let wisps: Vec<&Issue> = all_issues.iter().filter(|i| i.ephemeral).collect();
+    // Wisps are ephemeral issues with a `wsp-` ID prefix. `--ephemeral`
+    // issues created outside `br wisp` share the ephemeral flag but are not
+    // wisps, so the prefix check keeps `wisp list`/`gc` scoped to real wisps.
+    let wisps: Vec<&Issue> = all_issues.iter().filter(|i| is_wisp(i)).collect();
 
     // JSON mode is checked before the empty check: an empty list still has
     // to be a JSON document, or `br wisp list --json | jq` breaks on an
@@ -172,6 +175,13 @@ fn execute_list(
         );
     }
     Ok(())
+}
+
+/// True when the issue is a wisp: flagged ephemeral AND carrying the
+/// `wsp-` ID prefix that `br wisp create` mints. Plain `--ephemeral`
+/// issues (created via `br create --ephemeral`) deliberately do not match.
+fn is_wisp(issue: &Issue) -> bool {
+    issue.ephemeral && issue.id.starts_with("wsp-")
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -427,10 +437,11 @@ fn execute_gc(
         ..Default::default()
     })?;
 
-    // Filter to ephemeral + older than cutoff
+    // Filter to wisps older than cutoff (ephemeral flag AND wsp- prefix —
+    // see `is_wisp`; plain `--ephemeral` issues are not wisps).
     let stale: Vec<&Issue> = all_issues
         .iter()
-        .filter(|i| i.ephemeral && i.updated_at < cutoff)
+        .filter(|i| is_wisp(i) && i.updated_at < cutoff)
         .collect();
 
     if stale.is_empty() {

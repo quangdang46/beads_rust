@@ -6,7 +6,8 @@ use beads_rust::output::OutputContext;
 use beads_rust::sync::{
     auto_flush, auto_import_if_stale, auto_import_probe, auto_import_probe_refreshing_witnesses,
 };
-use beads_rust::{BeadsError, Result, StructuredError};
+use beads_rust::{BeadsError, ErrorCode, Result, StructuredError};
+use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
 use std::ffi::OsStr;
@@ -56,7 +57,10 @@ fn main() {
     // completion subprocess (above) would also be safe.
     beads_rust::shutdown::install();
 
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => handle_clap_parse_error(err),
+    };
     let json_error_mode = should_render_errors_as_json(&cli);
     let color_error_mode = should_color_human_errors_for_cli(&cli);
     let output_ctx = OutputContext::from_args(&cli);
@@ -1381,6 +1385,71 @@ fn into_beads_error(err: anyhow::Error) -> BeadsError {
         Err(untyped) => BeadsError::Internal {
             message: untyped.to_string(),
         },
+    }
+}
+
+/// True when the raw argv (or output-format env vars) asks for machine
+/// output. Used only on the clap parse-error path, where no `Cli` exists
+/// yet — mirrors the `--json` / `--format json|toon` / env checks that
+/// `should_render_errors_as_json` performs on a parsed command.
+fn argv_requests_machine_output() -> bool {
+    if matches!(
+        OutputFormat::from_env(),
+        Some(OutputFormat::Json | OutputFormat::Toon)
+    ) {
+        return true;
+    }
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--json" {
+            return true;
+        }
+        if arg == "--format" || arg == "-f" {
+            if let Some(value) = args.get(index + 1)
+                && matches!(value.as_str(), "json" | "toon")
+            {
+                return true;
+            }
+        }
+        if let Some(value) = arg.strip_prefix("--format=")
+            && matches!(value, "json" | "toon")
+        {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
+/// Handle a clap parse failure.
+///
+/// `--help`/`--version` keep clap's own rendering and exit code. Real
+/// usage errors keep clap's plain-text stderr output UNLESS the caller
+/// asked for machine output (`--json`, `--format json|toon`, or the
+/// output-format env vars) — in that case a single `ErrorEnvelope` JSON
+/// document goes to stdout so `br --json <bad-usage> | jq` stays
+/// parseable, and the process still exits with clap's usage code (2).
+fn handle_clap_parse_error(err: clap::Error) -> ! {
+    match err.kind() {
+        ErrorKind::DisplayHelp
+        | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        | ErrorKind::DisplayVersion => err.exit(),
+        _ if argv_requests_machine_output() => {
+            let structured = StructuredError {
+                code: ErrorCode::UsageError,
+                message: beads_rust::format::sanitize_terminal_text(&err.to_string()).into_owned(),
+                hint: Some("Run `br help` for usage information.".to_string()),
+                retryable: true,
+                context: None,
+            };
+            let json = structured.to_json();
+            let rendered = serde_json::to_string_pretty(&json).unwrap_or_else(|_| json.to_string());
+            println!("{rendered}");
+            std::process::exit(err.exit_code());
+        }
+        _ => err.exit(),
     }
 }
 

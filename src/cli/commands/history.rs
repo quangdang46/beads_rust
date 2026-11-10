@@ -7,8 +7,9 @@ use crate::output::OutputContext;
 use crate::sync::history;
 use crate::sync::{require_safe_sync_overwrite_path, validate_temp_file_path};
 use rich_rust::prelude::*;
-use serde_json::json;
+use serde_json::{Value, json};
 use similar::TextDiff;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
@@ -327,13 +328,14 @@ pub fn execute(args: HistoryArgs, cli: &config::CliOverrides, ctx: &OutputContex
     let _ = history::validate_history_dir_path(&history_dir)?;
 
     match args.command {
-        Some(HistoryCommands::Diff { file }) => {
+        Some(HistoryCommands::Diff { file, fields }) => {
             let active_jsonl_path = config::resolve_paths(&beads_dir, cli.db.as_ref())?.jsonl_path;
             diff_backup(
                 &beads_dir,
                 &history_dir,
                 &file,
                 Some(&active_jsonl_path),
+                fields,
                 ctx,
             )
         }
@@ -473,6 +475,7 @@ fn diff_backup(
     history_dir: &Path,
     filename: &str,
     active_jsonl_path: Option<&Path>,
+    fields: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
     let backup_name = validated_backup_filename(filename)?;
@@ -490,6 +493,16 @@ fn diff_backup(
             kind: "Current JSONL".to_string(),
             id: history_display_text(&current_name),
         });
+    }
+
+    if fields {
+        return diff_backup_fields(
+            &current_path,
+            &backup_path,
+            &current_name,
+            &backup_name,
+            ctx,
+        );
     }
 
     if ctx.is_json() {
@@ -565,6 +578,324 @@ fn diff_backup(
         }
     }
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Field-level diff (`br history diff --fields`)
+// ---------------------------------------------------------------------------
+
+/// A single changed top-level field on one issue record.
+struct FieldChange {
+    field: String,
+    old: Value,
+    new: Value,
+}
+
+/// Per-issue field diff entry.
+enum IssueFieldDiff {
+    Added {
+        id: String,
+        title: Option<String>,
+    },
+    Removed {
+        id: String,
+        title: Option<String>,
+    },
+    Changed {
+        id: String,
+        changes: Vec<FieldChange>,
+    },
+}
+
+/// Parse a JSONL file into `id -> issue object` for field-level comparison.
+///
+/// Returns the map plus a count of non-empty lines that failed to parse
+/// (reported to the caller so silently dropped records stay visible).
+/// Unparseable lines are skipped; lines without an `id` are keyed by
+/// their 1-based line number so they still participate in the diff.
+fn parse_jsonl_by_id(path: &Path) -> Result<(BTreeMap<String, Value>, usize)> {
+    let content = fs::read_to_string(path)?;
+    let mut map = BTreeMap::new();
+    let mut skipped = 0usize;
+    for (index, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Value>(trimmed) {
+            Ok(value) => {
+                let key = value
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("#line-{}", index + 1));
+                map.insert(key, value);
+            }
+            Err(_) => skipped += 1,
+        }
+    }
+    Ok((map, skipped))
+}
+
+fn issue_title(value: &Value) -> Option<String> {
+    value
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// Compare two parsed JSONL issue maps and return per-issue field diffs,
+/// sorted by issue ID for deterministic output.
+fn compute_field_diffs(
+    current: &BTreeMap<String, Value>,
+    backup: &BTreeMap<String, Value>,
+) -> Vec<IssueFieldDiff> {
+    let ids: BTreeSet<&String> = current.keys().chain(backup.keys()).collect();
+
+    let mut diffs = Vec::new();
+    for &id in &ids {
+        match (current.get(id), backup.get(id)) {
+            (Some(new_value), None) => diffs.push(IssueFieldDiff::Added {
+                id: id.clone(),
+                title: issue_title(new_value),
+            }),
+            (None, Some(old_value)) => diffs.push(IssueFieldDiff::Removed {
+                id: id.clone(),
+                title: issue_title(old_value),
+            }),
+            (Some(new_value), Some(old_value)) => {
+                if new_value == old_value {
+                    continue;
+                }
+                let mut changes = Vec::new();
+                let new_obj = new_value.as_object();
+                let old_obj = old_value.as_object();
+                if let (Some(new_obj), Some(old_obj)) = (new_obj, old_obj) {
+                    let fields: BTreeSet<&String> = new_obj.keys().chain(old_obj.keys()).collect();
+                    for field in fields {
+                        let old_field = old_obj.get(field).cloned().unwrap_or(Value::Null);
+                        let new_field = new_obj.get(field).cloned().unwrap_or(Value::Null);
+                        if old_field != new_field {
+                            changes.push(FieldChange {
+                                field: field.clone(),
+                                old: old_field,
+                                new: new_field,
+                            });
+                        }
+                    }
+                } else if new_value != old_value {
+                    // Non-object records (should not happen for issues.jsonl,
+                    // but stay total): report the whole value as one change.
+                    changes.push(FieldChange {
+                        field: "$".to_string(),
+                        old: old_value.clone(),
+                        new: new_value.clone(),
+                    });
+                }
+                if !changes.is_empty() {
+                    diffs.push(IssueFieldDiff::Changed {
+                        id: id.clone(),
+                        changes,
+                    });
+                }
+            }
+            (None, None) => {}
+        }
+    }
+    diffs
+}
+
+/// Compact single-line rendering of a field value for text output.
+fn field_value_text(value: &Value) -> String {
+    let rendered = if value.is_object() {
+        format!("<object:{} keys>", value.as_object().map_or(0, |o| o.len()))
+    } else if value.is_array() {
+        format!("<array:{} items>", value.as_array().map_or(0, |a| a.len()))
+    } else {
+        serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
+    };
+    let sanitized = sanitize_terminal_inline(&rendered).into_owned();
+    const MAX_VALUE_CHARS: usize = 120;
+    if sanitized.chars().count() > MAX_VALUE_CHARS {
+        let truncated: String = sanitized.chars().take(MAX_VALUE_CHARS - 1).collect();
+        format!("{truncated}…")
+    } else {
+        sanitized
+    }
+}
+
+/// Render the field-level diff for text (non-JSON) output.
+fn print_field_diff_text(
+    diffs: &[IssueFieldDiff],
+    current_name: &str,
+    backup_name: &str,
+    skipped_lines: usize,
+) {
+    println!(
+        "Field-level diff: {} vs {}",
+        history_display_text(current_name),
+        history_display_text(backup_name)
+    );
+    if diffs.is_empty() {
+        println!("All issue records are identical at field level.");
+    }
+    let mut changed = 0usize;
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    for diff in diffs {
+        match diff {
+            IssueFieldDiff::Added { id, title } => {
+                added += 1;
+                match title {
+                    Some(title) => println!(
+                        "+ {} \"{}\" (added)",
+                        history_display_text(id),
+                        history_display_text(title)
+                    ),
+                    None => println!("+ {} (added)", history_display_text(id)),
+                }
+            }
+            IssueFieldDiff::Removed { id, title } => {
+                removed += 1;
+                match title {
+                    Some(title) => println!(
+                        "- {} \"{}\" (removed)",
+                        history_display_text(id),
+                        history_display_text(title)
+                    ),
+                    None => println!("- {} (removed)", history_display_text(id)),
+                }
+            }
+            IssueFieldDiff::Changed { id, changes } => {
+                changed += 1;
+                let parts: Vec<String> = changes
+                    .iter()
+                    .map(|c| {
+                        format!(
+                            "{}: {} -> {}",
+                            c.field,
+                            field_value_text(&c.old),
+                            field_value_text(&c.new)
+                        )
+                    })
+                    .collect();
+                println!("~ {}: {}", history_display_text(id), parts.join("; "));
+            }
+        }
+    }
+    if !diffs.is_empty() {
+        println!("Summary: {changed} changed, {added} added, {removed} removed.");
+    }
+    if skipped_lines > 0 {
+        println!("Note: {skipped_lines} unparseable line(s) were skipped.");
+    }
+}
+
+/// `br history diff --fields`: parse both JSONL files and report which
+/// fields changed per issue instead of a raw whole-line diff.
+fn diff_backup_fields(
+    current_path: &Path,
+    backup_path: &Path,
+    current_name: &str,
+    backup_name: &str,
+    ctx: &OutputContext,
+) -> Result<()> {
+    // Field diffing parses whole files; keep the same size guard as the
+    // text diff so a huge JSONL cannot exhaust memory.
+    for path in [current_path, backup_path] {
+        let size = fs::metadata(path)?.len();
+        if size > MAX_HISTORY_TEXT_DIFF_BYTES {
+            return Err(BeadsError::Config(format!(
+                "{} exceeds the {} byte field-diff size limit",
+                history_display_path(path),
+                MAX_HISTORY_TEXT_DIFF_BYTES
+            )));
+        }
+    }
+
+    let (current_issues, skipped_current) = parse_jsonl_by_id(current_path)?;
+    let (backup_issues, skipped_backup) = parse_jsonl_by_id(backup_path)?;
+    let diffs = compute_field_diffs(&current_issues, &backup_issues);
+    let skipped_lines = skipped_current + skipped_backup;
+
+    let changed = diffs
+        .iter()
+        .filter(|d| matches!(d, IssueFieldDiff::Changed { .. }))
+        .count();
+    let added = diffs
+        .iter()
+        .filter(|d| matches!(d, IssueFieldDiff::Added { .. }))
+        .count();
+    let removed = diffs
+        .iter()
+        .filter(|d| matches!(d, IssueFieldDiff::Removed { .. }))
+        .count();
+    let status = if diffs.is_empty() {
+        "identical"
+    } else {
+        "different"
+    };
+
+    if ctx.is_json() || ctx.is_toon() {
+        let issues: Vec<Value> = diffs
+            .iter()
+            .map(|diff| match diff {
+                IssueFieldDiff::Added { id, title } => {
+                    json!({ "id": id, "kind": "added", "title": title })
+                }
+                IssueFieldDiff::Removed { id, title } => {
+                    json!({ "id": id, "kind": "removed", "title": title })
+                }
+                IssueFieldDiff::Changed { id, changes } => json!({
+                    "id": id,
+                    "kind": "changed",
+                    "changes": changes
+                        .iter()
+                        .map(|c| json!({ "field": c.field, "old": c.old, "new": c.new }))
+                        .collect::<Vec<_>>(),
+                }),
+            })
+            .collect();
+        let output = json!({
+            "action": "diff",
+            "mode": "fields",
+            "backup": backup_name,
+            "current": current_path.display().to_string(),
+            "status": status,
+            "changed": changed,
+            "added": added,
+            "removed": removed,
+            "skipped_lines": skipped_lines,
+            "issues": issues,
+        });
+        if ctx.is_json() {
+            ctx.json_pretty(&output);
+        } else {
+            ctx.toon(&output);
+        }
+        return Ok(());
+    }
+
+    if ctx.is_quiet() {
+        return Ok(());
+    }
+
+    if ctx.is_rich() {
+        let theme = ctx.theme();
+        let header = format!(
+            "Current: {}\nBackup: {}\nMode: field-level",
+            history_display_text(current_name),
+            history_display_text(backup_name)
+        );
+        let panel = Panel::from_text(&header)
+            .title(Text::styled("History Diff", theme.panel_title.clone()))
+            .box_style(theme.box_style)
+            .border_style(theme.panel_border.clone());
+        ctx.render(&panel);
+    }
+
+    print_field_diff_text(&diffs, current_name, backup_name, skipped_lines);
     Ok(())
 }
 
@@ -1603,7 +1934,8 @@ mod tests {
         fs::remove_file(&target_path).unwrap();
 
         let ctx = OutputContext::from_flags(false, true, true);
-        let err = diff_backup(&beads_dir, &history_dir, &backup_name, None, &ctx).unwrap_err();
+        let err =
+            diff_backup(&beads_dir, &history_dir, &backup_name, None, false, &ctx).unwrap_err();
 
         // A missing current JSONL is a not-found condition, not a config error.
         assert!(

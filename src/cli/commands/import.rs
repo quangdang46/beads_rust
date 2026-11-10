@@ -191,6 +191,43 @@ fn import_issues(
     strict: bool,
     force: bool,
 ) -> Result<(usize, usize)> {
+    // Foreign-prefix guard, mirroring the JSONL import path: IDs outside
+    // the configured `issue_prefix` would leave mixed prefixes in one
+    // database. The JSONL path renames them (`rename_on_import`); the
+    // JSON/CSV/Obsidian paths have no rename machinery, so `--strict`
+    // rejects the file and the default mode warns before importing.
+    // Tombstones are exempt, matching the JSONL prefix check.
+    let expected_prefix = storage
+        .get_config("issue_prefix")?
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| "br".to_string());
+    let foreign_ids: Vec<&str> = issues
+        .iter()
+        .filter(|issue| {
+            issue.status != Status::Tombstone
+                && !crate::sync::id_matches_expected_prefix(&issue.id, &expected_prefix)
+        })
+        .map(|issue| issue.id.as_str())
+        .collect();
+    if !foreign_ids.is_empty() {
+        let detail = foreign_ids
+            .iter()
+            .take(3)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let message = format!(
+            "{} issue(s) have IDs outside the configured prefix '{expected_prefix}' \
+             (e.g. {detail}); this leaves mixed ID prefixes in one database",
+            foreign_ids.len()
+        );
+        if strict {
+            return Err(BeadsError::Config(message));
+        }
+        eprintln!("Warning: {message}");
+    }
+
     let mut imported = 0usize;
     let mut skipped = 0usize;
     for issue in issues {

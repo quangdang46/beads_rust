@@ -135,6 +135,10 @@ pub enum ErrorCode {
     /// Closure-time policy gate fired (issue #274)
     PolicyViolation,
 
+    // === Usage Errors (exit code 2) ===
+    /// CLI usage error (unknown flag, missing argument, etc.)
+    UsageError,
+
     // === Internal Errors (exit code 1) ===
     /// Unexpected internal error
     InternalError,
@@ -191,6 +195,8 @@ impl ErrorCode {
             Self::NothingToDo => "NOTHING_TO_DO",
             // Policy
             Self::PolicyViolation => "POLICY_VIOLATION",
+            // Usage
+            Self::UsageError => "USAGE_ERROR",
             // Internal
             Self::InternalError => "INTERNAL_ERROR",
         }
@@ -212,6 +218,7 @@ impl ErrorCode {
                 | Self::InvalidPriority
                 | Self::RequiredField
                 | Self::AmbiguousId
+                | Self::UsageError
         )
     }
 
@@ -219,7 +226,7 @@ impl ErrorCode {
     ///
     /// Exit codes are grouped by error category:
     /// - 1: Internal/unknown errors
-    /// - 2: Database errors
+    /// - 2: Database and CLI usage errors
     /// - 3: Issue errors
     /// - 4: Validation errors
     /// - 5: Dependency errors
@@ -268,6 +275,8 @@ impl ErrorCode {
             Self::ConfigError | Self::ConfigNotFound | Self::ConfigParseError => 7,
             // I/O (8)
             Self::IoError | Self::JsonError | Self::YamlError => 8,
+            // Usage (2) — matches clap's usage-error exit code
+            Self::UsageError => 2,
             // Internal (1)
             Self::InternalError => 1,
         }
