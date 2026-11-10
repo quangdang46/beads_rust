@@ -27,7 +27,10 @@ use std::str::FromStr;
 #[derive(clap::Args, Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct ExportArgs {
-    /// Export payload format: jsonl (default), csv, json, obsidian
+    /// Export payload format: jsonl (default), csv, json, obsidian.
+    /// All formats include closed issues by default (narrow with
+    /// `--status`); only a full `-f jsonl -o` sync export also carries
+    /// tombstones, which exist solely for JSONL round-trip fidelity.
     #[arg(long, short = 'f', default_value = "jsonl")]
     pub format: String,
 
@@ -112,6 +115,18 @@ fn execute_inner(
     let (mut filters, predicate) = build_filters(&list_args)?;
     filters.limit = None;
     filters.offset = None;
+
+    // Export is a data-port operation, not a browsing view: unlike
+    // `br list`, the default selection includes closed issues so `-f
+    // json`, `-f csv`, and `-f jsonl` subsets do not silently drop them
+    // (previously only the full `-f jsonl -o` sync export carried closed
+    // issues — an asymmetric default that lost data for consumers).
+    // Narrow the selection with `--status`/`--filter` when needed; a
+    // status filter that implies `include_closed` (e.g. `-s closed`)
+    // already sets the flag inside `build_filters`.
+    if filters.statuses.is_none() {
+        filters.include_closed = true;
+    }
 
     // Query issues
     let mut issues = storage.list_issues(&filters)?;
