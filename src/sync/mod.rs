@@ -4441,6 +4441,7 @@ fn build_prefix_renames(
     };
 
     let generator = IdGenerator::new(IdConfig::with_prefix(prefix));
+    let normalized_prefix = prefix.trim_end_matches('-');
     let mut occupied_ids = plan.occupied_ids.clone();
     occupied_ids.extend(storage.get_all_ids()?);
 
@@ -4448,14 +4449,29 @@ fn build_prefix_renames(
     let mut renames = HashMap::with_capacity(plan.prefix_mismatches.len());
 
     for seed in &plan.prefix_mismatches {
-        let new_id = generator.generate(
-            &seed.title,
-            seed.description.as_deref(),
-            seed.created_by.as_deref(),
-            seed.created_at,
-            plan.record_count,
-            |candidate| occupied_ids.contains(candidate) || generated_ids.contains(candidate),
-        );
+        // Prefer preserving the old ID's suffix (`other-x1` ->
+        // `<prefix>-x1`) over minting a fresh hash: re-running the same
+        // import then collides on the *same* renamed ID and is skipped
+        // as a duplicate instead of silently creating a second issue.
+        // Fall back to the hash generator when the suffix-preserving
+        // candidate is taken.
+        let suffix_candidate = crate::util::id::split_prefix_remainder(&seed.old_id)
+            .map(|(_, remainder)| format!("{normalized_prefix}-{remainder}"));
+        let new_id = match suffix_candidate {
+            Some(candidate)
+                if !occupied_ids.contains(&candidate) && !generated_ids.contains(&candidate) =>
+            {
+                candidate
+            }
+            _ => generator.generate(
+                &seed.title,
+                seed.description.as_deref(),
+                seed.created_by.as_deref(),
+                seed.created_at,
+                plan.record_count,
+                |candidate| occupied_ids.contains(candidate) || generated_ids.contains(candidate),
+            ),
+        };
         generated_ids.insert(new_id.clone());
         renames.insert(seed.old_id.clone(), new_id);
     }
