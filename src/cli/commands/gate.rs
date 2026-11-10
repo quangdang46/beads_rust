@@ -125,9 +125,13 @@ fn execute_report(
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
-    storage_ctx
-        .storage
-        .record_gate_result(&issue_id, gate, provider, passed, note, &actor)?;
+    // Route through the write-transaction path (BEGIN IMMEDIATE + BUSY
+    // retry) so a concurrent writer can't interleave or surface a bare
+    // SQLITE_BUSY — gate writes are auxiliary metadata and intentionally
+    // stay outside `mutate()` (no events / dirty-issue export).
+    storage_ctx.storage.with_write_transaction(|storage| {
+        storage.record_gate_result(&issue_id, gate, provider, passed, note, &actor)
+    })?;
 
     crate::util::set_last_touched_id(beads_dir, &issue_id);
 
@@ -361,7 +365,9 @@ fn execute_add_waiter(
     let resolver = build_resolver(&config_layer);
     let issue_id = resolve_issue_id(&storage_ctx.storage, &resolver, &args.id)?;
 
-    storage_ctx.storage.record_gate_waiter(&issue_id, waiter)?;
+    storage_ctx
+        .storage
+        .with_write_transaction(|storage| storage.record_gate_waiter(&issue_id, waiter))?;
 
     let output = GateAddWaiterOutput {
         issue_id: issue_id.clone(),
@@ -403,16 +409,20 @@ fn execute_remove_waiter(
     let issue_id = resolve_issue_id(&storage_ctx.storage, &resolver, &args.id)?;
 
     // Make removal of a never-registered waiter a consistent, explicit
-    // error instead of a silent no-op DELETE.
-    let registered = storage_ctx.storage.get_gate_waiters(&issue_id)?;
-    if !registered.iter().any(|w| w == waiter) {
-        return Err(BeadsError::validation(
-            "waiter",
-            format!("waiter '{waiter}' is not registered on gate {issue_id}"),
-        ));
-    }
+    // error instead of a silent no-op DELETE. The membership check and the
+    // DELETE run inside one write transaction so a concurrent remover
+    // can't slip between them.
+    storage_ctx.storage.with_write_transaction(|storage| {
+        let registered = storage.get_gate_waiters(&issue_id)?;
+        if !registered.iter().any(|w| w == waiter) {
+            return Err(BeadsError::validation(
+                "waiter",
+                format!("waiter '{waiter}' is not registered on gate {issue_id}"),
+            ));
+        }
 
-    storage_ctx.storage.remove_gate_waiter(&issue_id, waiter)?;
+        storage.remove_gate_waiter(&issue_id, waiter)
+    })?;
 
     let output = GateRemoveWaiterOutput {
         issue_id: issue_id.clone(),

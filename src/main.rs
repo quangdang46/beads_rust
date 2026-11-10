@@ -999,6 +999,14 @@ const fn is_mutating_command(cmd: &Commands) -> bool {
             command,
             beads_rust::cli::EpicCommands::CloseEligible(args) if !args.dry_run
         ),
+        // Gate subcommands that write gate_results / gate_waiters rows.
+        // `list` and `list-waiters` are read-only.
+        Commands::Gate { command } => matches!(
+            command,
+            beads_rust::cli::GateCommands::Report(_)
+                | beads_rust::cli::GateCommands::AddWaiter(_)
+                | beads_rust::cli::GateCommands::RemoveWaiter(_)
+        ),
         Commands::Orphans(args) => args.fix,
         _ => false,
     }
@@ -1060,6 +1068,11 @@ const fn needs_write_lock(cmd: &Commands) -> bool {
         | Commands::Admin { .. }
         | Commands::Prime(_)
         | Commands::Reflect(_)
+        // `br gate` opens the SQLite DB family for every subcommand; the
+        // mutating ones (report/add-waiter/remove-waiter) are already covered
+        // by `is_mutating_command`, and the read ones need the same startup
+        // serialization as every other DB-opening command.
+        | Commands::Gate { .. }
         | Commands::Sql(_) => true,
         Commands::Config { command } => !matches!(
             command,
