@@ -230,7 +230,9 @@ pub fn execute(
             )
         }
         ConfigCommands::Set { args } => set_config_value(args, json_mode, overrides, ctx),
-        ConfigCommands::Delete { key } => delete_config_value(key, json_mode, overrides, ctx),
+        ConfigCommands::Delete { key, user } => {
+            delete_config_value(key, *user, json_mode, overrides, ctx)
+        }
         ConfigCommands::Get { key } => {
             let beads_dir = discover_optional_beads_dir_with_cli(overrides)?;
             get_config_value(key, beads_dir.as_ref(), overrides, json_mode, ctx)
@@ -1132,9 +1134,18 @@ fn load_mutable_yaml_config(config_path: &Path) -> Result<serde_yml::Value> {
     }
 }
 
-/// Delete a config value from the database, project config, and user config.
+/// Delete a config value from the database and config YAML layers.
+///
+/// Layer scope mirrors `config set`: inside a workspace only the
+/// workspace-scoped layers (the DB and `.beads/config.yaml`) are touched.
+/// The user-global config (`~/.config/bd/config.yaml`) is only mutated
+/// when `--user` is passed explicitly or when no workspace exists (where
+/// the user file is the only possible target, same as `config set`).
+/// This keeps `br config delete` from silently rewriting a file outside
+/// the workspace as a side effect.
 fn delete_config_value(
     key: &str,
+    user_flag: bool,
     _json_mode: bool,
     overrides: &CliOverrides,
     ctx: &OutputContext,
@@ -1157,6 +1168,13 @@ fn delete_config_value(
         .map(|dir| prepare_yaml_delete(&dir.join("config.yaml"), key))
         .transpose()?
         .flatten();
+    // User-global layers are only mutated with `--user`, or when there is
+    // no workspace at all (mirroring `config set`, which writes the user
+    // file only outside a workspace). We still *prepare* the deletes so a
+    // key that lives solely in user config produces a clear error instead
+    // of a misleading "not found".
+    let in_workspace = beads_dir.is_some();
+    let apply_user_delete = user_flag || !in_workspace;
     let prepared_user_delete = get_user_config_path()
         .map(|path| prepare_yaml_delete(&path, key))
         .transpose()?
@@ -1165,6 +1183,7 @@ fn delete_config_value(
         .map(|path| prepare_yaml_delete(&path, key))
         .transpose()?
         .flatten();
+    let user_key_present = prepared_user_delete.is_some() || prepared_legacy_user_delete.is_some();
 
     // 1. Delete from DB
     let mut db_deleted = false;
@@ -1182,9 +1201,36 @@ fn delete_config_value(
     // 2. Delete from Project YAML
     let project_deleted = apply_prepared_yaml_delete(prepared_project_delete)?;
 
-    // 3. Delete from User YAML
-    let user_deleted = apply_prepared_yaml_delete(prepared_user_delete)?;
-    let legacy_user_deleted = apply_prepared_yaml_delete(prepared_legacy_user_delete)?;
+    // 3. Delete from User YAML (gated — see above)
+    let (user_deleted, legacy_user_deleted) = if apply_user_delete {
+        (
+            apply_prepared_yaml_delete(prepared_user_delete)?,
+            apply_prepared_yaml_delete(prepared_legacy_user_delete)?,
+        )
+    } else {
+        (false, false)
+    };
+
+    // The key exists only in user-global config and the operator did not
+    // opt in to touching it: surface that explicitly rather than reporting
+    // a misleading "not found" or silently mutating the global file.
+    if !apply_user_delete && user_key_present && !db_deleted && !project_deleted {
+        return Err(BeadsError::Config(format!(
+            "Config key '{key}' is only set in the user-global config. \
+             Re-run with `br config delete {key} --user` to remove it there, \
+             or run outside a workspace."
+        )));
+    }
+
+    // Workspace layers were cleaned but a user-global copy remains: the
+    // layered lookup would fall back to it, so warn that the effective
+    // value may still be set.
+    if !apply_user_delete && user_key_present && (db_deleted || project_deleted) {
+        ctx.warning(&format!(
+            "key '{key}' also exists in the user-global config and was left untouched; \
+             pass --user to delete it there too"
+        ));
+    }
 
     if ctx.is_json() {
         let output = json!({
@@ -1192,6 +1238,7 @@ fn delete_config_value(
             "deleted_from_db": db_deleted,
             "deleted_from_project": project_deleted,
             "deleted_from_user": user_deleted || legacy_user_deleted,
+            "user_delete_skipped": !apply_user_delete && user_key_present,
         });
         ctx.json_pretty(&output);
     } else if ctx.is_quiet() {

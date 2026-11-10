@@ -3543,6 +3543,14 @@ pub enum ConfigCommands {
         /// Config key
         #[arg(add = ArgValueCompleter::new(config_key_completer))]
         key: String,
+
+        /// Also delete the key from the user-global config
+        /// (`~/.config/bd/config.yaml`). Without this flag, `config
+        /// delete` inside a workspace only touches workspace-scoped
+        /// layers (the DB and `.beads/config.yaml`); the user-global
+        /// file is never mutated as a side effect.
+        #[arg(long)]
+        user: bool,
     },
 
     /// Open user config file in $EDITOR
