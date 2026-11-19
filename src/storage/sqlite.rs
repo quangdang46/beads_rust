@@ -282,31 +282,90 @@ fn append_issue_id_membership_filter(
     params: &mut Vec<SqlValue>,
     issue_ids: &[String],
 ) {
-    let has_wild = issue_ids.iter().any(|id| id.contains('*'));
+    let mut clauses: Vec<String> = Vec::new();
 
-    sql.push_str(" AND (");
-    if has_wild {
-        for (index, id) in issue_ids.iter().enumerate() {
-            if index > 0 {
-                sql.push_str(" OR ");
-            }
-            let like_pattern = escape_like_pattern(id).replace('*', "%");
-            sql.push_str("id LIKE ? ESCAPE '\\'");
-            params.push(SqlValue::from(like_pattern.as_str()));
-        }
-    } else {
-        for (index, chunk) in issue_ids.chunks(SQLITE_VAR_LIMIT).enumerate() {
-            if index > 0 {
-                sql.push_str(" OR ");
-            }
-            let placeholders: Vec<String> = chunk.iter().map(|_| "?".to_string()).collect();
-            let _ = write!(sql, "id IN ({})", placeholders.join(","));
-            for issue_id in chunk {
-                params.push(SqlValue::from(issue_id.as_str()));
-            }
+    // Exact IDs use IN (...) — case-sensitive, matching the client filter.
+    let exact: Vec<&String> = issue_ids
+        .iter()
+        .filter(|id| !id.contains('*'))
+        .collect();
+    for chunk in exact.chunks(SQLITE_VAR_LIMIT) {
+        let placeholders: Vec<String> = chunk.iter().map(|_| "?".to_string()).collect();
+        clauses.push(format!("id IN ({})", placeholders.join(",")));
+        for issue_id in chunk {
+            params.push(SqlValue::from(issue_id.as_str()));
         }
     }
+
+    for id in issue_ids.iter().filter(|id| id.contains('*')) {
+        if id.contains(['?', '[', ']']) {
+            // `?`, `[` and `]` are literal in the Rust-side glob but active in
+            // SQLite GLOB, so those patterns keep the LIKE form: a
+            // case-insensitive *superset* the caller re-checks exactly.
+            clauses.push("id LIKE ? ESCAPE '\\'".to_string());
+            let like_pattern = escape_like_pattern(id).replace('*', "%");
+            params.push(SqlValue::from(like_pattern.as_str()));
+        } else {
+            // GLOB is case-sensitive like the Rust-side glob matcher, so
+            // `*` patterns can be evaluated exactly in SQL.
+            clauses.push("id GLOB ?".to_string());
+            params.push(SqlValue::from(id.as_str()));
+        }
+    }
+
+    if clauses.is_empty() {
+        // All callers guard on non-empty input; stay safe anyway.
+        sql.push_str(" AND 0");
+        return;
+    }
+    sql.push_str(" AND (");
+    sql.push_str(&clauses.join(" OR "));
     sql.push(')');
+}
+
+/// Append the `br list` filters that are safe to evaluate in SQL. Priority
+/// bounds, overdue, and id matching are exact; `description_contains` /
+/// `notes_contains` are supersets that still need the client-side Unicode
+/// recheck (see `apply_client_filters`).
+fn append_list_pushdown_filters(
+    sql: &mut String,
+    params: &mut Vec<SqlValue>,
+    filters: &ListFilters,
+) {
+    if let Some(min) = filters.priority_min {
+        sql.push_str(" AND priority >= ?");
+        params.push(SqlValue::from(i64::from(min)));
+    }
+    if let Some(max) = filters.priority_max {
+        sql.push_str(" AND priority <= ?");
+        params.push(SqlValue::from(i64::from(max)));
+    }
+
+    for (column, needle) in [
+        ("description", &filters.description_contains),
+        ("notes", &filters.notes_contains),
+    ] {
+        if let Some(needle) = needle {
+            // Column names are compile-time constants — no injection surface.
+            // Same ASCII-lowercase superset trick as
+            // `append_issue_text_match_filter`: non-ASCII rows stay as
+            // candidates for the exact Rust recheck.
+            let _ = write!(
+                sql,
+                " AND (instr(lower(IFNULL({column}, '')), ?) > 0 \
+                 OR length(CAST(IFNULL({column}, '') AS BLOB)) != length(IFNULL({column}, '')))"
+            );
+            params.push(SqlValue::from(needle.to_lowercase().as_str()));
+        }
+    }
+
+    if filters.overdue_only {
+        sql.push_str(" AND due_at < ? AND status NOT IN ('closed', 'tombstone')");
+        params.push(SqlValue::from(Utc::now().to_rfc3339()));
+        if filters.overdue_exclude_deferred {
+            sql.push_str(" AND status != 'deferred'");
+        }
+    }
 }
 
 /// Append WHERE clauses for metadata key=value filtering using LIKE on the
@@ -4111,6 +4170,8 @@ impl SqliteStorage {
             append_issue_id_membership_filter(&mut sql, &mut params, ids);
         }
 
+        append_list_pushdown_filters(&mut sql, &mut params, filters);
+
         if let Some(ref mf) = filters.metadata_filters
             && !mf.is_empty()
         {
@@ -4161,7 +4222,8 @@ impl SqliteStorage {
         }
 
         if let Some(text_query) = text_query {
-            append_issue_text_match_filter(&mut sql, &mut params, text_query);
+            let fts_available = search_fts_available(self.conn());
+            append_issue_text_match_filter(&mut sql, &mut params, text_query, fts_available);
         }
 
         if !sort_default_in_rust {
@@ -4330,7 +4392,7 @@ impl SqliteStorage {
                 .metadata_filters
                 .as_ref()
                 .is_some_and(|mf| !mf.is_empty());
-        if unsupported_filter {
+        if unsupported_filter || filters.has_list_pushdown_filters() {
             return self.list_issues(filters);
         }
 
@@ -4472,7 +4534,7 @@ impl SqliteStorage {
             || filters.updated_after.is_some()
             || filters.sort.as_deref() != Some("updated_at")
             || !filters.reverse;
-        if unsupported_filter {
+        if unsupported_filter || filters.has_list_pushdown_filters() {
             return self.list_issues(filters);
         }
 
@@ -4572,7 +4634,7 @@ impl SqliteStorage {
             || filters.offset.is_some()
             || filters.sort.is_some()
             || filters.reverse;
-        if unsupported_filter {
+        if unsupported_filter || filters.has_list_pushdown_filters() {
             return self.list_issues(filters);
         }
 
@@ -4678,7 +4740,7 @@ impl SqliteStorage {
             || filters.offset.is_some()
             || filters.sort.is_some()
             || filters.reverse;
-        if unsupported_filter {
+        if unsupported_filter || filters.has_list_pushdown_filters() {
             return self.list_issues(filters);
         }
 
@@ -4747,7 +4809,7 @@ impl SqliteStorage {
             || filters.offset.is_some()
             || filters.sort.is_some()
             || filters.reverse;
-        if unsupported_filter {
+        if unsupported_filter || filters.has_list_pushdown_filters() {
             return self.list_issues(filters);
         }
 
@@ -4959,6 +5021,8 @@ impl SqliteStorage {
         {
             append_issue_id_membership_filter(&mut sql, &mut params, ids);
         }
+
+        append_list_pushdown_filters(&mut sql, &mut params, filters);
 
         if let Some(ref mf) = filters.metadata_filters
             && !mf.is_empty()
@@ -5382,6 +5446,8 @@ impl SqliteStorage {
             append_issue_id_membership_filter(&mut sql, &mut params, ids);
         }
 
+        append_list_pushdown_filters(&mut sql, &mut params, filters);
+
         if let Some(ref mf) = filters.metadata_filters
             && !mf.is_empty()
         {
@@ -5556,6 +5622,8 @@ impl SqliteStorage {
         {
             append_issue_id_membership_filter(&mut sql, &mut params, ids);
         }
+
+        append_list_pushdown_filters(&mut sql, &mut params, filters);
 
         if let Some(ref mf) = filters.metadata_filters
             && !mf.is_empty()
@@ -7005,7 +7073,10 @@ impl SqliteStorage {
             entries.push((issue_id, blockers_json));
         }
 
-        let count = Self::insert_blocked_cache_entries(conn, &entries)?;
+        // The table was just emptied by `reset_blocked_cache_table`, so the
+        // per-entry DELETEs in `insert_blocked_cache_entries` would be pure
+        // waste — append directly instead.
+        let count = Self::append_blocked_cache_entries(conn, &entries)?;
         tracing::debug!(blocked_count = count, "Rebuilt blocked issues cache");
         Ok(count)
     }
@@ -7138,17 +7209,41 @@ impl SqliteStorage {
                 "DELETE FROM blocked_issues_cache WHERE issue_id = ?1",
                 &[SqlValue::from(issue_id.as_str())],
             )?;
-            db::exec_with(
-                &conn,
-                "INSERT INTO blocked_issues_cache (issue_id, blocked_by, blocked_at) VALUES (?1, ?2, CURRENT_TIMESTAMP)",
-                &[
-                    SqlValue::from(issue_id.as_str()),
-                    SqlValue::from(blockers_json.as_str()),
-                ],
-            )?;
+            Self::insert_blocked_cache_entry(conn, issue_id, blockers_json)?;
             count += 1;
         }
         Ok(count)
+    }
+
+    /// Insert cache entries into a table known to be empty (the rebuild path
+    /// calls this right after `reset_blocked_cache_table`). Skipping the
+    /// per-entry DELETE halves the statement count on full rebuilds.
+    fn append_blocked_cache_entries(
+        conn: &Connection,
+        entries: &[(String, String)],
+    ) -> Result<usize> {
+        let mut count = 0;
+        for (issue_id, blockers_json) in entries {
+            Self::insert_blocked_cache_entry(conn, issue_id, blockers_json)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    fn insert_blocked_cache_entry(
+        conn: &Connection,
+        issue_id: &str,
+        blockers_json: &str,
+    ) -> Result<()> {
+        db::exec_with(
+            &conn,
+            "INSERT INTO blocked_issues_cache (issue_id, blocked_by, blocked_at) VALUES (?1, ?2, CURRENT_TIMESTAMP)",
+            &[
+                SqlValue::from(issue_id),
+                SqlValue::from(blockers_json),
+            ],
+        )?;
+        Ok(())
     }
 
     fn load_direct_blockers_impl(conn: &Connection) -> Result<HashMap<String, Vec<String>>> {
@@ -11839,6 +11934,34 @@ pub struct ListFilters {
     pub mol_type: Option<MolType>,
     /// Filter by external reference.
     pub external_ref: Option<String>,
+    /// Minimum priority (inclusive) — `br list --priority-min`.
+    pub priority_min: Option<i32>,
+    /// Maximum priority (inclusive) — `br list --priority-max`.
+    pub priority_max: Option<i32>,
+    /// Case-insensitive substring pre-filter on `description`. This is a
+    /// *superset* of the client matcher (SQLite `lower()` is ASCII-only), so
+    /// callers must keep the exact Rust-side recheck.
+    pub description_contains: Option<String>,
+    /// Same as `description_contains` but for `notes`.
+    pub notes_contains: Option<String>,
+    /// `br list --overdue`: `due_at` before now and status not terminal.
+    pub overdue_only: bool,
+    /// With `overdue_only`, also exclude deferred rows — mirrors the client
+    /// filter's `include_deferred` logic for the `--overdue` flag.
+    pub overdue_exclude_deferred: bool,
+}
+
+impl ListFilters {
+    /// True when any `br list` pushdown filter is set. Lean command paths
+    /// must fall back to `list_issues` in that case so the predicates are
+    /// actually applied.
+    pub(crate) fn has_list_pushdown_filters(&self) -> bool {
+        self.priority_min.is_some()
+            || self.priority_max.is_some()
+            || self.description_contains.is_some()
+            || self.notes_contains.is_some()
+            || self.overdue_only
+    }
 }
 
 impl Default for ListFilters {
@@ -11874,6 +11997,12 @@ impl Default for ListFilters {
             pinned: None,
             mol_type: None,
             external_ref: None,
+            priority_min: None,
+            priority_max: None,
+            description_contains: None,
+            notes_contains: None,
+            overdue_only: false,
+            overdue_exclude_deferred: false,
         }
     }
 }
@@ -12102,7 +12231,8 @@ fn default_visible_limited_page_limit(filters: &ListFilters) -> Option<usize> {
         && filters.metadata_filters.as_ref().is_none_or(Vec::is_empty)
         && filters.owner.is_none()
         && filters.pinned.is_none()
-        && filters.mol_type.is_none();
+        && filters.mol_type.is_none()
+        && !filters.has_list_pushdown_filters();
 
     is_default_visible.then_some(limit)
 }
@@ -12132,7 +12262,8 @@ fn default_visible_single_label_count_filter(filters: &ListFilters) -> Option<&s
         && filters.metadata_filters.as_ref().is_none_or(Vec::is_empty)
         && filters.owner.is_none()
         && filters.pinned.is_none()
-        && filters.mol_type.is_none();
+        && filters.mol_type.is_none()
+        && !filters.has_list_pushdown_filters();
 
     is_default_visible.then_some(label.as_str())
 }
@@ -12695,17 +12826,70 @@ const SEARCH_TEXT_COLUMNS: &[&str] = &[
     "created_by",
 ];
 
+/// Build the FTS5 trigram MATCH phrase for `query`, or `None` when the caller
+/// must use the `instr()` scan fallback instead.
+///
+/// The trigram tokenizer needs at least 3 bytes to match anything, and its
+/// case folding is only guaranteed to agree with Rust's Unicode
+/// `to_lowercase` for ASCII input — both cases fall back to the scan
+/// predicate, which remains a correct superset either way.
+fn fts_trigram_matcher(query: &str) -> Option<String> {
+    if query.len() < 3 || !query.is_ascii() || query.contains('"') {
+        return None;
+    }
+    Some(format!("\"{query}\""))
+}
+
+/// Whether the FTS5 search indexes (`issues_fts`/`labels_fts`, schema v22)
+/// exist on this database. Old databases opened read-only, or any database
+/// that has not been migrated yet, lack them and must use the scan fallback.
+fn search_fts_available(conn: &Connection) -> bool {
+    db::query_row_with(
+        conn,
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'issues_fts' LIMIT 1",
+        &[],
+    )
+    .ok()
+    .flatten()
+    .is_some()
+}
+
 /// Append the `br search` free-text predicate to a `list_issues`-style
 /// WHERE clause.
 ///
-/// The predicate is a *superset* of the client-side matcher: SQLite
-/// `lower()` only folds ASCII while Rust's `to_lowercase()` is
-/// Unicode-aware, so any row containing non-ASCII text in a searchable
-/// field is kept as a candidate (detected via UTF-8 byte length vs
-/// character length) for the caller to re-check exactly. For pure-ASCII
-/// content `instr(lower(col), needle)` is identical to
+/// When `fts_available` is set and the query is safe for the trigram index,
+/// the predicate reads the FTS5 tables: `issues_fts` covers the seven
+/// searchable issue columns and `labels_fts` covers labels, with the
+/// `nonascii` UNINDEXED flag preserving the old "keep non-ASCII rows as
+/// candidates" clause. Otherwise the predicate is a *superset* of the
+/// client-side matcher: SQLite `lower()` only folds ASCII while Rust's
+/// `to_lowercase()` is Unicode-aware, so any row containing non-ASCII text
+/// in a searchable field is kept as a candidate (detected via UTF-8 byte
+/// length vs character length) for the caller to re-check exactly. For
+/// pure-ASCII content `instr(lower(col), needle)` is identical to
 /// `col.to_lowercase().contains(needle)`.
-fn append_issue_text_match_filter(sql: &mut String, params: &mut Vec<SqlValue>, query: &str) {
+fn append_issue_text_match_filter(
+    sql: &mut String,
+    params: &mut Vec<SqlValue>,
+    query: &str,
+    fts_available: bool,
+) {
+    if fts_available && let Some(matcher) = fts_trigram_matcher(query) {
+        // FTS5 path. Each MATCH subquery is materialized once by the query
+        // planner (IN, not a correlated EXISTS), and the `nonascii` flag
+        // scans return only the small set of rows that need the exact
+        // Rust-side recheck anyway.
+        sql.push_str(
+            " AND (issues.rowid IN (SELECT rowid FROM issues_fts WHERE issues_fts MATCH ?) \
+             OR issues.rowid IN (SELECT rowid FROM issues_fts WHERE nonascii <> 0) \
+             OR issues.id IN (SELECT issue_id FROM labels_fts WHERE labels_fts MATCH ?) \
+             OR issues.id IN (SELECT issue_id FROM labels_fts WHERE nonascii <> 0))",
+        );
+        params.push(SqlValue::from(matcher.as_str()));
+        params.push(SqlValue::from(matcher));
+        return;
+    }
+
     let needle = query.to_lowercase();
     sql.push_str(" AND (");
     for (index, column) in SEARCH_TEXT_COLUMNS.iter().enumerate() {

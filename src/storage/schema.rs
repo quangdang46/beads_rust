@@ -9,7 +9,7 @@ use crate::model::{IssueType, Priority, Status};
 use crate::storage::db::{self, SqlValue, db_err};
 use crate::util::content_hash_from_parts;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 21;
+pub const CURRENT_SCHEMA_VERSION: i32 = 22;
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 
 /// The complete SQL schema for the beads database.
@@ -390,6 +390,153 @@ pub const SCHEMA_SQL: &str = r"
     );
 ";
 
+/// FTS5 search index DDL (beads_rust-rsd8c), applied alongside [`SCHEMA_SQL`].
+///
+/// `br search` / `list --text` previously evaluated `instr(lower(col), ?)`
+/// across seven issue columns plus a correlated `EXISTS` on `labels` for
+/// every candidate row — a full table scan per query. These trigram-tokenized
+/// FTS5 tables answer the same predicate from the full-text index instead.
+///
+/// Design notes:
+/// - **Full-content** (not `content='issues'` external content) so the
+///   `nonascii` UNINDEXED flag — which external-content tables cannot store —
+///   can ride along in the same row. The flag mirrors the old predicate's
+///   "keep rows whose searchable text contains non-ASCII as candidates"
+///   clause, because SQLite `lower()`/trigram folding is not identical to
+///   Rust's Unicode `to_lowercase`. Callers still re-check candidates exactly
+///   in Rust, so the index only needs to be a *superset* of exact matches.
+/// - The fts `rowid` is pinned to the source table's `rowid` so MATCH results
+///   join back without a text-column lookup. `INSERT OR REPLACE` in the
+///   triggers self-heals any stale rowid left behind by table rebuilds.
+/// - `UPDATE OF` column lists keep the index off the hot path: `updated_at`,
+///   `status`, and the other non-searchable columns do not reindex.
+/// - Orphan rows (issue deleted without its trigger firing, e.g. FK cascade
+///   edge cases or `DROP TABLE`) are harmless: every query joins back to
+///   `issues`/`labels`, so stale ids/rowids simply never match.
+pub(crate) const SEARCH_FTS_SCHEMA_SQL: &str = r"
+    CREATE VIRTUAL TABLE IF NOT EXISTS issues_fts USING fts5(
+        id,
+        title,
+        description,
+        design,
+        acceptance_criteria,
+        notes,
+        created_by,
+        nonascii UNINDEXED,
+        tokenize = 'trigram'
+    );
+
+    CREATE VIRTUAL TABLE IF NOT EXISTS labels_fts USING fts5(
+        label,
+        issue_id UNINDEXED,
+        nonascii UNINDEXED,
+        tokenize = 'trigram'
+    );
+
+    CREATE TRIGGER IF NOT EXISTS issues_fts_ai AFTER INSERT ON issues BEGIN
+        INSERT OR REPLACE INTO issues_fts(
+            rowid, id, title, description, design, acceptance_criteria,
+            notes, created_by, nonascii
+        ) VALUES (
+            new.rowid, new.id, new.title, new.description, new.design,
+            new.acceptance_criteria, new.notes, new.created_by,
+            CASE WHEN
+                length(CAST(IFNULL(new.id, '') AS BLOB)) != length(IFNULL(new.id, ''))
+                OR length(CAST(IFNULL(new.title, '') AS BLOB)) != length(IFNULL(new.title, ''))
+                OR length(CAST(IFNULL(new.description, '') AS BLOB)) != length(IFNULL(new.description, ''))
+                OR length(CAST(IFNULL(new.design, '') AS BLOB)) != length(IFNULL(new.design, ''))
+                OR length(CAST(IFNULL(new.acceptance_criteria, '') AS BLOB)) != length(IFNULL(new.acceptance_criteria, ''))
+                OR length(CAST(IFNULL(new.notes, '') AS BLOB)) != length(IFNULL(new.notes, ''))
+                OR length(CAST(IFNULL(new.created_by, '') AS BLOB)) != length(IFNULL(new.created_by, ''))
+            THEN 1 ELSE 0 END
+        );
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS issues_fts_ad AFTER DELETE ON issues BEGIN
+        DELETE FROM issues_fts WHERE rowid = old.rowid;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS issues_fts_au
+    AFTER UPDATE OF id, title, description, design, acceptance_criteria,
+        notes, created_by ON issues BEGIN
+        DELETE FROM issues_fts WHERE rowid = old.rowid;
+        INSERT OR REPLACE INTO issues_fts(
+            rowid, id, title, description, design, acceptance_criteria,
+            notes, created_by, nonascii
+        ) VALUES (
+            new.rowid, new.id, new.title, new.description, new.design,
+            new.acceptance_criteria, new.notes, new.created_by,
+            CASE WHEN
+                length(CAST(IFNULL(new.id, '') AS BLOB)) != length(IFNULL(new.id, ''))
+                OR length(CAST(IFNULL(new.title, '') AS BLOB)) != length(IFNULL(new.title, ''))
+                OR length(CAST(IFNULL(new.description, '') AS BLOB)) != length(IFNULL(new.description, ''))
+                OR length(CAST(IFNULL(new.design, '') AS BLOB)) != length(IFNULL(new.design, ''))
+                OR length(CAST(IFNULL(new.acceptance_criteria, '') AS BLOB)) != length(IFNULL(new.acceptance_criteria, ''))
+                OR length(CAST(IFNULL(new.notes, '') AS BLOB)) != length(IFNULL(new.notes, ''))
+                OR length(CAST(IFNULL(new.created_by, '') AS BLOB)) != length(IFNULL(new.created_by, ''))
+            THEN 1 ELSE 0 END
+        );
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS labels_fts_ai AFTER INSERT ON labels BEGIN
+        INSERT OR REPLACE INTO labels_fts(rowid, label, issue_id, nonascii)
+        VALUES (
+            new.rowid, new.label, new.issue_id,
+            CASE WHEN length(CAST(IFNULL(new.label, '') AS BLOB)) != length(IFNULL(new.label, ''))
+            THEN 1 ELSE 0 END
+        );
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS labels_fts_ad AFTER DELETE ON labels BEGIN
+        DELETE FROM labels_fts WHERE rowid = old.rowid;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS labels_fts_au
+    AFTER UPDATE OF issue_id, label ON labels BEGIN
+        DELETE FROM labels_fts WHERE rowid = old.rowid;
+        INSERT OR REPLACE INTO labels_fts(rowid, label, issue_id, nonascii)
+        VALUES (
+            new.rowid, new.label, new.issue_id,
+            CASE WHEN length(CAST(IFNULL(new.label, '') AS BLOB)) != length(IFNULL(new.label, ''))
+            THEN 1 ELSE 0 END
+        );
+    END;
+";
+
+/// SQL that repopulates `issues_fts` from `issues`. Used by the v22
+/// migration for databases that predate the index. Must stay
+/// column-for-column in sync with [`SEARCH_FTS_SCHEMA_SQL`]'s `nonascii`
+/// expressions — the same "UTF-8 byte length != character length" test the
+/// old `instr()` predicate used to keep non-ASCII rows as candidates.
+const SEARCH_FTS_POPULATE_ISSUES_SQL: &str = r"
+    INSERT OR REPLACE INTO issues_fts(
+        rowid, id, title, description, design, acceptance_criteria,
+        notes, created_by, nonascii
+    )
+    SELECT rowid, id, title, description, design, acceptance_criteria,
+        notes, created_by,
+        CASE WHEN
+            length(CAST(IFNULL(id, '') AS BLOB)) != length(IFNULL(id, ''))
+            OR length(CAST(IFNULL(title, '') AS BLOB)) != length(IFNULL(title, ''))
+            OR length(CAST(IFNULL(description, '') AS BLOB)) != length(IFNULL(description, ''))
+            OR length(CAST(IFNULL(design, '') AS BLOB)) != length(IFNULL(design, ''))
+            OR length(CAST(IFNULL(acceptance_criteria, '') AS BLOB)) != length(IFNULL(acceptance_criteria, ''))
+            OR length(CAST(IFNULL(notes, '') AS BLOB)) != length(IFNULL(notes, ''))
+            OR length(CAST(IFNULL(created_by, '') AS BLOB)) != length(IFNULL(created_by, ''))
+        THEN 1 ELSE 0 END
+    FROM issues;
+";
+
+/// SQL that repopulates `labels_fts` from `labels` (see
+/// [`SEARCH_FTS_POPULATE_ISSUES_SQL`]).
+const SEARCH_FTS_POPULATE_LABELS_SQL: &str = r"
+    INSERT OR REPLACE INTO labels_fts(rowid, label, issue_id, nonascii)
+    SELECT rowid, label, issue_id,
+        CASE WHEN length(CAST(IFNULL(label, '') AS BLOB)) != length(IFNULL(label, ''))
+        THEN 1 ELSE 0 END
+    FROM labels;
+";
+
 /// Run a query and collect every row as owned column values.
 ///
 /// A collected row is a `Vec<SqlValue>`, so `row.get(i)` is the same lenient
@@ -460,6 +607,7 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
     // the database without the index — the same DDL reaching a DB that genuinely lacks
     // the column is a real fault, not one to absorb.
     conn.execute_batch(SCHEMA_SQL).map_err(db_err)?;
+    conn.execute_batch(SEARCH_FTS_SCHEMA_SQL).map_err(db_err)?;
 
     if is_fresh {
         // Fresh database: SCHEMA_SQL already created everything at the
@@ -583,6 +731,7 @@ pub(crate) fn apply_runtime_compatible_schema(conn: &Connection) -> Result<()> {
     // The table layouts are already safe to operate on, so we can skip the
     // heavier pre-schema rebuilds and just restore any missing canonical DDL.
     conn.execute_batch(SCHEMA_SQL).map_err(db_err)?;
+    conn.execute_batch(SEARCH_FTS_SCHEMA_SQL).map_err(db_err)?;
     run_migrations(conn, false)?;
     set_pragma(
         conn,
@@ -1834,6 +1983,25 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
         )?;
     }
 
+    // Migration v21 -> v22 (beads_rust-rsd8c): FTS5 trigram search indexes.
+    //
+    // `SEARCH_FTS_SCHEMA_SQL` is normally applied by `apply_schema` before
+    // this runs, but `run_migrations_atomic` (the doctor DbMigrate
+    // chokepoint) reaches `run_migrations` without it — so the DDL is
+    // re-asserted here. Both statements are fully idempotent
+    // (`IF NOT EXISTS`), and the populate uses `INSERT OR REPLACE` so a
+    // retried or racing migration cannot fail on duplicate fts rowids.
+    if user_version < 22 {
+        tracing::info!("Migrating database to schema version 22 (FTS5 search indexes)");
+        conn.execute_batch(SEARCH_FTS_SCHEMA_SQL)?;
+        if table_exists(conn, "issues") {
+            conn.execute_batch(SEARCH_FTS_POPULATE_ISSUES_SQL)?;
+        }
+        if table_exists(conn, "labels") {
+            conn.execute_batch(SEARCH_FTS_POPULATE_LABELS_SQL)?;
+        }
+    }
+
     // Migration: Add missing indexes for bd parity
     // These use IF NOT EXISTS so they're safe to run multiple times
     conn.execute_batch(
@@ -1944,7 +2112,9 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
     // user_version hasn't been bumped. Insert OR REPLACE handles the case
     // where run_migrations is called multiple times (fresh + runtime-compatible).
     if table_exists(conn, "schema_migration_hashes") {
-        let combined_sql = format!("{SCHEMA_SQL}\n{CURRENT_SCHEMA_VERSION}");
+        let combined_sql = format!(
+            "{SCHEMA_SQL}\n{SEARCH_FTS_SCHEMA_SQL}\n{CURRENT_SCHEMA_VERSION}"
+        );
         record_migration_hash(conn, CURRENT_SCHEMA_VERSION, &combined_sql)?;
     }
 

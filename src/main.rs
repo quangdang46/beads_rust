@@ -1036,6 +1036,17 @@ const fn is_mutating_command(cmd: &Commands) -> bool {
                 | beads_rust::cli::GateCommands::AddWaiter(_)
                 | beads_rust::cli::GateCommands::RemoveWaiter(_)
         ),
+        // Mol subcommands that write issues/dependencies: `bond` adds a
+        // dependency edge, `pour` creates an issue, and `swarm create`
+        // creates a molecule. `swarm validate` is read-only.
+        Commands::Mol { command } => matches!(
+            command,
+            commands::mol::MolCommands::Bond(_)
+                | commands::mol::MolCommands::Pour(_)
+                | commands::mol::MolCommands::Swarm {
+                    command: commands::mol::MolSwarmCommands::Create(_),
+                }
+        ),
         Commands::Orphans(args) => args.fix,
         _ => false,
     }
@@ -1102,6 +1113,10 @@ const fn needs_write_lock(cmd: &Commands) -> bool {
         // by `is_mutating_command`, and the read ones need the same startup
         // serialization as every other DB-opening command.
         | Commands::Gate { .. }
+        // Every `br mol` subcommand opens the SQLite DB family (bond/pour/
+        // swarm create write; swarm validate reads), so it must serialize
+        // with other DB openers under `--allow-stale`/`--no-auto-import`.
+        | Commands::Mol { .. }
         | Commands::Sql(_) => true,
         Commands::Config { command } => !matches!(
             command,

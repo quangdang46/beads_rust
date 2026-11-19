@@ -177,11 +177,13 @@ fn execute_bond(
         });
     }
 
-    // Resolve to dependency type
+    // Resolve to dependency type. `parallel` maps to `related`: it carries
+    // no ordering constraint, whereas `parent-child` enforces the
+    // single-parent invariant and would reject a second parallel bond.
     let dep_type_str = match bond_type.as_str() {
         "sequential" => "blocks",
         "conditional" => "conditional-blocks",
-        _ => "parent-child", // parallel
+        _ => "related", // parallel
     };
 
     if args.dry_run {
@@ -205,10 +207,11 @@ fn execute_bond(
         return Ok(());
     }
 
-    // Create the dependency: target depends on source with the resolved dep type
-    storage.add_dependency(&target_id, &source_id, dep_type_str, actor)?;
-
-    // Add metadata to the dependency to record bonding info
+    // Create the dependency: target depends on source with the resolved dep
+    // type, carrying the bond metadata in the same write. Calling
+    // `add_dependency` first and `add_dependency_with_metadata` second used
+    // to hit the existing-edge check on the second call, silently dropping
+    // the bond_type/bond_point metadata while still reporting "Bonded ok".
     let metadata = serde_json::json!({
         "bond_type": bond_type,
         "bond_point": "",
@@ -967,4 +970,110 @@ fn find_existing_swarm(storage: &SqliteStorage, epic_id: &str) -> Result<Option<
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_issue(id: &str) -> Issue {
+        Issue {
+            id: id.to_string(),
+            title: format!("issue {id}"),
+            ..Issue::default()
+        }
+    }
+
+    fn bond_args(source: &str, target: &str, bond_type: &str) -> MolBondArgs {
+        MolBondArgs {
+            source: source.to_string(),
+            target: target.to_string(),
+            bond_type: bond_type.to_string(),
+            dry_run: false,
+        }
+    }
+
+    #[test]
+    fn bond_persists_metadata_on_the_dependency() {
+        // Regression: `execute_bond` used to call `add_dependency` and then
+        // `add_dependency_with_metadata`; the second call hit the
+        // existing-edge check and the bond metadata was silently dropped.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        storage
+            .create_issue(&test_issue("bd-src"), "tester")
+            .unwrap();
+        storage
+            .create_issue(&test_issue("bd-tgt"), "tester")
+            .unwrap();
+        let ctx = OutputContext::from_flags(true, true, true);
+
+        execute_bond(
+            &bond_args("bd-src", "bd-tgt", "sequential"),
+            &mut storage,
+            "tester",
+            &ctx,
+        )
+        .unwrap();
+
+        let deps = storage.get_dependencies_full("bd-tgt").unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].dep_type, DependencyType::Blocks);
+        let metadata: serde_json::Value =
+            serde_json::from_str(deps[0].metadata.as_deref().expect("dep metadata"))
+                .expect("metadata is valid JSON");
+        assert_eq!(metadata["bond_type"], "sequential");
+        assert!(metadata.get("bond_point").is_some());
+    }
+
+    #[test]
+    fn parallel_bonds_do_not_hit_single_parent_invariant() {
+        // Regression: `--bond-type parallel` used to map to `parent-child`,
+        // so a second parallel bond onto the same target failed the
+        // single-parent check. It now maps to `related`.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        for id in ["bd-a", "bd-b", "bd-c"] {
+            storage.create_issue(&test_issue(id), "tester").unwrap();
+        }
+        let ctx = OutputContext::from_flags(true, true, true);
+
+        execute_bond(
+            &bond_args("bd-a", "bd-c", "parallel"),
+            &mut storage,
+            "tester",
+            &ctx,
+        )
+        .unwrap();
+        execute_bond(
+            &bond_args("bd-b", "bd-c", "parallel"),
+            &mut storage,
+            "tester",
+            &ctx,
+        )
+        .unwrap();
+
+        let deps = storage.get_dependencies_full("bd-c").unwrap();
+        assert_eq!(deps.len(), 2);
+        assert!(deps.iter().all(|d| d.dep_type == DependencyType::Related));
+    }
+
+    #[test]
+    fn invalid_bond_type_is_rejected() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        storage
+            .create_issue(&test_issue("bd-src"), "tester")
+            .unwrap();
+        storage
+            .create_issue(&test_issue("bd-tgt"), "tester")
+            .unwrap();
+        let ctx = OutputContext::from_flags(true, true, true);
+
+        let err = execute_bond(
+            &bond_args("bd-src", "bd-tgt", "bogus"),
+            &mut storage,
+            "tester",
+            &ctx,
+        )
+        .expect_err("invalid bond type must be rejected");
+        assert!(err.to_string().contains("invalid bond type"));
+    }
 }

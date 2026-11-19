@@ -53,8 +53,7 @@
 //!   comparison in Phase 6 is what detects it. Do not add a conversion that "helpfully"
 //! coerces, because a coercion here is exactly the class of bug the golden exists to catch.
 
-use rusqlite::fallible_streaming_iterator::FallibleStreamingIterator as _;
-use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, Value, ValueRef};
+use rusqlite::types::{FromSql, FromSqlError, ToSql, ToSqlOutput, Value, ValueRef};
 use rusqlite::{Connection, Error, Row, Statement};
 
 /// A bindable value, shaped so that the `SqliteValue::from(x)` call sites keep working
@@ -184,10 +183,21 @@ impl_from! {
 }
 
 impl ToSql for SqlValue {
-    /// rusqlite 0.40 returns a `ToSqlOutput`, not a `Value`. An owned value is correct here
-    /// because `SqlValue` always owns its data and hands rusqlite a borrow of it.
+    /// Hand rusqlite a borrow of the stored value instead of cloning it.
+    ///
+    /// The previous `ToSqlOutput::Owned(self.0.clone())` deep-copied every
+    /// bound value — including large `TEXT`/`BLOB` payloads — once per bind
+    /// per row, which dominated bulk insert/update paths. `Borrowed` keeps
+    /// the same bytes with zero copies; the borrow only needs to live until
+    /// the statement finishes executing, which `&self` guarantees.
     fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
-        Ok(ToSqlOutput::Owned(self.0.clone()))
+        Ok(match &self.0 {
+            Value::Null => ToSqlOutput::Borrowed(ValueRef::Null),
+            Value::Integer(i) => ToSqlOutput::Borrowed(ValueRef::Integer(*i)),
+            Value::Real(f) => ToSqlOutput::Borrowed(ValueRef::Real(*f)),
+            Value::Text(t) => ToSqlOutput::Borrowed(ValueRef::Text(t.as_bytes())),
+            Value::Blob(b) => ToSqlOutput::Borrowed(ValueRef::Blob(b.as_slice())),
+        })
     }
 }
 
@@ -272,7 +282,7 @@ pub fn query_row_values(stmt: &mut Statement<'_>) -> rusqlite::Result<Option<Vec
 
 /// Run a statement that returns no rows.
 pub fn db_exec(conn: &Connection, sql: &str) -> rusqlite::Result<usize> {
-    conn.execute(sql, [])
+    conn.prepare_cached(sql)?.execute([])
 }
 
 /// The direct replacements for the four frankensqlite call shapes.
@@ -288,7 +298,12 @@ pub fn db_exec(conn: &Connection, sql: &str) -> rusqlite::Result<usize> {
 /// The `[..]` argument is an ordinary temporary, so it lives to the end of the call and the
 /// borrow inside is fine. No `unsafe`, no `'static` requirement, no clone of the values.
 pub fn exec_with(conn: &Connection, sql: &str, values: &[SqlValue]) -> rusqlite::Result<usize> {
-    conn.execute(sql, params_from(values).as_slice())
+    // `prepare_cached` keeps the parsed statement in the connection's LRU
+    // cache, so repeated executions of the same SQL (row loops, event
+    // flushes, import batches) skip `sqlite3_prepare` entirely. `conn.execute`
+    // would re-prepare on every call.
+    let mut stmt = conn.prepare_cached(sql)?;
+    stmt.execute(params_from(values).as_slice())
 }
 
 /// `conn.query_with_params(sql, &[..])` returning `Vec<Row>`.
@@ -297,7 +312,7 @@ pub fn query_rows_with(
     sql: &str,
     values: &[SqlValue],
 ) -> rusqlite::Result<Vec<Vec<SqlValue>>> {
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare_cached(sql)?;
     query_rows_with_params(&mut stmt, params_from(values).as_slice())
 }
 
@@ -308,19 +323,19 @@ pub fn query_row_with(
     sql: &str,
     values: &[SqlValue],
 ) -> rusqlite::Result<Option<Vec<SqlValue>>> {
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare_cached(sql)?;
     query_row_values_with_params(&mut stmt, params_from(values).as_slice())
 }
 
 /// `conn.query(sql)` returning `Vec<Row>`.
 pub fn query_all(conn: &Connection, sql: &str) -> rusqlite::Result<Vec<Vec<SqlValue>>> {
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare_cached(sql)?;
     query_rows(&mut stmt)
 }
 
 /// `conn.query_row(sql)` returning the row, or `None` when it matched nothing.
 pub fn query_row_all(conn: &Connection, sql: &str) -> rusqlite::Result<Option<Vec<SqlValue>>> {
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare_cached(sql)?;
     query_row_values(&mut stmt)
 }
 

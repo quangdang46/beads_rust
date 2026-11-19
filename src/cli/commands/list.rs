@@ -638,6 +638,21 @@ pub(crate) fn build_filters(
             .as_ref()
             .and_then(|m| MolType::from_str(m).ok()),
         external_ref: args.external_ref.clone(),
+        priority_min: args.priority_min.map(i32::from),
+        priority_max: args.priority_max.map(i32::from),
+        description_contains: args.desc_contains.clone(),
+        notes_contains: args.notes_contains.clone(),
+        overdue_only: args.overdue,
+        // Mirrors `apply_client_filters`' `include_deferred` for `--overdue`:
+        // deferred rows are dropped unless `--deferred`, `--all`, or an
+        // explicit `--status deferred` asks for them.
+        overdue_exclude_deferred: args.overdue
+            && !args.deferred
+            && !args.all
+            && !args
+                .status
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case("deferred")),
     };
 
     // Apply query DSL filter (--filter) on top of explicit CLI filters
@@ -744,13 +759,16 @@ pub(crate) fn validate_list_args(args: &ListArgs) -> Result<()> {
 }
 
 fn needs_client_filters(args: &ListArgs) -> bool {
-    !args.id.is_empty()
-        || args.priority_min.is_some()
-        || args.priority_max.is_some()
-        || args.desc_contains.is_some()
+    // `--id`, `--priority-min/max`, `--deferred`, and `--overdue` are all
+    // evaluated in SQL now. Only the description/notes substring filters
+    // (Unicode-exact recheck) and `*` id globs containing characters that are
+    // literal in the Rust glob but active in SQLite GLOB still need the
+    // client path.
+    args.desc_contains.is_some()
         || args.notes_contains.is_some()
-        || args.deferred
-        || args.overdue
+        || args.id.iter().any(|id| {
+            id.contains('*') && id.contains(['?', '[', ']'])
+        })
 }
 
 fn should_use_full_relation_scan(
@@ -983,6 +1001,17 @@ mod tests {
                 .contains(&Status::Closed)
         );
         info!("test_build_filters_includes_closed_for_terminal_status: assertions passed");
+    }
+
+    #[test]
+    fn test_parse_time_filter_rejects_out_of_range_duration() {
+        init_logging();
+        // Regression: huge duration shorthand used to panic via non-`try_*`
+        // chrono constructors (SIGABRT under `panic = "abort"`); it must
+        // surface as a validation error instead.
+        assert!(parse_time_filter(Some("200000000000d")).is_err());
+        assert!(parse_time_filter(Some("1000000000d")).is_err());
+        assert!(parse_time_filter(Some("7d")).is_ok());
     }
 
     #[test]

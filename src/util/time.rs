@@ -362,15 +362,18 @@ pub fn parse_duration_shorthand(s: &str) -> Option<DateTime<Utc>> {
     let value: i64 = caps.get(1)?.as_str().parse().ok()?;
     let unit = caps.get(2)?.as_str();
     let now = Utc::now();
+    // `try_*` constructors and `checked_sub_signed` keep absurdly large
+    // user input (e.g. `--created-after 200000000000d`) from panicking;
+    // `panic = "abort"` in the release profile turns that into SIGABRT.
     let duration = match unit {
-        "s" => Duration::seconds(value),
-        "m" => Duration::minutes(value),
-        "h" => Duration::hours(value),
-        "d" => Duration::days(value),
-        "w" => Duration::weeks(value),
+        "s" => Duration::try_seconds(value),
+        "m" => Duration::try_minutes(value),
+        "h" => Duration::try_hours(value),
+        "d" => Duration::try_days(value),
+        "w" => Duration::try_weeks(value),
         _ => return None,
-    };
-    Some(now - duration)
+    }?;
+    now.checked_sub_signed(duration)
 }
 
 #[cfg(test)]
@@ -450,6 +453,18 @@ mod tests {
                 .contains("relative duration is out of supported range"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn test_parse_duration_shorthand_rejects_out_of_range() {
+        // Regression: non-`try_*` chrono constructors used to panic on huge
+        // input, and `panic = "abort"` in the release profile turned that
+        // into SIGABRT.
+        assert!(parse_duration_shorthand("200000000000d").is_none());
+        assert!(parse_duration_shorthand("99999999999999999999d").is_none());
+        // Fits in `Duration` but overflows the `DateTime` range.
+        assert!(parse_duration_shorthand("1000000000d").is_none());
+        assert!(parse_duration_shorthand("7d").is_some());
     }
 
     #[test]

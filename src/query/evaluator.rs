@@ -77,15 +77,21 @@ fn parse_duration_shorthand(s: &str) -> Result<Duration, QueryError> {
     let num: i64 = num_str
         .parse()
         .map_err(|_| QueryError::InvalidValue(format!("invalid duration number: {s}")))?;
-    match unit {
-        "d" => Ok(Duration::days(num)),
-        "h" => Ok(Duration::hours(num)),
-        "m" => Ok(Duration::minutes(num)),
-        "s" => Ok(Duration::seconds(num)),
-        _ => Err(QueryError::InvalidValue(format!(
-            "unknown duration unit: {s}"
-        ))),
-    }
+    // `try_*` constructors keep huge values (e.g. `created>200000000000d`)
+    // from panicking; `panic = "abort"` in the release profile turns that
+    // into SIGABRT on user input.
+    let duration = match unit {
+        "d" => Duration::try_days(num),
+        "h" => Duration::try_hours(num),
+        "m" => Duration::try_minutes(num),
+        "s" => Duration::try_seconds(num),
+        _ => {
+            return Err(QueryError::InvalidValue(format!(
+                "unknown duration unit: {s}"
+            )));
+        }
+    };
+    duration.ok_or_else(|| QueryError::InvalidValue(format!("duration out of range: {s}")))
 }
 
 /// Parse a timestamp value from a query comparison string.
@@ -100,7 +106,11 @@ fn parse_timestamp_value(s: &str) -> Result<DateTime<Utc>, QueryError> {
     // First try duration shorthand (old behavior: "7d" = 7 days ago)
     if s.ends_with(['d', 'h', 'm', 's']) && s.starts_with(|c: char| c.is_ascii_digit()) {
         let dur = parse_duration_shorthand(s)?;
-        return Ok(Utc::now() - dur);
+        // `checked_sub_signed` guards the DateTime range; a duration that
+        // fits in `Duration` can still overflow `DateTime` (e.g. `1000000000d`).
+        return Utc::now()
+            .checked_sub_signed(dur)
+            .ok_or_else(|| QueryError::InvalidValue(format!("timestamp out of range: {s}")));
     }
 
     // Fall through to flexible timestamp parsing (ISO dates, natural language, +/- offsets)
@@ -973,6 +983,17 @@ mod tests {
         let result = parse_and_evaluate("created>-3d").unwrap();
         assert!(!result.requires_predicate);
         assert!(result.filters.created_after.is_some());
+    }
+
+    #[test]
+    fn test_duration_out_of_range_does_not_panic() {
+        // Regression: huge duration shorthand used to panic via non-`try_*`
+        // chrono constructors (SIGABRT under `panic = "abort"`).
+        let err = parse_and_evaluate("created>200000000000d").unwrap_err();
+        assert!(matches!(err, QueryError::InvalidValue(_)));
+        // Fits in `Duration` but overflows the `DateTime` range.
+        let err = parse_and_evaluate("created>1000000000d").unwrap_err();
+        assert!(matches!(err, QueryError::InvalidValue(_)));
     }
 
     #[test]

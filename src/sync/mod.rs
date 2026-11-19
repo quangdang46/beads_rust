@@ -1591,29 +1591,33 @@ fn verify_exported_jsonl_integrity(path: &Path, expected_ids: &[String]) -> Resu
             continue;
         }
 
-        let issue: Issue = serde_json::from_str(trimmed).map_err(|err| {
+        // Only the id is needed for integrity verification — the export
+        // writer produced these lines itself, so field-level type errors
+        // cannot occur without also breaking JSON syntax. Parsing the full
+        // `Issue` here roughly doubled export cost on large databases.
+        let partial: PartialId = serde_json::from_str(trimmed).map_err(|err| {
             BeadsError::Config(format!(
                 "Export verification failed: invalid exported JSON at line {line_num}: {err}"
             ))
         })?;
 
-        if issue.id.trim().is_empty() {
+        if partial.id.trim().is_empty() {
             return Err(BeadsError::Config(format!(
                 "Export verification failed: empty issue id at line {line_num}"
             )));
         }
 
-        if !expected.contains(issue.id.as_str()) {
+        if !expected.contains(partial.id.as_str()) {
             return Err(BeadsError::Config(format!(
                 "Export verification failed: unexpected issue id '{}' at line {line_num}",
-                issue.id
+                partial.id
             )));
         }
 
-        if !observed.insert(issue.id.clone()) {
+        if !observed.insert(partial.id.clone()) {
             return Err(BeadsError::Config(format!(
                 "Export verification failed: duplicate issue id '{}' at line {line_num}",
-                issue.id
+                partial.id
             )));
         }
 
@@ -4374,6 +4378,31 @@ fn collect_import_validation_plan(
     config: &ImportConfig,
     expected_prefix: Option<&str>,
 ) -> Result<ImportValidationPlan> {
+    collect_import_validation_plan_inner(input_path, config, expected_prefix, None)
+}
+
+/// [`collect_import_validation_plan`] variant that also retains every parsed
+/// issue so the collision scan and apply passes can reuse them instead of
+/// re-reading and re-parsing the file (beads_rust-dqe0g). Only used for
+/// inputs below [`IMPORT_BUFFER_MAX_BYTES`]; larger files keep the streaming
+/// multi-pass path to bound memory.
+fn collect_import_validation_plan_buffered(
+    input_path: &Path,
+    config: &ImportConfig,
+    expected_prefix: Option<&str>,
+) -> Result<(ImportValidationPlan, Vec<Issue>)> {
+    let mut buffer = Vec::new();
+    let plan =
+        collect_import_validation_plan_inner(input_path, config, expected_prefix, Some(&mut buffer))?;
+    Ok((plan, buffer))
+}
+
+fn collect_import_validation_plan_inner(
+    input_path: &Path,
+    config: &ImportConfig,
+    expected_prefix: Option<&str>,
+    mut issue_buffer: Option<&mut Vec<Issue>>,
+) -> Result<ImportValidationPlan> {
     let mut plan = ImportValidationPlan::default();
     let mut seen_ids = HashSet::new();
     let invalid_policy = if config.strict {
@@ -4410,16 +4439,20 @@ fn collect_import_validation_plan(
 
             if prefix_mismatch {
                 plan.prefix_mismatches.push(PrefixRenameSeed {
-                    old_id: issue.id,
-                    title: issue.title,
-                    description: issue.description,
-                    created_by: issue.created_by,
+                    old_id: issue.id.clone(),
+                    title: issue.title.clone(),
+                    description: issue.description.clone(),
+                    created_by: issue.created_by.clone(),
                     created_at: issue.created_at,
                 });
             } else {
-                plan.occupied_ids.insert(issue.id);
+                plan.occupied_ids.insert(issue.id.clone());
             }
             plan.record_count += 1;
+
+            if let Some(buffer) = issue_buffer.as_mut() {
+                buffer.push(issue);
+            }
 
             Ok(())
         })?;
@@ -4728,6 +4761,158 @@ fn export_hash_entry_for_import_action(
     }
 }
 
+/// Inputs above this size keep the streaming multi-pass import path so a
+/// huge JSONL cannot exhaust memory with a fully buffered issue set
+/// (beads_rust-dqe0g). 32 MiB covers typical `br export` outputs (~tens of
+/// thousands of issues) while bounding worst-case buffered `Issue` memory.
+const IMPORT_BUFFER_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Per-issue outcome of the buffered collision scan, carried into the write
+/// transaction so the apply pass neither re-parses the file nor recomputes
+/// `content_hash`/collision detection (beads_rust-dqe0g).
+struct BufferedImportOutcome {
+    action: CollisionAction,
+    target_id: String,
+    computed_hash: String,
+}
+
+/// A parsed import issue plus its scan outcome. `outcome` stays `None` for
+/// ephemeral issues, which every pass skips.
+struct BufferedImportEntry {
+    issue: Issue,
+    outcome: Option<BufferedImportOutcome>,
+}
+
+/// Buffered equivalent of [`scan_import_collision_renames`]: runs the same
+/// per-issue pipeline (prefix renames, ephemeral skip, external-ref dedup,
+/// content hash, collision detection, action resolution) over issues already
+/// parsed by the validation pass, recording each outcome for the apply pass.
+fn scan_buffered_import_entries(
+    entries: &mut [BufferedImportEntry],
+    config: &ImportConfig,
+    prefix_renames: &HashMap<String, String>,
+    metadata: &ImportMetadataMaps,
+    result: &mut ImportResult,
+    progress: &indicatif::ProgressBar,
+) -> Result<HashMap<String, String>> {
+    let mut seen_external_refs = HashSet::new();
+    let mut renames = HashMap::new();
+
+    for entry in entries.iter_mut() {
+        let issue = &mut entry.issue;
+        apply_prefix_renames(issue, prefix_renames);
+
+        if issue.ephemeral {
+            result.skipped_count += 1;
+            progress.inc(1);
+            continue;
+        }
+
+        handle_duplicate_external_ref(issue, &mut seen_external_refs, config)?;
+
+        let computed_hash = crate::util::content_hash(issue);
+        let collision = detect_collision(
+            issue,
+            &metadata.id_by_ext_ref,
+            &metadata.id_by_hash,
+            &metadata.meta_by_id,
+            &computed_hash,
+        );
+        let action = determine_action(
+            &collision,
+            issue,
+            &metadata.meta_by_id,
+            config.force_upsert,
+        )?;
+        let target_id = match &collision {
+            CollisionResult::Match { existing_id, .. } => existing_id.clone(),
+            CollisionResult::NewIssue => issue.id.clone(),
+        };
+
+        if target_id != issue.id {
+            renames.insert(issue.id.clone(), target_id.clone());
+        }
+
+        entry.outcome = Some(BufferedImportOutcome {
+            action,
+            target_id,
+            computed_hash,
+        });
+
+        progress.inc(1);
+    }
+
+    Ok(renames)
+}
+
+/// Buffered equivalent of [`stream_import_actions_in_tx`]: applies the
+/// precomputed collision actions to the buffered issues inside the write
+/// transaction. The per-issue work (prefix/collision renames, action,
+/// content hash) was already done by [`scan_buffered_import_entries`], so
+/// this pass performs DB writes only.
+fn stream_buffered_import_actions_in_tx(
+    storage: &SqliteStorage,
+    entries: &mut [BufferedImportEntry],
+    config: &ImportConfig,
+    collision_renames: &HashMap<String, String>,
+    base_result: &ImportResult,
+    progress: &indicatif::ProgressBar,
+) -> Result<ImportResult> {
+    let mut tx_result = base_result.clone();
+    let mut export_hash_batch = Vec::with_capacity(IMPORT_EXPORT_HASH_BATCH_SIZE);
+    let mut export_hash_ids = HashSet::new();
+    let mut uncertified_local_wins = 0usize;
+
+    progress.set_position(0);
+    storage.clear_all_export_hashes_in_tx()?;
+
+    for entry in entries.iter_mut() {
+        let issue = &mut entry.issue;
+        if issue.ephemeral {
+            progress.inc(1);
+            continue;
+        }
+
+        let outcome = entry.outcome.take().ok_or_else(|| {
+            BeadsError::internal(format!(
+                "import scan produced no outcome for issue {}",
+                issue.id
+            ))
+        })?;
+
+        apply_collision_renames(issue, collision_renames);
+        process_import_action(storage, &outcome.action, issue, &mut tx_result)?;
+
+        if let Some((export_id, export_hash)) = export_hash_entry_for_import_action(
+            storage,
+            &outcome.action,
+            &outcome.target_id,
+            issue,
+            &outcome.computed_hash,
+        )? {
+            export_hash_ids.insert(export_id.clone());
+            export_hash_batch.push((export_id, export_hash));
+            if export_hash_batch.len() >= IMPORT_EXPORT_HASH_BATCH_SIZE {
+                storage.insert_export_hashes_after_clear_in_tx(&export_hash_batch)?;
+                export_hash_batch.clear();
+            }
+        } else {
+            uncertified_local_wins += 1;
+        }
+
+        progress.inc(1);
+    }
+
+    finish_import_actions_in_tx(
+        storage,
+        tx_result,
+        export_hash_batch,
+        export_hash_ids,
+        uncertified_local_wins,
+        config,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn stream_import_actions_in_tx(
     storage: &SqliteStorage,
@@ -4806,6 +4991,29 @@ fn stream_import_actions_in_tx(
         Ok(())
     })?;
 
+    finish_import_actions_in_tx(
+        storage,
+        tx_result,
+        export_hash_batch,
+        export_hash_ids,
+        uncertified_local_wins,
+        config,
+    )
+}
+
+/// Shared post-loop tail of the import apply transaction: flush the pending
+/// export-hash batch, record `needs_flush` for uncertified local wins, sweep
+/// orphan FK rows, and rebuild derived caches. Used by both the streaming
+/// (re-parse) and buffered (single-parse) apply paths.
+#[allow(clippy::too_many_arguments)]
+fn finish_import_actions_in_tx(
+    storage: &SqliteStorage,
+    mut tx_result: ImportResult,
+    export_hash_batch: Vec<(String, String)>,
+    export_hash_ids: HashSet<String>,
+    uncertified_local_wins: usize,
+    config: &ImportConfig,
+) -> Result<ImportResult> {
     if !export_hash_batch.is_empty() {
         storage.insert_export_hashes_after_clear_in_tx(&export_hash_batch)?;
     }
@@ -4902,9 +5110,24 @@ pub fn import_from_jsonl(
     // Step 1: Conflict marker scan
     ensure_no_conflict_markers(input_path)?;
 
+    // Small inputs are parsed once and buffered so the collision scan and
+    // apply passes reuse the same `Issue` values (beads_rust-dqe0g) instead
+    // of re-reading and re-parsing the file three times. Large inputs keep
+    // the streaming multi-pass path to bound memory.
+    let use_buffered_import = std::fs::metadata(input_path)
+        .map(|meta| meta.len() <= IMPORT_BUFFER_MAX_BYTES)
+        .unwrap_or(false);
+
     // Step 2: Parse, Normalize, Validate, and collect minimal rename state.
     let spinner = create_spinner("Parsing and validating issues", config.show_progress);
-    let validation_plan = collect_import_validation_plan(input_path, config, expected_prefix)?;
+    let (validation_plan, buffered_issues) = if use_buffered_import {
+        collect_import_validation_plan_buffered(input_path, config, expected_prefix)?
+    } else {
+        (
+            collect_import_validation_plan(input_path, config, expected_prefix)?,
+            Vec::new(),
+        )
+    };
     spinner.finish_with_message("Parsed and validated issues");
 
     let mut result = ImportResult {
@@ -4925,14 +5148,38 @@ pub fn import_from_jsonl(
     let metadata = load_import_metadata_maps(storage)?;
 
     // Phase 1: Scan and Resolve IDs
-    let collision_renames = scan_import_collision_renames(
-        input_path,
-        config,
-        &prefix_renames,
-        &metadata,
-        &mut result,
-        validation_plan.record_count,
-    )?;
+    let mut buffered_entries: Option<Vec<BufferedImportEntry>> = None;
+    let collision_renames = if use_buffered_import {
+        let mut entries: Vec<BufferedImportEntry> = buffered_issues
+            .into_iter()
+            .map(|issue| BufferedImportEntry { issue, outcome: None })
+            .collect();
+        let scan_progress = create_progress_bar(
+            validation_plan.record_count as u64,
+            "Scanning issues",
+            config.show_progress,
+        );
+        let renames = scan_buffered_import_entries(
+            &mut entries,
+            config,
+            &prefix_renames,
+            &metadata,
+            &mut result,
+            &scan_progress,
+        )?;
+        scan_progress.finish_with_message("Scan complete");
+        buffered_entries = Some(entries);
+        renames
+    } else {
+        scan_import_collision_renames(
+            input_path,
+            config,
+            &prefix_renames,
+            &metadata,
+            &mut result,
+            validation_plan.record_count,
+        )?
+    };
 
     let jsonl_hash = compute_jsonl_hash(input_path)?;
     let observed_jsonl = observed_jsonl_witness(input_path)?;
@@ -4956,16 +5203,27 @@ pub fn import_from_jsonl(
     );
 
     let apply_result = storage.with_write_transaction(|storage| -> Result<ImportResult> {
-        let tx_result = stream_import_actions_in_tx(
-            storage,
-            input_path,
-            config,
-            &prefix_renames,
-            &collision_renames,
-            &metadata,
-            &result,
-            &progress,
-        )?;
+        let tx_result = if let Some(entries) = buffered_entries.as_mut() {
+            stream_buffered_import_actions_in_tx(
+                storage,
+                entries,
+                config,
+                &collision_renames,
+                &result,
+                &progress,
+            )?
+        } else {
+            stream_import_actions_in_tx(
+                storage,
+                input_path,
+                config,
+                &prefix_renames,
+                &collision_renames,
+                &metadata,
+                &result,
+                &progress,
+            )?
+        };
 
         storage.set_metadata_in_tx(METADATA_LAST_IMPORT_TIME, &chrono::Utc::now().to_rfc3339())?;
         storage.set_metadata_in_tx(METADATA_JSONL_CONTENT_HASH, &jsonl_hash)?;
@@ -6857,24 +7115,34 @@ mod tests {
         let json1 = serde_json::to_string(&issue1).unwrap();
         let json2 = serde_json::to_string(&issue2).unwrap();
 
-        let cases = [
-            ("collapsed adjacent records", format!("{json1}{json2}\n")),
+        // Verification parses only the `id` field (PartialId), so the last
+        // case is well-formed JSON with a valid id: it is rejected by the
+        // issue-count check rather than the JSON parse check.
+        let cases: [(&str, String, &str); 4] = [
+            (
+                "collapsed adjacent records",
+                format!("{json1}{json2}\n"),
+                "invalid exported JSON at line 1",
+            ),
             (
                 "stray issue prefix",
                 "{\"i{\"id\":\"bd-001\"}\n".to_string(),
+                "invalid exported JSON at line 1",
             ),
             (
                 "missing comments array closure",
                 "{\"id\":\"bd-001\",\"title\":\"Broken\",\"comments\":[{\"id\":1}\n".to_string(),
+                "invalid exported JSON at line 1",
             ),
             (
                 "object nested in numeric field",
                 "{\"id\":\"bd-001\",\"title\":\"Broken\",\"original_size\":{\"id\":\"bd-002\"}}\n"
                     .to_string(),
+                "expected 2 issues, JSONL has 1 valid issue lines",
             ),
         ];
 
-        for (name, content) in cases {
+        for (name, content, expected_message) in cases {
             fs::write(&path, content).unwrap();
 
             let err = verify_exported_jsonl_integrity(
@@ -6884,7 +7152,7 @@ mod tests {
             .unwrap_err()
             .to_string();
             assert!(
-                err.contains("invalid exported JSON at line 1"),
+                err.contains(expected_message),
                 "{name}: unexpected error: {err}"
             );
         }

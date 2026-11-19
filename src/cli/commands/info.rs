@@ -439,6 +439,11 @@ fn actual_table_names(conn: &Connection) -> Vec<String> {
     .map(|rows| {
         rows.into_iter()
             .filter_map(|row| row.get(0).and_then(SqlValue::as_text).map(str::to_string))
+            // FTS5 search indexes (issues_fts/labels_fts) and their shadow
+            // tables are internal implementation details, not user tables.
+            .filter(|name| {
+                !(name.starts_with("issues_fts") || name.starts_with("labels_fts"))
+            })
             .collect()
     })
     .unwrap_or_default()
